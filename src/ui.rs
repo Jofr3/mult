@@ -7,12 +7,17 @@ use ratatui::{
 };
 
 use crate::{
-    app::{App, Mode, NavItem},
-    model::{ChatStatus, TerminalId, TerminalLaunch, TerminalStatus, WorkspaceId},
+    app::{
+        chat_agent_terminal_id, App, Mode, NavItem, TerminalCellStyle, TerminalColor,
+        TerminalRenderLine,
+    },
+    config,
+    model::{ChatId, ChatStatus, TerminalId, TerminalLaunch, TerminalStatus, WorkspaceId},
     storage,
 };
 
-const FOOTER: &str = "q/esc quit • j/k move • o open/import • w workspace • c chat • t terminal • d command • s/x start/stop PTY • i input";
+const FOOTER: &str = "q/esc quit • j/k move • o open/import • w workspace • c chat • p pi agent • t terminal • d command • D/del delete • s/x PTY • i input";
+const CHAT_AGENT_HEADER_LINES: u16 = 9;
 const TERMINAL_HEADER_LINES: u16 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +44,15 @@ pub fn selected_terminal_output_area(app: &App, frame_area: Rect) -> Option<(Ter
     Some((terminal, terminal_output_area(layout.main)))
 }
 
+pub fn selected_chat_agent_output_area(app: &App, frame_area: Rect) -> Option<(ChatId, Rect)> {
+    let Some(NavItem::Chat { chat, .. }) = app.selected_item() else {
+        return None;
+    };
+
+    let layout = layout_areas(app, frame_area);
+    Some((chat, chat_agent_output_area(layout.main)))
+}
+
 fn layout_areas(app: &App, frame_area: Rect) -> LayoutAreas {
     let footer_height = if app.is_prompt_active() { 4 } else { 1 };
     let [body, footer] =
@@ -54,8 +68,16 @@ fn layout_areas(app: &App, frame_area: Rect) -> LayoutAreas {
 }
 
 fn terminal_output_area(main: Rect) -> Rect {
+    output_area_after_header(main, TERMINAL_HEADER_LINES)
+}
+
+fn chat_agent_output_area(main: Rect) -> Rect {
+    output_area_after_header(main, CHAT_AGENT_HEADER_LINES)
+}
+
+fn output_area_after_header(main: Rect, header_lines: u16) -> Rect {
     let inner = bordered_inner(main);
-    let header_height = TERMINAL_HEADER_LINES.min(inner.height);
+    let header_height = header_lines.min(inner.height);
 
     Rect {
         x: inner.x,
@@ -76,7 +98,11 @@ fn bordered_inner(area: Rect) -> Rect {
 
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let items = sidebar_items(app);
-    let selected = (!items.is_empty()).then_some(app.selected.min(items.len() - 1));
+    let selected = if items.is_empty() {
+        None
+    } else {
+        Some(app.selected.min(items.len() - 1))
+    };
     let mut state = ListState::default();
     state.select(selected);
 
@@ -147,9 +173,12 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
         .title(" mult — AI agent multiplexer ");
 
     let terminal_output_rows = usize::from(terminal_output_area(area).height.max(1));
+    let chat_agent_output_rows = usize::from(chat_agent_output_area(area).height.max(1));
     let lines = match app.selected_item() {
         Some(NavItem::Workspace(workspace)) => workspace_details(app, workspace),
-        Some(NavItem::Chat { workspace, chat }) => chat_details(app, workspace, chat),
+        Some(NavItem::Chat { workspace, chat }) => {
+            chat_details(app, workspace, chat, chat_agent_output_rows)
+        }
         Some(NavItem::Terminal {
             workspace,
             terminal,
@@ -201,6 +230,7 @@ fn workspace_details(app: &App, workspace_id: WorkspaceId) -> Vec<Line<'static>>
         Line::from(""),
         Line::from("M1 is nearly complete: stable IDs, cwd/env metadata, JSON persistence, and open/import."),
         Line::from("Press `o` to import another workspace by directory path."),
+        Line::from("Press `D` or Delete to remove the selected workspace/chat/terminal."),
     ]
 }
 
@@ -208,6 +238,7 @@ fn chat_details(
     app: &App,
     workspace_id: WorkspaceId,
     chat_id: crate::model::ChatId,
+    output_rows: usize,
 ) -> Vec<Line<'static>> {
     let Some(workspace) = app.project.workspace(workspace_id) else {
         return vec![Line::from("Missing workspace.")];
@@ -216,7 +247,7 @@ fn chat_details(
         return vec![Line::from("Missing chat.")];
     };
 
-    vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("Chat: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -239,13 +270,49 @@ fn chat_details(
             Span::styled(chat.status.label(), chat_status_style(chat.status)),
         ]),
         Line::from(""),
-        Line::from("Placeholder transcript"),
-        Line::from("──────────────────────"),
-        Line::from("user  > sketch the multiplexer architecture"),
-        Line::from("agent > building the shell: state, sidebar, detail pane, and keybindings"),
+        Line::from("Controls: p start/focus pi • x stop pi • i focus input • D/delete remove"),
         Line::from(""),
-        Line::from("The real implementation will stream agent output into this pane."),
-    ]
+        Line::from("Pi agent"),
+        Line::from("──────────────────────"),
+    ];
+
+    let output_plain = app.terminal_lines(chat_agent_terminal_id(chat_id));
+    let output = app.terminal_render_lines(chat_agent_terminal_id(chat_id));
+    if terminal_plain_output_is_blank(&output_plain) {
+        lines.push(Line::from(
+            "Pi agent not started. Press `p` to run pi here, then type prompts directly.",
+        ));
+        lines.push(Line::from("Set `pi_agent_command` in:"));
+        lines.push(Line::from(config::config_path().display().to_string()));
+        let transcript = app.chat_lines(chat_id);
+        if !transcript.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from("Saved transcript"));
+            lines.extend(
+                transcript
+                    .into_iter()
+                    .rev()
+                    .take(output_rows.saturating_sub(4))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .map(Line::from),
+            );
+        }
+    } else {
+        lines.extend(
+            output
+                .into_iter()
+                .rev()
+                .take(output_rows)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(terminal_render_line_to_line),
+        );
+    }
+
+    lines
 }
 
 fn terminal_details(
@@ -291,14 +358,15 @@ fn terminal_details(
             Span::raw(launch_label(&terminal.launch)),
         ]),
         Line::from(""),
-        Line::from("Controls: s start • x stop • i focus input • Esc unfocus"),
+        Line::from("Controls: s start • x stop • i focus input • D/delete remove"),
         Line::from(""),
         Line::from("PTY output"),
         Line::from("──────────────────────"),
     ];
 
-    let output = app.terminal_lines(terminal_id);
-    if output.is_empty() {
+    let output_plain = app.terminal_lines(terminal_id);
+    let output = app.terminal_render_lines(terminal_id);
+    if terminal_plain_output_is_blank(&output_plain) {
         lines.push(Line::from(
             "PTY not started. Select this terminal and press `s`.",
         ));
@@ -314,7 +382,7 @@ fn terminal_details(
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
-                .map(Line::from),
+                .map(terminal_render_line_to_line),
         );
     }
 
@@ -349,12 +417,44 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                 "enter adds command terminal • esc/ctrl-c cancels",
             );
         }
+        Mode::ConfirmDelete(confirmation) => {
+            draw_delete_confirmation(frame, area, confirmation);
+        }
         Mode::TerminalInput { .. } => {
             let footer = Paragraph::new("terminal input focused • typing goes to PTY • Esc returns to mult • Ctrl-C sends interrupt")
                 .style(Style::default().fg(Color::Yellow));
             frame.render_widget(footer, area);
         }
+        Mode::ChatAgentInput { .. } => {
+            let footer = Paragraph::new("pi agent focused • typing goes directly to pi • Esc returns to mult • Ctrl-C sends interrupt")
+                .style(Style::default().fg(Color::Yellow));
+            frame.render_widget(footer, area);
+        }
     }
+}
+
+fn draw_delete_confirmation(
+    frame: &mut Frame,
+    area: Rect,
+    confirmation: &crate::app::DeleteConfirmation,
+) {
+    let prompt = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Delete: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(confirmation.label.clone(), Style::default().fg(Color::Red)),
+        ]),
+        Line::from(confirmation.detail.clone()),
+        Line::from(Span::styled(
+            "confirm with y/enter • n/esc/ctrl-c cancels",
+            Style::default().fg(Color::Yellow),
+        )),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" confirm delete "),
+    );
+    frame.render_widget(prompt, area);
 }
 
 fn draw_text_prompt(
@@ -384,6 +484,61 @@ fn draw_text_prompt(
     frame.render_widget(prompt, area);
 }
 
+fn terminal_plain_output_is_blank(lines: &[String]) -> bool {
+    lines.iter().all(|line| line.trim().is_empty())
+}
+
+fn terminal_render_line_to_line(line: TerminalRenderLine) -> Line<'static> {
+    Line::from(
+        line.spans
+            .into_iter()
+            .map(|span| Span::styled(span.text, terminal_style(span.style)))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn terminal_style(style: TerminalCellStyle) -> Style {
+    let mut output = Style::default();
+    if let Some(fg) = style.fg {
+        output = output.fg(terminal_color(fg));
+    }
+    if let Some(bg) = style.bg {
+        output = output.bg(terminal_color(bg));
+    }
+    if style.bold {
+        output = output.add_modifier(Modifier::BOLD);
+    }
+    if style.italic {
+        output = output.add_modifier(Modifier::ITALIC);
+    }
+    if style.underlined {
+        output = output.add_modifier(Modifier::UNDERLINED);
+    }
+    output
+}
+
+fn terminal_color(color: TerminalColor) -> Color {
+    match color {
+        TerminalColor::Black => Color::Black,
+        TerminalColor::Red => Color::Red,
+        TerminalColor::Green => Color::Green,
+        TerminalColor::Yellow => Color::Yellow,
+        TerminalColor::Blue => Color::Blue,
+        TerminalColor::Magenta => Color::Magenta,
+        TerminalColor::Cyan => Color::Cyan,
+        TerminalColor::White => Color::White,
+        TerminalColor::BrightBlack => Color::DarkGray,
+        TerminalColor::BrightRed => Color::LightRed,
+        TerminalColor::BrightGreen => Color::LightGreen,
+        TerminalColor::BrightYellow => Color::LightYellow,
+        TerminalColor::BrightBlue => Color::LightBlue,
+        TerminalColor::BrightMagenta => Color::LightMagenta,
+        TerminalColor::BrightCyan => Color::LightCyan,
+        TerminalColor::BrightWhite => Color::Gray,
+        TerminalColor::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
+    }
+}
+
 fn launch_label(launch: &TerminalLaunch) -> String {
     match launch {
         TerminalLaunch::Shell => "shell".to_string(),
@@ -396,6 +551,7 @@ fn chat_status_style(status: ChatStatus) -> Style {
         ChatStatus::Idle => Color::Blue,
         ChatStatus::Thinking => Color::Yellow,
         ChatStatus::Waiting => Color::Magenta,
+        ChatStatus::Failed => Color::Red,
         ChatStatus::Done => Color::Green,
     };
 
@@ -413,7 +569,20 @@ fn terminal_status_style(status: TerminalStatus) -> Style {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::{backend::TestBackend, Terminal};
+
     use super::*;
+
+    #[test]
+    fn draw_handles_empty_workspace_list() {
+        let mut app = App::default();
+        app.project.workspaces.clear();
+        app.selected = 0;
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal.draw(|frame| draw(frame, &app)).expect("draw app");
+    }
 
     #[test]
     fn selected_terminal_output_area_tracks_visible_main_pane_size() {
@@ -439,5 +608,21 @@ mod tests {
             selected_terminal_output_area(&app, Rect::new(0, 0, 120, 40)),
             None
         );
+    }
+
+    #[test]
+    fn selected_chat_agent_output_area_tracks_visible_main_pane_size() {
+        let mut app = App::default();
+        app.selected = app
+            .nav_items()
+            .iter()
+            .position(|item| matches!(item, NavItem::Chat { .. }))
+            .expect("seed state has a chat");
+
+        let (_, area) = selected_chat_agent_output_area(&app, Rect::new(0, 0, 120, 40))
+            .expect("chat selection has pi output area");
+
+        assert_eq!(area.width, 84);
+        assert_eq!(area.height, 28);
     }
 }

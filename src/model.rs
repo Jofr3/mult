@@ -28,6 +28,23 @@ pub struct ChatSession {
     pub id: ChatId,
     pub name: String,
     pub status: ChatStatus,
+    #[serde(default)]
+    pub messages: Vec<ChatMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: ChatMessageRole,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChatMessageRole {
+    User,
+    Assistant,
+    System,
+    Tool,
+    Error,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +70,7 @@ pub enum ChatStatus {
     Idle,
     Thinking,
     Waiting,
+    Failed,
     Done,
 }
 
@@ -118,10 +136,63 @@ impl ProjectState {
             .iter()
             .position(|workspace| workspace.id == workspace_id)?;
         let id = self.allocate_chat_id();
-        self.workspaces[workspace_index]
-            .chats
-            .push(ChatSession { id, name, status });
+        self.workspaces[workspace_index].chats.push(ChatSession {
+            id,
+            name,
+            status,
+            messages: Vec::new(),
+        });
         Some(id)
+    }
+
+    pub fn append_chat_message(
+        &mut self,
+        workspace_id: WorkspaceId,
+        chat_id: ChatId,
+        role: ChatMessageRole,
+        text: String,
+    ) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+
+        let Some(chat) = self.chat_mut(workspace_id, chat_id) else {
+            return false;
+        };
+
+        chat.messages.push(ChatMessage { role, text });
+        true
+    }
+
+    pub fn append_chat_delta(
+        &mut self,
+        workspace_id: WorkspaceId,
+        chat_id: ChatId,
+        role: ChatMessageRole,
+        text: &str,
+    ) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+
+        let Some(chat) = self.chat_mut(workspace_id, chat_id) else {
+            return false;
+        };
+
+        if let Some(message) = chat
+            .messages
+            .last_mut()
+            .filter(|message| message.role == role)
+        {
+            message.text.push_str(text);
+        } else {
+            chat.messages.push(ChatMessage {
+                role,
+                text: text.to_string(),
+            });
+        }
+
+        true
     }
 
     pub fn add_terminal(
@@ -164,6 +235,37 @@ impl ProjectState {
                 launch,
             });
         Some(id)
+    }
+
+    pub fn remove_workspace(&mut self, workspace_id: WorkspaceId) -> Option<Workspace> {
+        let index = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)?;
+        Some(self.workspaces.remove(index))
+    }
+
+    pub fn remove_chat(
+        &mut self,
+        workspace_id: WorkspaceId,
+        chat_id: ChatId,
+    ) -> Option<ChatSession> {
+        let workspace = self.workspace_mut(workspace_id)?;
+        let index = workspace.chats.iter().position(|chat| chat.id == chat_id)?;
+        Some(workspace.chats.remove(index))
+    }
+
+    pub fn remove_terminal(
+        &mut self,
+        workspace_id: WorkspaceId,
+        terminal_id: TerminalId,
+    ) -> Option<TerminalSession> {
+        let workspace = self.workspace_mut(workspace_id)?;
+        let index = workspace
+            .terminals
+            .iter()
+            .position(|terminal| terminal.id == terminal_id)?;
+        Some(workspace.terminals.remove(index))
     }
 
     pub fn workspace(&self, id: WorkspaceId) -> Option<&Workspace> {
@@ -258,6 +360,7 @@ impl ChatStatus {
             Self::Idle => "idle",
             Self::Thinking => "thinking",
             Self::Waiting => "waiting",
+            Self::Failed => "failed",
             Self::Done => "done",
         }
     }
@@ -266,8 +369,21 @@ impl ChatStatus {
         match self {
             Self::Idle => Self::Thinking,
             Self::Thinking => Self::Waiting,
-            Self::Waiting => Self::Done,
+            Self::Waiting => Self::Failed,
+            Self::Failed => Self::Done,
             Self::Done => Self::Idle,
+        }
+    }
+}
+
+impl ChatMessageRole {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "agent",
+            Self::System => "system",
+            Self::Tool => "tool",
+            Self::Error => "error",
         }
     }
 }
@@ -334,5 +450,56 @@ mod tests {
         let terminal: TerminalSession = serde_json::from_str(json).expect("deserialize terminal");
 
         assert_eq!(terminal.launch, TerminalLaunch::Shell);
+    }
+
+    #[test]
+    fn chat_messages_default_for_old_state_files() {
+        let json = r#"
+        {
+          "id": 1,
+          "name": "agent",
+          "status": "Idle"
+        }
+        "#;
+
+        let chat: ChatSession = serde_json::from_str(json).expect("deserialize chat");
+
+        assert!(chat.messages.is_empty());
+    }
+
+    #[test]
+    fn chat_deltas_append_to_last_message_with_same_role() {
+        let mut state = ProjectState::default();
+        let workspace = state.workspaces[0].id;
+        let chat = state.workspaces[0].chats[0].id;
+
+        assert!(state.append_chat_delta(workspace, chat, ChatMessageRole::Assistant, "hello"));
+        assert!(state.append_chat_delta(workspace, chat, ChatMessageRole::Assistant, " world"));
+        assert!(state.append_chat_delta(workspace, chat, ChatMessageRole::System, "done"));
+
+        let messages = &state.chat(workspace, chat).unwrap().messages;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].text, "hello world");
+        assert_eq!(messages[1].role, ChatMessageRole::System);
+    }
+
+    #[test]
+    fn remove_workspace_chat_and_terminal_by_id() {
+        let mut state = ProjectState::default();
+        let workspace = state.workspaces[0].id;
+        let chat = state.workspaces[0].chats[0].id;
+        let terminal = state.workspaces[0].terminals[0].id;
+
+        assert_eq!(state.remove_chat(workspace, chat).unwrap().id, chat);
+        assert!(state.chat(workspace, chat).is_none());
+
+        assert_eq!(
+            state.remove_terminal(workspace, terminal).unwrap().id,
+            terminal
+        );
+        assert!(state.terminal(workspace, terminal).is_none());
+
+        assert_eq!(state.remove_workspace(workspace).unwrap().id, workspace);
+        assert!(state.workspace(workspace).is_none());
     }
 }

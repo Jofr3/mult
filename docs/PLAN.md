@@ -47,15 +47,19 @@ Goal: prove the app skeleton and UX layout.
 - [x] Support resizing from pane dimensions instead of fixed 80x24.
 - [x] Spawn named commands/dev servers, not only default shells.
 
-### M3 — Agent adapters
+### M3 — Agent adapters (done)
 
-- Define an `AgentBackend` trait for sending prompts and streaming events.
-- Support process-backed adapters first (for local CLIs), then HTTP/WebSocket adapters if useful.
-- Normalize events: message delta, tool call, file change, command started, status changed, error.
-- Keep agent sessions resumable per workspace.
+- [x] Define an `AgentBackend` trait for sending prompts and streaming events.
+- [x] Support process-backed adapters first (for local CLIs), then HTTP/WebSocket adapters if useful.
+- [x] Normalize events: message delta, tool call, file change, command started, status changed, error.
+- [x] Add explicit confirmation before launching process-backed agent commands.
+- [x] Keep agent sessions resumable per workspace.
 
-### M4 — Layout and workflow UX
+### M4 — Layout and workflow UX (in progress)
 
+- [x] Render a pi agent directly in selected chat panes via PTY.
+- [x] Load user config from `~/.config/mult/config.json`.
+- [x] Delete workspaces, agent chats, and terminals with confirmation.
 - Add focus modes: sidebar, chat, terminal, command palette.
 - Support split panes/tabs per workspace.
 - Add command palette for workspace/session/terminal actions.

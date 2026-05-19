@@ -3,7 +3,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::model::{ChatId, ChatStatus, ProjectState, TerminalId, TerminalStatus, WorkspaceId};
+use crate::{
+    agent::{AgentEvent, AgentMessageRole, AgentTarget},
+    model::{
+        ChatId, ChatMessage, ChatMessageRole, ChatStatus, ProjectState, TerminalId, TerminalStatus,
+        WorkspaceId,
+    },
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct App {
@@ -11,6 +17,7 @@ pub struct App {
     pub selected: usize,
     pub mode: Mode,
     pub terminal_buffers: BTreeMap<TerminalId, TerminalBuffer>,
+    pub chat_buffers: BTreeMap<ChatId, ChatBuffer>,
     pub should_quit: bool,
     dirty: bool,
 }
@@ -20,9 +27,14 @@ pub enum Mode {
     Normal,
     OpenWorkspace(OpenWorkspacePrompt),
     NewTerminalCommand(TerminalCommandPrompt),
+    ConfirmDelete(DeleteConfirmation),
     TerminalInput {
         workspace: WorkspaceId,
         terminal: TerminalId,
+    },
+    ChatAgentInput {
+        workspace: WorkspaceId,
+        chat: ChatId,
     },
 }
 
@@ -38,10 +50,107 @@ pub struct TerminalCommandPrompt {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteConfirmation {
+    pub target: DeleteTarget,
+    pub label: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteTarget {
+    Workspace(WorkspaceId),
+    Chat {
+        workspace: WorkspaceId,
+        chat: ChatId,
+    },
+    Terminal {
+        workspace: WorkspaceId,
+        terminal: TerminalId,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TerminalBuffer {
+    screen: TerminalScreen,
+    parser: TerminalParser,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalScreen {
+    rows: u16,
+    cols: u16,
+    cursor_row: usize,
+    cursor_col: usize,
+    saved_cursor: Option<(usize, usize)>,
+    current_style: TerminalCellStyle,
+    cells: Vec<Vec<TerminalCell>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum TerminalParser {
+    #[default]
+    Ground,
+    Escape,
+    Csi(String),
+    Osc {
+        esc_seen: bool,
+    },
+    IgnoreOne,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TerminalCellStyle {
+    pub fg: Option<TerminalColor>,
+    pub bg: Option<TerminalColor>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underlined: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalColor {
+    Black,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    White,
+    BrightBlack,
+    BrightRed,
+    BrightGreen,
+    BrightYellow,
+    BrightBlue,
+    BrightMagenta,
+    BrightCyan,
+    BrightWhite,
+    Rgb(u8, u8, u8),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TerminalCell {
+    ch: char,
+    style: TerminalCellStyle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalRenderLine {
+    pub spans: Vec<TerminalRenderSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalRenderSpan {
+    pub text: String,
+    pub style: TerminalCellStyle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChatBuffer {
     lines: Vec<String>,
     partial: String,
+    partial_role: Option<ChatMessageRole>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,14 +172,30 @@ impl Default for App {
     }
 }
 
+pub fn chat_agent_terminal_id(chat: ChatId) -> TerminalId {
+    TerminalId(chat.0 | (1 << 63))
+}
+
+pub fn chat_id_from_agent_terminal_id(terminal: TerminalId) -> Option<ChatId> {
+    ((terminal.0 & (1 << 63)) != 0).then_some(ChatId(terminal.0 & !(1 << 63)))
+}
+
 impl App {
     pub fn new(mut project: ProjectState) -> Self {
         project.reset_terminal_statuses();
+        let chat_buffers = project
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.chats.iter())
+            .map(|chat| (chat.id, ChatBuffer::from_messages(&chat.messages)))
+            .filter(|(_, buffer)| !buffer.is_empty())
+            .collect();
         let mut app = Self {
             project,
             selected: 0,
             mode: Mode::Normal,
             terminal_buffers: BTreeMap::new(),
+            chat_buffers,
             should_quit: false,
             dirty: false,
         };
@@ -93,13 +218,21 @@ impl App {
     pub fn is_prompt_active(&self) -> bool {
         matches!(
             self.mode,
-            Mode::OpenWorkspace(_) | Mode::NewTerminalCommand(_)
+            Mode::OpenWorkspace(_) | Mode::NewTerminalCommand(_) | Mode::ConfirmDelete(_)
         )
     }
 
     pub fn terminal_input_target(&self) -> Option<TerminalId> {
         match self.mode {
             Mode::TerminalInput { terminal, .. } => Some(terminal),
+            _ => None,
+        }
+    }
+
+    pub fn pty_input_target(&self) -> Option<TerminalId> {
+        match self.mode {
+            Mode::TerminalInput { terminal, .. } => Some(terminal),
+            Mode::ChatAgentInput { chat, .. } => Some(chat_agent_terminal_id(chat)),
             _ => None,
         }
     }
@@ -155,6 +288,129 @@ impl App {
         }
     }
 
+    pub fn selected_chat_id(&self) -> Option<(WorkspaceId, ChatId)> {
+        match self.selected_item() {
+            Some(NavItem::Chat { workspace, chat }) => Some((workspace, chat)),
+            _ => None,
+        }
+    }
+
+    pub fn begin_delete_selected(&mut self) -> bool {
+        let Some(target) = self.selected_delete_target() else {
+            return false;
+        };
+        let Some((label, detail)) = self.delete_target_description(target) else {
+            return false;
+        };
+
+        self.mode = Mode::ConfirmDelete(DeleteConfirmation {
+            target,
+            label,
+            detail,
+        });
+        true
+    }
+
+    pub fn confirm_delete_selected(&mut self) -> Vec<TerminalId> {
+        let Mode::ConfirmDelete(confirmation) = &self.mode else {
+            return Vec::new();
+        };
+        let target = confirmation.target;
+        self.mode = Mode::Normal;
+
+        let mut runtime_terminals = Vec::new();
+        match target {
+            DeleteTarget::Workspace(workspace_id) => {
+                if let Some(workspace) = self.project.remove_workspace(workspace_id) {
+                    runtime_terminals
+                        .extend(workspace.terminals.iter().map(|terminal| terminal.id));
+                    runtime_terminals.extend(
+                        workspace
+                            .chats
+                            .iter()
+                            .map(|chat| chat_agent_terminal_id(chat.id)),
+                    );
+                    for terminal in &runtime_terminals {
+                        self.terminal_buffers.remove(terminal);
+                    }
+                    for chat in workspace.chats {
+                        self.chat_buffers.remove(&chat.id);
+                    }
+                    self.dirty = true;
+                }
+            }
+            DeleteTarget::Chat { workspace, chat } => {
+                if self.project.remove_chat(workspace, chat).is_some() {
+                    let terminal = chat_agent_terminal_id(chat);
+                    runtime_terminals.push(terminal);
+                    self.terminal_buffers.remove(&terminal);
+                    self.chat_buffers.remove(&chat);
+                    self.dirty = true;
+                }
+            }
+            DeleteTarget::Terminal {
+                workspace,
+                terminal,
+            } => {
+                if self.project.remove_terminal(workspace, terminal).is_some() {
+                    runtime_terminals.push(terminal);
+                    self.terminal_buffers.remove(&terminal);
+                    self.dirty = true;
+                }
+            }
+        }
+
+        self.clamp_selection();
+        runtime_terminals
+    }
+
+    fn selected_delete_target(&self) -> Option<DeleteTarget> {
+        match self.selected_item()? {
+            NavItem::Workspace(workspace) => Some(DeleteTarget::Workspace(workspace)),
+            NavItem::Chat { workspace, chat } => Some(DeleteTarget::Chat { workspace, chat }),
+            NavItem::Terminal {
+                workspace,
+                terminal,
+            } => Some(DeleteTarget::Terminal {
+                workspace,
+                terminal,
+            }),
+        }
+    }
+
+    fn delete_target_description(&self, target: DeleteTarget) -> Option<(String, String)> {
+        match target {
+            DeleteTarget::Workspace(workspace_id) => {
+                let workspace = self.project.workspace(workspace_id)?;
+                Some((
+                    format!("workspace `{}`", workspace.name),
+                    format!(
+                        "Deletes {} agent chat(s) and {} terminal(s).",
+                        workspace.chats.len(),
+                        workspace.terminals.len()
+                    ),
+                ))
+            }
+            DeleteTarget::Chat { workspace, chat } => {
+                let chat = self.project.chat(workspace, chat)?;
+                Some((
+                    format!("agent `{}`", chat.name),
+                    "Deletes saved transcript and stops its pi agent if running.".to_string(),
+                ))
+            }
+            DeleteTarget::Terminal {
+                workspace,
+                terminal,
+            } => {
+                let terminal = self.project.terminal(workspace, terminal)?;
+                Some((
+                    format!("terminal `{}`", terminal.name),
+                    "Deletes terminal config and stops its PTY if running.".to_string(),
+                ))
+            }
+        }
+    }
+
     pub fn mark_terminal_running(&mut self, terminal: TerminalId) {
         if let Some(terminal) = self.project.terminal_mut_by_id(terminal) {
             terminal.status = TerminalStatus::Running;
@@ -190,6 +446,105 @@ impl App {
             .get(&terminal)
             .map(TerminalBuffer::visible_lines)
             .unwrap_or_default()
+    }
+
+    pub fn terminal_render_lines(&self, terminal: TerminalId) -> Vec<TerminalRenderLine> {
+        self.terminal_buffers
+            .get(&terminal)
+            .map(TerminalBuffer::render_lines)
+            .unwrap_or_default()
+    }
+
+    pub fn resize_terminal_buffer(&mut self, terminal: TerminalId, rows: u16, cols: u16) {
+        self.terminal_buffers
+            .entry(terminal)
+            .or_default()
+            .resize(rows, cols);
+    }
+
+    pub fn chat_lines(&self, chat: ChatId) -> Vec<String> {
+        self.chat_buffers
+            .get(&chat)
+            .map(ChatBuffer::visible_lines)
+            .unwrap_or_default()
+    }
+
+    fn append_chat_message(
+        &mut self,
+        target: AgentTarget,
+        role: ChatMessageRole,
+        text: impl Into<String>,
+    ) {
+        let text = text.into();
+        self.chat_buffers
+            .entry(target.chat)
+            .or_default()
+            .append_delta(role, &format!("{text}\n"));
+        if self
+            .project
+            .append_chat_message(target.workspace, target.chat, role, text)
+        {
+            self.dirty = true;
+        }
+    }
+
+    pub fn apply_agent_event(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::MessageDelta {
+                target, role, text, ..
+            } => {
+                let role = chat_role_from_agent(role);
+                self.chat_buffers
+                    .entry(target.chat)
+                    .or_default()
+                    .append_delta(role, &text);
+                if self
+                    .project
+                    .append_chat_delta(target.workspace, target.chat, role, &text)
+                {
+                    self.dirty = true;
+                }
+            }
+            AgentEvent::ToolCall {
+                target,
+                name,
+                arguments,
+            } => {
+                let text = if arguments.is_empty() {
+                    name
+                } else {
+                    format!("{name} {arguments}")
+                };
+                self.append_chat_message(target, ChatMessageRole::Tool, text);
+            }
+            AgentEvent::FileChanged { target, path } => {
+                self.append_chat_message(
+                    target,
+                    ChatMessageRole::System,
+                    format!("file changed: {}", path.display()),
+                );
+            }
+            AgentEvent::CommandStarted { target, command } => {
+                self.append_chat_message(
+                    target,
+                    ChatMessageRole::System,
+                    format!("cmd: {command}"),
+                );
+            }
+            AgentEvent::StatusChanged { target, status } => {
+                if let Some(chat) = self.project.chat_mut(target.workspace, target.chat) {
+                    chat.status = status;
+                    self.dirty = true;
+                }
+            }
+            AgentEvent::Error { target, message } => {
+                if let Some(chat) = self.project.chat_mut(target.workspace, target.chat) {
+                    chat.status = ChatStatus::Failed;
+                    self.dirty = true;
+                }
+                self.append_chat_message(target, ChatMessageRole::Error, message);
+            }
+        }
     }
 
     pub fn select_next(&mut self) {
@@ -260,8 +615,36 @@ impl App {
         true
     }
 
+    pub fn begin_chat_agent_input(&mut self) -> bool {
+        let Some((workspace, chat)) = self.selected_chat_id() else {
+            return false;
+        };
+
+        self.mode = Mode::ChatAgentInput { workspace, chat };
+        true
+    }
+
     pub fn end_terminal_input(&mut self) {
         self.mode = Mode::Normal;
+    }
+
+    pub fn end_pty_input(&mut self) {
+        self.mode = Mode::Normal;
+    }
+
+    pub fn mark_chat_status_by_id(&mut self, chat: ChatId, status: ChatStatus) {
+        for chat_session in self
+            .project
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| workspace.chats.iter_mut())
+        {
+            if chat_session.id == chat {
+                chat_session.status = status;
+                self.dirty = true;
+                return;
+            }
+        }
     }
 
     pub fn push_prompt_char(&mut self, c: char) {
@@ -371,23 +754,20 @@ impl App {
         }
     }
 
-    pub fn add_chat_to_selected_workspace(&mut self) {
-        let Some(workspace) = self.selected_workspace_id() else {
-            return;
-        };
+    pub fn add_chat_to_selected_workspace_and_return(&mut self) -> Option<(WorkspaceId, ChatId)> {
+        let workspace = self.selected_workspace_id()?;
         let next = self
             .project
             .workspace(workspace)
             .map(|workspace| workspace.chats.len() + 1)
             .unwrap_or(1);
 
-        if let Some(chat) =
+        let chat =
             self.project
-                .add_chat(workspace, format!("agent: chat-{next}"), ChatStatus::Idle)
-        {
-            self.select_item(NavItem::Chat { workspace, chat });
-            self.dirty = true;
-        }
+                .add_chat(workspace, format!("agent: chat-{next}"), ChatStatus::Idle)?;
+        self.select_item(NavItem::Chat { workspace, chat });
+        self.dirty = true;
+        Some((workspace, chat))
     }
 
     pub fn add_terminal_to_selected_workspace(&mut self) {
@@ -465,25 +845,578 @@ impl App {
 }
 
 impl TerminalBuffer {
-    const MAX_LINES: usize = 500;
-
     fn append(&mut self, text: &str) {
-        let mut chars = text.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch == '\u{1b}' {
-                if chars.next_if_eq(&'[').is_some() {
-                    for code in chars.by_ref() {
-                        if ('@'..='~').contains(&code) {
-                            break;
+        for ch in text.chars() {
+            self.process_char(ch);
+        }
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        self.screen.resize(rows.max(1), cols.max(1));
+    }
+
+    fn visible_lines(&self) -> Vec<String> {
+        self.screen.visible_lines()
+    }
+
+    fn render_lines(&self) -> Vec<TerminalRenderLine> {
+        self.screen.render_lines()
+    }
+
+    fn push_line(&mut self, line: String) {
+        self.append(&line);
+        self.screen.carriage_return();
+        self.screen.line_feed();
+    }
+
+    fn process_char(&mut self, ch: char) {
+        let state = std::mem::take(&mut self.parser);
+        self.parser = match state {
+            TerminalParser::Ground => self.process_ground_char(ch),
+            TerminalParser::Escape => self.process_escape_char(ch),
+            TerminalParser::Csi(mut sequence) => {
+                if ('@'..='~').contains(&ch) {
+                    self.apply_csi(&sequence, ch);
+                    TerminalParser::Ground
+                } else {
+                    sequence.push(ch);
+                    TerminalParser::Csi(sequence)
+                }
+            }
+            TerminalParser::Osc { esc_seen } => match (esc_seen, ch) {
+                (_, '\u{7}') => TerminalParser::Ground,
+                (true, '\\') => TerminalParser::Ground,
+                (_, '\u{1b}') => TerminalParser::Osc { esc_seen: true },
+                _ => TerminalParser::Osc { esc_seen: false },
+            },
+            TerminalParser::IgnoreOne => TerminalParser::Ground,
+        };
+    }
+
+    fn process_ground_char(&mut self, ch: char) -> TerminalParser {
+        match ch {
+            '\u{1b}' => TerminalParser::Escape,
+            '\n' => {
+                self.screen.line_feed();
+                TerminalParser::Ground
+            }
+            '\r' => {
+                self.screen.carriage_return();
+                TerminalParser::Ground
+            }
+            '\t' => {
+                self.screen.tab();
+                TerminalParser::Ground
+            }
+            '\u{8}' => {
+                self.screen.backspace();
+                TerminalParser::Ground
+            }
+            ch if ch.is_control() => TerminalParser::Ground,
+            ch => {
+                self.screen.put_char(ch);
+                TerminalParser::Ground
+            }
+        }
+    }
+
+    fn process_escape_char(&mut self, ch: char) -> TerminalParser {
+        match ch {
+            '[' => TerminalParser::Csi(String::new()),
+            ']' => TerminalParser::Osc { esc_seen: false },
+            '(' | ')' | '*' | '+' => TerminalParser::IgnoreOne,
+            'c' => {
+                self.screen.clear();
+                TerminalParser::Ground
+            }
+            '7' => {
+                self.screen.save_cursor();
+                TerminalParser::Ground
+            }
+            '8' => {
+                self.screen.restore_cursor();
+                TerminalParser::Ground
+            }
+            'D' => {
+                self.screen.line_feed();
+                TerminalParser::Ground
+            }
+            'E' => {
+                self.screen.carriage_return();
+                self.screen.line_feed();
+                TerminalParser::Ground
+            }
+            'M' => {
+                self.screen.reverse_index();
+                TerminalParser::Ground
+            }
+            _ => TerminalParser::Ground,
+        }
+    }
+
+    fn apply_csi(&mut self, sequence: &str, final_char: char) {
+        let private = sequence.contains('?');
+        let params = parse_csi_params(sequence);
+        match final_char {
+            'A' => self.screen.move_cursor_up(param_or_default(&params, 0, 1)),
+            'B' => self
+                .screen
+                .move_cursor_down(param_or_default(&params, 0, 1)),
+            'C' => self
+                .screen
+                .move_cursor_right(param_or_default(&params, 0, 1)),
+            'D' => self
+                .screen
+                .move_cursor_left(param_or_default(&params, 0, 1)),
+            'G' => self.screen.set_cursor_col(param_or_default(&params, 0, 1)),
+            'H' | 'f' => self.screen.set_cursor_position(
+                param_or_default(&params, 0, 1),
+                param_or_default(&params, 1, 1),
+            ),
+            'J' => self.screen.erase_display(param_or_default(&params, 0, 0)),
+            'K' => self.screen.erase_line(param_or_default(&params, 0, 0)),
+            'm' => self.screen.apply_sgr(&params),
+            'S' => self.screen.scroll_up(param_or_default(&params, 0, 1)),
+            'T' => self.screen.scroll_down(param_or_default(&params, 0, 1)),
+            'd' => self.screen.set_cursor_row(param_or_default(&params, 0, 1)),
+            's' => self.screen.save_cursor(),
+            'u' => self.screen.restore_cursor(),
+            'h' if private
+                && params
+                    .iter()
+                    .any(|param| matches!(*param, 47 | 1047 | 1049)) =>
+            {
+                self.screen.clear();
+            }
+            'l' if private
+                && params
+                    .iter()
+                    .any(|param| matches!(*param, 47 | 1047 | 1049)) =>
+            {
+                self.screen.clear();
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Default for TerminalScreen {
+    fn default() -> Self {
+        Self::new(24, 80)
+    }
+}
+
+impl TerminalScreen {
+    fn new(rows: u16, cols: u16) -> Self {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        Self {
+            rows,
+            cols,
+            cursor_row: 0,
+            cursor_col: 0,
+            saved_cursor: None,
+            current_style: TerminalCellStyle::default(),
+            cells: vec![vec![TerminalCell::blank(); usize::from(cols)]; usize::from(rows)],
+        }
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        self.rows = rows;
+        self.cols = cols;
+        let row_len = usize::from(cols);
+        let row_count = usize::from(rows);
+        self.cells.resize(row_count, Vec::new());
+        for row in &mut self.cells {
+            row.resize(row_len, TerminalCell::blank());
+        }
+        self.clamp_cursor();
+    }
+
+    fn visible_lines(&self) -> Vec<String> {
+        self.cells
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn render_lines(&self) -> Vec<TerminalRenderLine> {
+        self.cells
+            .iter()
+            .map(|row| render_terminal_row(row))
+            .collect()
+    }
+
+    fn put_char(&mut self, ch: char) {
+        if self.cursor_col >= usize::from(self.cols) {
+            self.carriage_return();
+            self.line_feed();
+        }
+        self.cells[self.cursor_row][self.cursor_col] = TerminalCell {
+            ch,
+            style: self.current_style,
+        };
+        self.cursor_col += 1;
+        if self.cursor_col >= usize::from(self.cols) {
+            self.cursor_col = usize::from(self.cols).saturating_sub(1);
+        }
+    }
+
+    fn line_feed(&mut self) {
+        if self.cursor_row + 1 >= usize::from(self.rows) {
+            self.scroll_up(1);
+        } else {
+            self.cursor_row += 1;
+        }
+    }
+
+    fn carriage_return(&mut self) {
+        self.cursor_col = 0;
+    }
+
+    fn tab(&mut self) {
+        let next_tab = ((self.cursor_col / 8) + 1) * 8;
+        self.cursor_col = next_tab.min(usize::from(self.cols).saturating_sub(1));
+    }
+
+    fn backspace(&mut self) {
+        self.cursor_col = self.cursor_col.saturating_sub(1);
+    }
+
+    fn reverse_index(&mut self) {
+        self.cursor_row = self.cursor_row.saturating_sub(1);
+    }
+
+    fn move_cursor_up(&mut self, count: usize) {
+        self.cursor_row = self.cursor_row.saturating_sub(count);
+    }
+
+    fn move_cursor_down(&mut self, count: usize) {
+        self.cursor_row = (self.cursor_row + count).min(usize::from(self.rows).saturating_sub(1));
+    }
+
+    fn move_cursor_right(&mut self, count: usize) {
+        self.cursor_col = (self.cursor_col + count).min(usize::from(self.cols).saturating_sub(1));
+    }
+
+    fn move_cursor_left(&mut self, count: usize) {
+        self.cursor_col = self.cursor_col.saturating_sub(count);
+    }
+
+    fn set_cursor_position(&mut self, row: usize, col: usize) {
+        self.cursor_row = row
+            .saturating_sub(1)
+            .min(usize::from(self.rows).saturating_sub(1));
+        self.cursor_col = col
+            .saturating_sub(1)
+            .min(usize::from(self.cols).saturating_sub(1));
+    }
+
+    fn set_cursor_row(&mut self, row: usize) {
+        self.cursor_row = row
+            .saturating_sub(1)
+            .min(usize::from(self.rows).saturating_sub(1));
+    }
+
+    fn set_cursor_col(&mut self, col: usize) {
+        self.cursor_col = col
+            .saturating_sub(1)
+            .min(usize::from(self.cols).saturating_sub(1));
+    }
+
+    fn erase_display(&mut self, mode: usize) {
+        match mode {
+            0 => {
+                self.erase_line_from_cursor();
+                for row in self.cursor_row + 1..usize::from(self.rows) {
+                    self.clear_row(row);
+                }
+            }
+            1 => {
+                for row in 0..self.cursor_row {
+                    self.clear_row(row);
+                }
+                self.erase_line_to_cursor();
+            }
+            2 | 3 => self.clear(),
+            _ => {}
+        }
+    }
+
+    fn erase_line(&mut self, mode: usize) {
+        match mode {
+            0 => self.erase_line_from_cursor(),
+            1 => self.erase_line_to_cursor(),
+            2 => self.clear_row(self.cursor_row),
+            _ => {}
+        }
+    }
+
+    fn scroll_up(&mut self, count: usize) {
+        for _ in 0..count.max(1) {
+            if !self.cells.is_empty() {
+                self.cells.remove(0);
+                self.cells
+                    .push(vec![TerminalCell::blank(); usize::from(self.cols)]);
+            }
+        }
+    }
+
+    fn scroll_down(&mut self, count: usize) {
+        for _ in 0..count.max(1) {
+            if !self.cells.is_empty() {
+                self.cells.pop();
+                self.cells
+                    .insert(0, vec![TerminalCell::blank(); usize::from(self.cols)]);
+            }
+        }
+    }
+
+    fn save_cursor(&mut self) {
+        self.saved_cursor = Some((self.cursor_row, self.cursor_col));
+    }
+
+    fn restore_cursor(&mut self) {
+        if let Some((row, col)) = self.saved_cursor {
+            self.cursor_row = row;
+            self.cursor_col = col;
+            self.clamp_cursor();
+        }
+    }
+
+    fn clear(&mut self) {
+        for row in 0..usize::from(self.rows) {
+            self.clear_row(row);
+        }
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+    }
+
+    fn erase_line_from_cursor(&mut self) {
+        let cols = usize::from(self.cols);
+        for col in self.cursor_col..cols {
+            self.cells[self.cursor_row][col] = TerminalCell::blank();
+        }
+    }
+
+    fn erase_line_to_cursor(&mut self) {
+        for col in 0..=self.cursor_col {
+            self.cells[self.cursor_row][col] = TerminalCell::blank();
+        }
+    }
+
+    fn clear_row(&mut self, row: usize) {
+        if let Some(row) = self.cells.get_mut(row) {
+            row.fill(TerminalCell::blank());
+        }
+    }
+
+    fn apply_sgr(&mut self, params: &[usize]) {
+        if params.is_empty() {
+            self.current_style = TerminalCellStyle::default();
+            return;
+        }
+
+        let mut index = 0;
+        while index < params.len() {
+            match params[index] {
+                0 => self.current_style = TerminalCellStyle::default(),
+                1 => self.current_style.bold = true,
+                3 => self.current_style.italic = true,
+                4 => self.current_style.underlined = true,
+                22 => self.current_style.bold = false,
+                23 => self.current_style.italic = false,
+                24 => self.current_style.underlined = false,
+                30..=37 => self.current_style.fg = ansi_color(params[index] - 30, false),
+                39 => self.current_style.fg = None,
+                40..=47 => self.current_style.bg = ansi_color(params[index] - 40, false),
+                49 => self.current_style.bg = None,
+                90..=97 => self.current_style.fg = ansi_color(params[index] - 90, true),
+                100..=107 => self.current_style.bg = ansi_color(params[index] - 100, true),
+                38 | 48 => {
+                    let is_fg = params[index] == 38;
+                    if let Some((color, consumed)) = extended_color(&params[index + 1..]) {
+                        if is_fg {
+                            self.current_style.fg = Some(color);
+                        } else {
+                            self.current_style.bg = Some(color);
                         }
+                        index += consumed;
                     }
                 }
-                continue;
+                _ => {}
             }
+            index += 1;
+        }
+    }
 
+    fn clamp_cursor(&mut self) {
+        self.cursor_row = self
+            .cursor_row
+            .min(usize::from(self.rows).saturating_sub(1));
+        self.cursor_col = self
+            .cursor_col
+            .min(usize::from(self.cols).saturating_sub(1));
+    }
+}
+
+impl TerminalCell {
+    fn blank() -> Self {
+        Self {
+            ch: ' ',
+            style: TerminalCellStyle::default(),
+        }
+    }
+}
+
+fn render_terminal_row(row: &[TerminalCell]) -> TerminalRenderLine {
+    let last_visible = row.iter().rposition(|cell| cell.ch != ' ');
+    let Some(last_visible) = last_visible else {
+        return TerminalRenderLine { spans: Vec::new() };
+    };
+
+    let mut spans = Vec::new();
+    let mut current_style = row[0].style;
+    let mut text = String::new();
+    for cell in &row[..=last_visible] {
+        if cell.style != current_style && !text.is_empty() {
+            spans.push(TerminalRenderSpan {
+                text: std::mem::take(&mut text),
+                style: current_style,
+            });
+        }
+        current_style = cell.style;
+        text.push(cell.ch);
+    }
+    if !text.is_empty() {
+        spans.push(TerminalRenderSpan {
+            text,
+            style: current_style,
+        });
+    }
+
+    TerminalRenderLine { spans }
+}
+
+fn ansi_color(index: usize, bright: bool) -> Option<TerminalColor> {
+    Some(match (index, bright) {
+        (0, false) => TerminalColor::Black,
+        (1, false) => TerminalColor::Red,
+        (2, false) => TerminalColor::Green,
+        (3, false) => TerminalColor::Yellow,
+        (4, false) => TerminalColor::Blue,
+        (5, false) => TerminalColor::Magenta,
+        (6, false) => TerminalColor::Cyan,
+        (7, false) => TerminalColor::White,
+        (0, true) => TerminalColor::BrightBlack,
+        (1, true) => TerminalColor::BrightRed,
+        (2, true) => TerminalColor::BrightGreen,
+        (3, true) => TerminalColor::BrightYellow,
+        (4, true) => TerminalColor::BrightBlue,
+        (5, true) => TerminalColor::BrightMagenta,
+        (6, true) => TerminalColor::BrightCyan,
+        (7, true) => TerminalColor::BrightWhite,
+        _ => return None,
+    })
+}
+
+fn extended_color(params: &[usize]) -> Option<(TerminalColor, usize)> {
+    match params {
+        [2, red, green, blue, ..] => {
+            Some((TerminalColor::Rgb(*red as u8, *green as u8, *blue as u8), 4))
+        }
+        [5, index, ..] => Some((xterm_256_color(*index), 2)),
+        _ => None,
+    }
+}
+
+fn xterm_256_color(index: usize) -> TerminalColor {
+    if index < 8 {
+        ansi_color(index, false).unwrap_or(TerminalColor::White)
+    } else if index < 16 {
+        ansi_color(index - 8, true).unwrap_or(TerminalColor::BrightWhite)
+    } else if (16..=231).contains(&index) {
+        let value = index - 16;
+        let red = value / 36;
+        let green = (value / 6) % 6;
+        let blue = value % 6;
+        TerminalColor::Rgb(
+            color_cube_value(red),
+            color_cube_value(green),
+            color_cube_value(blue),
+        )
+    } else {
+        let gray = 8 + ((index.saturating_sub(232)) * 10).min(238);
+        TerminalColor::Rgb(gray as u8, gray as u8, gray as u8)
+    }
+}
+
+fn color_cube_value(value: usize) -> u8 {
+    if value == 0 {
+        0
+    } else {
+        (55 + value * 40) as u8
+    }
+}
+
+fn parse_csi_params(sequence: &str) -> Vec<usize> {
+    sequence
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse().ok())
+        .collect()
+}
+
+fn param_or_default(params: &[usize], index: usize, default: usize) -> usize {
+    params
+        .get(index)
+        .copied()
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+impl ChatBuffer {
+    const MAX_LINES: usize = 500;
+
+    fn from_messages(messages: &[ChatMessage]) -> Self {
+        let mut buffer = Self::default();
+        for message in messages {
+            buffer.append_delta(message.role, &message.text);
+            buffer.flush_partial();
+        }
+        buffer
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lines.is_empty() && !self.partial_has_content()
+    }
+
+    fn append_delta(&mut self, role: ChatMessageRole, text: &str) {
+        if self.partial_role != Some(role) {
+            self.flush_partial();
+            self.partial = format!("{} > ", role.label());
+            self.partial_role = Some(role);
+        }
+
+        for ch in text.chars() {
             match ch {
-                '\n' => self.flush_partial(),
-                '\r' => self.partial.clear(),
+                '\n' => {
+                    self.flush_partial();
+                    self.partial = format!("{} > ", role.label());
+                    self.partial_role = Some(role);
+                }
+                '\r' => {
+                    self.partial = format!("{} > ", role.label());
+                    self.partial_role = Some(role);
+                }
                 '\t' => self.partial.push(' '),
                 ch if ch.is_control() => {}
                 ch => self.partial.push(ch),
@@ -493,15 +1426,25 @@ impl TerminalBuffer {
 
     fn visible_lines(&self) -> Vec<String> {
         let mut lines = self.lines.clone();
-        if !self.partial.is_empty() {
+        if self.partial_has_content() {
             lines.push(self.partial.clone());
         }
         lines
     }
 
     fn flush_partial(&mut self) {
-        let line = std::mem::take(&mut self.partial);
-        self.push_line(line);
+        if self.partial_has_content() {
+            let line = std::mem::take(&mut self.partial);
+            self.push_line(line);
+        } else {
+            self.partial.clear();
+        }
+        self.partial_role = None;
+    }
+
+    fn partial_has_content(&self) -> bool {
+        self.partial_role
+            .is_some_and(|role| self.partial != format!("{} > ", role.label()))
     }
 
     fn push_line(&mut self, line: String) {
@@ -544,6 +1487,15 @@ fn command_terminal_name(command: &str, next: usize) -> String {
         .unwrap_or_else(|| format!("command-{next}"))
 }
 
+fn chat_role_from_agent(role: AgentMessageRole) -> ChatMessageRole {
+    match role {
+        AgentMessageRole::User => ChatMessageRole::User,
+        AgentMessageRole::Assistant => ChatMessageRole::Assistant,
+        AgentMessageRole::System => ChatMessageRole::System,
+        AgentMessageRole::Tool => ChatMessageRole::Tool,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -568,15 +1520,17 @@ mod tests {
     }
 
     #[test]
-    fn adding_chat_selects_the_new_chat() {
+    fn adding_chat_can_return_workspace_and_chat_ids_for_auto_start() {
         let mut app = App::default();
         let workspace = app.project.workspaces[0].id;
 
-        app.add_chat_to_selected_workspace();
+        let added = app
+            .add_chat_to_selected_workspace_and_return()
+            .expect("chat is added");
 
         let chat = app.project.workspaces[0].chats.last().unwrap().id;
+        assert_eq!(added, (workspace, chat));
         assert_eq!(app.selected_item(), Some(NavItem::Chat { workspace, chat }));
-        assert!(app.is_dirty());
     }
 
     #[test]
@@ -592,6 +1546,7 @@ mod tests {
         assert!(app.begin_terminal_input());
 
         assert_eq!(app.terminal_input_target(), Some(terminal));
+        assert_eq!(app.pty_input_target(), Some(terminal));
         assert_eq!(
             app.mode,
             Mode::TerminalInput {
@@ -599,6 +1554,74 @@ mod tests {
                 terminal,
             }
         );
+    }
+
+    #[test]
+    fn selected_chat_can_enter_pi_agent_input_mode() {
+        let mut app = App {
+            selected: 1,
+            ..App::default()
+        };
+        let Some(NavItem::Chat { workspace, chat }) = app.selected_item() else {
+            panic!("expected selected chat");
+        };
+
+        assert!(app.begin_chat_agent_input());
+
+        assert_eq!(app.pty_input_target(), Some(chat_agent_terminal_id(chat)));
+        assert_eq!(
+            chat_id_from_agent_terminal_id(chat_agent_terminal_id(chat)),
+            Some(chat)
+        );
+        assert_eq!(app.mode, Mode::ChatAgentInput { workspace, chat });
+    }
+
+    #[test]
+    fn terminal_buffer_handles_cursor_positioning_and_osc_links() {
+        let mut app = App::default();
+        let terminal = TerminalId(99);
+        app.resize_terminal_buffer(terminal, 3, 12);
+
+        app.append_terminal_output(
+            terminal,
+            "\x1b[2J\x1b[2;3Hhi \x1b]8;;https://example.com\x07link\x1b]8;;\x07",
+        );
+
+        let lines = app.terminal_lines(terminal);
+        assert_eq!(lines[0], "");
+        assert_eq!(lines[1], "  hi link");
+        assert_eq!(lines[2], "");
+    }
+
+    #[test]
+    fn terminal_buffer_clears_and_rewrites_screen() {
+        let mut app = App::default();
+        let terminal = TerminalId(100);
+        app.resize_terminal_buffer(terminal, 2, 8);
+
+        app.append_terminal_output(terminal, "old\x1b[2J\x1b[1;1Hnew");
+
+        assert_eq!(
+            app.terminal_lines(terminal),
+            vec!["new".to_string(), "".to_string()]
+        );
+    }
+
+    #[test]
+    fn terminal_buffer_preserves_sgr_colors() {
+        let mut app = App::default();
+        let terminal = TerminalId(101);
+        app.resize_terminal_buffer(terminal, 1, 16);
+
+        app.append_terminal_output(terminal, "plain \x1b[31;1mred\x1b[0m ok");
+
+        let lines = app.terminal_render_lines(terminal);
+        assert_eq!(lines[0].spans[0].text, "plain ");
+        assert_eq!(lines[0].spans[1].text, "red");
+        assert_eq!(lines[0].spans[1].style.fg, Some(TerminalColor::Red));
+        assert!(lines[0].spans[1].style.bold);
+        assert_eq!(lines[0].spans[2].text, " ok");
+        assert_eq!(lines[0].spans[2].style, TerminalCellStyle::default());
     }
 
     #[test]
@@ -637,11 +1660,176 @@ mod tests {
     }
 
     #[test]
+    fn delete_selected_terminal_requires_confirmation_and_removes_it() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        let terminal = app.project.workspaces[0].terminals[0].id;
+        app.select_item(NavItem::Terminal {
+            workspace,
+            terminal,
+        });
+        app.resize_terminal_buffer(terminal, 1, 10);
+
+        assert!(app.begin_delete_selected());
+        assert!(matches!(
+            app.mode,
+            Mode::ConfirmDelete(DeleteConfirmation {
+                target: DeleteTarget::Terminal { .. },
+                ..
+            })
+        ));
+
+        let runtime_terminals = app.confirm_delete_selected();
+
+        assert_eq!(runtime_terminals, vec![terminal]);
+        assert!(app.project.terminal(workspace, terminal).is_none());
+        assert!(!app.terminal_buffers.contains_key(&terminal));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn delete_selected_chat_removes_transcript_and_pi_runtime_id() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        let chat = app.project.workspaces[0].chats[0].id;
+        app.select_item(NavItem::Chat { workspace, chat });
+        app.chat_buffers.insert(chat, ChatBuffer::default());
+        let pi_terminal = chat_agent_terminal_id(chat);
+        app.resize_terminal_buffer(pi_terminal, 1, 10);
+
+        assert!(app.begin_delete_selected());
+        let runtime_terminals = app.confirm_delete_selected();
+
+        assert_eq!(runtime_terminals, vec![pi_terminal]);
+        assert!(app.project.chat(workspace, chat).is_none());
+        assert!(!app.chat_buffers.contains_key(&chat));
+        assert!(!app.terminal_buffers.contains_key(&pi_terminal));
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn delete_selected_workspace_removes_nested_runtime_ids() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        let terminal = app.project.workspaces[0].terminals[0].id;
+        let chats = app.project.workspaces[0]
+            .chats
+            .iter()
+            .map(|chat| chat.id)
+            .collect::<Vec<_>>();
+        app.select_item(NavItem::Workspace(workspace));
+
+        assert!(app.begin_delete_selected());
+        let runtime_terminals = app.confirm_delete_selected();
+
+        assert!(runtime_terminals.contains(&terminal));
+        for chat in chats {
+            assert!(runtime_terminals.contains(&chat_agent_terminal_id(chat)));
+        }
+        assert!(app.project.workspace(workspace).is_none());
+        assert!(app.is_dirty());
+    }
+
+    #[test]
     fn non_terminal_selection_does_not_enter_input_mode() {
         let mut app = App::default();
 
         assert!(!app.begin_terminal_input());
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn agent_message_event_appends_chat_transcript() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        let chat = app.project.workspaces[0].chats[0].id;
+        let target = crate::agent::AgentTarget { workspace, chat };
+
+        app.apply_agent_event(crate::agent::AgentEvent::MessageDelta {
+            target,
+            role: crate::agent::AgentMessageRole::Assistant,
+            text: "hello".to_string(),
+        });
+        app.apply_agent_event(crate::agent::AgentEvent::MessageDelta {
+            target,
+            role: crate::agent::AgentMessageRole::Assistant,
+            text: " world\nnext".to_string(),
+        });
+
+        assert_eq!(
+            app.chat_lines(chat),
+            vec![
+                "agent > hello world".to_string(),
+                "agent > next".to_string()
+            ]
+        );
+        let messages = &app.project.chat(workspace, chat).unwrap().messages;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, ChatMessageRole::Assistant);
+        assert_eq!(messages[0].text, "hello world\nnext");
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn app_hydrates_chat_transcript_from_project_state() {
+        let mut state = ProjectState::default();
+        let workspace = state.workspaces[0].id;
+        let chat = state.workspaces[0].chats[0].id;
+        state.append_chat_message(workspace, chat, ChatMessageRole::User, "hello".to_string());
+        state.append_chat_message(
+            workspace,
+            chat,
+            ChatMessageRole::Assistant,
+            "hi there".to_string(),
+        );
+
+        let app = App::new(state);
+
+        assert_eq!(
+            app.chat_lines(chat),
+            vec!["user > hello".to_string(), "agent > hi there".to_string()]
+        );
+        assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn agent_status_and_error_events_update_chat_status() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        let chat = app.project.workspaces[0].chats[0].id;
+        let target = crate::agent::AgentTarget { workspace, chat };
+
+        app.apply_agent_event(crate::agent::AgentEvent::StatusChanged {
+            target,
+            status: ChatStatus::Done,
+        });
+
+        assert_eq!(
+            app.project.chat(workspace, chat).unwrap().status,
+            ChatStatus::Done
+        );
+        assert!(app.is_dirty());
+
+        app.mark_clean();
+        app.apply_agent_event(crate::agent::AgentEvent::Error {
+            target,
+            message: "backend failed".to_string(),
+        });
+
+        assert_eq!(
+            app.project.chat(workspace, chat).unwrap().status,
+            ChatStatus::Failed
+        );
+        assert_eq!(
+            app.chat_lines(chat),
+            vec!["error > backend failed".to_string()]
+        );
+        assert_eq!(
+            app.project.chat(workspace, chat).unwrap().messages[0].role,
+            ChatMessageRole::Error
+        );
+        assert!(app.is_dirty());
     }
 
     #[test]
