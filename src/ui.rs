@@ -8,26 +8,70 @@ use ratatui::{
 
 use crate::{
     app::{App, Mode, NavItem},
-    model::{ChatStatus, TerminalStatus, WorkspaceId},
+    model::{ChatStatus, TerminalId, TerminalLaunch, TerminalStatus, WorkspaceId},
     storage,
 };
 
-const FOOTER: &str = "q/esc quit • j/k move • o open/import • w workspace • c chat • t terminal • s/x start/stop PTY • r status";
+const FOOTER: &str = "q/esc quit • j/k move • o open/import • w workspace • c chat • t terminal • d command • s/x start/stop PTY • i input";
+const TERMINAL_HEADER_LINES: u16 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LayoutAreas {
+    sidebar: Rect,
+    main: Rect,
+    footer: Rect,
+}
 
 pub fn draw(frame: &mut Frame, app: &App) {
-    let footer_height = if app.is_open_workspace_prompt_active() {
-        4
-    } else {
-        1
+    let layout = layout_areas(app, frame.area());
+
+    draw_sidebar(frame, app, layout.sidebar);
+    draw_main(frame, app, layout.main);
+    draw_footer(frame, app, layout.footer);
+}
+
+pub fn selected_terminal_output_area(app: &App, frame_area: Rect) -> Option<(TerminalId, Rect)> {
+    let Some(NavItem::Terminal { terminal, .. }) = app.selected_item() else {
+        return None;
     };
-    let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)])
-        .areas(frame.area());
+
+    let layout = layout_areas(app, frame_area);
+    Some((terminal, terminal_output_area(layout.main)))
+}
+
+fn layout_areas(app: &App, frame_area: Rect) -> LayoutAreas {
+    let footer_height = if app.is_prompt_active() { 4 } else { 1 };
+    let [body, footer] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)]).areas(frame_area);
     let [sidebar, main] =
         Layout::horizontal([Constraint::Length(34), Constraint::Min(40)]).areas(body);
 
-    draw_sidebar(frame, app, sidebar);
-    draw_main(frame, app, main);
-    draw_footer(frame, app, footer);
+    LayoutAreas {
+        sidebar,
+        main,
+        footer,
+    }
+}
+
+fn terminal_output_area(main: Rect) -> Rect {
+    let inner = bordered_inner(main);
+    let header_height = TERMINAL_HEADER_LINES.min(inner.height);
+
+    Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(header_height),
+        width: inner.width,
+        height: inner.height.saturating_sub(header_height),
+    }
+}
+
+fn bordered_inner(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
 }
 
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
@@ -102,13 +146,14 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .title(" mult — AI agent multiplexer ");
 
+    let terminal_output_rows = usize::from(terminal_output_area(area).height.max(1));
     let lines = match app.selected_item() {
         Some(NavItem::Workspace(workspace)) => workspace_details(app, workspace),
         Some(NavItem::Chat { workspace, chat }) => chat_details(app, workspace, chat),
         Some(NavItem::Terminal {
             workspace,
             terminal,
-        }) => terminal_details(app, workspace, terminal),
+        }) => terminal_details(app, workspace, terminal, terminal_output_rows),
         None => vec![Line::from("No workspaces yet.")],
     };
 
@@ -207,6 +252,7 @@ fn terminal_details(
     app: &App,
     workspace_id: WorkspaceId,
     terminal_id: crate::model::TerminalId,
+    output_rows: usize,
 ) -> Vec<Line<'static>> {
     let Some(workspace) = app.project.workspace(workspace_id) else {
         return vec![Line::from("Missing workspace.")];
@@ -240,8 +286,12 @@ fn terminal_details(
                 terminal_status_style(terminal.status),
             ),
         ]),
+        Line::from(vec![
+            Span::styled("Launch: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(launch_label(&terminal.launch)),
+        ]),
         Line::from(""),
-        Line::from("Controls: s start shell • x stop shell"),
+        Line::from("Controls: s start • x stop • i focus input • Esc unfocus"),
         Line::from(""),
         Line::from("PTY output"),
         Line::from("──────────────────────"),
@@ -253,14 +303,14 @@ fn terminal_details(
             "PTY not started. Select this terminal and press `s`.",
         ));
         lines.push(Line::from(
-            "This slice captures shell output; keyboard input routing comes next.",
+            "After starting, press `i` to focus terminal input.",
         ));
     } else {
         lines.extend(
             output
                 .into_iter()
                 .rev()
-                .take(20)
+                .take(output_rows)
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
@@ -278,30 +328,66 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             frame.render_widget(footer, area);
         }
         Mode::OpenWorkspace(prompt) => {
-            let error = prompt
-                .error
-                .as_deref()
-                .unwrap_or("enter imports • esc/ctrl-c cancels");
-            let error_style = if prompt.error.is_some() {
-                Style::default().fg(Color::Red)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let prompt = Paragraph::new(vec![
-                Line::from(vec![
-                    Span::styled("Path: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(prompt.input.clone()),
-                    Span::styled("▌", Style::default().fg(Color::Yellow)),
-                ]),
-                Line::from(Span::styled(error.to_string(), error_style)),
-            ])
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" open workspace "),
+            draw_text_prompt(
+                frame,
+                area,
+                " open workspace ",
+                "Path: ",
+                &prompt.input,
+                prompt.error.as_deref(),
+                "enter imports • esc/ctrl-c cancels",
             );
-            frame.render_widget(prompt, area);
         }
+        Mode::NewTerminalCommand(prompt) => {
+            draw_text_prompt(
+                frame,
+                area,
+                " new command terminal ",
+                "Command: ",
+                &prompt.input,
+                prompt.error.as_deref(),
+                "enter adds command terminal • esc/ctrl-c cancels",
+            );
+        }
+        Mode::TerminalInput { .. } => {
+            let footer = Paragraph::new("terminal input focused • typing goes to PTY • Esc returns to mult • Ctrl-C sends interrupt")
+                .style(Style::default().fg(Color::Yellow));
+            frame.render_widget(footer, area);
+        }
+    }
+}
+
+fn draw_text_prompt(
+    frame: &mut Frame,
+    area: Rect,
+    title: &'static str,
+    label: &'static str,
+    input: &str,
+    error: Option<&str>,
+    help: &'static str,
+) {
+    let message = error.unwrap_or(help);
+    let message_style = if error.is_some() {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let prompt = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(label, Style::default().fg(Color::DarkGray)),
+            Span::raw(input.to_string()),
+            Span::styled("▌", Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(Span::styled(message.to_string(), message_style)),
+    ])
+    .block(Block::default().borders(Borders::ALL).title(title));
+    frame.render_widget(prompt, area);
+}
+
+fn launch_label(launch: &TerminalLaunch) -> String {
+    match launch {
+        TerminalLaunch::Shell => "shell".to_string(),
+        TerminalLaunch::Command(command) => format!("command: {command}"),
     }
 }
 
@@ -323,4 +409,35 @@ fn terminal_status_style(status: TerminalStatus) -> Style {
     };
 
     Style::default().fg(color)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_terminal_output_area_tracks_visible_main_pane_size() {
+        let mut app = App::default();
+        app.selected = app
+            .nav_items()
+            .iter()
+            .position(|item| matches!(item, NavItem::Terminal { .. }))
+            .expect("seed state has a terminal");
+
+        let (_, area) = selected_terminal_output_area(&app, Rect::new(0, 0, 120, 40))
+            .expect("terminal selection has output area");
+
+        assert_eq!(area.width, 84);
+        assert_eq!(area.height, 27);
+    }
+
+    #[test]
+    fn selected_terminal_output_area_is_absent_for_non_terminal_selection() {
+        let app = App::default();
+
+        assert_eq!(
+            selected_terminal_output_area(&app, Rect::new(0, 0, 120, 40)),
+            None
+        );
+    }
 }

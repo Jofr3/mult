@@ -19,10 +19,21 @@ pub struct App {
 pub enum Mode {
     Normal,
     OpenWorkspace(OpenWorkspacePrompt),
+    NewTerminalCommand(TerminalCommandPrompt),
+    TerminalInput {
+        workspace: WorkspaceId,
+        terminal: TerminalId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenWorkspacePrompt {
+    pub input: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalCommandPrompt {
     pub input: String,
     pub error: Option<String>,
 }
@@ -79,8 +90,18 @@ impl App {
         self.dirty = false;
     }
 
-    pub fn is_open_workspace_prompt_active(&self) -> bool {
-        matches!(self.mode, Mode::OpenWorkspace(_))
+    pub fn is_prompt_active(&self) -> bool {
+        matches!(
+            self.mode,
+            Mode::OpenWorkspace(_) | Mode::NewTerminalCommand(_)
+        )
+    }
+
+    pub fn terminal_input_target(&self) -> Option<TerminalId> {
+        match self.mode {
+            Mode::TerminalInput { terminal, .. } => Some(terminal),
+            _ => None,
+        }
     }
 
     pub fn nav_items(&self) -> Vec<NavItem> {
@@ -211,21 +232,63 @@ impl App {
         self.mode = Mode::OpenWorkspace(OpenWorkspacePrompt { input, error: None });
     }
 
+    pub fn begin_new_terminal_command(&mut self) -> bool {
+        if self.selected_workspace_id().is_none() {
+            return false;
+        }
+
+        self.mode = Mode::NewTerminalCommand(TerminalCommandPrompt {
+            input: String::new(),
+            error: None,
+        });
+        true
+    }
+
     pub fn cancel_prompt(&mut self) {
         self.mode = Mode::Normal;
     }
 
+    pub fn begin_terminal_input(&mut self) -> bool {
+        let Some((workspace, terminal)) = self.selected_terminal_id() else {
+            return false;
+        };
+
+        self.mode = Mode::TerminalInput {
+            workspace,
+            terminal,
+        };
+        true
+    }
+
+    pub fn end_terminal_input(&mut self) {
+        self.mode = Mode::Normal;
+    }
+
     pub fn push_prompt_char(&mut self, c: char) {
-        if let Mode::OpenWorkspace(prompt) = &mut self.mode {
-            prompt.input.push(c);
-            prompt.error = None;
+        match &mut self.mode {
+            Mode::OpenWorkspace(prompt) => {
+                prompt.input.push(c);
+                prompt.error = None;
+            }
+            Mode::NewTerminalCommand(prompt) => {
+                prompt.input.push(c);
+                prompt.error = None;
+            }
+            _ => {}
         }
     }
 
     pub fn pop_prompt_char(&mut self) {
-        if let Mode::OpenWorkspace(prompt) = &mut self.mode {
-            prompt.input.pop();
-            prompt.error = None;
+        match &mut self.mode {
+            Mode::OpenWorkspace(prompt) => {
+                prompt.input.pop();
+                prompt.error = None;
+            }
+            Mode::NewTerminalCommand(prompt) => {
+                prompt.input.pop();
+                prompt.error = None;
+            }
+            _ => {}
         }
     }
 
@@ -271,6 +334,41 @@ impl App {
         self.mode = Mode::Normal;
         self.select_item(NavItem::Workspace(workspace));
         self.dirty = true;
+    }
+
+    pub fn submit_new_terminal_command(&mut self) {
+        let Mode::NewTerminalCommand(prompt) = &self.mode else {
+            return;
+        };
+        let command = prompt.input.trim().to_string();
+        if command.is_empty() {
+            self.set_terminal_command_error("enter a command to run");
+            return;
+        }
+
+        let Some(workspace) = self.selected_workspace_id() else {
+            self.set_terminal_command_error("select a workspace first");
+            return;
+        };
+
+        let next = self
+            .project
+            .workspace(workspace)
+            .map(|workspace| workspace.terminals.len() + 1)
+            .unwrap_or(1);
+        let name = command_terminal_name(&command, next);
+
+        if let Some(terminal) =
+            self.project
+                .add_command_terminal(workspace, name, TerminalStatus::Stopped, command)
+        {
+            self.mode = Mode::Normal;
+            self.select_item(NavItem::Terminal {
+                workspace,
+                terminal,
+            });
+            self.dirty = true;
+        }
     }
 
     pub fn add_chat_to_selected_workspace(&mut self) {
@@ -338,6 +436,12 @@ impl App {
 
     fn set_open_workspace_error(&mut self, message: impl Into<String>) {
         if let Mode::OpenWorkspace(prompt) = &mut self.mode {
+            prompt.error = Some(message.into());
+        }
+    }
+
+    fn set_terminal_command_error(&mut self, message: impl Into<String>) {
+        if let Mode::NewTerminalCommand(prompt) = &mut self.mode {
             prompt.error = Some(message.into());
         }
     }
@@ -431,6 +535,15 @@ fn workspace_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+fn command_terminal_name(command: &str, next: usize) -> String {
+    command
+        .split_whitespace()
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(|name| format!("cmd: {name}"))
+        .unwrap_or_else(|| format!("command-{next}"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -464,6 +577,71 @@ mod tests {
         let chat = app.project.workspaces[0].chats.last().unwrap().id;
         assert_eq!(app.selected_item(), Some(NavItem::Chat { workspace, chat }));
         assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn selected_terminal_can_enter_input_mode() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        let terminal = app.project.workspaces[0].terminals[0].id;
+        app.select_item(NavItem::Terminal {
+            workspace,
+            terminal,
+        });
+
+        assert!(app.begin_terminal_input());
+
+        assert_eq!(app.terminal_input_target(), Some(terminal));
+        assert_eq!(
+            app.mode,
+            Mode::TerminalInput {
+                workspace,
+                terminal,
+            }
+        );
+    }
+
+    #[test]
+    fn command_terminal_prompt_adds_command_terminal() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+
+        assert!(app.begin_new_terminal_command());
+        app.push_prompt_char('c');
+        app.push_prompt_char('a');
+        app.push_prompt_char('r');
+        app.push_prompt_char('g');
+        app.push_prompt_char('o');
+        app.push_prompt_char(' ');
+        app.push_prompt_char('t');
+        app.push_prompt_char('e');
+        app.push_prompt_char('s');
+        app.push_prompt_char('t');
+        app.submit_new_terminal_command();
+
+        let terminal = app.project.workspaces[0].terminals.last().unwrap();
+        assert_eq!(terminal.name, "cmd: cargo");
+        assert_eq!(
+            terminal.launch,
+            crate::model::TerminalLaunch::Command("cargo test".to_string())
+        );
+        assert_eq!(
+            app.selected_item(),
+            Some(NavItem::Terminal {
+                workspace,
+                terminal: terminal.id,
+            })
+        );
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn non_terminal_selection_does_not_enter_input_mode() {
+        let mut app = App::default();
+
+        assert!(!app.begin_terminal_input());
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     #[test]

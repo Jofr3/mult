@@ -14,6 +14,7 @@ use crate::model::TerminalId;
 pub struct PtySpawn {
     pub terminal: TerminalId,
     pub program: String,
+    pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
     pub size: PtyDimensions,
@@ -56,7 +57,7 @@ pub struct PtyRuntime {
 struct PtySession {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
-    _writer: Box<dyn Write + Send>,
+    writer: Box<dyn Write + Send>,
 }
 
 impl Default for PtyRuntime {
@@ -79,6 +80,23 @@ impl PtySpawn {
         Self {
             terminal,
             program: default_shell(),
+            args: Vec::new(),
+            cwd,
+            env,
+            size: PtyDimensions::default(),
+        }
+    }
+
+    pub fn command_line(
+        terminal: TerminalId,
+        command: String,
+        cwd: Option<PathBuf>,
+        env: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            terminal,
+            program: default_shell(),
+            args: shell_command_args(command),
             cwd,
             env,
             size: PtyDimensions::default(),
@@ -120,6 +138,7 @@ impl PtyRuntime {
         let pair = pty_system.openpty(spawn.size.into()).map_err(error_to_io)?;
 
         let mut command = CommandBuilder::new(&spawn.program);
+        command.args(&spawn.args);
         if let Some(cwd) = &spawn.cwd {
             command.cwd(cwd.as_os_str());
         }
@@ -137,7 +156,7 @@ impl PtyRuntime {
             PtySession {
                 master: pair.master,
                 child,
-                _writer: writer,
+                writer,
             },
         );
 
@@ -150,6 +169,16 @@ impl PtyRuntime {
         };
 
         session.child.kill()?;
+        Ok(true)
+    }
+
+    pub fn send_input(&mut self, terminal: TerminalId, input: &[u8]) -> io::Result<bool> {
+        let Some(session) = self.sessions.get_mut(&terminal) else {
+            return Ok(false);
+        };
+
+        session.writer.write_all(input)?;
+        session.writer.flush()?;
         Ok(true)
     }
 
@@ -249,6 +278,18 @@ fn spawn_reader(terminal: TerminalId, mut reader: Box<dyn Read + Send>, sender: 
     });
 }
 
+fn shell_command_args(command: String) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        vec!["-NoExit".to_string(), "-Command".to_string(), command]
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec!["-lc".to_string(), command]
+    }
+}
+
 fn default_shell() -> String {
     #[cfg(windows)]
     {
@@ -274,7 +315,22 @@ mod tests {
         let spawn = PtySpawn::shell(TerminalId(7), None, BTreeMap::new());
 
         assert_eq!(spawn.terminal, TerminalId(7));
+        assert_eq!(spawn.args, Vec::<String>::new());
         assert_eq!(spawn.size, PtyDimensions { rows: 24, cols: 80 });
+        assert!(!spawn.program.is_empty());
+    }
+
+    #[test]
+    fn pty_spawn_command_line_runs_through_shell() {
+        let spawn = PtySpawn::command_line(
+            TerminalId(7),
+            "cargo test".to_string(),
+            None,
+            BTreeMap::new(),
+        );
+
+        assert_eq!(spawn.terminal, TerminalId(7));
+        assert_eq!(spawn.args.last().map(String::as_str), Some("cargo test"));
         assert!(!spawn.program.is_empty());
     }
 

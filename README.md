@@ -23,19 +23,21 @@ State is auto-saved to `$XDG_DATA_HOME/mult/state.json` or `~/.local/share/mult/
 - `o`: open/import workspace by directory path
 - `w`: add scratch workspace
 - `c`: add chat to selected workspace
-- `t`: add terminal to selected workspace
-- `s`: start a PTY shell for the selected terminal
-- `x`: stop the selected terminal PTY shell
+- `t`: add shell terminal to selected workspace
+- `d`: add a command/dev-server terminal to selected workspace
+- `s`: start the selected terminal PTY
+- `x`: stop the selected terminal PTY
+- `i`: focus terminal input for the selected running PTY
 - `r`: rotate selected chat/terminal status
 - `q`/Esc: quit
 
-When the open/import prompt is active:
+When the open/import or command prompt is active:
 
-- Type a directory path
-- Enter: import it
+- Type a directory path or command
+- Enter: submit it
 - Esc or Ctrl-C: cancel
 
-PTY shells currently stream output only; focused terminal input routing is the next M2 step.
+When terminal input is focused, typing is sent to the PTY; press Esc to return to mult controls. Running PTYs are sized from the visible terminal pane instead of a fixed 80x24 size.
 
 See `docs/PLAN.md` for the roadmap and `AGENTS.md` for contributor/agent guidance.
 # mult

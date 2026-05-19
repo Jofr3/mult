@@ -37,15 +37,15 @@ Goal: prove the app skeleton and UX layout.
 - [x] Add workspace cwd/env metadata.
 - [x] Add import/open workspace flow.
 
-### M2 — Real terminal panes (in progress)
+### M2 — Real terminal panes (done)
 
 - [x] Add PTY abstraction via `portable-pty`.
 - [x] Spawn shells with workspace cwd/env when a terminal is selected.
 - [x] Stream terminal output into in-memory scrollback buffers.
-- [ ] Handle keyboard input routing when a terminal pane is focused.
+- [x] Handle keyboard input routing when a terminal pane is focused.
 - [x] Track terminal process lifecycle and exit codes.
-- [ ] Support resizing from pane dimensions instead of fixed 80x24.
-- [ ] Spawn named commands/dev servers, not only default shells.
+- [x] Support resizing from pane dimensions instead of fixed 80x24.
+- [x] Spawn named commands/dev servers, not only default shells.
 
 ### M3 — Agent adapters
 

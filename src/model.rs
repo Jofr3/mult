@@ -35,6 +35,8 @@ pub struct TerminalSession {
     pub id: TerminalId,
     pub name: String,
     pub status: TerminalStatus,
+    #[serde(default)]
+    pub launch: TerminalLaunch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -58,6 +60,14 @@ pub enum ChatStatus {
 pub enum TerminalStatus {
     Stopped,
     Running,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "command", rename_all = "snake_case")]
+pub enum TerminalLaunch {
+    #[default]
+    Shell,
+    Command(String),
 }
 
 impl Default for ProjectState {
@@ -120,6 +130,26 @@ impl ProjectState {
         name: String,
         status: TerminalStatus,
     ) -> Option<TerminalId> {
+        self.add_terminal_with_launch(workspace_id, name, status, TerminalLaunch::Shell)
+    }
+
+    pub fn add_command_terminal(
+        &mut self,
+        workspace_id: WorkspaceId,
+        name: String,
+        status: TerminalStatus,
+        command: String,
+    ) -> Option<TerminalId> {
+        self.add_terminal_with_launch(workspace_id, name, status, TerminalLaunch::Command(command))
+    }
+
+    fn add_terminal_with_launch(
+        &mut self,
+        workspace_id: WorkspaceId,
+        name: String,
+        status: TerminalStatus,
+        launch: TerminalLaunch,
+    ) -> Option<TerminalId> {
         let workspace_index = self
             .workspaces
             .iter()
@@ -127,7 +157,12 @@ impl ProjectState {
         let id = self.allocate_terminal_id();
         self.workspaces[workspace_index]
             .terminals
-            .push(TerminalSession { id, name, status });
+            .push(TerminalSession {
+                id,
+                name,
+                status,
+                launch,
+            });
         Some(id)
     }
 
@@ -237,6 +272,15 @@ impl ChatStatus {
     }
 }
 
+impl TerminalLaunch {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Shell => "shell".to_string(),
+            Self::Command(command) => command.clone(),
+        }
+    }
+}
+
 impl TerminalStatus {
     pub fn label(self) -> &'static str {
         match self {
@@ -275,5 +319,20 @@ mod tests {
 
         assert_eq!(workspace, WorkspaceId(3));
         assert_eq!(chat, Some(ChatId(4)));
+    }
+
+    #[test]
+    fn terminal_launch_defaults_to_shell_for_old_state_files() {
+        let json = r#"
+        {
+          "id": 1,
+          "name": "shell",
+          "status": "Stopped"
+        }
+        "#;
+
+        let terminal: TerminalSession = serde_json::from_str(json).expect("deserialize terminal");
+
+        assert_eq!(terminal.launch, TerminalLaunch::Shell);
     }
 }

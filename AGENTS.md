@@ -10,13 +10,13 @@ Do not jump straight to the full product. Keep changes milestone-sized and prese
 
 ## Current milestone
 
-M2 real terminal panes is in progress, but keep changes incremental:
+M3 agent adapters is next, but keep changes incremental:
 
 - Keep the M1 durable model and open/import flow working.
-- PTY runtime lives outside persisted project state.
+- Keep M2 PTY runtime outside persisted project state.
 - Terminal scrollback is in-memory only unless explicitly designed otherwise.
-- Next small step: route keyboard input to the focused terminal pane.
 - Preserve JSON persistence and do not save running terminal status as durable state.
+- Start with a small `AgentBackend` trait before adding any concrete SDK or process adapter.
 
 See `docs/PLAN.md` for the roadmap.
 
