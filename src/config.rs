@@ -16,6 +16,48 @@ pub struct Config {
     pub auto_start_pi_agent: bool,
     #[serde(default = "default_auto_start_terminals")]
     pub auto_start_terminals: bool,
+    #[serde(default)]
+    pub colorscheme: ColorSchemeConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColorSchemeConfig {
+    #[serde(default = "default_moon_nc", rename = "_nc", alias = "nc")]
+    pub nc: String,
+    #[serde(default = "default_moon_base")]
+    pub base: String,
+    #[serde(default = "default_moon_surface")]
+    pub surface: String,
+    #[serde(default = "default_moon_overlay")]
+    pub overlay: String,
+    #[serde(default = "default_moon_muted")]
+    pub muted: String,
+    #[serde(default = "default_moon_subtle")]
+    pub subtle: String,
+    #[serde(default = "default_moon_text")]
+    pub text: String,
+    #[serde(default = "default_moon_love")]
+    pub love: String,
+    #[serde(default = "default_moon_gold")]
+    pub gold: String,
+    #[serde(default = "default_moon_rose")]
+    pub rose: String,
+    #[serde(default = "default_moon_pine")]
+    pub pine: String,
+    #[serde(default = "default_moon_foam")]
+    pub foam: String,
+    #[serde(default = "default_moon_iris")]
+    pub iris: String,
+    #[serde(default = "default_moon_leaf")]
+    pub leaf: String,
+    #[serde(default = "default_moon_highlight_low")]
+    pub highlight_low: String,
+    #[serde(default = "default_moon_highlight_med")]
+    pub highlight_med: String,
+    #[serde(default = "default_moon_highlight_high")]
+    pub highlight_high: String,
+    #[serde(default = "default_moon_none")]
+    pub none: String,
 }
 
 impl Default for Config {
@@ -24,6 +66,32 @@ impl Default for Config {
             pi_agent_command: default_pi_agent_command(),
             auto_start_pi_agent: default_auto_start_pi_agent(),
             auto_start_terminals: default_auto_start_terminals(),
+            colorscheme: ColorSchemeConfig::default(),
+        }
+    }
+}
+
+impl Default for ColorSchemeConfig {
+    fn default() -> Self {
+        Self {
+            nc: default_moon_nc(),
+            base: default_moon_base(),
+            surface: default_moon_surface(),
+            overlay: default_moon_overlay(),
+            muted: default_moon_muted(),
+            subtle: default_moon_subtle(),
+            text: default_moon_text(),
+            love: default_moon_love(),
+            gold: default_moon_gold(),
+            rose: default_moon_rose(),
+            pine: default_moon_pine(),
+            foam: default_moon_foam(),
+            iris: default_moon_iris(),
+            leaf: default_moon_leaf(),
+            highlight_low: default_moon_highlight_low(),
+            highlight_med: default_moon_highlight_med(),
+            highlight_high: default_moon_highlight_high(),
+            none: default_moon_none(),
         }
     }
 }
@@ -67,6 +135,78 @@ fn default_auto_start_terminals() -> bool {
     true
 }
 
+fn default_moon_nc() -> String {
+    "#1f1d30".to_string()
+}
+
+fn default_moon_base() -> String {
+    "#232136".to_string()
+}
+
+fn default_moon_surface() -> String {
+    "#2a273f".to_string()
+}
+
+fn default_moon_overlay() -> String {
+    "#393552".to_string()
+}
+
+fn default_moon_muted() -> String {
+    "#6e6a86".to_string()
+}
+
+fn default_moon_subtle() -> String {
+    "#908caa".to_string()
+}
+
+fn default_moon_text() -> String {
+    "#e0def4".to_string()
+}
+
+fn default_moon_love() -> String {
+    "#eb6f92".to_string()
+}
+
+fn default_moon_gold() -> String {
+    "#f6c177".to_string()
+}
+
+fn default_moon_rose() -> String {
+    "#ea9a97".to_string()
+}
+
+fn default_moon_pine() -> String {
+    "#3e8fb0".to_string()
+}
+
+fn default_moon_foam() -> String {
+    "#9ccfd8".to_string()
+}
+
+fn default_moon_iris() -> String {
+    "#c4a7e7".to_string()
+}
+
+fn default_moon_leaf() -> String {
+    "#95b1ac".to_string()
+}
+
+fn default_moon_highlight_low() -> String {
+    "#2a283e".to_string()
+}
+
+fn default_moon_highlight_med() -> String {
+    "#44415a".to_string()
+}
+
+fn default_moon_highlight_high() -> String {
+    "#56526e".to_string()
+}
+
+fn default_moon_none() -> String {
+    "NONE".to_string()
+}
+
 fn invalid_data(error: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
@@ -87,6 +227,8 @@ mod tests {
         assert_eq!(config.pi_agent_command, "pi");
         assert!(config.auto_start_pi_agent);
         assert!(config.auto_start_terminals);
+        assert_eq!(config.colorscheme.base, "#232136");
+        assert_eq!(config.colorscheme.nc, "#1f1d30");
     }
 
     #[test]
@@ -110,6 +252,7 @@ mod tests {
         assert_eq!(config.pi_agent_command, "pi -c");
         assert!(config.auto_start_pi_agent);
         assert!(config.auto_start_terminals);
+        assert_eq!(config.colorscheme.text, "#e0def4");
     }
 
     #[test]
@@ -126,6 +269,22 @@ mod tests {
         assert_eq!(config.pi_agent_command, "pi");
         assert!(!config.auto_start_pi_agent);
         assert!(!config.auto_start_terminals);
+    }
+
+    #[test]
+    fn config_loads_partial_colorscheme_from_json() {
+        let path = unique_temp_file();
+        fs::write(
+            &path,
+            r##"{"colorscheme":{"_nc":"#000001","text":"#ffffff"}}"##,
+        )
+        .expect("write config");
+
+        let config = load_from_path(&path).expect("load config");
+
+        assert_eq!(config.colorscheme.nc, "#000001");
+        assert_eq!(config.colorscheme.text, "#ffffff");
+        assert_eq!(config.colorscheme.base, "#232136");
     }
 
     #[test]

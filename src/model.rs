@@ -101,7 +101,7 @@ impl Default for ProjectState {
         let mult = state.add_workspace("mult".to_string(), std::env::current_dir().ok());
         state.add_chat(mult, "agent: planner".to_string(), ChatStatus::Thinking);
         state.add_chat(mult, "agent: coder".to_string(), ChatStatus::Idle);
-        state.add_terminal(mult, "dev server".to_string(), TerminalStatus::Running);
+        state.add_terminal(mult, "dev server".to_string(), TerminalStatus::Stopped);
 
         let website = state.add_workspace("website".to_string(), None);
         state.add_chat(website, "agent: reviewer".to_string(), ChatStatus::Waiting);
@@ -307,32 +307,11 @@ impl ProjectState {
             .find(|terminal| terminal.id == terminal_id)
     }
 
-    pub fn terminal_mut(
-        &mut self,
-        workspace_id: WorkspaceId,
-        terminal_id: TerminalId,
-    ) -> Option<&mut TerminalSession> {
-        self.workspace_mut(workspace_id)?
-            .terminals
-            .iter_mut()
-            .find(|terminal| terminal.id == terminal_id)
-    }
-
     pub fn terminal_mut_by_id(&mut self, terminal_id: TerminalId) -> Option<&mut TerminalSession> {
         self.workspaces
             .iter_mut()
             .flat_map(|workspace| workspace.terminals.iter_mut())
             .find(|terminal| terminal.id == terminal_id)
-    }
-
-    pub fn reset_terminal_statuses(&mut self) {
-        for terminal in self
-            .workspaces
-            .iter_mut()
-            .flat_map(|workspace| workspace.terminals.iter_mut())
-        {
-            terminal.status = TerminalStatus::Stopped;
-        }
     }
 
     fn allocate_workspace_id(&mut self) -> WorkspaceId {
@@ -364,16 +343,6 @@ impl ChatStatus {
             Self::Done => "done",
         }
     }
-
-    pub fn next(self) -> Self {
-        match self {
-            Self::Idle => Self::Thinking,
-            Self::Thinking => Self::Waiting,
-            Self::Waiting => Self::Failed,
-            Self::Failed => Self::Done,
-            Self::Done => Self::Idle,
-        }
-    }
 }
 
 impl ChatMessageRole {
@@ -393,13 +362,6 @@ impl TerminalStatus {
         match self {
             Self::Stopped => "stopped",
             Self::Running => "running",
-        }
-    }
-
-    pub fn next(self) -> Self {
-        match self {
-            Self::Stopped => Self::Running,
-            Self::Running => Self::Stopped,
         }
     }
 }

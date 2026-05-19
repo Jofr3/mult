@@ -18,10 +18,7 @@ pub fn load_or_default() -> io::Result<ProjectState> {
 }
 
 pub fn save(state: &ProjectState) -> io::Result<()> {
-    let path = state_path();
-    let mut snapshot = state.clone();
-    snapshot.reset_terminal_statuses();
-    save_to_path(&snapshot, &path)
+    save_to_path(state, &state_path())
 }
 
 pub fn state_path() -> PathBuf {
@@ -54,6 +51,10 @@ fn invalid_data(error: serde_json::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::model::TerminalStatus;
+
     use super::*;
 
     #[test]
@@ -65,5 +66,29 @@ mod tests {
         } else {
             assert!(path.ends_with("mult/state.json"));
         }
+    }
+
+    #[test]
+    fn save_preserves_running_terminal_status_for_restart() {
+        let path = unique_temp_file();
+        let mut state = ProjectState::default();
+        state.workspaces[0].terminals[0].status = TerminalStatus::Running;
+
+        save_to_path(&state, &path).expect("save state");
+
+        let bytes = fs::read(&path).expect("read saved state");
+        let decoded: ProjectState = serde_json::from_slice(&bytes).expect("decode state");
+        assert_eq!(
+            decoded.workspaces[0].terminals[0].status,
+            TerminalStatus::Running
+        );
+    }
+
+    fn unique_temp_file() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        env::temp_dir().join(format!("mult-storage-test-{unique}.json"))
     }
 }

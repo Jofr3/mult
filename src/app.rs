@@ -16,26 +16,45 @@ pub struct App {
     pub project: ProjectState,
     pub selected: usize,
     pub mode: Mode,
+    pub prompt: Option<Prompt>,
+    pub focus: FocusMode,
     pub terminal_buffers: BTreeMap<TerminalId, TerminalBuffer>,
     pub chat_buffers: BTreeMap<ChatId, ChatBuffer>,
     pub should_quit: bool,
     dirty: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
-    OpenWorkspace(OpenWorkspacePrompt),
-    NewTerminalCommand(TerminalCommandPrompt),
-    ConfirmDelete(DeleteConfirmation),
-    TerminalInput {
+    Input(InputTarget),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputTarget {
+    Terminal {
         workspace: WorkspaceId,
         terminal: TerminalId,
     },
-    ChatAgentInput {
+    ChatAgent {
         workspace: WorkspaceId,
         chat: ChatId,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Prompt {
+    OpenWorkspace(OpenWorkspacePrompt),
+    NewTerminalCommand(TerminalCommandPrompt),
+    ConfirmDelete(DeleteConfirmation),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FocusMode {
+    #[default]
+    Sidebar,
+    Chat,
+    Terminal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,8 +200,7 @@ pub fn chat_id_from_agent_terminal_id(terminal: TerminalId) -> Option<ChatId> {
 }
 
 impl App {
-    pub fn new(mut project: ProjectState) -> Self {
-        project.reset_terminal_statuses();
+    pub fn new(project: ProjectState) -> Self {
         let chat_buffers = project
             .workspaces
             .iter()
@@ -194,6 +212,8 @@ impl App {
             project,
             selected: 0,
             mode: Mode::Normal,
+            prompt: None,
+            focus: FocusMode::Sidebar,
             terminal_buffers: BTreeMap::new(),
             chat_buffers,
             should_quit: false,
@@ -216,29 +236,89 @@ impl App {
     }
 
     pub fn is_prompt_active(&self) -> bool {
-        matches!(
-            self.mode,
-            Mode::OpenWorkspace(_) | Mode::NewTerminalCommand(_) | Mode::ConfirmDelete(_)
-        )
+        self.prompt.is_some()
+    }
+
+    pub fn focus_next(&mut self) {
+        self.cycle_focus(false);
+    }
+
+    pub fn focus_previous(&mut self) {
+        self.cycle_focus(true);
+    }
+
+    pub fn focus_sidebar(&mut self) {
+        self.focus = FocusMode::Sidebar;
+    }
+
+    pub fn focus_selected_main(&mut self) -> bool {
+        let Some(focus) = self.selected_main_focus() else {
+            return false;
+        };
+
+        self.focus = focus;
+        true
+    }
+
+    fn cycle_focus(&mut self, backwards: bool) {
+        let available = self.available_focus_modes();
+        if available.is_empty() {
+            self.focus = FocusMode::Sidebar;
+            return;
+        }
+
+        let index = available
+            .iter()
+            .position(|focus| *focus == self.focus)
+            .unwrap_or(0);
+        let next = if backwards {
+            index.checked_sub(1).unwrap_or(available.len() - 1)
+        } else {
+            (index + 1) % available.len()
+        };
+        self.focus = available[next];
+    }
+
+    fn available_focus_modes(&self) -> Vec<FocusMode> {
+        let mut modes = vec![FocusMode::Sidebar];
+        if let Some(focus) = self.selected_main_focus() {
+            modes.push(focus);
+        }
+        modes
+    }
+
+    fn selected_main_focus(&self) -> Option<FocusMode> {
+        match self.selected_item()? {
+            NavItem::Chat { .. } => Some(FocusMode::Chat),
+            NavItem::Terminal { .. } => Some(FocusMode::Terminal),
+            NavItem::Workspace(_) => None,
+        }
+    }
+
+    fn normalize_focus(&mut self) {
+        if !self.available_focus_modes().contains(&self.focus) {
+            self.focus = FocusMode::Sidebar;
+        }
     }
 
     pub fn terminal_input_target(&self) -> Option<TerminalId> {
         match self.mode {
-            Mode::TerminalInput { terminal, .. } => Some(terminal),
+            Mode::Input(InputTarget::Terminal { terminal, .. }) => Some(terminal),
             _ => None,
         }
     }
 
     pub fn pty_input_target(&self) -> Option<TerminalId> {
         match self.mode {
-            Mode::TerminalInput { terminal, .. } => Some(terminal),
-            Mode::ChatAgentInput { chat, .. } => Some(chat_agent_terminal_id(chat)),
-            _ => None,
+            Mode::Input(InputTarget::Terminal { terminal, .. }) => Some(terminal),
+            Mode::Input(InputTarget::ChatAgent { chat, .. }) => Some(chat_agent_terminal_id(chat)),
+            Mode::Normal => None,
         }
     }
 
+    #[cfg(test)]
     pub fn nav_items(&self) -> Vec<NavItem> {
-        let mut items = Vec::new();
+        let mut items = Vec::with_capacity(self.nav_len());
 
         for workspace in &self.project.workspaces {
             items.push(NavItem::Workspace(workspace.id));
@@ -261,8 +341,48 @@ impl App {
         items
     }
 
+    pub fn nav_len(&self) -> usize {
+        self.project
+            .workspaces
+            .iter()
+            .map(|workspace| 1 + workspace.chats.len() + workspace.terminals.len())
+            .sum()
+    }
+
+    pub fn nav_item_at(&self, target_index: usize) -> Option<NavItem> {
+        let mut index = 0;
+        for workspace in &self.project.workspaces {
+            if index == target_index {
+                return Some(NavItem::Workspace(workspace.id));
+            }
+            index += 1;
+
+            for chat in &workspace.chats {
+                if index == target_index {
+                    return Some(NavItem::Chat {
+                        workspace: workspace.id,
+                        chat: chat.id,
+                    });
+                }
+                index += 1;
+            }
+
+            for terminal in &workspace.terminals {
+                if index == target_index {
+                    return Some(NavItem::Terminal {
+                        workspace: workspace.id,
+                        terminal: terminal.id,
+                    });
+                }
+                index += 1;
+            }
+        }
+
+        None
+    }
+
     pub fn selected_item(&self) -> Option<NavItem> {
-        self.nav_items().get(self.selected).copied()
+        self.nav_item_at(self.selected)
     }
 
     pub fn selected_workspace_id(&self) -> Option<WorkspaceId> {
@@ -303,20 +423,20 @@ impl App {
             return false;
         };
 
-        self.mode = Mode::ConfirmDelete(DeleteConfirmation {
+        self.prompt = Some(Prompt::ConfirmDelete(DeleteConfirmation {
             target,
             label,
             detail,
-        });
+        }));
         true
     }
 
     pub fn confirm_delete_selected(&mut self) -> Vec<TerminalId> {
-        let Mode::ConfirmDelete(confirmation) = &self.mode else {
+        let Some(Prompt::ConfirmDelete(confirmation)) = &self.prompt else {
             return Vec::new();
         };
         let target = confirmation.target;
-        self.mode = Mode::Normal;
+        self.prompt = None;
 
         let mut runtime_terminals = Vec::new();
         match target {
@@ -361,6 +481,7 @@ impl App {
         }
 
         self.clamp_selection();
+        self.normalize_focus();
         runtime_terminals
     }
 
@@ -414,12 +535,14 @@ impl App {
     pub fn mark_terminal_running(&mut self, terminal: TerminalId) {
         if let Some(terminal) = self.project.terminal_mut_by_id(terminal) {
             terminal.status = TerminalStatus::Running;
+            self.dirty = true;
         }
     }
 
     pub fn mark_terminal_stopped(&mut self, terminal: TerminalId) {
         if let Some(terminal) = self.project.terminal_mut_by_id(terminal) {
             terminal.status = TerminalStatus::Stopped;
+            self.dirty = true;
         }
     }
 
@@ -548,24 +671,27 @@ impl App {
     }
 
     pub fn select_next(&mut self) {
-        let len = self.nav_items().len();
+        let len = self.nav_len();
         if len > 0 {
             self.selected = (self.selected + 1) % len;
+            self.normalize_focus();
         }
     }
 
     pub fn select_previous(&mut self) {
-        let len = self.nav_items().len();
+        let len = self.nav_len();
         if len > 0 {
             self.selected = self.selected.checked_sub(1).unwrap_or(len - 1);
+            self.normalize_focus();
         }
     }
 
     pub fn add_workspace(&mut self) {
         let next = self.project.workspaces.len() + 1;
+        let name = format!("workspace-{next}");
         let workspace = self
             .project
-            .add_workspace(format!("workspace-{next}"), std::env::current_dir().ok());
+            .add_workspace(name.clone(), std::env::current_dir().ok());
         let chat =
             self.project
                 .add_chat(workspace, "agent: new chat".to_string(), ChatStatus::Idle);
@@ -584,7 +710,10 @@ impl App {
             .map(|path| path.display().to_string())
             .unwrap_or_default();
 
-        self.mode = Mode::OpenWorkspace(OpenWorkspacePrompt { input, error: None });
+        self.prompt = Some(Prompt::OpenWorkspace(OpenWorkspacePrompt {
+            input,
+            error: None,
+        }));
     }
 
     pub fn begin_new_terminal_command(&mut self) -> bool {
@@ -592,15 +721,15 @@ impl App {
             return false;
         }
 
-        self.mode = Mode::NewTerminalCommand(TerminalCommandPrompt {
+        self.prompt = Some(Prompt::NewTerminalCommand(TerminalCommandPrompt {
             input: String::new(),
             error: None,
-        });
+        }));
         true
     }
 
     pub fn cancel_prompt(&mut self) {
-        self.mode = Mode::Normal;
+        self.prompt = None;
     }
 
     pub fn begin_terminal_input(&mut self) -> bool {
@@ -608,10 +737,11 @@ impl App {
             return false;
         };
 
-        self.mode = Mode::TerminalInput {
+        self.focus = FocusMode::Terminal;
+        self.mode = Mode::Input(InputTarget::Terminal {
             workspace,
             terminal,
-        };
+        });
         true
     }
 
@@ -620,16 +750,19 @@ impl App {
             return false;
         };
 
-        self.mode = Mode::ChatAgentInput { workspace, chat };
+        self.focus = FocusMode::Chat;
+        self.mode = Mode::Input(InputTarget::ChatAgent { workspace, chat });
         true
     }
 
     pub fn end_terminal_input(&mut self) {
         self.mode = Mode::Normal;
+        self.focus = FocusMode::Sidebar;
     }
 
     pub fn end_pty_input(&mut self) {
         self.mode = Mode::Normal;
+        self.focus = FocusMode::Sidebar;
     }
 
     pub fn mark_chat_status_by_id(&mut self, chat: ChatId, status: ChatStatus) {
@@ -648,12 +781,12 @@ impl App {
     }
 
     pub fn push_prompt_char(&mut self, c: char) {
-        match &mut self.mode {
-            Mode::OpenWorkspace(prompt) => {
+        match &mut self.prompt {
+            Some(Prompt::OpenWorkspace(prompt)) => {
                 prompt.input.push(c);
                 prompt.error = None;
             }
-            Mode::NewTerminalCommand(prompt) => {
+            Some(Prompt::NewTerminalCommand(prompt)) => {
                 prompt.input.push(c);
                 prompt.error = None;
             }
@@ -662,12 +795,12 @@ impl App {
     }
 
     pub fn pop_prompt_char(&mut self) {
-        match &mut self.mode {
-            Mode::OpenWorkspace(prompt) => {
+        match &mut self.prompt {
+            Some(Prompt::OpenWorkspace(prompt)) => {
                 prompt.input.pop();
                 prompt.error = None;
             }
-            Mode::NewTerminalCommand(prompt) => {
+            Some(Prompt::NewTerminalCommand(prompt)) => {
                 prompt.input.pop();
                 prompt.error = None;
             }
@@ -676,7 +809,7 @@ impl App {
     }
 
     pub fn submit_open_workspace(&mut self) {
-        let Mode::OpenWorkspace(prompt) = &self.mode else {
+        let Some(Prompt::OpenWorkspace(prompt)) = &self.prompt else {
             return;
         };
         let raw_input = prompt.input.trim();
@@ -702,25 +835,25 @@ impl App {
             .iter()
             .find(|workspace| workspace.cwd.as_deref() == Some(cwd.as_path()))
         {
-            self.mode = Mode::Normal;
+            self.prompt = None;
             self.select_item(NavItem::Workspace(existing_workspace.id));
             return;
         }
 
         let name = workspace_name(&cwd);
-        let workspace = self.project.add_workspace(name, Some(cwd));
+        let workspace = self.project.add_workspace(name.clone(), Some(cwd));
         self.project
             .add_chat(workspace, "agent: new chat".to_string(), ChatStatus::Idle);
         self.project
             .add_terminal(workspace, "shell".to_string(), TerminalStatus::Stopped);
 
-        self.mode = Mode::Normal;
+        self.prompt = None;
         self.select_item(NavItem::Workspace(workspace));
         self.dirty = true;
     }
 
     pub fn submit_new_terminal_command(&mut self) {
-        let Mode::NewTerminalCommand(prompt) = &self.mode else {
+        let Some(Prompt::NewTerminalCommand(prompt)) = &self.prompt else {
             return;
         };
         let command = prompt.input.trim().to_string();
@@ -741,11 +874,13 @@ impl App {
             .unwrap_or(1);
         let name = command_terminal_name(&command, next);
 
-        if let Some(terminal) =
-            self.project
-                .add_command_terminal(workspace, name, TerminalStatus::Stopped, command)
-        {
-            self.mode = Mode::Normal;
+        if let Some(terminal) = self.project.add_command_terminal(
+            workspace,
+            name.clone(),
+            TerminalStatus::Stopped,
+            command,
+        ) {
+            self.prompt = None;
             self.select_item(NavItem::Terminal {
                 workspace,
                 terminal,
@@ -762,9 +897,10 @@ impl App {
             .map(|workspace| workspace.chats.len() + 1)
             .unwrap_or(1);
 
-        let chat =
-            self.project
-                .add_chat(workspace, format!("agent: chat-{next}"), ChatStatus::Idle)?;
+        let name = format!("agent: chat-{next}");
+        let chat = self
+            .project
+            .add_chat(workspace, name.clone(), ChatStatus::Idle)?;
         self.select_item(NavItem::Chat { workspace, chat });
         self.dirty = true;
         Some((workspace, chat))
@@ -780,11 +916,11 @@ impl App {
             .map(|workspace| workspace.terminals.len() + 1)
             .unwrap_or(1);
 
-        if let Some(terminal) = self.project.add_terminal(
-            workspace,
-            format!("terminal-{next}"),
-            TerminalStatus::Stopped,
-        ) {
+        let name = format!("terminal-{next}");
+        if let Some(terminal) =
+            self.project
+                .add_terminal(workspace, name.clone(), TerminalStatus::Stopped)
+        {
             self.select_item(NavItem::Terminal {
                 workspace,
                 terminal,
@@ -793,49 +929,63 @@ impl App {
         }
     }
 
-    pub fn rotate_selected_status(&mut self) {
-        match self.selected_item() {
-            Some(NavItem::Chat { workspace, chat }) => {
-                if let Some(chat) = self.project.chat_mut(workspace, chat) {
-                    chat.status = chat.status.next();
-                    self.dirty = true;
-                }
-            }
-            Some(NavItem::Terminal {
-                workspace,
-                terminal,
-            }) => {
-                if let Some(terminal) = self.project.terminal_mut(workspace, terminal) {
-                    terminal.status = terminal.status.next();
-                    self.dirty = true;
-                }
-            }
-            _ => {}
-        }
-    }
-
     fn set_open_workspace_error(&mut self, message: impl Into<String>) {
-        if let Mode::OpenWorkspace(prompt) = &mut self.mode {
+        if let Some(Prompt::OpenWorkspace(prompt)) = &mut self.prompt {
             prompt.error = Some(message.into());
         }
     }
 
     fn set_terminal_command_error(&mut self, message: impl Into<String>) {
-        if let Mode::NewTerminalCommand(prompt) = &mut self.mode {
+        if let Some(Prompt::NewTerminalCommand(prompt)) = &mut self.prompt {
             prompt.error = Some(message.into());
         }
     }
 
     fn select_item(&mut self, target: NavItem) {
-        if let Some(index) = self.nav_items().iter().position(|item| *item == target) {
+        if let Some(index) = self.nav_item_position(target) {
             self.selected = index;
         } else {
             self.clamp_selection();
         }
+        self.normalize_focus();
+    }
+
+    fn nav_item_position(&self, target: NavItem) -> Option<usize> {
+        let mut index = 0;
+        for workspace in &self.project.workspaces {
+            if NavItem::Workspace(workspace.id) == target {
+                return Some(index);
+            }
+            index += 1;
+
+            for chat in &workspace.chats {
+                if (NavItem::Chat {
+                    workspace: workspace.id,
+                    chat: chat.id,
+                }) == target
+                {
+                    return Some(index);
+                }
+                index += 1;
+            }
+
+            for terminal in &workspace.terminals {
+                if (NavItem::Terminal {
+                    workspace: workspace.id,
+                    terminal: terminal.id,
+                }) == target
+                {
+                    return Some(index);
+                }
+                index += 1;
+            }
+        }
+
+        None
     }
 
     fn clamp_selection(&mut self) {
-        let len = self.nav_items().len();
+        let len = self.nav_len();
         if len == 0 {
             self.selected = 0;
         } else if self.selected >= len {
@@ -1534,12 +1684,55 @@ mod tests {
         let workspace = app.project.workspaces[0].id;
         let chat = app.project.workspaces[0].chats[0].id;
 
-        assert_eq!(app.nav_items()[0], NavItem::Workspace(workspace));
-        assert_eq!(app.nav_items()[1], NavItem::Chat { workspace, chat });
+        assert_eq!(app.nav_len(), app.nav_items().len());
+        assert_eq!(app.nav_item_at(0), Some(NavItem::Workspace(workspace)));
+        assert_eq!(app.nav_item_at(1), Some(NavItem::Chat { workspace, chat }));
+        assert_eq!(app.nav_item_at(app.nav_len()), None);
         assert!(app
             .nav_items()
             .iter()
             .any(|item| matches!(item, NavItem::Terminal { .. })));
+    }
+
+    #[test]
+    fn focus_modes_cycle_between_sidebar_and_selected_main_pane() {
+        let mut app = App {
+            selected: 1,
+            ..App::default()
+        };
+        assert!(matches!(app.selected_item(), Some(NavItem::Chat { .. })));
+
+        assert_eq!(app.focus, FocusMode::Sidebar);
+        app.focus_next();
+        assert_eq!(app.focus, FocusMode::Chat);
+        app.focus_next();
+        assert_eq!(app.focus, FocusMode::Sidebar);
+
+        let terminal_index = app
+            .nav_items()
+            .iter()
+            .position(|item| matches!(item, NavItem::Terminal { .. }))
+            .expect("seed state has a terminal");
+        app.selected = terminal_index;
+        app.focus_next();
+        assert_eq!(app.focus, FocusMode::Terminal);
+        app.focus_previous();
+        assert_eq!(app.focus, FocusMode::Sidebar);
+    }
+
+    #[test]
+    fn focus_falls_back_to_sidebar_for_workspace_selection() {
+        let mut app = App {
+            selected: 1,
+            focus: FocusMode::Chat,
+            ..App::default()
+        };
+
+        app.select_previous();
+
+        assert!(matches!(app.selected_item(), Some(NavItem::Workspace(_))));
+        assert_eq!(app.focus, FocusMode::Sidebar);
+        assert!(!app.focus_selected_main());
     }
 
     #[test]
@@ -1572,11 +1765,12 @@ mod tests {
         assert_eq!(app.pty_input_target(), Some(terminal));
         assert_eq!(
             app.mode,
-            Mode::TerminalInput {
+            Mode::Input(InputTarget::Terminal {
                 workspace,
                 terminal,
-            }
+            })
         );
+        assert_eq!(app.focus, FocusMode::Terminal);
     }
 
     #[test]
@@ -1596,7 +1790,28 @@ mod tests {
             chat_id_from_agent_terminal_id(chat_agent_terminal_id(chat)),
             Some(chat)
         );
-        assert_eq!(app.mode, Mode::ChatAgentInput { workspace, chat });
+        assert_eq!(
+            app.mode,
+            Mode::Input(InputTarget::ChatAgent { workspace, chat })
+        );
+        assert_eq!(app.focus, FocusMode::Chat);
+    }
+
+    #[test]
+    fn ending_input_mode_returns_focus_to_sidebar() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        let terminal = app.project.workspaces[0].terminals[0].id;
+        app.select_item(NavItem::Terminal {
+            workspace,
+            terminal,
+        });
+        assert!(app.begin_terminal_input());
+
+        app.end_pty_input();
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.focus, FocusMode::Sidebar);
     }
 
     #[test]
@@ -1723,11 +1938,11 @@ mod tests {
 
         assert!(app.begin_delete_selected());
         assert!(matches!(
-            app.mode,
-            Mode::ConfirmDelete(DeleteConfirmation {
+            app.prompt,
+            Some(Prompt::ConfirmDelete(DeleteConfirmation {
                 target: DeleteTarget::Terminal { .. },
                 ..
-            })
+            }))
         ));
 
         let runtime_terminals = app.confirm_delete_selected();
@@ -1884,29 +2099,10 @@ mod tests {
     }
 
     #[test]
-    fn rotating_selected_chat_status_marks_app_dirty() {
-        let mut app = App {
-            selected: 1,
-            ..App::default()
-        };
-        let Some(NavItem::Chat { workspace, chat }) = app.selected_item() else {
-            panic!("expected a chat selection");
-        };
-
-        app.rotate_selected_status();
-
-        assert_eq!(
-            app.project.chat(workspace, chat).unwrap().status,
-            ChatStatus::Waiting
-        );
-        assert!(app.is_dirty());
-    }
-
-    #[test]
     fn prompt_input_can_be_edited() {
         let mut app = App::default();
         app.begin_open_workspace();
-        if let Mode::OpenWorkspace(prompt) = &mut app.mode {
+        if let Some(Prompt::OpenWorkspace(prompt)) = &mut app.prompt {
             prompt.input.clear();
         }
 
@@ -1915,11 +2111,11 @@ mod tests {
         app.pop_prompt_char();
 
         assert_eq!(
-            app.mode,
-            Mode::OpenWorkspace(OpenWorkspacePrompt {
+            app.prompt,
+            Some(Prompt::OpenWorkspace(OpenWorkspacePrompt {
                 input: "/".to_string(),
                 error: None,
-            })
+            }))
         );
     }
 
@@ -1928,7 +2124,7 @@ mod tests {
         let path = unique_temp_dir();
         let mut app = App::default();
         app.begin_open_workspace();
-        if let Mode::OpenWorkspace(prompt) = &mut app.mode {
+        if let Some(Prompt::OpenWorkspace(prompt)) = &mut app.prompt {
             prompt.input = path.display().to_string();
         }
 
@@ -1939,6 +2135,7 @@ mod tests {
         assert_eq!(imported.chats.len(), 1);
         assert_eq!(imported.terminals.len(), 1);
         assert_eq!(app.selected_item(), Some(NavItem::Workspace(imported.id)));
+        assert_eq!(app.prompt, None);
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.is_dirty());
     }
@@ -1947,13 +2144,13 @@ mod tests {
     fn invalid_import_stays_in_prompt() {
         let mut app = App::default();
         app.begin_open_workspace();
-        if let Mode::OpenWorkspace(prompt) = &mut app.mode {
+        if let Some(Prompt::OpenWorkspace(prompt)) = &mut app.prompt {
             prompt.input = "/this/path/should/not/exist".to_string();
         }
 
         app.submit_open_workspace();
 
-        let Mode::OpenWorkspace(prompt) = &app.mode else {
+        let Some(Prompt::OpenWorkspace(prompt)) = &app.prompt else {
             panic!("expected prompt to remain open");
         };
         assert_eq!(prompt.error.as_deref(), Some("path does not exist"));

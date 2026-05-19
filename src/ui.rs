@@ -2,23 +2,104 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 
 use crate::{
     app::{
-        chat_agent_terminal_id, App, Mode, NavItem, TerminalCellStyle, TerminalColor,
-        TerminalRenderLine,
+        chat_agent_terminal_id, App, FocusMode, Mode, NavItem, Prompt, TerminalCellStyle,
+        TerminalColor, TerminalRenderLine,
     },
-    config,
-    model::{ChatId, ChatStatus, TerminalId, TerminalStatus, WorkspaceId},
-    storage,
+    config::{self, ColorSchemeConfig},
+    model::{ChatId, ChatStatus, TerminalId, TerminalLaunch, TerminalStatus, WorkspaceId},
 };
 
-const FOOTER: &str = "q/esc quit • j/k move • o open/import • w workspace • c chat • p pi agent • t terminal • d command • D/del delete • s/x PTY • i input";
+const FOOTER: &str = "tab focus • enter/→ pane • ← sidebar • q quit • j/k sidebar • o open/import • w workspace • c chat • t terminal • d command • D/del delete • s/x PTY • i input";
 const CHAT_AGENT_HEADER_LINES: u16 = 0;
 const TERMINAL_HEADER_LINES: u16 = 0;
+
+#[allow(dead_code)]
+mod moon {
+    use ratatui::style::Color;
+
+    pub const NC: Color = Color::Rgb(31, 29, 48);
+    pub const BASE: Color = Color::Rgb(35, 33, 54);
+    pub const SURFACE: Color = Color::Rgb(42, 39, 63);
+    pub const OVERLAY: Color = Color::Rgb(57, 53, 82);
+    pub const MUTED: Color = Color::Rgb(110, 106, 134);
+    pub const SUBTLE: Color = Color::Rgb(144, 140, 170);
+    pub const TEXT: Color = Color::Rgb(224, 222, 244);
+    pub const LOVE: Color = Color::Rgb(235, 111, 146);
+    pub const GOLD: Color = Color::Rgb(246, 193, 119);
+    pub const ROSE: Color = Color::Rgb(234, 154, 151);
+    pub const PINE: Color = Color::Rgb(62, 143, 176);
+    pub const FOAM: Color = Color::Rgb(156, 207, 216);
+    pub const IRIS: Color = Color::Rgb(196, 167, 231);
+    pub const LEAF: Color = Color::Rgb(149, 177, 172);
+    pub const HIGHLIGHT_LOW: Color = Color::Rgb(42, 40, 62);
+    pub const HIGHLIGHT_MED: Color = Color::Rgb(68, 65, 90);
+    pub const HIGHLIGHT_HIGH: Color = Color::Rgb(86, 82, 110);
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+struct Palette {
+    nc: Color,
+    base: Color,
+    surface: Color,
+    overlay: Color,
+    muted: Color,
+    subtle: Color,
+    text: Color,
+    love: Color,
+    gold: Color,
+    rose: Color,
+    pine: Color,
+    foam: Color,
+    iris: Color,
+    leaf: Color,
+    highlight_low: Color,
+    highlight_med: Color,
+    highlight_high: Color,
+}
+
+impl Palette {
+    fn from_colorscheme(colorscheme: &ColorSchemeConfig) -> Self {
+        Self {
+            nc: parse_color(&colorscheme.nc).unwrap_or(moon::NC),
+            base: parse_color(&colorscheme.base).unwrap_or(moon::BASE),
+            surface: parse_color(&colorscheme.surface).unwrap_or(moon::SURFACE),
+            overlay: parse_color(&colorscheme.overlay).unwrap_or(moon::OVERLAY),
+            muted: parse_color(&colorscheme.muted).unwrap_or(moon::MUTED),
+            subtle: parse_color(&colorscheme.subtle).unwrap_or(moon::SUBTLE),
+            text: parse_color(&colorscheme.text).unwrap_or(moon::TEXT),
+            love: parse_color(&colorscheme.love).unwrap_or(moon::LOVE),
+            gold: parse_color(&colorscheme.gold).unwrap_or(moon::GOLD),
+            rose: parse_color(&colorscheme.rose).unwrap_or(moon::ROSE),
+            pine: parse_color(&colorscheme.pine).unwrap_or(moon::PINE),
+            foam: parse_color(&colorscheme.foam).unwrap_or(moon::FOAM),
+            iris: parse_color(&colorscheme.iris).unwrap_or(moon::IRIS),
+            leaf: parse_color(&colorscheme.leaf).unwrap_or(moon::LEAF),
+            highlight_low: parse_color(&colorscheme.highlight_low).unwrap_or(moon::HIGHLIGHT_LOW),
+            highlight_med: parse_color(&colorscheme.highlight_med).unwrap_or(moon::HIGHLIGHT_MED),
+            highlight_high: parse_color(&colorscheme.highlight_high)
+                .unwrap_or(moon::HIGHLIGHT_HIGH),
+        }
+    }
+}
+
+fn parse_color(input: &str) -> Option<Color> {
+    let hex = input.trim().strip_prefix('#').unwrap_or(input.trim());
+    if hex.len() != 6 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    let red = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let green = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let blue = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(Color::Rgb(red, green, blue))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LayoutAreas {
@@ -27,12 +108,13 @@ struct LayoutAreas {
     footer: Rect,
 }
 
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &App, config: &config::Config) {
     let layout = layout_areas(app, frame.area());
+    let palette = Palette::from_colorscheme(&config.colorscheme);
 
-    draw_sidebar(frame, app, layout.sidebar);
-    draw_main(frame, app, layout.main);
-    draw_footer(frame, app, layout.footer);
+    draw_sidebar(frame, app, layout.sidebar, palette);
+    draw_main(frame, app, layout.main, palette);
+    draw_footer(frame, app, layout.footer, palette);
 }
 
 pub fn selected_terminal_output_area(app: &App, frame_area: Rect) -> Option<(TerminalId, Rect)> {
@@ -54,7 +136,7 @@ pub fn selected_chat_agent_output_area(app: &App, frame_area: Rect) -> Option<(C
 }
 
 fn layout_areas(app: &App, frame_area: Rect) -> LayoutAreas {
-    let footer_height = if app.is_prompt_active() { 4 } else { 1 };
+    let footer_height = if app.is_prompt_active() { 3 } else { 1 };
     let [body, footer] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)]).areas(frame_area);
     let [sidebar, main] =
@@ -76,7 +158,7 @@ fn chat_agent_output_area(main: Rect) -> Rect {
 }
 
 fn output_area_after_header(main: Rect, header_lines: u16) -> Rect {
-    let inner = bordered_inner(main);
+    let inner = pane_inner(main);
     let header_height = header_lines.min(inner.height);
 
     Rect {
@@ -87,17 +169,12 @@ fn output_area_after_header(main: Rect, header_lines: u16) -> Rect {
     }
 }
 
-fn bordered_inner(area: Rect) -> Rect {
-    Rect {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    }
+fn pane_inner(area: Rect) -> Rect {
+    area
 }
 
-fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
-    let items = sidebar_items(app);
+fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
+    let items = sidebar_items(app, palette);
     let selected = if items.is_empty() {
         None
     } else {
@@ -106,12 +183,14 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let mut state = ListState::default();
     state.select(selected);
 
+    let focused = focus_is_active(app, FocusMode::Sidebar);
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" workspaces "))
+        .block(Block::default().style(pane_style(focused, palette)))
+        .style(pane_style(focused, palette))
         .highlight_style(
             Style::default()
-                .bg(Color::DarkGray)
-                .fg(Color::White)
+                .bg(palette.highlight_med)
+                .fg(palette.text)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -119,17 +198,17 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn sidebar_items(app: &App) -> Vec<ListItem<'static>> {
+fn sidebar_items(app: &App, palette: Palette) -> Vec<ListItem<'static>> {
     app.project
         .workspaces
         .iter()
         .flat_map(|workspace| {
             let workspace_line = ListItem::new(Line::from(vec![
-                Span::styled("▣ ", Style::default().fg(Color::Cyan)),
+                Span::styled("▣ ", Style::default().fg(palette.foam)),
                 Span::styled(
                     workspace.name.clone(),
                     Style::default()
-                        .fg(Color::White)
+                        .fg(palette.text)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]));
@@ -137,11 +216,11 @@ fn sidebar_items(app: &App) -> Vec<ListItem<'static>> {
             let chat_lines = workspace.chats.iter().map(move |chat| {
                 ListItem::new(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled("● ", chat_status_style(chat.status)),
+                    Span::styled("● ", chat_status_style(chat.status, palette)),
                     Span::raw(chat.name.clone()),
                     Span::styled(
                         format!(" [{}]", chat.status.label()),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(palette.muted),
                     ),
                 ]))
             });
@@ -149,11 +228,11 @@ fn sidebar_items(app: &App) -> Vec<ListItem<'static>> {
             let terminal_lines = workspace.terminals.iter().map(move |terminal| {
                 ListItem::new(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled("$ ", terminal_status_style(terminal.status)),
+                    Span::styled("$ ", terminal_status_style(terminal.status, palette)),
                     Span::raw(terminal.name.clone()),
                     Span::styled(
                         format!(" [{}]", terminal.status.label()),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(palette.muted),
                     ),
                 ]))
             });
@@ -167,32 +246,53 @@ fn sidebar_items(app: &App) -> Vec<ListItem<'static>> {
         .collect()
 }
 
-fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" mult — AI agent multiplexer ");
+fn draw_main(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
+    let selected_item = app.selected_item();
+    let pane_focus = selected_item.and_then(main_pane_focus);
+    let focused = pane_focus.is_some_and(|focus| focus_is_active(app, focus));
 
     let terminal_output_rows = usize::from(terminal_output_area(area).height.max(1));
     let chat_agent_output_rows = usize::from(chat_agent_output_area(area).height.max(1));
-    let lines = match app.selected_item() {
-        Some(NavItem::Workspace(workspace)) => workspace_details(app, workspace),
+    let lines = match selected_item {
+        Some(NavItem::Workspace(workspace)) => workspace_details(app, workspace, palette),
         Some(NavItem::Chat { workspace, chat }) => {
-            chat_details(app, workspace, chat, chat_agent_output_rows)
+            chat_details(app, workspace, chat, chat_agent_output_rows, palette)
         }
         Some(NavItem::Terminal {
             workspace,
             terminal,
-        }) => terminal_details(app, workspace, terminal, terminal_output_rows),
+        }) => terminal_details(app, workspace, terminal, terminal_output_rows, palette),
         None => vec![Line::from("No workspaces yet.")],
     };
 
     let paragraph = Paragraph::new(lines)
-        .block(block)
+        .block(Block::default().style(pane_style(focused, palette)))
+        .style(pane_style(focused, palette))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
-fn workspace_details(app: &App, workspace_id: WorkspaceId) -> Vec<Line<'static>> {
+fn main_pane_focus(item: NavItem) -> Option<FocusMode> {
+    match item {
+        NavItem::Chat { .. } => Some(FocusMode::Chat),
+        NavItem::Terminal { .. } => Some(FocusMode::Terminal),
+        NavItem::Workspace(_) => None,
+    }
+}
+
+fn focus_is_active(app: &App, focus: FocusMode) -> bool {
+    !app.is_prompt_active() && app.focus == focus
+}
+
+fn pane_style(focused: bool, palette: Palette) -> Style {
+    if focused {
+        Style::default().fg(palette.text).bg(palette.base)
+    } else {
+        Style::default().fg(palette.text).bg(palette.nc)
+    }
+}
+
+fn workspace_details(app: &App, workspace_id: WorkspaceId, palette: Palette) -> Vec<Line<'static>> {
     let Some(workspace) = app.project.workspace(workspace_id) else {
         return vec![Line::from("Missing workspace.")];
     };
@@ -203,37 +303,75 @@ fn workspace_details(app: &App, workspace_id: WorkspaceId) -> Vec<Line<'static>>
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "<unset>".to_string());
 
-    vec![
+    let mut lines = vec![
+        Line::from(Span::styled(
+            workspace.name.clone(),
+            Style::default()
+                .fg(palette.foam)
+                .add_modifier(Modifier::BOLD),
+        )),
         Line::from(vec![
-            Span::styled("Workspace: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                workspace.name.clone(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Id: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(workspace.id.0.to_string()),
-        ]),
-        Line::from(vec![
-            Span::styled("Cwd: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("cwd ", Style::default().fg(palette.muted)),
             Span::raw(cwd),
         ]),
-        Line::from(format!("Env vars: {}", workspace.environment.len())),
-        Line::from(format!("Chats: {}", workspace.chats.len())),
-        Line::from(format!("Terminals: {}", workspace.terminals.len())),
         Line::from(""),
         Line::from(vec![
-            Span::styled("State file: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(storage::state_path().display().to_string()),
+            Span::styled(pad_cell("Chats", 42), Style::default().fg(palette.muted)),
+            Span::styled("Terminals", Style::default().fg(palette.muted)),
         ]),
-        Line::from(""),
-        Line::from("M1 is nearly complete: stable IDs, cwd/env metadata, JSON persistence, and open/import."),
-        Line::from("Press `o` to import another workspace by directory path."),
-        Line::from("Press `D` or Delete to remove the selected workspace/chat/terminal."),
-    ]
+    ];
+
+    let rows = workspace.chats.len().max(workspace.terminals.len());
+    if rows == 0 {
+        lines.push(Line::from(
+            "No chats or terminals. Press `c` or `t` to add one.",
+        ));
+        return lines;
+    }
+
+    for index in 0..rows {
+        let chat = workspace
+            .chats
+            .get(index)
+            .map(|chat| {
+                (
+                    format!("● {} [{}]", chat.name, chat.status.label()),
+                    chat_status_style(chat.status, palette),
+                )
+            })
+            .unwrap_or_else(|| (String::new(), Style::default().fg(palette.text)));
+        let terminal = workspace
+            .terminals
+            .get(index)
+            .map(|terminal| {
+                (
+                    format!("$ {} [{}]", terminal.name, terminal.status.label()),
+                    terminal_status_style(terminal.status, palette),
+                )
+            })
+            .unwrap_or_else(|| (String::new(), Style::default().fg(palette.text)));
+
+        lines.push(Line::from(vec![
+            Span::styled(pad_cell(&chat.0, 42), chat.1),
+            Span::styled(terminal.0, terminal.1),
+        ]));
+    }
+
+    lines
+}
+
+fn pad_cell(value: &str, width: usize) -> String {
+    let value = if value.chars().count() > width {
+        let mut truncated = value
+            .chars()
+            .take(width.saturating_sub(1))
+            .collect::<String>();
+        truncated.push('…');
+        truncated
+    } else {
+        value.to_string()
+    };
+    format!("{value:<width$}")
 }
 
 fn chat_details(
@@ -241,6 +379,7 @@ fn chat_details(
     workspace_id: WorkspaceId,
     chat_id: crate::model::ChatId,
     output_rows: usize,
+    palette: Palette,
 ) -> Vec<Line<'static>> {
     if app.project.workspace(workspace_id).is_none() {
         return vec![Line::from("Missing workspace.")];
@@ -259,16 +398,22 @@ fn chat_details(
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
-            .map(terminal_render_line_to_line)
+            .map(|line| terminal_render_line_to_line(line, palette))
             .collect();
     }
 
     if matches!(chat.status, ChatStatus::Thinking | ChatStatus::Waiting) {
-        return Vec::new();
+        return vec![
+            Line::from(format!(
+                "Pi agent is {}; waiting for output.",
+                chat.status.label()
+            )),
+            Line::from("Press `i` to enter input mode, or `x` to stop."),
+        ];
     }
 
     let mut lines = vec![
-        Line::from("Pi agent not started. Press `p` to run pi here, or check auto-start config."),
+        Line::from("Pi agent not started. Press `i` to start and enter input mode."),
         Line::from("Set `pi_agent_command`/`auto_start_pi_agent` in:"),
         Line::from(config::config_path().display().to_string()),
     ];
@@ -296,17 +441,32 @@ fn terminal_details(
     workspace_id: WorkspaceId,
     terminal_id: crate::model::TerminalId,
     output_rows: usize,
+    palette: Palette,
 ) -> Vec<Line<'static>> {
     if app.project.workspace(workspace_id).is_none() {
         return vec![Line::from("Missing workspace.")];
     }
-    if app.project.terminal(workspace_id, terminal_id).is_none() {
+    let Some(terminal) = app.project.terminal(workspace_id, terminal_id) else {
         return vec![Line::from("Missing terminal.")];
-    }
+    };
 
     let output_plain = app.terminal_lines(terminal_id);
     if terminal_plain_output_is_blank(&output_plain) {
-        return Vec::new();
+        let mut lines = vec![match terminal.status {
+            TerminalStatus::Running => Line::from("Terminal is running; waiting for output."),
+            TerminalStatus::Stopped => Line::from("Terminal is stopped. Press `s` to start it."),
+        }];
+        lines.push(Line::from(
+            "Press `i` to focus PTY input after start, or `x` to stop a running PTY.",
+        ));
+        if let TerminalLaunch::Command(command) = &terminal.launch {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("Command: ", Style::default().fg(palette.muted)),
+                Span::raw(command.clone()),
+            ]));
+        }
+        return lines;
     }
 
     app.terminal_render_lines(terminal_id)
@@ -316,82 +476,79 @@ fn terminal_details(
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
-        .map(terminal_render_line_to_line)
+        .map(|line| terminal_render_line_to_line(line, palette))
         .collect()
 }
 
-fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    match &app.mode {
-        Mode::Normal => {
-            let footer = Paragraph::new(FOOTER).style(Style::default().fg(Color::DarkGray));
-            frame.render_widget(footer, area);
-        }
-        Mode::OpenWorkspace(prompt) => {
-            draw_text_prompt(
+fn draw_footer(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
+    if let Some(prompt) = &app.prompt {
+        match prompt {
+            Prompt::OpenWorkspace(prompt) => draw_text_prompt(
                 frame,
                 area,
-                " open workspace ",
+                palette,
                 "Path: ",
                 &prompt.input,
                 prompt.error.as_deref(),
                 "enter imports • esc/ctrl-c cancels",
-            );
-        }
-        Mode::NewTerminalCommand(prompt) => {
-            draw_text_prompt(
+            ),
+            Prompt::NewTerminalCommand(prompt) => draw_text_prompt(
                 frame,
                 area,
-                " new command terminal ",
+                palette,
                 "Command: ",
                 &prompt.input,
                 prompt.error.as_deref(),
                 "enter adds command terminal • esc/ctrl-c cancels",
-            );
+            ),
+            Prompt::ConfirmDelete(confirmation) => {
+                draw_delete_confirmation(frame, area, confirmation, palette)
+            }
         }
-        Mode::ConfirmDelete(confirmation) => {
-            draw_delete_confirmation(frame, area, confirmation);
-        }
-        Mode::TerminalInput { .. } => {
-            let footer = Paragraph::new("terminal input focused • typing goes to PTY • Esc returns to mult • Ctrl-C sends interrupt")
-                .style(Style::default().fg(Color::Yellow));
-            frame.render_widget(footer, area);
-        }
-        Mode::ChatAgentInput { .. } => {
-            let footer = Paragraph::new("pi agent focused • typing goes directly to pi • Esc returns to mult • Ctrl-C sends interrupt")
-                .style(Style::default().fg(Color::Yellow));
-            frame.render_widget(footer, area);
-        }
+        return;
     }
+
+    let footer = match app.mode {
+        Mode::Normal => Line::styled(FOOTER, Style::default().fg(palette.muted)),
+        Mode::Input(_) => Line::styled(
+            "input mode • typing goes to selected PTY • Esc returns to normal mode • Ctrl-C sends interrupt",
+            Style::default().fg(palette.gold),
+        ),
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().bg(palette.base)),
+        area,
+    );
 }
 
 fn draw_delete_confirmation(
     frame: &mut Frame,
     area: Rect,
     confirmation: &crate::app::DeleteConfirmation,
+    palette: Palette,
 ) {
     let prompt = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("Delete: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(confirmation.label.clone(), Style::default().fg(Color::Red)),
+            Span::styled("Delete: ", Style::default().fg(palette.muted)),
+            Span::styled(
+                confirmation.label.clone(),
+                Style::default().fg(palette.love),
+            ),
         ]),
         Line::from(confirmation.detail.clone()),
         Line::from(Span::styled(
             "confirm with y/enter • n/esc/ctrl-c cancels",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(palette.gold),
         )),
     ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" confirm delete "),
-    );
+    .style(Style::default().fg(palette.text).bg(palette.base));
     frame.render_widget(prompt, area);
 }
 
 fn draw_text_prompt(
     frame: &mut Frame,
     area: Rect,
-    title: &'static str,
+    palette: Palette,
     label: &'static str,
     input: &str,
     error: Option<&str>,
@@ -399,19 +556,19 @@ fn draw_text_prompt(
 ) {
     let message = error.unwrap_or(help);
     let message_style = if error.is_some() {
-        Style::default().fg(Color::Red)
+        Style::default().fg(palette.love)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(palette.muted)
     };
     let prompt = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled(label, Style::default().fg(Color::DarkGray)),
+            Span::styled(label, Style::default().fg(palette.muted)),
             Span::raw(input.to_string()),
-            Span::styled("▌", Style::default().fg(Color::Yellow)),
+            Span::styled("▌", Style::default().fg(palette.gold)),
         ]),
         Line::from(Span::styled(message.to_string(), message_style)),
     ])
-    .block(Block::default().borders(Borders::ALL).title(title));
+    .style(Style::default().fg(palette.text).bg(palette.base));
     frame.render_widget(prompt, area);
 }
 
@@ -419,22 +576,22 @@ fn terminal_plain_output_is_blank(lines: &[String]) -> bool {
     lines.iter().all(|line| line.trim().is_empty())
 }
 
-fn terminal_render_line_to_line(line: TerminalRenderLine) -> Line<'static> {
+fn terminal_render_line_to_line(line: TerminalRenderLine, palette: Palette) -> Line<'static> {
     Line::from(
         line.spans
             .into_iter()
-            .map(|span| Span::styled(span.text, terminal_style(span.style)))
+            .map(|span| Span::styled(span.text, terminal_style(span.style, palette)))
             .collect::<Vec<_>>(),
     )
 }
 
-fn terminal_style(style: TerminalCellStyle) -> Style {
+fn terminal_style(style: TerminalCellStyle, palette: Palette) -> Style {
     let mut output = Style::default();
     if let Some(fg) = style.fg {
-        output = output.fg(terminal_color(fg));
+        output = output.fg(terminal_color(fg, palette));
     }
     if let Some(bg) = style.bg {
-        output = output.bg(terminal_color(bg));
+        output = output.bg(terminal_color(bg, palette));
     }
     if style.bold {
         output = output.add_modifier(Modifier::BOLD);
@@ -449,44 +606,44 @@ fn terminal_style(style: TerminalCellStyle) -> Style {
     output
 }
 
-fn terminal_color(color: TerminalColor) -> Color {
+fn terminal_color(color: TerminalColor, palette: Palette) -> Color {
     match color {
-        TerminalColor::Black => Color::Black,
-        TerminalColor::Red => Color::Red,
-        TerminalColor::Green => Color::Green,
-        TerminalColor::Yellow => Color::Yellow,
-        TerminalColor::Blue => Color::Blue,
-        TerminalColor::Magenta => Color::Magenta,
-        TerminalColor::Cyan => Color::Cyan,
-        TerminalColor::White => Color::White,
-        TerminalColor::BrightBlack => Color::DarkGray,
-        TerminalColor::BrightRed => Color::LightRed,
-        TerminalColor::BrightGreen => Color::LightGreen,
-        TerminalColor::BrightYellow => Color::LightYellow,
-        TerminalColor::BrightBlue => Color::LightBlue,
-        TerminalColor::BrightMagenta => Color::LightMagenta,
-        TerminalColor::BrightCyan => Color::LightCyan,
-        TerminalColor::BrightWhite => Color::Gray,
+        TerminalColor::Black => palette.base,
+        TerminalColor::Red => palette.love,
+        TerminalColor::Green => palette.leaf,
+        TerminalColor::Yellow => palette.gold,
+        TerminalColor::Blue => palette.pine,
+        TerminalColor::Magenta => palette.iris,
+        TerminalColor::Cyan => palette.foam,
+        TerminalColor::White => palette.text,
+        TerminalColor::BrightBlack => palette.muted,
+        TerminalColor::BrightRed => palette.love,
+        TerminalColor::BrightGreen => palette.leaf,
+        TerminalColor::BrightYellow => palette.gold,
+        TerminalColor::BrightBlue => palette.pine,
+        TerminalColor::BrightMagenta => palette.iris,
+        TerminalColor::BrightCyan => palette.foam,
+        TerminalColor::BrightWhite => palette.text,
         TerminalColor::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
     }
 }
 
-fn chat_status_style(status: ChatStatus) -> Style {
+fn chat_status_style(status: ChatStatus, palette: Palette) -> Style {
     let color = match status {
-        ChatStatus::Idle => Color::Blue,
-        ChatStatus::Thinking => Color::Yellow,
-        ChatStatus::Waiting => Color::Magenta,
-        ChatStatus::Failed => Color::Red,
-        ChatStatus::Done => Color::Green,
+        ChatStatus::Idle => palette.pine,
+        ChatStatus::Thinking => palette.gold,
+        ChatStatus::Waiting => palette.iris,
+        ChatStatus::Failed => palette.love,
+        ChatStatus::Done => palette.leaf,
     };
 
     Style::default().fg(color)
 }
 
-fn terminal_status_style(status: TerminalStatus) -> Style {
+fn terminal_status_style(status: TerminalStatus, palette: Palette) -> Style {
     let color = match status {
-        TerminalStatus::Stopped => Color::Red,
-        TerminalStatus::Running => Color::Green,
+        TerminalStatus::Stopped => palette.love,
+        TerminalStatus::Running => palette.leaf,
     };
 
     Style::default().fg(color)
@@ -506,7 +663,9 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
 
-        terminal.draw(|frame| draw(frame, &app)).expect("draw app");
+        terminal
+            .draw(|frame| draw(frame, &app, &config::Config::default()))
+            .expect("draw app");
     }
 
     #[test]
@@ -521,8 +680,8 @@ mod tests {
         let (_, area) = selected_terminal_output_area(&app, Rect::new(0, 0, 120, 40))
             .expect("terminal selection has output area");
 
-        assert_eq!(area.width, 84);
-        assert_eq!(area.height, 37);
+        assert_eq!(area.width, 86);
+        assert_eq!(area.height, 39);
     }
 
     #[test]
@@ -547,7 +706,7 @@ mod tests {
         let (_, area) = selected_chat_agent_output_area(&app, Rect::new(0, 0, 120, 40))
             .expect("chat selection has pi output area");
 
-        assert_eq!(area.width, 84);
-        assert_eq!(area.height, 37);
+        assert_eq!(area.width, 86);
+        assert_eq!(area.height, 39);
     }
 }

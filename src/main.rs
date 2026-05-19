@@ -9,10 +9,10 @@ mod ui;
 use std::{io, time::Duration};
 
 use agent::{AgentBackend, AgentEvent, NoopAgentBackend, ProcessAgentBackend, ProcessAgentCommand};
-use app::{chat_agent_terminal_id, chat_id_from_agent_terminal_id, App, Mode};
+use app::{chat_agent_terminal_id, chat_id_from_agent_terminal_id, App, FocusMode, Mode, Prompt};
 use config::Config;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use model::{ChatStatus, TerminalId, TerminalLaunch};
+use model::{ChatStatus, TerminalId, TerminalLaunch, TerminalStatus};
 use pty::{PtyDimensions, PtyEvent, PtyRuntime, PtySpawn};
 use ratatui::{layout::Rect, DefaultTerminal};
 
@@ -26,7 +26,7 @@ fn main() -> io::Result<()> {
 }
 
 const AGENT_CMD_ENV: &str = "MULT_AGENT_CMD";
-const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(8);
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const READY_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(0);
 
 enum RuntimeAgentBackend {
@@ -76,6 +76,7 @@ fn run(terminal: &mut DefaultTerminal, mut app: App, config: Config) -> io::Resu
     let mut agent_backend = RuntimeAgentBackend::from_env();
     let size = terminal.size()?;
     let mut frame_area = Rect::new(0, 0, size.width, size.height);
+    restore_persisted_sessions(&mut app, &mut pty_runtime, &config, frame_area);
 
     while !app.should_quit {
         drain_pty_events(&mut app, &mut pty_runtime);
@@ -85,7 +86,7 @@ fn run(terminal: &mut DefaultTerminal, mut app: App, config: Config) -> io::Resu
         resize_visible_chat_agent(&mut app, &mut pty_runtime, frame_area);
         auto_start_selected_terminal(&mut app, &mut pty_runtime, &config, frame_area);
         auto_start_selected_chat_agent(&mut app, &mut pty_runtime, &config, frame_area);
-        frame_area = terminal.draw(|frame| ui::draw(frame, &app))?.area;
+        frame_area = terminal.draw(|frame| ui::draw(frame, &app, &config))?.area;
 
         if event::poll(EVENT_POLL_INTERVAL)? {
             handle_event(
@@ -112,6 +113,44 @@ fn run(terminal: &mut DefaultTerminal, mut app: App, config: Config) -> io::Resu
     Ok(())
 }
 
+fn restore_persisted_sessions(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    config: &Config,
+    frame_area: Rect,
+) {
+    let terminals = app
+        .project
+        .workspaces
+        .iter()
+        .flat_map(|workspace| {
+            workspace.terminals.iter().filter_map(|terminal| {
+                (terminal.status == TerminalStatus::Running).then_some((workspace.id, terminal.id))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for (workspace, terminal) in terminals {
+        start_terminal(app, pty_runtime, frame_area, workspace, terminal);
+    }
+
+    let chats = app
+        .project
+        .workspaces
+        .iter()
+        .flat_map(|workspace| {
+            workspace.chats.iter().filter_map(|chat| {
+                matches!(chat.status, ChatStatus::Thinking | ChatStatus::Waiting)
+                    .then_some((workspace.id, chat.id))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for (workspace, chat) in chats {
+        start_or_focus_chat_agent(app, pty_runtime, config, frame_area, workspace, chat, false);
+    }
+}
+
 fn handle_event(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
@@ -133,19 +172,14 @@ fn handle_key(
     key: KeyEvent,
     frame_area: Rect,
 ) {
-    if matches!(&app.mode, Mode::OpenWorkspace(_)) {
-        handle_open_workspace_key(app, key);
-    } else if matches!(&app.mode, Mode::NewTerminalCommand(_)) {
-        handle_terminal_command_key(app, key);
-    } else if matches!(&app.mode, Mode::ConfirmDelete(_)) {
-        handle_delete_confirmation_key(app, pty_runtime, key);
-    } else if matches!(
-        &app.mode,
-        Mode::TerminalInput { .. } | Mode::ChatAgentInput { .. }
-    ) {
-        handle_pty_input_key(app, pty_runtime, key);
-    } else {
-        handle_normal_key(app, pty_runtime, config, key, frame_area);
+    match (&app.prompt, app.mode) {
+        (Some(Prompt::OpenWorkspace(_)), _) => handle_open_workspace_key(app, key),
+        (Some(Prompt::NewTerminalCommand(_)), _) => handle_terminal_command_key(app, key),
+        (Some(Prompt::ConfirmDelete(_)), _) => {
+            handle_delete_confirmation_key(app, pty_runtime, key)
+        }
+        (None, Mode::Input(_)) => handle_pty_input_key(app, pty_runtime, key),
+        (None, Mode::Normal) => handle_normal_key(app, pty_runtime, config, key, frame_area),
     }
 }
 
@@ -157,9 +191,19 @@ fn handle_normal_key(
     frame_area: Rect,
 ) {
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.quit(),
-        KeyCode::Char('j') | KeyCode::Down => app.select_next(),
-        KeyCode::Char('k') | KeyCode::Up => app.select_previous(),
+        KeyCode::Char('q') => app.quit(),
+        KeyCode::Tab => app.focus_next(),
+        KeyCode::BackTab => app.focus_previous(),
+        KeyCode::Enter | KeyCode::Right if app.focus == FocusMode::Sidebar => {
+            app.focus_selected_main();
+        }
+        KeyCode::Left if app.focus != FocusMode::Sidebar => {
+            app.focus_sidebar();
+        }
+        KeyCode::Char('j') | KeyCode::Down if app.focus == FocusMode::Sidebar => app.select_next(),
+        KeyCode::Char('k') | KeyCode::Up if app.focus == FocusMode::Sidebar => {
+            app.select_previous();
+        }
         KeyCode::Char('w') => app.add_workspace(),
         KeyCode::Char('o') => app.begin_open_workspace(),
         KeyCode::Char('c') => {
@@ -175,20 +219,16 @@ fn handle_normal_key(
                 );
             }
         }
-        KeyCode::Char('p') => {
-            start_or_focus_selected_chat_agent(app, pty_runtime, config, frame_area)
-        }
         KeyCode::Char('t') => app.add_terminal_to_selected_workspace(),
         KeyCode::Char('d') => {
             app.begin_new_terminal_command();
         }
-        KeyCode::Char('r') => app.rotate_selected_status(),
         KeyCode::Char('D') | KeyCode::Delete => {
             app.begin_delete_selected();
         }
         KeyCode::Char('s') => start_selected_terminal(app, pty_runtime, frame_area),
         KeyCode::Char('x') => stop_selected_pane(app, pty_runtime),
-        KeyCode::Char('i') => focus_selected_pty(app, pty_runtime),
+        KeyCode::Char('i') => focus_selected_input(app, pty_runtime, config, frame_area),
         _ => {}
     }
 }
@@ -266,22 +306,33 @@ fn start_selected_terminal(app: &mut App, pty_runtime: &mut PtyRuntime, frame_ar
         return;
     };
 
+    start_terminal(app, pty_runtime, frame_area, workspace_id, terminal_id);
+}
+
+fn start_terminal(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    frame_area: Rect,
+    workspace_id: crate::model::WorkspaceId,
+    terminal_id: crate::model::TerminalId,
+) -> bool {
     if pty_runtime.is_running(terminal_id) {
         app.append_terminal_system_line(terminal_id, "PTY already running");
-        return;
+        return true;
     }
 
     let Some(workspace) = app.project.workspace(workspace_id) else {
-        return;
+        return false;
     };
     let Some(terminal) = workspace
         .terminals
         .iter()
         .find(|terminal| terminal.id == terminal_id)
     else {
-        return;
+        return false;
     };
 
+    let terminal_name = terminal.name.clone();
     let mut spawn = match &terminal.launch {
         TerminalLaunch::Shell => PtySpawn::shell(
             terminal_id,
@@ -302,9 +353,15 @@ fn start_selected_terminal(app: &mut App, pty_runtime: &mut PtyRuntime, frame_ar
     match pty_runtime.start(spawn) {
         Ok(()) => {
             app.mark_terminal_running(terminal_id);
+            true
         }
         Err(error) => {
-            app.append_terminal_system_line(terminal_id, format!("failed to start PTY: {error}"));
+            app.append_terminal_system_line(
+                terminal_id,
+                format!("failed to start terminal `{terminal_name}`: {error}"),
+            );
+            app.mark_terminal_stopped(terminal_id);
+            false
         }
     }
 }
@@ -351,6 +408,12 @@ fn start_or_focus_chat_agent(
     let Some(workspace) = app.project.workspace(workspace_id) else {
         return;
     };
+    let chat_name = workspace
+        .chats
+        .iter()
+        .find(|chat| chat.id == chat_id)
+        .map(|chat| chat.name.clone())
+        .unwrap_or_else(|| format!("chat {}", chat_id.0));
     let command = pi_command(config);
     let mut spawn = PtySpawn::command_line(
         terminal_id,
@@ -373,7 +436,7 @@ fn start_or_focus_chat_agent(
             app.mark_chat_status_by_id(chat_id, ChatStatus::Failed);
             app.append_terminal_system_line(
                 terminal_id,
-                format!("failed to start pi agent: {error}"),
+                format!("failed to start pi agent for `{chat_name}`: {error}"),
             );
         }
     }
@@ -385,7 +448,7 @@ fn auto_start_selected_terminal(
     config: &Config,
     frame_area: Rect,
 ) {
-    if !config.auto_start_terminals || !matches!(app.mode, Mode::Normal) {
+    if !config.auto_start_terminals || !matches!(app.mode, Mode::Normal) || app.is_prompt_active() {
         return;
     }
 
@@ -405,7 +468,7 @@ fn auto_start_selected_chat_agent(
     config: &Config,
     frame_area: Rect,
 ) {
-    if !config.auto_start_pi_agent || !matches!(app.mode, Mode::Normal) {
+    if !config.auto_start_pi_agent || !matches!(app.mode, Mode::Normal) || app.is_prompt_active() {
         return;
     }
 
@@ -453,7 +516,9 @@ fn stop_selected_terminal(app: &mut App, pty_runtime: &mut PtyRuntime) {
             app.mark_terminal_stopped(terminal_id);
             app.append_terminal_system_line(terminal_id, "stopped PTY shell");
         }
-        Ok(false) => app.append_terminal_system_line(terminal_id, "PTY is not running"),
+        Ok(false) => {
+            app.append_terminal_system_line(terminal_id, "PTY is not running");
+        }
         Err(error) => {
             app.append_terminal_system_line(terminal_id, format!("failed to stop PTY: {error}"));
         }
@@ -471,7 +536,9 @@ fn stop_selected_chat_agent(app: &mut App, pty_runtime: &mut PtyRuntime) {
             app.mark_chat_status_by_id(chat_id, ChatStatus::Idle);
             app.append_terminal_system_line(terminal_id, "stopped pi agent");
         }
-        Ok(false) => app.append_terminal_system_line(terminal_id, "pi agent is not running"),
+        Ok(false) => {
+            app.append_terminal_system_line(terminal_id, "pi agent is not running");
+        }
         Err(error) => {
             app.append_terminal_system_line(
                 terminal_id,
@@ -489,39 +556,30 @@ fn stop_selected_pane(app: &mut App, pty_runtime: &mut PtyRuntime) {
     }
 }
 
-fn focus_selected_terminal(app: &mut App, pty_runtime: &mut PtyRuntime) {
+fn focus_selected_input(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    config: &Config,
+    frame_area: Rect,
+) {
+    if app.selected_chat_id().is_some() {
+        start_or_focus_selected_chat_agent(app, pty_runtime, config, frame_area);
+    } else if app.selected_terminal_id().is_some() {
+        start_or_focus_selected_terminal(app, pty_runtime, frame_area);
+    }
+}
+
+fn start_or_focus_selected_terminal(app: &mut App, pty_runtime: &mut PtyRuntime, frame_area: Rect) {
     let Some((_, terminal_id)) = app.selected_terminal_id() else {
         return;
     };
 
+    if !pty_runtime.is_running(terminal_id) {
+        start_selected_terminal(app, pty_runtime, frame_area);
+    }
+
     if pty_runtime.is_running(terminal_id) {
         app.begin_terminal_input();
-    } else {
-        app.append_terminal_system_line(terminal_id, "start PTY before focusing input");
-    }
-}
-
-fn focus_selected_chat_agent(app: &mut App, pty_runtime: &mut PtyRuntime) {
-    let Some((_, chat_id)) = app.selected_chat_id() else {
-        return;
-    };
-    let terminal_id = chat_agent_terminal_id(chat_id);
-
-    if pty_runtime.is_running(terminal_id) {
-        app.begin_chat_agent_input();
-    } else {
-        app.append_terminal_system_line(
-            terminal_id,
-            "start pi agent with `p` before focusing input",
-        );
-    }
-}
-
-fn focus_selected_pty(app: &mut App, pty_runtime: &mut PtyRuntime) {
-    if app.selected_chat_id().is_some() {
-        focus_selected_chat_agent(app, pty_runtime);
-    } else {
-        focus_selected_terminal(app, pty_runtime);
     }
 }
 
@@ -592,23 +650,19 @@ fn drain_pty_events(app: &mut App, pty_runtime: &mut PtyRuntime) {
                     if app.pty_input_target() == Some(terminal) {
                         app.end_pty_input();
                     }
-                    app.append_terminal_system_line(
-                        terminal,
-                        format!("pi agent exited: {}", status.label()),
-                    );
+                    let exit_message = format!("pi agent exited: {}", status.label());
+                    app.append_terminal_system_line(terminal, exit_message.as_str());
                 } else {
                     app.mark_terminal_stopped(terminal);
                     if app.terminal_input_target() == Some(terminal) {
                         app.end_terminal_input();
                     }
-                    app.append_terminal_system_line(
-                        terminal,
-                        format!("PTY exited: {}", status.label()),
-                    );
+                    let exit_message = format!("PTY exited: {}", status.label());
+                    app.append_terminal_system_line(terminal, exit_message.as_str());
                 }
             }
             PtyEvent::Error { terminal, message } => {
-                app.append_terminal_system_line(terminal, message);
+                app.append_terminal_system_line(terminal, message.as_str());
             }
         }
     }
@@ -721,6 +775,7 @@ mod tests {
                 pi_agent_command: "pi -c".to_string(),
                 auto_start_pi_agent: false,
                 auto_start_terminals: false,
+                colorscheme: Default::default(),
             }),
             "pi -c"
         );
@@ -729,9 +784,39 @@ mod tests {
                 pi_agent_command: "   ".to_string(),
                 auto_start_pi_agent: false,
                 auto_start_terminals: false,
+                colorscheme: Default::default(),
             }),
             "pi"
         );
+    }
+
+    #[test]
+    fn h_and_l_do_not_move_focus_in_normal_mode() {
+        let mut app = App::default();
+        app.selected = 1;
+        let mut pty_runtime = PtyRuntime::default();
+        let config = Config::default();
+        let frame_area = Rect::new(0, 0, 120, 40);
+
+        handle_normal_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            frame_area,
+        );
+        assert_eq!(app.focus, FocusMode::Sidebar);
+
+        assert!(app.focus_selected_main());
+        assert_eq!(app.focus, FocusMode::Chat);
+        handle_normal_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+            frame_area,
+        );
+        assert_eq!(app.focus, FocusMode::Chat);
     }
 
     #[test]
