@@ -1051,7 +1051,13 @@ impl TerminalScreen {
     fn render_lines(&self) -> Vec<TerminalRenderLine> {
         self.cells
             .iter()
-            .map(|row| render_terminal_row(row))
+            .enumerate()
+            .map(|(row_index, row)| {
+                render_terminal_row(
+                    row,
+                    (row_index == self.cursor_row).then_some(self.cursor_col),
+                )
+            })
             .collect()
     }
 
@@ -1277,8 +1283,11 @@ impl TerminalCell {
     }
 }
 
-fn render_terminal_row(row: &[TerminalCell]) -> TerminalRenderLine {
-    let last_visible = row.iter().rposition(|cell| cell.ch != ' ');
+fn render_terminal_row(row: &[TerminalCell], cursor_col: Option<usize>) -> TerminalRenderLine {
+    let last_visible_cell = row
+        .iter()
+        .rposition(|cell| cell.ch != ' ' || cell.style != TerminalCellStyle::default());
+    let last_visible = last_visible_cell.into_iter().chain(cursor_col).max();
     let Some(last_visible) = last_visible else {
         return TerminalRenderLine { spans: Vec::new() };
     };
@@ -1286,7 +1295,14 @@ fn render_terminal_row(row: &[TerminalCell]) -> TerminalRenderLine {
     let mut spans = Vec::new();
     let mut current_style = row[0].style;
     let mut text = String::new();
-    for cell in &row[..=last_visible] {
+    for (index, cell) in row[..=last_visible].iter().enumerate() {
+        let mut cell = *cell;
+        if cursor_col == Some(index) {
+            cell.style = cursor_style(cell.style);
+            if cell.ch == ' ' {
+                cell.ch = '▌';
+            }
+        }
         if cell.style != current_style && !text.is_empty() {
             spans.push(TerminalRenderSpan {
                 text: std::mem::take(&mut text),
@@ -1304,6 +1320,13 @@ fn render_terminal_row(row: &[TerminalCell]) -> TerminalRenderLine {
     }
 
     TerminalRenderLine { spans }
+}
+
+fn cursor_style(mut style: TerminalCellStyle) -> TerminalCellStyle {
+    style.fg = Some(TerminalColor::BrightWhite);
+    style.bg = None;
+    style.underlined = false;
+    style
 }
 
 fn ansi_color(index: usize, bright: bool) -> Option<TerminalColor> {
@@ -1622,6 +1645,34 @@ mod tests {
         assert!(lines[0].spans[1].style.bold);
         assert_eq!(lines[0].spans[2].text, " ok");
         assert_eq!(lines[0].spans[2].style, TerminalCellStyle::default());
+    }
+
+    #[test]
+    fn terminal_render_lines_preserve_styled_trailing_spaces() {
+        let mut app = App::default();
+        let terminal = TerminalId(102);
+        app.resize_terminal_buffer(terminal, 1, 8);
+
+        app.append_terminal_output(terminal, "\x1b[44m    \x1b[0m");
+
+        let lines = app.terminal_render_lines(terminal);
+        assert_eq!(lines[0].spans[0].text, "    ");
+        assert_eq!(lines[0].spans[0].style.bg, Some(TerminalColor::Blue));
+    }
+
+    #[test]
+    fn terminal_render_lines_show_cursor() {
+        let mut app = App::default();
+        let terminal = TerminalId(103);
+        app.resize_terminal_buffer(terminal, 1, 4);
+
+        app.append_terminal_output(terminal, "ok");
+
+        let lines = app.terminal_render_lines(terminal);
+        assert_eq!(lines[0].spans[0].text, "ok");
+        assert_eq!(lines[0].spans[1].text, "▌");
+        assert_eq!(lines[0].spans[1].style.fg, Some(TerminalColor::BrightWhite));
+        assert_eq!(lines[0].spans[1].style.bg, None);
     }
 
     #[test]

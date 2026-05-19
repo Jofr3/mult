@@ -12,13 +12,13 @@ use crate::{
         TerminalRenderLine,
     },
     config,
-    model::{ChatId, ChatStatus, TerminalId, TerminalLaunch, TerminalStatus, WorkspaceId},
+    model::{ChatId, ChatStatus, TerminalId, TerminalStatus, WorkspaceId},
     storage,
 };
 
 const FOOTER: &str = "q/esc quit • j/k move • o open/import • w workspace • c chat • p pi agent • t terminal • d command • D/del delete • s/x PTY • i input";
-const CHAT_AGENT_HEADER_LINES: u16 = 9;
-const TERMINAL_HEADER_LINES: u16 = 10;
+const CHAT_AGENT_HEADER_LINES: u16 = 0;
+const TERMINAL_HEADER_LINES: u16 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LayoutAreas {
@@ -186,7 +186,9 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
         None => vec![Line::from("No workspaces yet.")],
     };
 
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
@@ -240,75 +242,49 @@ fn chat_details(
     chat_id: crate::model::ChatId,
     output_rows: usize,
 ) -> Vec<Line<'static>> {
-    let Some(workspace) = app.project.workspace(workspace_id) else {
+    if app.project.workspace(workspace_id).is_none() {
         return vec![Line::from("Missing workspace.")];
-    };
+    }
     let Some(chat) = app.project.chat(workspace_id, chat_id) else {
         return vec![Line::from("Missing chat.")];
     };
 
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("Chat: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                chat.name.clone(),
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Id: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(chat.id.0.to_string()),
-        ]),
-        Line::from(vec![
-            Span::styled("Workspace: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(workspace.name.clone()),
-        ]),
-        Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(chat.status.label(), chat_status_style(chat.status)),
-        ]),
-        Line::from(""),
-        Line::from("Controls: p start/focus pi • x stop pi • i focus input • D/delete remove"),
-        Line::from(""),
-        Line::from("Pi agent"),
-        Line::from("──────────────────────"),
-    ];
-
     let output_plain = app.terminal_lines(chat_agent_terminal_id(chat_id));
     let output = app.terminal_render_lines(chat_agent_terminal_id(chat_id));
-    if terminal_plain_output_is_blank(&output_plain) {
-        lines.push(Line::from(
-            "Pi agent not started. Press `p` to run pi here, then type prompts directly.",
-        ));
-        lines.push(Line::from("Set `pi_agent_command` in:"));
-        lines.push(Line::from(config::config_path().display().to_string()));
-        let transcript = app.chat_lines(chat_id);
-        if !transcript.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::from("Saved transcript"));
-            lines.extend(
-                transcript
-                    .into_iter()
-                    .rev()
-                    .take(output_rows.saturating_sub(4))
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .map(Line::from),
-            );
-        }
-    } else {
+    if !terminal_plain_output_is_blank(&output_plain) {
+        return output
+            .into_iter()
+            .rev()
+            .take(output_rows)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(terminal_render_line_to_line)
+            .collect();
+    }
+
+    if matches!(chat.status, ChatStatus::Thinking | ChatStatus::Waiting) {
+        return Vec::new();
+    }
+
+    let mut lines = vec![
+        Line::from("Pi agent not started. Press `p` to run pi here, or check auto-start config."),
+        Line::from("Set `pi_agent_command`/`auto_start_pi_agent` in:"),
+        Line::from(config::config_path().display().to_string()),
+    ];
+    let transcript = app.chat_lines(chat_id);
+    if !transcript.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from("Saved transcript"));
         lines.extend(
-            output
+            transcript
                 .into_iter()
                 .rev()
-                .take(output_rows)
+                .take(output_rows.saturating_sub(5))
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
-                .map(terminal_render_line_to_line),
+                .map(Line::from),
         );
     }
 
@@ -321,72 +297,27 @@ fn terminal_details(
     terminal_id: crate::model::TerminalId,
     output_rows: usize,
 ) -> Vec<Line<'static>> {
-    let Some(workspace) = app.project.workspace(workspace_id) else {
+    if app.project.workspace(workspace_id).is_none() {
         return vec![Line::from("Missing workspace.")];
-    };
-    let Some(terminal) = app.project.terminal(workspace_id, terminal_id) else {
+    }
+    if app.project.terminal(workspace_id, terminal_id).is_none() {
         return vec![Line::from("Missing terminal.")];
-    };
-
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("Terminal: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                terminal.name.clone(),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Id: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(terminal.id.0.to_string()),
-        ]),
-        Line::from(vec![
-            Span::styled("Workspace: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(workspace.name.clone()),
-        ]),
-        Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                terminal.status.label(),
-                terminal_status_style(terminal.status),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Launch: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(launch_label(&terminal.launch)),
-        ]),
-        Line::from(""),
-        Line::from("Controls: s start • x stop • i focus input • D/delete remove"),
-        Line::from(""),
-        Line::from("PTY output"),
-        Line::from("──────────────────────"),
-    ];
-
-    let output_plain = app.terminal_lines(terminal_id);
-    let output = app.terminal_render_lines(terminal_id);
-    if terminal_plain_output_is_blank(&output_plain) {
-        lines.push(Line::from(
-            "PTY not started. Select this terminal and press `s`.",
-        ));
-        lines.push(Line::from(
-            "After starting, press `i` to focus terminal input.",
-        ));
-    } else {
-        lines.extend(
-            output
-                .into_iter()
-                .rev()
-                .take(output_rows)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .map(terminal_render_line_to_line),
-        );
     }
 
-    lines
+    let output_plain = app.terminal_lines(terminal_id);
+    if terminal_plain_output_is_blank(&output_plain) {
+        return Vec::new();
+    }
+
+    app.terminal_render_lines(terminal_id)
+        .into_iter()
+        .rev()
+        .take(output_rows)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(terminal_render_line_to_line)
+        .collect()
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -511,9 +442,10 @@ fn terminal_style(style: TerminalCellStyle) -> Style {
     if style.italic {
         output = output.add_modifier(Modifier::ITALIC);
     }
-    if style.underlined {
-        output = output.add_modifier(Modifier::UNDERLINED);
-    }
+    // Many prompts use underline for decorative path segments. It reads as a
+    // selection/cursor artifact inside nested panes, so mult intentionally
+    // suppresses underline when rendering embedded PTYs.
+    let _ = style.underlined;
     output
 }
 
@@ -536,13 +468,6 @@ fn terminal_color(color: TerminalColor) -> Color {
         TerminalColor::BrightCyan => Color::LightCyan,
         TerminalColor::BrightWhite => Color::Gray,
         TerminalColor::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
-    }
-}
-
-fn launch_label(launch: &TerminalLaunch) -> String {
-    match launch {
-        TerminalLaunch::Shell => "shell".to_string(),
-        TerminalLaunch::Command(command) => format!("command: {command}"),
     }
 }
 
@@ -597,7 +522,7 @@ mod tests {
             .expect("terminal selection has output area");
 
         assert_eq!(area.width, 84);
-        assert_eq!(area.height, 27);
+        assert_eq!(area.height, 37);
     }
 
     #[test]
@@ -623,6 +548,6 @@ mod tests {
             .expect("chat selection has pi output area");
 
         assert_eq!(area.width, 84);
-        assert_eq!(area.height, 28);
+        assert_eq!(area.height, 37);
     }
 }

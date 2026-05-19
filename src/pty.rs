@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, HashMap},
     io::{self, Read, Write},
     path::PathBuf,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Arc, Mutex,
+    },
     thread,
 };
 
@@ -54,10 +57,12 @@ pub struct PtyRuntime {
     receiver: Receiver<PtyEvent>,
 }
 
+type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+
 struct PtySession {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
-    writer: Box<dyn Write + Send>,
+    writer: SharedPtyWriter,
 }
 
 impl Default for PtyRuntime {
@@ -148,8 +153,13 @@ impl PtyRuntime {
 
         let child = pair.slave.spawn_command(command).map_err(error_to_io)?;
         let reader = pair.master.try_clone_reader().map_err(error_to_io)?;
-        let writer = pair.master.take_writer().map_err(error_to_io)?;
-        spawn_reader(spawn.terminal, reader, self.sender.clone());
+        let writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(error_to_io)?));
+        spawn_reader(
+            spawn.terminal,
+            reader,
+            self.sender.clone(),
+            Arc::clone(&writer),
+        );
 
         self.sessions.insert(
             spawn.terminal,
@@ -177,8 +187,12 @@ impl PtyRuntime {
             return Ok(false);
         };
 
-        session.writer.write_all(input)?;
-        session.writer.flush()?;
+        let mut writer = session
+            .writer
+            .lock()
+            .map_err(|_| io::Error::other("PTY writer lock poisoned"))?;
+        writer.write_all(input)?;
+        writer.flush()?;
         Ok(true)
     }
 
@@ -253,13 +267,20 @@ impl PtyExit {
     }
 }
 
-fn spawn_reader(terminal: TerminalId, mut reader: Box<dyn Read + Send>, sender: Sender<PtyEvent>) {
+fn spawn_reader(
+    terminal: TerminalId,
+    mut reader: Box<dyn Read + Send>,
+    sender: Sender<PtyEvent>,
+    writer: SharedPtyWriter,
+) {
     thread::spawn(move || {
         let mut buffer = [0; 8192];
+        let mut query_tail = Vec::new();
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(n) => {
+                    write_terminal_query_responses(&buffer[..n], &mut query_tail, &writer);
                     let text = String::from_utf8_lossy(&buffer[..n]).into_owned();
                     if sender.send(PtyEvent::Output { terminal, text }).is_err() {
                         break;
@@ -276,6 +297,83 @@ fn spawn_reader(terminal: TerminalId, mut reader: Box<dyn Read + Send>, sender: 
             }
         }
     });
+}
+
+const TERMINAL_QUERY_TAIL_BYTES: usize = 16;
+const PRIMARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[?1;2c";
+
+fn write_terminal_query_responses(
+    bytes: &[u8],
+    query_tail: &mut Vec<u8>,
+    writer: &SharedPtyWriter,
+) {
+    let already_seen = query_tail.len();
+    let mut scan = Vec::with_capacity(already_seen + bytes.len());
+    scan.extend_from_slice(query_tail);
+    scan.extend_from_slice(bytes);
+
+    let response_count = primary_device_attribute_query_count(&scan, already_seen);
+    if response_count > 0 {
+        if let Ok(mut writer) = writer.lock() {
+            for _ in 0..response_count {
+                let _ = writer.write_all(PRIMARY_DEVICE_ATTRIBUTES_RESPONSE);
+            }
+            let _ = writer.flush();
+        }
+    }
+
+    query_tail.clear();
+    let keep = scan.len().min(TERMINAL_QUERY_TAIL_BYTES);
+    query_tail.extend_from_slice(&scan[scan.len().saturating_sub(keep)..]);
+}
+
+fn primary_device_attribute_query_count(bytes: &[u8], already_seen: usize) -> usize {
+    let mut count = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let Some((end, is_query)) = primary_device_attribute_query_at(bytes, index) else {
+            index += 1;
+            continue;
+        };
+
+        if is_query && end > already_seen {
+            count += 1;
+        }
+        index = end;
+    }
+
+    count
+}
+
+fn primary_device_attribute_query_at(bytes: &[u8], index: usize) -> Option<(usize, bool)> {
+    if bytes.get(index) != Some(&0x1b) {
+        return None;
+    }
+
+    if bytes.get(index + 1) == Some(&b'Z') {
+        return Some((index + 2, true));
+    }
+
+    if bytes.get(index + 1) != Some(&b'[') {
+        return None;
+    }
+
+    let mut final_index = index + 2;
+    while let Some(byte) = bytes.get(final_index) {
+        if (0x40..=0x7e).contains(byte) {
+            break;
+        }
+        final_index += 1;
+    }
+
+    let final_byte = bytes.get(final_index)?;
+    if *final_byte != b'c' {
+        return Some((final_index + 1, false));
+    }
+
+    let params = &bytes[index + 2..final_index];
+    let is_primary_query = params.is_empty() || params == b"0";
+    Some((final_index + 1, is_primary_query))
 }
 
 fn shell_command_args(command: String) -> Vec<String> {
@@ -342,5 +440,19 @@ mod tests {
         };
 
         assert_eq!(exit.label(), "exit 2");
+    }
+
+    #[test]
+    fn primary_device_attribute_queries_are_detected() {
+        assert_eq!(primary_device_attribute_query_count(b"\x1b[c", 0), 1);
+        assert_eq!(primary_device_attribute_query_count(b"\x1b[0c", 0), 1);
+        assert_eq!(primary_device_attribute_query_count(b"\x1bZ", 0), 1);
+        assert_eq!(primary_device_attribute_query_count(b"\x1b[?1;2c", 0), 0);
+    }
+
+    #[test]
+    fn split_primary_device_attribute_query_is_detected_once() {
+        assert_eq!(primary_device_attribute_query_count(b"\x1b[c", 2), 1);
+        assert_eq!(primary_device_attribute_query_count(b"\x1b[c", 3), 0);
     }
 }

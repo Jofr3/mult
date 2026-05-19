@@ -21,11 +21,13 @@ Configuration is loaded from `$XDG_CONFIG_HOME/mult/config.json` or `~/.config/m
 
 ```json
 {
-  "pi_agent_command": "pi"
+  "pi_agent_command": "pi",
+  "auto_start_pi_agent": true,
+  "auto_start_terminals": true
 }
 ```
 
-Use `MULT_CONFIG_PATH=/path/to/config.json` to point at another config file.
+Use `MULT_CONFIG_PATH=/path/to/config.json` to point at another config file. `auto_start_pi_agent` and `auto_start_terminals` default to `true`; set either to `false` if you want panes to wait for manual start.
 
 ## Current controls
 

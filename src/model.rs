@@ -388,15 +388,6 @@ impl ChatMessageRole {
     }
 }
 
-impl TerminalLaunch {
-    pub fn label(&self) -> String {
-        match self {
-            Self::Shell => "shell".to_string(),
-            Self::Command(command) => command.clone(),
-        }
-    }
-}
-
 impl TerminalStatus {
     pub fn label(self) -> &'static str {
         match self {

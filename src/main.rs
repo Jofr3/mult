@@ -12,7 +12,7 @@ use agent::{AgentBackend, AgentEvent, NoopAgentBackend, ProcessAgentBackend, Pro
 use app::{chat_agent_terminal_id, chat_id_from_agent_terminal_id, App, Mode};
 use config::Config;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use model::{ChatStatus, TerminalLaunch};
+use model::{ChatStatus, TerminalId, TerminalLaunch};
 use pty::{PtyDimensions, PtyEvent, PtyRuntime, PtySpawn};
 use ratatui::{layout::Rect, DefaultTerminal};
 
@@ -26,7 +26,8 @@ fn main() -> io::Result<()> {
 }
 
 const AGENT_CMD_ENV: &str = "MULT_AGENT_CMD";
-const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(8);
+const READY_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(0);
 
 enum RuntimeAgentBackend {
     Noop(NoopAgentBackend),
@@ -82,20 +83,47 @@ fn run(terminal: &mut DefaultTerminal, mut app: App, config: Config) -> io::Resu
         save_if_dirty(&mut app)?;
         resize_visible_terminal(&mut app, &mut pty_runtime, frame_area);
         resize_visible_chat_agent(&mut app, &mut pty_runtime, frame_area);
+        auto_start_selected_terminal(&mut app, &mut pty_runtime, &config, frame_area);
+        auto_start_selected_chat_agent(&mut app, &mut pty_runtime, &config, frame_area);
         frame_area = terminal.draw(|frame| ui::draw(frame, &app))?.area;
 
         if event::poll(EVENT_POLL_INTERVAL)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    handle_key(&mut app, &mut pty_runtime, &config, key, frame_area);
-                    save_if_dirty(&mut app)?;
-                }
+            handle_event(
+                &mut app,
+                &mut pty_runtime,
+                &config,
+                event::read()?,
+                frame_area,
+            );
+            while !app.should_quit && event::poll(READY_EVENT_POLL_INTERVAL)? {
+                handle_event(
+                    &mut app,
+                    &mut pty_runtime,
+                    &config,
+                    event::read()?,
+                    frame_area,
+                );
             }
+            save_if_dirty(&mut app)?;
         }
     }
 
     save_if_dirty(&mut app)?;
     Ok(())
+}
+
+fn handle_event(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    config: &Config,
+    event: Event,
+    frame_area: Rect,
+) {
+    if let Event::Key(key) = event {
+        if key.kind == KeyEventKind::Press {
+            handle_key(app, pty_runtime, config, key, frame_area);
+        }
+    }
 }
 
 fn handle_key(
@@ -136,7 +164,15 @@ fn handle_normal_key(
         KeyCode::Char('o') => app.begin_open_workspace(),
         KeyCode::Char('c') => {
             if let Some((workspace, chat)) = app.add_chat_to_selected_workspace_and_return() {
-                start_or_focus_chat_agent(app, pty_runtime, config, frame_area, workspace, chat);
+                start_or_focus_chat_agent(
+                    app,
+                    pty_runtime,
+                    config,
+                    frame_area,
+                    workspace,
+                    chat,
+                    true,
+                );
             }
         }
         KeyCode::Char('p') => {
@@ -259,7 +295,6 @@ fn start_selected_terminal(app: &mut App, pty_runtime: &mut PtyRuntime, frame_ar
             workspace.environment.clone(),
         ),
     };
-    let launch_label = terminal.launch.label();
     spawn.size = selected_terminal_dimensions(app, frame_area, terminal_id).unwrap_or_default();
     let size = spawn.size;
     app.resize_terminal_buffer(terminal_id, size.rows, size.cols);
@@ -267,10 +302,6 @@ fn start_selected_terminal(app: &mut App, pty_runtime: &mut PtyRuntime, frame_ar
     match pty_runtime.start(spawn) {
         Ok(()) => {
             app.mark_terminal_running(terminal_id);
-            app.append_terminal_system_line(
-                terminal_id,
-                format!("started PTY: {launch_label} ({}x{})", size.cols, size.rows),
-            );
         }
         Err(error) => {
             app.append_terminal_system_line(terminal_id, format!("failed to start PTY: {error}"));
@@ -288,7 +319,15 @@ fn start_or_focus_selected_chat_agent(
         return;
     };
 
-    start_or_focus_chat_agent(app, pty_runtime, config, frame_area, workspace_id, chat_id);
+    start_or_focus_chat_agent(
+        app,
+        pty_runtime,
+        config,
+        frame_area,
+        workspace_id,
+        chat_id,
+        true,
+    );
 }
 
 fn start_or_focus_chat_agent(
@@ -298,11 +337,14 @@ fn start_or_focus_chat_agent(
     frame_area: Rect,
     workspace_id: crate::model::WorkspaceId,
     chat_id: crate::model::ChatId,
+    focus_after_start: bool,
 ) {
     let terminal_id = chat_agent_terminal_id(chat_id);
 
     if pty_runtime.is_running(terminal_id) {
-        app.begin_chat_agent_input();
+        if focus_after_start {
+            app.begin_chat_agent_input();
+        }
         return;
     }
 
@@ -323,11 +365,9 @@ fn start_or_focus_chat_agent(
     match pty_runtime.start(spawn) {
         Ok(()) => {
             app.mark_chat_status_by_id(chat_id, ChatStatus::Thinking);
-            app.append_terminal_system_line(
-                terminal_id,
-                format!("started pi agent: {command} ({}x{})", size.cols, size.rows),
-            );
-            app.begin_chat_agent_input();
+            if focus_after_start {
+                app.begin_chat_agent_input();
+            }
         }
         Err(error) => {
             app.mark_chat_status_by_id(chat_id, ChatStatus::Failed);
@@ -337,6 +377,61 @@ fn start_or_focus_chat_agent(
             );
         }
     }
+}
+
+fn auto_start_selected_terminal(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    config: &Config,
+    frame_area: Rect,
+) {
+    if !config.auto_start_terminals || !matches!(app.mode, Mode::Normal) {
+        return;
+    }
+
+    let Some((_, terminal_id)) = app.selected_terminal_id() else {
+        return;
+    };
+    if pty_runtime.is_running(terminal_id) || !terminal_output_is_blank(app, terminal_id) {
+        return;
+    }
+
+    start_selected_terminal(app, pty_runtime, frame_area);
+}
+
+fn auto_start_selected_chat_agent(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    config: &Config,
+    frame_area: Rect,
+) {
+    if !config.auto_start_pi_agent || !matches!(app.mode, Mode::Normal) {
+        return;
+    }
+
+    let Some((workspace_id, chat_id)) = app.selected_chat_id() else {
+        return;
+    };
+    let terminal_id = chat_agent_terminal_id(chat_id);
+    if pty_runtime.is_running(terminal_id) || !terminal_output_is_blank(app, terminal_id) {
+        return;
+    }
+
+    start_or_focus_chat_agent(
+        app,
+        pty_runtime,
+        config,
+        frame_area,
+        workspace_id,
+        chat_id,
+        false,
+    );
+}
+
+fn terminal_output_is_blank(app: &App, terminal_id: TerminalId) -> bool {
+    app.terminal_lines(terminal_id)
+        .iter()
+        .all(|line| line.trim().is_empty())
 }
 
 fn pi_command(config: &Config) -> String {
@@ -624,12 +719,16 @@ mod tests {
         assert_eq!(
             pi_command(&Config {
                 pi_agent_command: "pi -c".to_string(),
+                auto_start_pi_agent: false,
+                auto_start_terminals: false,
             }),
             "pi -c"
         );
         assert_eq!(
             pi_command(&Config {
                 pi_agent_command: "   ".to_string(),
+                auto_start_pi_agent: false,
+                auto_start_terminals: false,
             }),
             "pi"
         );

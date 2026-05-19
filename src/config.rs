@@ -12,12 +12,18 @@ const CONFIG_FILE_NAME: &str = "config.json";
 pub struct Config {
     #[serde(default = "default_pi_agent_command")]
     pub pi_agent_command: String,
+    #[serde(default = "default_auto_start_pi_agent")]
+    pub auto_start_pi_agent: bool,
+    #[serde(default = "default_auto_start_terminals")]
+    pub auto_start_terminals: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             pi_agent_command: default_pi_agent_command(),
+            auto_start_pi_agent: default_auto_start_pi_agent(),
+            auto_start_terminals: default_auto_start_terminals(),
         }
     }
 }
@@ -53,6 +59,14 @@ fn default_pi_agent_command() -> String {
     "pi".to_string()
 }
 
+fn default_auto_start_pi_agent() -> bool {
+    true
+}
+
+fn default_auto_start_terminals() -> bool {
+    true
+}
+
 fn invalid_data(error: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
@@ -71,6 +85,8 @@ mod tests {
         let config = Config::default();
 
         assert_eq!(config.pi_agent_command, "pi");
+        assert!(config.auto_start_pi_agent);
+        assert!(config.auto_start_terminals);
     }
 
     #[test]
@@ -92,6 +108,24 @@ mod tests {
         let config = load_from_path(&path).expect("load config");
 
         assert_eq!(config.pi_agent_command, "pi -c");
+        assert!(config.auto_start_pi_agent);
+        assert!(config.auto_start_terminals);
+    }
+
+    #[test]
+    fn config_loads_auto_start_flags_from_json() {
+        let path = unique_temp_file();
+        fs::write(
+            &path,
+            r#"{"auto_start_pi_agent":false,"auto_start_terminals":false}"#,
+        )
+        .expect("write config");
+
+        let config = load_from_path(&path).expect("load config");
+
+        assert_eq!(config.pi_agent_command, "pi");
+        assert!(!config.auto_start_pi_agent);
+        assert!(!config.auto_start_terminals);
     }
 
     #[test]
