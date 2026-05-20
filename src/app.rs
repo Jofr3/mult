@@ -12,8 +12,8 @@ use crate::{
 };
 
 pub use mult_protocol::{
-    Cursor, ScreenSnapshot, TerminalCell, TerminalCellStyle, TerminalColor, TerminalRenderLine,
-    TerminalRenderSpan,
+    Cursor, ScreenSnapshot, ScreenUpdate, TerminalCell, TerminalCellStyle, TerminalColor,
+    TerminalRenderLine, TerminalRenderSpan,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -471,6 +471,13 @@ impl App {
 
     pub fn set_terminal_snapshot(&mut self, terminal: TerminalId, snapshot: ScreenSnapshot) {
         self.terminal_snapshots.insert(terminal, snapshot);
+    }
+
+    pub fn apply_terminal_update(&mut self, terminal: TerminalId, update: ScreenUpdate) {
+        self.terminal_snapshots
+            .entry(terminal)
+            .or_insert_with(|| ScreenSnapshot::blank(update.rows, update.cols))
+            .apply_update(update);
     }
 
     pub fn append_terminal_system_line(

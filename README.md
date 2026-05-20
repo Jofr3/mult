@@ -6,7 +6,7 @@
 
 ```sh
 nix develop
-just server   # keep this running in one terminal
+just server   # keep this running in one terminal during development
 just run      # start/discard TUI clients in another terminal
 ```
 
@@ -16,6 +16,8 @@ Or without `just`:
 cargo run --bin mult-server
 cargo run
 ```
+
+Installed `mult` clients autospawn `mult-server` if the socket is missing, but the recommended long-lived setup is a systemd user service; see `docs/DAEMON.md`.
 
 State is auto-saved to `$XDG_DATA_HOME/mult/state.json` or `~/.local/share/mult/state.json`. Override with `MULT_STATE_PATH=/path/to/state.json`. Chat transcripts, terminal definitions, and running/restorable chat-terminal status are persisted with workspace state; terminal scrollback remains in-memory.
 

@@ -32,6 +32,10 @@
           type = "app";
           program = "${self.packages.${system}.default}/bin/mult";
         };
+        server = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/mult-server";
+        };
       });
 
       checks = forAllSystems (system: {

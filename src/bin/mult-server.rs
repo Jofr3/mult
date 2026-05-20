@@ -11,7 +11,8 @@ use std::{
 use mult::app::TerminalBuffer;
 use mult_protocol::{
     read_message, write_message, ClientMessage, ExitInfo, LaunchSpec, PaneId, PaneInfo,
-    ScreenSnapshot, ServerMessage, SessionId, SessionInfo, DEFAULT_SOCKET_NAME, PROTOCOL_VERSION,
+    ScreenSnapshot, ScreenUpdate, ServerMessage, SessionId, SessionInfo, DEFAULT_SOCKET_NAME,
+    PROTOCOL_VERSION,
 };
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
@@ -40,6 +41,7 @@ struct PaneState {
     name: String,
     title: String,
     terminal: TerminalBuffer,
+    last_snapshot: Option<ScreenSnapshot>,
     master: SharedMasterPty,
     writer: SharedPtyWriter,
     _child: Box<dyn Child + Send + Sync>,
@@ -199,6 +201,7 @@ fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SharedPane>
 
     let mut terminal = TerminalBuffer::default();
     terminal.resize(rows, cols);
+    let last_snapshot = Some(terminal.snapshot());
     let title = pane_title(&shell, &spec.launch);
 
     let pane = Arc::new(Mutex::new(PaneState {
@@ -207,6 +210,7 @@ fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SharedPane>
         name: spec.name,
         title,
         terminal,
+        last_snapshot,
         master,
         writer,
         _child: child,
@@ -327,7 +331,9 @@ fn handle_client_messages(
                     if !pane.clients.iter().any(|existing| existing.id == client.id) {
                         pane.clients.push(client.clone());
                     }
-                    (pane.pane_info(), pane.terminal.snapshot())
+                    let snapshot = pane.terminal.snapshot();
+                    pane.last_snapshot = Some(snapshot.clone());
+                    (pane.pane_info(), snapshot)
                 };
 
                 let _ = client.sender.send(ServerMessage::Attached {
@@ -352,7 +358,9 @@ fn handle_client_messages(
                     let (pane_id, snapshot) = {
                         let mut pane = pane.lock().map_err(lock_error)?;
                         pane.resize(rows, cols)?;
-                        (pane.pane, pane.terminal.snapshot())
+                        let snapshot = pane.terminal.snapshot();
+                        pane.last_snapshot = Some(snapshot.clone());
+                        (pane.pane, snapshot)
                     };
                     let _ = client.sender.send(ServerMessage::Snapshot {
                         pane: pane_id,
@@ -408,14 +416,21 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, pane: SharedPane) {
                     write_terminal_query_responses(&buffer[..n], &mut query_tail, &writer);
 
                     let text = String::from_utf8_lossy(&buffer[..n]).into_owned();
-                    let (pane_id, snapshot, clients) = match pane.lock() {
+                    let (pane_id, update, clients) = match pane.lock() {
                         Ok(mut pane) => {
                             pane.terminal.append(&text);
-                            (pane.pane, pane.terminal.snapshot(), pane.clients.clone())
+                            let snapshot = pane.terminal.snapshot();
+                            let update = pane
+                                .last_snapshot
+                                .as_ref()
+                                .map(|previous| ScreenUpdate::diff(previous, &snapshot))
+                                .unwrap_or_else(|| ScreenUpdate::from_snapshot(&snapshot));
+                            pane.last_snapshot = Some(snapshot);
+                            (pane.pane, update, pane.clients.clone())
                         }
                         Err(_) => break,
                     };
-                    broadcast_snapshot(pane_id, snapshot, clients);
+                    broadcast_update(pane_id, update, clients);
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
@@ -441,11 +456,11 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, pane: SharedPane) {
     });
 }
 
-fn broadcast_snapshot(pane: PaneId, snapshot: ScreenSnapshot, clients: Vec<ClientHandle>) {
+fn broadcast_update(pane: PaneId, update: ScreenUpdate, clients: Vec<ClientHandle>) {
     for client in clients {
         let _ = client.sender.send(ServerMessage::Update {
             pane,
-            snapshot: snapshot.clone(),
+            update: update.clone(),
         });
     }
 }

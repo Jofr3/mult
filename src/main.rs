@@ -727,6 +727,7 @@ fn drain_pty_events(app: &mut App, pty_runtime: &mut PtyRuntime) {
             PtyEvent::Snapshot { terminal, snapshot } => {
                 app.set_terminal_snapshot(terminal, snapshot)
             }
+            PtyEvent::Update { terminal, update } => app.apply_terminal_update(terminal, update),
             PtyEvent::Output { terminal, text } => app.append_terminal_output(terminal, &text),
             PtyEvent::Exited { terminal, status } => {
                 if let Some(chat_id) = chat_id_from_agent_terminal_id(terminal) {

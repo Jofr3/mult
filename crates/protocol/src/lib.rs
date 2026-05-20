@@ -46,6 +46,21 @@ pub struct ScreenSnapshot {
     pub scrollback_rows: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenUpdate {
+    pub rows: u16,
+    pub cols: u16,
+    pub changed_rows: Vec<RowUpdate>,
+    pub cursor: Option<Cursor>,
+    pub scrollback_rows: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowUpdate {
+    pub row: u16,
+    pub cells: Vec<TerminalCell>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursor {
     pub row: u16,
@@ -154,7 +169,7 @@ pub enum ServerMessage {
     },
     Update {
         pane: PaneId,
-        snapshot: ScreenSnapshot,
+        update: ScreenUpdate,
     },
     PaneExited {
         pane: PaneId,
@@ -166,8 +181,44 @@ pub enum ServerMessage {
 }
 
 impl ScreenSnapshot {
+    pub fn blank(rows: u16, cols: u16) -> Self {
+        Self {
+            rows,
+            cols,
+            cells: vec![TerminalCell::blank(); usize::from(rows) * usize::from(cols)],
+            cursor: None,
+            scrollback_rows: 0,
+        }
+    }
+
     pub fn is_blank(&self) -> bool {
         self.cells.iter().all(|cell| cell.ch == ' ')
+    }
+
+    pub fn apply_update(&mut self, update: ScreenUpdate) {
+        if self.rows != update.rows
+            || self.cols != update.cols
+            || self.cells.len() != usize::from(update.rows) * usize::from(update.cols)
+        {
+            *self = Self::blank(update.rows, update.cols);
+        }
+
+        self.cursor = update.cursor;
+        self.scrollback_rows = update.scrollback_rows;
+
+        let cols = usize::from(self.cols);
+        for row in update.changed_rows {
+            let row_index = usize::from(row.row);
+            if row_index >= usize::from(self.rows) {
+                continue;
+            }
+            let start = row_index.saturating_mul(cols);
+            let end = start.saturating_add(cols).min(self.cells.len());
+            let target = &mut self.cells[start..end];
+            target.fill(TerminalCell::blank());
+            let copy_len = target.len().min(row.cells.len());
+            target[..copy_len].copy_from_slice(&row.cells[..copy_len]);
+        }
     }
 
     pub fn render_lines(&self) -> Vec<TerminalRenderLine> {
@@ -184,6 +235,49 @@ impl ScreenSnapshot {
                 render_terminal_row(&self.cells[start..end], cursor_col)
             })
             .collect()
+    }
+}
+
+impl ScreenUpdate {
+    pub fn from_snapshot(snapshot: &ScreenSnapshot) -> Self {
+        Self {
+            rows: snapshot.rows,
+            cols: snapshot.cols,
+            changed_rows: (0..snapshot.rows)
+                .map(|row| RowUpdate {
+                    row,
+                    cells: snapshot_row(snapshot, usize::from(row)),
+                })
+                .collect(),
+            cursor: snapshot.cursor,
+            scrollback_rows: snapshot.scrollback_rows,
+        }
+    }
+
+    pub fn diff(previous: &ScreenSnapshot, current: &ScreenSnapshot) -> Self {
+        if previous.rows != current.rows || previous.cols != current.cols {
+            return Self::from_snapshot(current);
+        }
+
+        let changed_rows = (0..current.rows)
+            .filter_map(|row| {
+                let row_index = usize::from(row);
+                let previous_row = snapshot_row(previous, row_index);
+                let current_row = snapshot_row(current, row_index);
+                (previous_row != current_row).then_some(RowUpdate {
+                    row,
+                    cells: current_row,
+                })
+            })
+            .collect();
+
+        Self {
+            rows: current.rows,
+            cols: current.cols,
+            changed_rows,
+            cursor: current.cursor,
+            scrollback_rows: current.scrollback_rows,
+        }
     }
 }
 
@@ -220,7 +314,23 @@ pub fn write_message<T: Serialize>(writer: &mut impl Write, message: &T) -> io::
     writer.flush()
 }
 
+fn snapshot_row(snapshot: &ScreenSnapshot, row: usize) -> Vec<TerminalCell> {
+    let cols = usize::from(snapshot.cols);
+    let start = row.saturating_mul(cols);
+    let mut cells = vec![TerminalCell::blank(); cols];
+    if start >= snapshot.cells.len() {
+        return cells;
+    }
+
+    let available = snapshot.cells.len().saturating_sub(start).min(cols);
+    cells[..available].copy_from_slice(&snapshot.cells[start..start + available]);
+    cells
+}
+
 fn render_terminal_row(row: &[TerminalCell], cursor_col: Option<usize>) -> TerminalRenderLine {
+    if row.is_empty() {
+        return TerminalRenderLine { spans: Vec::new() };
+    }
     let last_visible_cell = row
         .iter()
         .rposition(|cell| cell.ch != ' ' || cell.style != TerminalCellStyle::default());
@@ -303,5 +413,24 @@ mod tests {
         };
 
         assert_eq!(snapshot.render_lines()[0].spans[0].text, "▌");
+    }
+
+    #[test]
+    fn screen_update_diff_only_includes_changed_rows() {
+        let mut previous = ScreenSnapshot::blank(2, 3);
+        let mut current = previous.clone();
+        current.cells[4].ch = 'x';
+        current.cursor = Some(Cursor {
+            row: 1,
+            col: 1,
+            visible: true,
+        });
+
+        let update = ScreenUpdate::diff(&previous, &current);
+        assert_eq!(update.changed_rows.len(), 1);
+        assert_eq!(update.changed_rows[0].row, 1);
+
+        previous.apply_update(update);
+        assert_eq!(previous, current);
     }
 }

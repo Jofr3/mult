@@ -2,17 +2,19 @@ use std::{
     collections::{BTreeMap, HashMap},
     env, io,
     os::unix::net::UnixStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{
         mpsc::{self, Receiver},
         Arc, Mutex,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use mult_protocol::{
-    read_message, write_message, ClientMessage, LaunchSpec, PaneId, ScreenSnapshot, ServerMessage,
-    SessionId, DEFAULT_SOCKET_NAME, PROTOCOL_VERSION,
+    read_message, write_message, ClientMessage, LaunchSpec, PaneId, ScreenSnapshot, ScreenUpdate,
+    ServerMessage, SessionId, DEFAULT_SOCKET_NAME, PROTOCOL_VERSION,
 };
 
 use crate::model::TerminalId;
@@ -38,6 +40,10 @@ pub enum PtyEvent {
     Snapshot {
         terminal: TerminalId,
         snapshot: ScreenSnapshot,
+    },
+    Update {
+        terminal: TerminalId,
+        update: ScreenUpdate,
     },
     Output {
         terminal: TerminalId,
@@ -205,10 +211,14 @@ impl PtyRuntime {
                     ServerMessage::Hello { .. }
                     | ServerMessage::Sessions(_)
                     | ServerMessage::Attached { .. } => {}
-                    ServerMessage::Snapshot { pane, snapshot }
-                    | ServerMessage::Update { pane, snapshot } => {
+                    ServerMessage::Snapshot { pane, snapshot } => {
                         if let Some(terminal) = self.pane_to_terminal.get(&pane).copied() {
                             events.push(PtyEvent::Snapshot { terminal, snapshot });
+                        }
+                    }
+                    ServerMessage::Update { pane, update } => {
+                        if let Some(terminal) = self.pane_to_terminal.get(&pane).copied() {
+                            events.push(PtyEvent::Update { terminal, update });
                         }
                     }
                     ServerMessage::PaneExited { pane, exit } => {
@@ -254,7 +264,7 @@ impl PtyRuntime {
     }
 
     fn connect(&mut self) -> io::Result<()> {
-        let stream = UnixStream::connect(socket_path())?;
+        let stream = connect_or_spawn_server()?;
         stream.set_nonblocking(false)?;
         let mut writer_stream = stream.try_clone()?;
         write_message(
@@ -301,6 +311,18 @@ impl PtyRuntime {
 
     fn send(&mut self, message: ClientMessage) -> io::Result<()> {
         self.ensure_connected()?;
+        match self.write(&message) {
+            Ok(()) => Ok(()),
+            Err(error) if is_disconnected_error(&error) => {
+                self.connection = None;
+                self.ensure_connected()?;
+                self.write(&message)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn write(&self, message: &ClientMessage) -> io::Result<()> {
         let Some(connection) = &self.connection else {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -311,7 +333,7 @@ impl PtyRuntime {
             .writer
             .lock()
             .map_err(|_| io::Error::other("server socket writer lock poisoned"))?;
-        write_message(&mut *writer, &message)
+        write_message(&mut *writer, message)
     }
 }
 
@@ -332,6 +354,99 @@ impl PtyExit {
             None => format!("exit {}", self.code),
         }
     }
+}
+
+fn connect_or_spawn_server() -> io::Result<UnixStream> {
+    let path = socket_path();
+    match UnixStream::connect(&path) {
+        Ok(stream) => Ok(stream),
+        Err(error) if should_autospawn_server(&error) => {
+            spawn_server()?;
+            wait_for_server(&path).map_err(|wait_error| {
+                io::Error::new(
+                    wait_error.kind(),
+                    format!(
+                        "failed to connect to mult-server after autospawn: {wait_error}; initial error: {error}"
+                    ),
+                )
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn should_autospawn_server(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    ) && autospawn_enabled()
+        && server_executable().is_some()
+}
+
+fn autospawn_enabled() -> bool {
+    !matches!(
+        env::var("MULT_SERVER_AUTOSPAWN").as_deref(),
+        Ok("0") | Ok("false") | Ok("False") | Ok("FALSE")
+    )
+}
+
+fn spawn_server() -> io::Result<()> {
+    let server = server_executable().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "could not locate mult-server next to the mult executable; run `mult-server` manually",
+        )
+    })?;
+
+    Command::new(server)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+}
+
+fn wait_for_server(path: &Path) -> io::Result<UnixStream> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match UnixStream::connect(path) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    Err(last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "timed out")))
+}
+
+fn server_executable() -> Option<PathBuf> {
+    let mut path = env::current_exe().ok()?;
+    let stem = path.file_stem()?.to_str()?;
+    if stem != "mult" {
+        return None;
+    }
+
+    path.set_file_name(server_executable_name());
+    Some(path)
+}
+
+fn server_executable_name() -> &'static str {
+    if cfg!(windows) {
+        "mult-server.exe"
+    } else {
+        "mult-server"
+    }
+}
+
+fn is_disconnected_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+    )
 }
 
 fn socket_path() -> PathBuf {
