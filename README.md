@@ -50,19 +50,15 @@ Use `MULT_CONFIG_PATH=/path/to/config.json` to point at another config file. `au
 
 ## Current controls
 
-- `Tab`/`Shift-Tab`: cycle focus between sidebar and the selected chat/terminal pane
-- `Enter` or `Right`: focus the selected chat/terminal pane from the sidebar
-- `Left`: return focus to the sidebar
+- `Enter`: focus the selected chat/terminal pane from the sidebar
+- `Esc`: return focus to the sidebar
 - `j`/`k` or `Up`/`Down`: move selection when the sidebar is focused
-- `o`: open/import workspace by directory path
-- `w`: add scratch workspace
-- `c`: add chat to selected workspace and start/focus its pi agent
-- `t`: add shell terminal to selected workspace
-- `d`: add a command/dev-server terminal to selected workspace
-- `s`: start the selected terminal PTY
-- `x`: stop the selected terminal PTY or selected chat's pi agent
+- `n` then `a`: add agent to selected workspace and start/focus its pi agent
+- `n` then `t`: add shell terminal to selected workspace
+- `n` then `c`: add a command/dev-server terminal to selected workspace
+- `n` then `w`: open/import workspace by directory path
+- `d` then `d`: delete selected workspace, agent chat, or terminal immediately
 - `i`: start/focus terminal or pi-agent input for the selected pane
-- `D` or Delete: delete selected workspace, agent chat, or terminal
 - `q`: quit
 
 When the open/import or command prompt is active:
@@ -71,7 +67,7 @@ When the open/import or command prompt is active:
 - Enter: submit it
 - Esc or Ctrl-C: cancel
 
-Delete actions show a confirmation prompt. Deleting a workspace also deletes its agent chats and terminals; deleting a chat or terminal stops its running PTY if needed.
+Deleting a workspace also deletes its agent chats and terminals; deleting a chat or terminal stops its running PTY if needed.
 
 Focus controls whether the sidebar or selected main pane is active; the inactive pane uses a darker background. Input mode is only for typing into a terminal or pi agent; press Esc to return to normal mode. Esc does not quit mult. Running PTYs are sized from the visible pane instead of a fixed 80x24 size. Chat panes run `pi` by default; set `pi_agent_command` in the config file to override it.
 

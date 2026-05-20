@@ -74,6 +74,7 @@ fn parse_process_agent_command(raw: &str) -> Option<ProcessAgentCommand> {
 fn run(terminal: &mut DefaultTerminal, mut app: App, config: Config) -> io::Result<()> {
     let mut pty_runtime = PtyRuntime::default();
     let mut agent_backend = RuntimeAgentBackend::from_env();
+    let mut normal_prefix = None;
     let size = terminal.size()?;
     let mut frame_area = Rect::new(0, 0, size.width, size.height);
     restore_persisted_sessions(&mut app, &mut pty_runtime, &config, frame_area);
@@ -93,6 +94,7 @@ fn run(terminal: &mut DefaultTerminal, mut app: App, config: Config) -> io::Resu
                 &mut app,
                 &mut pty_runtime,
                 &config,
+                &mut normal_prefix,
                 event::read()?,
                 frame_area,
             );
@@ -101,6 +103,7 @@ fn run(terminal: &mut DefaultTerminal, mut app: App, config: Config) -> io::Resu
                     &mut app,
                     &mut pty_runtime,
                     &config,
+                    &mut normal_prefix,
                     event::read()?,
                     frame_area,
                 );
@@ -155,31 +158,47 @@ fn handle_event(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
+    normal_prefix: &mut Option<NormalPrefix>,
     event: Event,
     frame_area: Rect,
 ) {
     if let Event::Key(key) = event {
         if key.kind == KeyEventKind::Press {
-            handle_key(app, pty_runtime, config, key, frame_area);
+            handle_key(app, pty_runtime, config, normal_prefix, key, frame_area);
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NormalPrefix {
+    Delete,
+    New,
 }
 
 fn handle_key(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
+    normal_prefix: &mut Option<NormalPrefix>,
     key: KeyEvent,
     frame_area: Rect,
 ) {
     match (&app.prompt, app.mode) {
-        (Some(Prompt::OpenWorkspace(_)), _) => handle_open_workspace_key(app, key),
-        (Some(Prompt::NewTerminalCommand(_)), _) => handle_terminal_command_key(app, key),
-        (Some(Prompt::ConfirmDelete(_)), _) => {
-            handle_delete_confirmation_key(app, pty_runtime, key)
+        (Some(Prompt::OpenWorkspace(_)), _) => {
+            *normal_prefix = None;
+            handle_open_workspace_key(app, key);
         }
-        (None, Mode::Input(_)) => handle_pty_input_key(app, pty_runtime, key),
-        (None, Mode::Normal) => handle_normal_key(app, pty_runtime, config, key, frame_area),
+        (Some(Prompt::NewTerminalCommand(_)), _) => {
+            *normal_prefix = None;
+            handle_terminal_command_key(app, key);
+        }
+        (None, Mode::Input(_)) => {
+            *normal_prefix = None;
+            handle_pty_input_key(app, pty_runtime, key);
+        }
+        (None, Mode::Normal) => {
+            handle_normal_key(app, pty_runtime, config, normal_prefix, key, frame_area);
+        }
     }
 }
 
@@ -187,49 +206,69 @@ fn handle_normal_key(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
+    normal_prefix: &mut Option<NormalPrefix>,
     key: KeyEvent,
     frame_area: Rect,
 ) {
+    if let Some(prefix) = normal_prefix.take() {
+        handle_normal_prefix_key(app, pty_runtime, config, prefix, key, frame_area);
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q') => app.quit(),
-        KeyCode::Tab => app.focus_next(),
-        KeyCode::BackTab => app.focus_previous(),
-        KeyCode::Enter | KeyCode::Right if app.focus == FocusMode::Sidebar => {
+        KeyCode::Esc => app.focus_sidebar(),
+        KeyCode::Enter if app.focus == FocusMode::Sidebar => {
             app.focus_selected_main();
-        }
-        KeyCode::Left if app.focus != FocusMode::Sidebar => {
-            app.focus_sidebar();
         }
         KeyCode::Char('j') | KeyCode::Down if app.focus == FocusMode::Sidebar => app.select_next(),
         KeyCode::Char('k') | KeyCode::Up if app.focus == FocusMode::Sidebar => {
             app.select_previous();
         }
-        KeyCode::Char('w') => app.add_workspace(),
-        KeyCode::Char('o') => app.begin_open_workspace(),
-        KeyCode::Char('c') => {
-            if let Some((workspace, chat)) = app.add_chat_to_selected_workspace_and_return() {
-                start_or_focus_chat_agent(
-                    app,
-                    pty_runtime,
-                    config,
-                    frame_area,
-                    workspace,
-                    chat,
-                    true,
-                );
-            }
-        }
-        KeyCode::Char('t') => app.add_terminal_to_selected_workspace(),
-        KeyCode::Char('d') => {
-            app.begin_new_terminal_command();
-        }
-        KeyCode::Char('D') | KeyCode::Delete => {
-            app.begin_delete_selected();
-        }
-        KeyCode::Char('s') => start_selected_terminal(app, pty_runtime, frame_area),
-        KeyCode::Char('x') => stop_selected_pane(app, pty_runtime),
+        KeyCode::Char('n') => *normal_prefix = Some(NormalPrefix::New),
+        KeyCode::Char('d') => *normal_prefix = Some(NormalPrefix::Delete),
         KeyCode::Char('i') => focus_selected_input(app, pty_runtime, config, frame_area),
         _ => {}
+    }
+}
+
+fn handle_normal_prefix_key(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    config: &Config,
+    prefix: NormalPrefix,
+    key: KeyEvent,
+    frame_area: Rect,
+) {
+    match (prefix, key.code) {
+        (NormalPrefix::Delete, KeyCode::Char('d')) => delete_selected_now(app, pty_runtime),
+        (NormalPrefix::New, KeyCode::Char('a')) => {
+            add_agent_to_selected_workspace(app, pty_runtime, config, frame_area);
+        }
+        (NormalPrefix::New, KeyCode::Char('t')) => app.add_terminal_to_selected_workspace(),
+        (NormalPrefix::New, KeyCode::Char('c')) => {
+            app.begin_new_terminal_command();
+        }
+        (NormalPrefix::New, KeyCode::Char('w')) => app.begin_open_workspace(),
+        (_, KeyCode::Esc) => {}
+        _ => {}
+    }
+}
+
+fn add_agent_to_selected_workspace(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    config: &Config,
+    frame_area: Rect,
+) {
+    if let Some((workspace, chat)) = app.add_chat_to_selected_workspace_and_return() {
+        start_or_focus_chat_agent(app, pty_runtime, config, frame_area, workspace, chat, true);
+    }
+}
+
+fn delete_selected_now(app: &mut App, pty_runtime: &mut PtyRuntime) {
+    for terminal in app.delete_selected_immediately() {
+        let _ = pty_runtime.stop(terminal);
     }
 }
 
@@ -243,7 +282,6 @@ fn handle_pty_input_key(app: &mut App, pty_runtime: &mut PtyRuntime, key: KeyEve
         app.end_pty_input();
         return;
     };
-
     let bytes = key_to_pty_bytes(key);
     if bytes.is_empty() {
         return;
@@ -283,19 +321,6 @@ fn handle_terminal_command_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cancel_prompt(),
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.push_prompt_char(c);
-        }
-        _ => {}
-    }
-}
-
-fn handle_delete_confirmation_key(app: &mut App, pty_runtime: &mut PtyRuntime, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('n') => app.cancel_prompt(),
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cancel_prompt(),
-        KeyCode::Enter | KeyCode::Char('y') => {
-            for terminal in app.confirm_delete_selected() {
-                let _ = pty_runtime.stop(terminal);
-            }
         }
         _ => {}
     }
@@ -503,56 +528,6 @@ fn pi_command(config: &Config) -> String {
         "pi".to_string()
     } else {
         command.to_string()
-    }
-}
-
-fn stop_selected_terminal(app: &mut App, pty_runtime: &mut PtyRuntime) {
-    let Some((_, terminal_id)) = app.selected_terminal_id() else {
-        return;
-    };
-
-    match pty_runtime.stop(terminal_id) {
-        Ok(true) => {
-            app.mark_terminal_stopped(terminal_id);
-            app.append_terminal_system_line(terminal_id, "stopped PTY shell");
-        }
-        Ok(false) => {
-            app.append_terminal_system_line(terminal_id, "PTY is not running");
-        }
-        Err(error) => {
-            app.append_terminal_system_line(terminal_id, format!("failed to stop PTY: {error}"));
-        }
-    }
-}
-
-fn stop_selected_chat_agent(app: &mut App, pty_runtime: &mut PtyRuntime) {
-    let Some((_, chat_id)) = app.selected_chat_id() else {
-        return;
-    };
-    let terminal_id = chat_agent_terminal_id(chat_id);
-
-    match pty_runtime.stop(terminal_id) {
-        Ok(true) => {
-            app.mark_chat_status_by_id(chat_id, ChatStatus::Idle);
-            app.append_terminal_system_line(terminal_id, "stopped pi agent");
-        }
-        Ok(false) => {
-            app.append_terminal_system_line(terminal_id, "pi agent is not running");
-        }
-        Err(error) => {
-            app.append_terminal_system_line(
-                terminal_id,
-                format!("failed to stop pi agent: {error}"),
-            );
-        }
-    }
-}
-
-fn stop_selected_pane(app: &mut App, pty_runtime: &mut PtyRuntime) {
-    if app.selected_chat_id().is_some() {
-        stop_selected_chat_agent(app, pty_runtime);
-    } else {
-        stop_selected_terminal(app, pty_runtime);
     }
 }
 
@@ -798,10 +773,12 @@ mod tests {
         let config = Config::default();
         let frame_area = Rect::new(0, 0, 120, 40);
 
+        let mut normal_prefix = None;
         handle_normal_key(
             &mut app,
             &mut pty_runtime,
             &config,
+            &mut normal_prefix,
             KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
             frame_area,
         );
@@ -813,10 +790,165 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &mut normal_prefix,
             KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
             frame_area,
         );
         assert_eq!(app.focus, FocusMode::Chat);
+    }
+
+    #[test]
+    fn removed_focus_keys_do_not_move_focus() {
+        let mut app = App::default();
+        app.selected = 1;
+        let mut pty_runtime = PtyRuntime::default();
+        let config = Config::default();
+        let frame_area = Rect::new(0, 0, 120, 40);
+        let mut normal_prefix = None;
+
+        handle_normal_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &mut normal_prefix,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            frame_area,
+        );
+        assert_eq!(app.focus, FocusMode::Sidebar);
+
+        handle_normal_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &mut normal_prefix,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            frame_area,
+        );
+        assert_eq!(app.focus, FocusMode::Sidebar);
+
+        assert!(app.focus_selected_main());
+        assert_eq!(app.focus, FocusMode::Chat);
+        handle_normal_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &mut normal_prefix,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            frame_area,
+        );
+        assert_eq!(app.focus, FocusMode::Chat);
+
+        handle_normal_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &mut normal_prefix,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            frame_area,
+        );
+        assert_eq!(app.focus, FocusMode::Sidebar);
+    }
+
+    #[test]
+    fn normal_prefix_keys_create_and_delete_without_confirmation() {
+        let mut app = App::default();
+        let mut pty_runtime = PtyRuntime::default();
+        let config = Config::default();
+        let frame_area = Rect::new(0, 0, 120, 40);
+        let mut normal_prefix = None;
+        let initial_terminals = app.project.workspaces[0].terminals.len();
+
+        handle_normal_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &mut normal_prefix,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            frame_area,
+        );
+        handle_normal_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &mut normal_prefix,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+            frame_area,
+        );
+        assert_eq!(
+            app.project.workspaces[0].terminals.len(),
+            initial_terminals + 1
+        );
+
+        handle_normal_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &mut normal_prefix,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            frame_area,
+        );
+        assert_eq!(app.prompt, None);
+        assert_eq!(
+            app.project.workspaces[0].terminals.len(),
+            initial_terminals + 1
+        );
+
+        handle_normal_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &mut normal_prefix,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            frame_area,
+        );
+        assert_eq!(app.prompt, None);
+        assert_eq!(app.project.workspaces[0].terminals.len(), initial_terminals);
+    }
+
+    #[test]
+    fn normal_prefix_keys_open_prompts() {
+        let mut app = App::default();
+        let mut pty_runtime = PtyRuntime::default();
+        let config = Config::default();
+        let frame_area = Rect::new(0, 0, 120, 40);
+        let mut normal_prefix = None;
+
+        handle_normal_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &mut normal_prefix,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            frame_area,
+        );
+        handle_normal_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &mut normal_prefix,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            frame_area,
+        );
+        assert!(matches!(app.prompt, Some(Prompt::NewTerminalCommand(_))));
+        app.cancel_prompt();
+
+        handle_normal_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &mut normal_prefix,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            frame_area,
+        );
+        handle_normal_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &mut normal_prefix,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+            frame_area,
+        );
+        assert!(matches!(app.prompt, Some(Prompt::OpenWorkspace(_))));
     }
 
     #[test]

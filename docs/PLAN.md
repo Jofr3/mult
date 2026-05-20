@@ -11,7 +11,7 @@
 - PTYs are managed in-memory with `portable-pty`, visible-pane resizing, shell terminals, and command/dev-server terminals.
 - Selected chat panes can run an embedded `pi` process through a PTY. Config is loaded from `$XDG_CONFIG_HOME/mult/config.json` or `~/.config/mult/config.json`.
 - The default UI palette is Rosé Pine Moon, with per-color `colorscheme` config overrides.
-- Workspace/chat/terminal deletion has confirmation and stops related running PTYs.
+- Workspace/chat/terminal deletion uses a two-key `d d` chord and stops related running PTYs.
 - Normal mode covers workspace/chat/terminal management; input mode is only for typing into the selected terminal or pi agent.
 - Focus is explicit for sidebar, chat pane, and terminal pane. `Tab`/`Shift-Tab`, `Enter`, and `Left`/`Right` move focus; the unfocused pane uses a darker background.
 
@@ -72,7 +72,7 @@ Completed in this milestone:
 
 - [x] Render a pi agent directly in selected chat panes via PTY.
 - [x] Load user config from `~/.config/mult/config.json`, including colorscheme overrides.
-- [x] Delete workspaces, agent chats, and terminals with confirmation.
+- [x] Delete workspaces, agent chats, and terminals with a two-key `d d` chord.
 - [x] Add explicit focus modes for sidebar/chat/terminal without changing PTY backend behavior.
 - [x] Use borderless panes with darker backgrounds for unfocused panes.
 - [x] Keep sidebar navigation scoped to sidebar focus.

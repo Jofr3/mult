@@ -12,10 +12,13 @@ use crate::{
         TerminalColor, TerminalRenderLine,
     },
     config::{self, ColorSchemeConfig},
-    model::{ChatId, ChatStatus, TerminalId, TerminalLaunch, TerminalStatus, WorkspaceId},
+    model::{
+        ChatId, ChatStatus, TerminalId, TerminalLaunch, TerminalSession, TerminalStatus,
+        WorkspaceId,
+    },
 };
 
-const FOOTER: &str = "tab focus • enter/→ pane • ← sidebar • q quit • j/k sidebar • o open/import • w workspace • c chat • t terminal • d command • D/del delete • s/x PTY • i input";
+const FOOTER: &str = "j/k nav • enter pane • esc sidebar • n a agent • n t terminal • n c command • n w workspace • d d delete • i input • q quit";
 const CHAT_AGENT_HEADER_LINES: u16 = 0;
 const TERMINAL_HEADER_LINES: u16 = 0;
 
@@ -193,7 +196,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
                 .fg(palette.text)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▸ ");
+        .highlight_symbol("▶ ");
 
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -218,10 +221,6 @@ fn sidebar_items(app: &App, palette: Palette) -> Vec<ListItem<'static>> {
                     Span::raw("  "),
                     Span::styled("● ", chat_status_style(chat.status, palette)),
                     Span::raw(chat.name.clone()),
-                    Span::styled(
-                        format!(" [{}]", chat.status.label()),
-                        Style::default().fg(palette.muted),
-                    ),
                 ]))
             });
 
@@ -229,11 +228,7 @@ fn sidebar_items(app: &App, palette: Palette) -> Vec<ListItem<'static>> {
                 ListItem::new(Line::from(vec![
                     Span::raw("  "),
                     Span::styled("$ ", terminal_status_style(terminal.status, palette)),
-                    Span::raw(terminal.name.clone()),
-                    Span::styled(
-                        format!(" [{}]", terminal.status.label()),
-                        Style::default().fg(palette.muted),
-                    ),
+                    Span::raw(terminal_name_label(terminal)),
                 ]))
             });
 
@@ -330,31 +325,23 @@ fn workspace_details(app: &App, workspace_id: WorkspaceId, palette: Palette) -> 
     }
 
     for index in 0..rows {
-        let chat = workspace
-            .chats
-            .get(index)
-            .map(|chat| {
-                (
-                    format!("● {} [{}]", chat.name, chat.status.label()),
-                    chat_status_style(chat.status, palette),
-                )
-            })
-            .unwrap_or_else(|| (String::new(), Style::default().fg(palette.text)));
-        let terminal = workspace
-            .terminals
-            .get(index)
-            .map(|terminal| {
-                (
-                    format!("$ {} [{}]", terminal.name, terminal.status.label()),
-                    terminal_status_style(terminal.status, palette),
-                )
-            })
-            .unwrap_or_else(|| (String::new(), Style::default().fg(palette.text)));
+        let mut spans = Vec::new();
+        if let Some(chat) = workspace.chats.get(index) {
+            spans.push(Span::styled("● ", chat_status_style(chat.status, palette)));
+            spans.push(Span::raw(pad_cell(&chat.name, 40)));
+        } else {
+            spans.push(Span::raw(pad_cell("", 42)));
+        }
 
-        lines.push(Line::from(vec![
-            Span::styled(pad_cell(&chat.0, 42), chat.1),
-            Span::styled(terminal.0, terminal.1),
-        ]));
+        if let Some(terminal) = workspace.terminals.get(index) {
+            spans.push(Span::styled(
+                "$ ",
+                terminal_status_style(terminal.status, palette),
+            ));
+            spans.push(Span::raw(terminal_name_label(terminal)));
+        }
+
+        lines.push(Line::from(spans));
     }
 
     lines
@@ -501,9 +488,6 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
                 prompt.error.as_deref(),
                 "enter adds command terminal • esc/ctrl-c cancels",
             ),
-            Prompt::ConfirmDelete(confirmation) => {
-                draw_delete_confirmation(frame, area, confirmation, palette)
-            }
         }
         return;
     }
@@ -519,30 +503,6 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
         Paragraph::new(footer).style(Style::default().bg(palette.base)),
         area,
     );
-}
-
-fn draw_delete_confirmation(
-    frame: &mut Frame,
-    area: Rect,
-    confirmation: &crate::app::DeleteConfirmation,
-    palette: Palette,
-) {
-    let prompt = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("Delete: ", Style::default().fg(palette.muted)),
-            Span::styled(
-                confirmation.label.clone(),
-                Style::default().fg(palette.love),
-            ),
-        ]),
-        Line::from(confirmation.detail.clone()),
-        Line::from(Span::styled(
-            "confirm with y/enter • n/esc/ctrl-c cancels",
-            Style::default().fg(palette.gold),
-        )),
-    ])
-    .style(Style::default().fg(palette.text).bg(palette.base));
-    frame.render_widget(prompt, area);
 }
 
 fn draw_text_prompt(
@@ -628,13 +588,30 @@ fn terminal_color(color: TerminalColor, palette: Palette) -> Color {
     }
 }
 
+fn terminal_name_label(terminal: &TerminalSession) -> String {
+    match &terminal.launch {
+        TerminalLaunch::Command(command) if terminal.name.starts_with("cmd: ") => {
+            let command = command.trim();
+            if command.is_empty() {
+                terminal
+                    .name
+                    .strip_prefix("cmd: ")
+                    .unwrap_or(&terminal.name)
+                    .to_string()
+            } else {
+                command.to_string()
+            }
+        }
+        _ => terminal.name.clone(),
+    }
+}
+
 fn chat_status_style(status: ChatStatus, palette: Palette) -> Style {
     let color = match status {
-        ChatStatus::Idle => palette.pine,
-        ChatStatus::Thinking => palette.gold,
-        ChatStatus::Waiting => palette.iris,
         ChatStatus::Failed => palette.love,
-        ChatStatus::Done => palette.leaf,
+        ChatStatus::Waiting => palette.gold,
+        ChatStatus::Thinking => palette.pine,
+        ChatStatus::Idle | ChatStatus::Done => palette.muted,
     };
 
     Style::default().fg(color)
@@ -642,8 +619,8 @@ fn chat_status_style(status: ChatStatus, palette: Palette) -> Style {
 
 fn terminal_status_style(status: TerminalStatus, palette: Palette) -> Style {
     let color = match status {
-        TerminalStatus::Stopped => palette.love,
-        TerminalStatus::Running => palette.leaf,
+        TerminalStatus::Running => palette.pine,
+        TerminalStatus::Stopped => palette.muted,
     };
 
     Style::default().fg(color)
@@ -666,6 +643,18 @@ mod tests {
         terminal
             .draw(|frame| draw(frame, &app, &config::Config::default()))
             .expect("draw app");
+    }
+
+    #[test]
+    fn terminal_name_label_hides_legacy_command_prefix() {
+        let terminal = TerminalSession {
+            id: TerminalId(99),
+            name: "cmd: ping".to_string(),
+            status: TerminalStatus::Running,
+            launch: TerminalLaunch::Command("ping example.com".to_string()),
+        };
+
+        assert_eq!(terminal_name_label(&terminal), "ping example.com");
     }
 
     #[test]

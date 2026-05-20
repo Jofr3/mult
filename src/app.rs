@@ -7,7 +7,7 @@ use crate::{
     agent::{AgentEvent, AgentMessageRole, AgentTarget},
     model::{
         ChatId, ChatMessage, ChatMessageRole, ChatStatus, ProjectState, TerminalId, TerminalStatus,
-        WorkspaceId,
+        WorkspaceId, DEFAULT_AGENT_CHAT_TITLE,
     },
 };
 
@@ -46,7 +46,6 @@ pub enum InputTarget {
 pub enum Prompt {
     OpenWorkspace(OpenWorkspacePrompt),
     NewTerminalCommand(TerminalCommandPrompt),
-    ConfirmDelete(DeleteConfirmation),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -67,13 +66,6 @@ pub struct OpenWorkspacePrompt {
 pub struct TerminalCommandPrompt {
     pub input: String,
     pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeleteConfirmation {
-    pub target: DeleteTarget,
-    pub label: String,
-    pub detail: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,7 +192,8 @@ pub fn chat_id_from_agent_terminal_id(terminal: TerminalId) -> Option<ChatId> {
 }
 
 impl App {
-    pub fn new(project: ProjectState) -> Self {
+    pub fn new(mut project: ProjectState) -> Self {
+        let titles_normalized = normalize_agent_chat_titles(&mut project);
         let chat_buffers = project
             .workspaces
             .iter()
@@ -217,7 +210,7 @@ impl App {
             terminal_buffers: BTreeMap::new(),
             chat_buffers,
             should_quit: false,
-            dirty: false,
+            dirty: titles_normalized,
         };
         app.clamp_selection();
         app
@@ -239,10 +232,12 @@ impl App {
         self.prompt.is_some()
     }
 
+    #[cfg(test)]
     pub fn focus_next(&mut self) {
         self.cycle_focus(false);
     }
 
+    #[cfg(test)]
     pub fn focus_previous(&mut self) {
         self.cycle_focus(true);
     }
@@ -260,6 +255,7 @@ impl App {
         true
     }
 
+    #[cfg(test)]
     fn cycle_focus(&mut self, backwards: bool) {
         let available = self.available_focus_modes();
         if available.is_empty() {
@@ -415,29 +411,15 @@ impl App {
         }
     }
 
-    pub fn begin_delete_selected(&mut self) -> bool {
+    pub fn delete_selected_immediately(&mut self) -> Vec<TerminalId> {
         let Some(target) = self.selected_delete_target() else {
-            return false;
-        };
-        let Some((label, detail)) = self.delete_target_description(target) else {
-            return false;
-        };
-
-        self.prompt = Some(Prompt::ConfirmDelete(DeleteConfirmation {
-            target,
-            label,
-            detail,
-        }));
-        true
-    }
-
-    pub fn confirm_delete_selected(&mut self) -> Vec<TerminalId> {
-        let Some(Prompt::ConfirmDelete(confirmation)) = &self.prompt else {
             return Vec::new();
         };
-        let target = confirmation.target;
         self.prompt = None;
+        self.delete_target(target)
+    }
 
+    fn delete_target(&mut self, target: DeleteTarget) -> Vec<TerminalId> {
         let mut runtime_terminals = Vec::new();
         match target {
             DeleteTarget::Workspace(workspace_id) => {
@@ -496,39 +478,6 @@ impl App {
                 workspace,
                 terminal,
             }),
-        }
-    }
-
-    fn delete_target_description(&self, target: DeleteTarget) -> Option<(String, String)> {
-        match target {
-            DeleteTarget::Workspace(workspace_id) => {
-                let workspace = self.project.workspace(workspace_id)?;
-                Some((
-                    format!("workspace `{}`", workspace.name),
-                    format!(
-                        "Deletes {} agent chat(s) and {} terminal(s).",
-                        workspace.chats.len(),
-                        workspace.terminals.len()
-                    ),
-                ))
-            }
-            DeleteTarget::Chat { workspace, chat } => {
-                let chat = self.project.chat(workspace, chat)?;
-                Some((
-                    format!("agent `{}`", chat.name),
-                    "Deletes saved transcript and stops its pi agent if running.".to_string(),
-                ))
-            }
-            DeleteTarget::Terminal {
-                workspace,
-                terminal,
-            } => {
-                let terminal = self.project.terminal(workspace, terminal)?;
-                Some((
-                    format!("terminal `{}`", terminal.name),
-                    "Deletes terminal config and stops its PTY if running.".to_string(),
-                ))
-            }
         }
     }
 
@@ -686,24 +635,6 @@ impl App {
         }
     }
 
-    pub fn add_workspace(&mut self) {
-        let next = self.project.workspaces.len() + 1;
-        let name = format!("workspace-{next}");
-        let workspace = self
-            .project
-            .add_workspace(name.clone(), std::env::current_dir().ok());
-        let chat =
-            self.project
-                .add_chat(workspace, "agent: new chat".to_string(), ChatStatus::Idle);
-
-        if let Some(chat) = chat {
-            self.select_item(NavItem::Chat { workspace, chat });
-        } else {
-            self.select_item(NavItem::Workspace(workspace));
-        }
-        self.dirty = true;
-    }
-
     pub fn begin_open_workspace(&mut self) {
         let input = std::env::current_dir()
             .ok()
@@ -842,8 +773,11 @@ impl App {
 
         let name = workspace_name(&cwd);
         let workspace = self.project.add_workspace(name.clone(), Some(cwd));
-        self.project
-            .add_chat(workspace, "agent: new chat".to_string(), ChatStatus::Idle);
+        self.project.add_chat(
+            workspace,
+            DEFAULT_AGENT_CHAT_TITLE.to_string(),
+            ChatStatus::Idle,
+        );
         self.project
             .add_terminal(workspace, "shell".to_string(), TerminalStatus::Stopped);
 
@@ -891,16 +825,8 @@ impl App {
 
     pub fn add_chat_to_selected_workspace_and_return(&mut self) -> Option<(WorkspaceId, ChatId)> {
         let workspace = self.selected_workspace_id()?;
-        let next = self
-            .project
-            .workspace(workspace)
-            .map(|workspace| workspace.chats.len() + 1)
-            .unwrap_or(1);
-
-        let name = format!("agent: chat-{next}");
-        let chat = self
-            .project
-            .add_chat(workspace, name.clone(), ChatStatus::Idle)?;
+        let name = DEFAULT_AGENT_CHAT_TITLE.to_string();
+        let chat = self.project.add_chat(workspace, name, ChatStatus::Idle)?;
         self.select_item(NavItem::Chat { workspace, chat });
         self.dirty = true;
         Some((workspace, chat))
@@ -1651,13 +1577,29 @@ fn workspace_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+fn normalize_agent_chat_titles(project: &mut ProjectState) -> bool {
+    let mut changed = false;
+    for chat in project
+        .workspaces
+        .iter_mut()
+        .flat_map(|workspace| workspace.chats.iter_mut())
+    {
+        if chat.name != DEFAULT_AGENT_CHAT_TITLE {
+            chat.name = DEFAULT_AGENT_CHAT_TITLE.to_string();
+            changed = true;
+        }
+    }
+
+    changed
+}
+
 fn command_terminal_name(command: &str, next: usize) -> String {
-    command
-        .split_whitespace()
-        .next()
-        .filter(|name| !name.is_empty())
-        .map(|name| format!("cmd: {name}"))
-        .unwrap_or_else(|| format!("command-{next}"))
+    let command = command.trim();
+    if command.is_empty() {
+        format!("command-{next}")
+    } else {
+        command.to_string()
+    }
 }
 
 fn chat_role_from_agent(role: AgentMessageRole) -> ChatMessageRole {
@@ -1891,6 +1833,32 @@ mod tests {
     }
 
     #[test]
+    fn new_chats_use_agent_title() {
+        let mut app = App::default();
+        let Some((workspace, chat)) = app.add_chat_to_selected_workspace_and_return() else {
+            panic!("chat should be added");
+        };
+
+        assert_eq!(
+            app.project.chat(workspace, chat).unwrap().name,
+            DEFAULT_AGENT_CHAT_TITLE
+        );
+    }
+
+    #[test]
+    fn app_normalizes_chat_titles_to_agent_on_load() {
+        let mut state = ProjectState::default();
+        state.workspaces[0].chats[0].name = "pi: old topic title".to_string();
+        let app = App::new(state);
+
+        assert_eq!(
+            app.project.workspaces[0].chats[0].name,
+            DEFAULT_AGENT_CHAT_TITLE
+        );
+        assert!(app.is_dirty());
+    }
+
+    #[test]
     fn command_terminal_prompt_adds_command_terminal() {
         let mut app = App::default();
         let workspace = app.project.workspaces[0].id;
@@ -1909,7 +1877,7 @@ mod tests {
         app.submit_new_terminal_command();
 
         let terminal = app.project.workspaces[0].terminals.last().unwrap();
-        assert_eq!(terminal.name, "cmd: cargo");
+        assert_eq!(terminal.name, "cargo test");
         assert_eq!(
             terminal.launch,
             crate::model::TerminalLaunch::Command("cargo test".to_string())
@@ -1926,7 +1894,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_selected_terminal_requires_confirmation_and_removes_it() {
+    fn delete_selected_terminal_removes_it_immediately() {
         let mut app = App::default();
         let workspace = app.project.workspaces[0].id;
         let terminal = app.project.workspaces[0].terminals[0].id;
@@ -1936,16 +1904,7 @@ mod tests {
         });
         app.resize_terminal_buffer(terminal, 1, 10);
 
-        assert!(app.begin_delete_selected());
-        assert!(matches!(
-            app.prompt,
-            Some(Prompt::ConfirmDelete(DeleteConfirmation {
-                target: DeleteTarget::Terminal { .. },
-                ..
-            }))
-        ));
-
-        let runtime_terminals = app.confirm_delete_selected();
+        let runtime_terminals = app.delete_selected_immediately();
 
         assert_eq!(runtime_terminals, vec![terminal]);
         assert!(app.project.terminal(workspace, terminal).is_none());
@@ -1964,8 +1923,7 @@ mod tests {
         let pi_terminal = chat_agent_terminal_id(chat);
         app.resize_terminal_buffer(pi_terminal, 1, 10);
 
-        assert!(app.begin_delete_selected());
-        let runtime_terminals = app.confirm_delete_selected();
+        let runtime_terminals = app.delete_selected_immediately();
 
         assert_eq!(runtime_terminals, vec![pi_terminal]);
         assert!(app.project.chat(workspace, chat).is_none());
@@ -1986,8 +1944,7 @@ mod tests {
             .collect::<Vec<_>>();
         app.select_item(NavItem::Workspace(workspace));
 
-        assert!(app.begin_delete_selected());
-        let runtime_terminals = app.confirm_delete_selected();
+        let runtime_terminals = app.delete_selected_immediately();
 
         assert!(runtime_terminals.contains(&terminal));
         for chat in chats {

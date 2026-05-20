@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub const STATE_VERSION: u32 = 1;
+pub const DEFAULT_AGENT_CHAT_TITLE: &str = "agent";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectState {
@@ -99,12 +100,20 @@ impl Default for ProjectState {
         };
 
         let mult = state.add_workspace("mult".to_string(), std::env::current_dir().ok());
-        state.add_chat(mult, "agent: planner".to_string(), ChatStatus::Thinking);
-        state.add_chat(mult, "agent: coder".to_string(), ChatStatus::Idle);
+        state.add_chat(
+            mult,
+            DEFAULT_AGENT_CHAT_TITLE.to_string(),
+            ChatStatus::Thinking,
+        );
+        state.add_chat(mult, DEFAULT_AGENT_CHAT_TITLE.to_string(), ChatStatus::Idle);
         state.add_terminal(mult, "dev server".to_string(), TerminalStatus::Stopped);
 
         let website = state.add_workspace("website".to_string(), None);
-        state.add_chat(website, "agent: reviewer".to_string(), ChatStatus::Waiting);
+        state.add_chat(
+            website,
+            DEFAULT_AGENT_CHAT_TITLE.to_string(),
+            ChatStatus::Waiting,
+        );
         state.add_terminal(website, "shell".to_string(), TerminalStatus::Stopped);
 
         state
@@ -353,15 +362,6 @@ impl ChatMessageRole {
             Self::System => "system",
             Self::Tool => "tool",
             Self::Error => "error",
-        }
-    }
-}
-
-impl TerminalStatus {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Stopped => "stopped",
-            Self::Running => "running",
         }
     }
 }
