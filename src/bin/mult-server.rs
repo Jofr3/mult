@@ -6,15 +6,16 @@ use std::{
     path::PathBuf,
     sync::{mpsc, Arc, Mutex},
     thread,
+    time::Duration,
 };
 
 use mult::app::TerminalBuffer;
 use mult_protocol::{
-    read_message, write_message, ClientMessage, ExitInfo, LaunchSpec, PaneId, PaneInfo,
-    ScreenSnapshot, ScreenUpdate, ServerMessage, SessionId, SessionInfo, DEFAULT_SOCKET_NAME,
-    PROTOCOL_VERSION,
+    bounded_screen_dimensions, default_socket_path, read_message, write_message, ClientMessage,
+    ExitInfo, LaunchSpec, PaneId, PaneInfo, ScreenSnapshot, ScreenUpdate, ServerMessage, SessionId,
+    SessionInfo, PROTOCOL_VERSION,
 };
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, ExitStatus, MasterPty, PtySize};
 
 type ClientId = u64;
 type SharedServer = Arc<Mutex<ServerState>>;
@@ -22,6 +23,8 @@ type SharedPane = Arc<Mutex<PaneState>>;
 type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 type SharedMasterPty = Arc<Mutex<Box<dyn MasterPty + Send>>>;
 type ClientSender = mpsc::Sender<ServerMessage>;
+
+const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 struct ClientHandle {
@@ -44,7 +47,7 @@ struct PaneState {
     last_snapshot: Option<ScreenSnapshot>,
     master: SharedMasterPty,
     writer: SharedPtyWriter,
-    _child: Box<dyn Child + Send + Sync>,
+    child: Option<Box<dyn Child + Send + Sync>>,
     clients: Vec<ClientHandle>,
 }
 
@@ -62,11 +65,17 @@ struct PaneSpawnSpec {
     cols: u16,
 }
 
+struct SpawnedPane {
+    pane: SharedPane,
+    reader: Box<dyn Read + Send>,
+}
+
 fn main() -> io::Result<()> {
-    let socket_path = socket_path();
+    let socket_path = default_socket_path();
     bind_socket_path(&socket_path)?;
     let server = Arc::new(Mutex::new(ServerState::default()));
     let listener = UnixListener::bind(&socket_path)?;
+    restrict_socket_permissions(&socket_path)?;
     eprintln!("mult-server listening on {}", socket_path.display());
 
     for stream in listener.incoming() {
@@ -131,6 +140,32 @@ impl ServerState {
         })
     }
 
+    fn remove_pane_by_id(&mut self, pane: PaneId) -> Option<SharedPane> {
+        if let Some(removed) = self.sessions.remove(&SessionId(pane.0)) {
+            return Some(removed);
+        }
+
+        let session = self.sessions.iter().find_map(|(session, candidate)| {
+            let matches = candidate
+                .lock()
+                .ok()
+                .is_some_and(|candidate| candidate.pane == pane);
+            matches.then_some(*session)
+        })?;
+        self.sessions.remove(&session)
+    }
+
+    fn remove_session_if_same(&mut self, session: SessionId, pane: &SharedPane) -> bool {
+        let matches = self
+            .sessions
+            .get(&session)
+            .is_some_and(|existing| Arc::ptr_eq(existing, pane));
+        if matches {
+            self.sessions.remove(&session);
+        }
+        matches
+    }
+
     fn remove_client(&mut self, client_id: ClientId) {
         for pane in self.sessions.values() {
             if let Ok(mut pane) = pane.lock() {
@@ -141,37 +176,58 @@ impl ServerState {
 }
 
 fn bind_socket_path(path: &PathBuf) -> io::Result<()> {
-    if path.exists() {
-        match UnixStream::connect(path) {
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!("server already listening at {}", path.display()),
-                ));
-            }
-            Err(_) => fs::remove_file(path)?,
+    match UnixStream::connect(path) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("server already listening at {}", path.display()),
+            ));
         }
+        Err(error) => remove_stale_socket_file(path, error)?,
     }
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     Ok(())
 }
 
-fn socket_path() -> PathBuf {
-    if let Some(runtime_dir) = env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join(DEFAULT_SOCKET_NAME);
+fn remove_stale_socket_file(path: &PathBuf, connect_error: io::Error) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    if connect_error.kind() == io::ErrorKind::NotFound {
+        return Ok(());
     }
 
-    let user = env::var("UID")
-        .or_else(|_| env::var("USER"))
-        .unwrap_or_else(|_| "unknown".to_string());
-    PathBuf::from(format!("/tmp/mult-{user}.sock"))
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    if metadata.file_type().is_socket() {
+        fs::remove_file(path)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to remove non-socket path {} after connect failed: {connect_error}",
+                path.display()
+            ),
+        ))
+    }
 }
 
-fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SharedPane> {
-    let rows = spec.rows.max(1);
-    let cols = spec.cols.max(1);
+fn restrict_socket_permissions(path: &PathBuf) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(path, permissions)
+}
+
+fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SpawnedPane> {
+    let (rows, cols) = bounded_pty_dimensions(spec.rows, spec.cols);
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -213,12 +269,11 @@ fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SharedPane>
         last_snapshot,
         master,
         writer,
-        _child: child,
+        child: Some(child),
         clients: Vec::new(),
     }));
 
-    spawn_reader(reader, Arc::clone(&pane));
-    Ok(pane)
+    Ok(SpawnedPane { pane, reader })
 }
 
 fn handle_client(stream: UnixStream, server: SharedServer) -> io::Result<()> {
@@ -251,27 +306,29 @@ fn handle_client_messages(
     server: &SharedServer,
     client: ClientHandle,
 ) -> io::Result<()> {
-    loop {
-        let message = match read_message::<ClientMessage>(&mut stream) {
-            Ok(message) => message,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::UnexpectedEof
-                        | io::ErrorKind::ConnectionReset
-                        | io::ErrorKind::BrokenPipe
-                ) =>
-            {
-                break;
-            }
-            Err(error) => return Err(error),
-        };
+    stream.set_read_timeout(Some(CLIENT_HELLO_TIMEOUT))?;
+    let Some(message) = read_client_message(&mut stream)? else {
+        return Ok(());
+    };
+    stream.set_read_timeout(None)?;
 
+    let ClientMessage::Hello { protocol_version } = message else {
+        let _ = client.sender.send(ServerMessage::Error {
+            message: "expected protocol hello before other client messages".to_string(),
+        });
+        return Ok(());
+    };
+
+    if !send_hello_response(&client, protocol_version) {
+        return Ok(());
+    }
+
+    while let Some(message) = read_client_message(&mut stream)? {
         match message {
-            ClientMessage::Hello { .. } => {
-                let _ = client.sender.send(ServerMessage::Hello {
-                    protocol_version: PROTOCOL_VERSION,
-                });
+            ClientMessage::Hello { protocol_version } => {
+                if !send_hello_response(&client, protocol_version) {
+                    break;
+                }
             }
             ClientMessage::ListSessions => {
                 let sessions = server.lock().map_err(lock_error)?.session_infos();
@@ -369,10 +426,59 @@ fn handle_client_messages(
                 }
             }
             ClientMessage::Detach => break,
+            ClientMessage::Stop { pane } => {
+                let target = { server.lock().map_err(lock_error)?.pane_by_id(pane) };
+                let Some(target) = target else {
+                    continue;
+                };
+
+                let stop_result = target.lock().map_err(lock_error)?.stop();
+                match stop_result {
+                    Ok(()) => {
+                        server.lock().map_err(lock_error)?.remove_pane_by_id(pane);
+                    }
+                    Err(error) => {
+                        let _ = client.sender.send(ServerMessage::Error {
+                            message: format!("failed to stop pane: {error}"),
+                        });
+                    }
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+fn read_client_message(stream: &mut UnixStream) -> io::Result<Option<ClientMessage>> {
+    match read_message::<ClientMessage>(stream) {
+        Ok(message) => Ok(Some(message)),
+        Err(error) if is_client_disconnect(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_client_disconnect(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+    )
+}
+
+fn send_hello_response(client: &ClientHandle, protocol_version: u16) -> bool {
+    if protocol_version != PROTOCOL_VERSION {
+        let _ = client.sender.send(ServerMessage::Error {
+            message: format!(
+                "client protocol version {protocol_version} is incompatible with server version {PROTOCOL_VERSION}; restart mult clients"
+            ),
+        });
+        return false;
+    }
+
+    let _ = client.sender.send(ServerMessage::Hello {
+        protocol_version: PROTOCOL_VERSION,
+    });
+    true
 }
 
 fn create_session(server: &SharedServer, spec: SessionCreateSpec) -> io::Result<SharedPane> {
@@ -392,16 +498,21 @@ fn create_session(server: &SharedServer, spec: SessionCreateSpec) -> io::Result<
         return Ok(existing);
     }
 
-    let pane = spawn_pane(session, spec.pane)?;
+    let spawned = spawn_pane(session, spec.pane)?;
     server
         .lock()
         .map_err(lock_error)?
         .sessions
-        .insert(session, Arc::clone(&pane));
-    Ok(pane)
+        .insert(session, Arc::clone(&spawned.pane));
+    spawn_reader(
+        spawned.reader,
+        Arc::clone(&spawned.pane),
+        Arc::clone(server),
+    );
+    Ok(spawned.pane)
 }
 
-fn spawn_reader(mut reader: Box<dyn Read + Send>, pane: SharedPane) {
+fn spawn_reader(mut reader: Box<dyn Read + Send>, pane: SharedPane, server: SharedServer) {
     thread::spawn(move || {
         let mut buffer = [0; 8192];
         let mut query_tail = Vec::new();
@@ -440,20 +551,61 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, pane: SharedPane) {
             }
         }
 
-        let (pane_id, clients) = match pane.lock() {
-            Ok(pane) => (pane.pane, pane.clients.clone()),
-            Err(_) => (PaneId(0), Vec::new()),
+        let Some((session, pane_id, clients, exit)) = pane_exit(&pane) else {
+            return;
         };
-        for client in clients {
-            let _ = client.sender.send(ServerMessage::PaneExited {
-                pane: pane_id,
-                exit: ExitInfo {
-                    code: 0,
-                    signal: None,
-                },
-            });
+        if let Ok(mut server) = server.lock() {
+            server.remove_session_if_same(session, &pane);
         }
+        broadcast_exit(pane_id, exit, clients);
     });
+}
+
+fn pane_exit(pane: &SharedPane) -> Option<(SessionId, PaneId, Vec<ClientHandle>, ExitInfo)> {
+    let (session, pane_id, clients, mut child) = {
+        let mut pane = pane.lock().ok()?;
+        let child = pane.child.take()?;
+        (pane.session, pane.pane, pane.clients.clone(), child)
+    };
+
+    let exit = match child.try_wait() {
+        Ok(Some(status)) => exit_info(status),
+        Ok(None) => match child.wait() {
+            Ok(status) => exit_info(status),
+            Err(error) => {
+                eprintln!("failed to wait for PTY child: {error}");
+                ExitInfo {
+                    code: 1,
+                    signal: None,
+                }
+            }
+        },
+        Err(error) => {
+            eprintln!("failed to poll PTY child exit: {error}");
+            ExitInfo {
+                code: 1,
+                signal: None,
+            }
+        }
+    };
+
+    Some((session, pane_id, clients, exit))
+}
+
+fn exit_info(status: ExitStatus) -> ExitInfo {
+    ExitInfo {
+        code: status.exit_code(),
+        signal: status.signal().map(ToOwned::to_owned),
+    }
+}
+
+fn broadcast_exit(pane: PaneId, exit: ExitInfo, clients: Vec<ClientHandle>) {
+    for client in clients {
+        let _ = client.sender.send(ServerMessage::PaneExited {
+            pane,
+            exit: exit.clone(),
+        });
+    }
 }
 
 fn broadcast_update(pane: PaneId, update: ScreenUpdate, clients: Vec<ClientHandle>) {
@@ -486,8 +638,7 @@ impl PaneState {
     }
 
     fn resize(&mut self, rows: u16, cols: u16) -> io::Result<()> {
-        let rows = rows.max(1);
-        let cols = cols.max(1);
+        let (rows, cols) = bounded_pty_dimensions(rows, cols);
         self.terminal.resize(rows, cols);
         self.master
             .lock()
@@ -500,6 +651,18 @@ impl PaneState {
             })
             .map_err(error_to_io)
     }
+
+    fn stop(&mut self) -> io::Result<()> {
+        if let Some(child) = &mut self.child {
+            child.kill()
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn bounded_pty_dimensions(rows: u16, cols: u16) -> (u16, u16) {
+    bounded_screen_dimensions(rows.max(1), cols.max(1))
 }
 
 fn write_pty_input(writer: &SharedPtyWriter, bytes: &[u8]) -> io::Result<()> {
@@ -608,4 +771,138 @@ fn lock_error<T>(_: std::sync::PoisonError<T>) -> io::Error {
 
 fn error_to_io(error: anyhow::Error) -> io::Error {
     io::Error::other(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        os::unix::fs::PermissionsExt,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    use super::*;
+
+    #[test]
+    fn exit_info_preserves_child_exit_code() {
+        let info = exit_info(ExitStatus::with_exit_code(7));
+
+        assert_eq!(info.code, 7);
+        assert_eq!(info.signal, None);
+    }
+
+    #[test]
+    fn exit_info_preserves_child_signal() {
+        let info = exit_info(ExitStatus::with_signal("SIGTERM"));
+
+        assert_eq!(info.code, 1);
+        assert_eq!(info.signal.as_deref(), Some("SIGTERM"));
+    }
+
+    #[test]
+    fn restrict_socket_permissions_sets_user_only_mode() {
+        let path = unique_socket_path();
+        let _listener = UnixListener::bind(&path).expect("bind test socket");
+
+        restrict_socket_permissions(&path).expect("restrict socket permissions");
+
+        let mode = fs::metadata(&path)
+            .expect("socket metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        fs::remove_file(&path).expect("remove test socket");
+    }
+
+    #[test]
+    fn server_rejects_incompatible_client_protocol_version() {
+        let (mut client_stream, server_stream) = UnixStream::pair().expect("create socket pair");
+        client_stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set read timeout");
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let server_thread = thread::spawn(move || handle_client(server_stream, server));
+
+        write_message(
+            &mut client_stream,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION + 1,
+            },
+        )
+        .expect("write incompatible hello");
+
+        let message: ServerMessage = read_message(&mut client_stream).expect("read error");
+        assert!(
+            matches!(message, ServerMessage::Error { message } if message.contains("incompatible"))
+        );
+        server_thread
+            .join()
+            .expect("server thread should not panic")
+            .expect("server handles incompatible hello");
+    }
+
+    #[test]
+    fn server_rejects_non_hello_first_message() {
+        let (mut client_stream, server_stream) = UnixStream::pair().expect("create socket pair");
+        client_stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set read timeout");
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let server_thread = thread::spawn(move || handle_client(server_stream, server));
+
+        write_message(&mut client_stream, &ClientMessage::ListSessions)
+            .expect("write non-hello message");
+
+        let message: ServerMessage = read_message(&mut client_stream).expect("read error");
+        assert!(
+            matches!(message, ServerMessage::Error { message } if message.contains("expected protocol hello"))
+        );
+        server_thread
+            .join()
+            .expect("server thread should not panic")
+            .expect("server rejects non-hello first message");
+    }
+
+    #[test]
+    fn pty_dimensions_are_bounded_for_server_allocations() {
+        let (rows, cols) = bounded_pty_dimensions(u16::MAX, u16::MAX);
+
+        assert!(usize::from(rows) * usize::from(cols) <= mult_protocol::MAX_SCREEN_CELLS);
+        assert!(rows > 0);
+        assert!(cols > 0);
+    }
+
+    #[test]
+    fn bind_socket_path_refuses_to_remove_existing_non_socket_path() {
+        let path = unique_socket_path();
+        fs::write(&path, "do not remove").expect("write collision file");
+
+        let error = bind_socket_path(&path).expect_err("refuse non-socket collision");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(&path).expect("collision file remains"),
+            "do not remove"
+        );
+        fs::remove_file(&path).expect("remove collision file");
+    }
+
+    #[test]
+    fn bind_socket_path_removes_stale_socket_file() {
+        let path = unique_socket_path();
+        let listener = UnixListener::bind(&path).expect("bind stale socket");
+        drop(listener);
+
+        bind_socket_path(&path).expect("remove stale socket");
+
+        assert!(!path.exists());
+    }
+
+    fn unique_socket_path() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        env::temp_dir().join(format!("mult-server-test-{unique}.sock"))
+    }
 }

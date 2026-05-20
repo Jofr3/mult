@@ -187,16 +187,18 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
     state.select(selected);
 
     let focused = focus_is_active(app, FocusMode::Sidebar);
+    let style = pane_style(focused, palette);
+    frame.render_widget(Block::default().style(style), area);
+
     let list = List::new(items)
-        .block(Block::default().style(pane_style(focused, palette)))
-        .style(pane_style(focused, palette))
+        .style(style)
         .highlight_style(
             Style::default()
                 .bg(palette.highlight_med)
                 .fg(palette.text)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol(" ");
 
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -325,7 +327,7 @@ fn workspace_details(app: &App, workspace_id: WorkspaceId, palette: Palette) -> 
     let rows = workspace.chats.len().max(workspace.terminals.len());
     if rows == 0 {
         lines.push(Line::from(
-            "No chats or terminals. Press `c` or `t` to add one.",
+            "No chats or terminals. Press `n a`, `n t`, or `n c` to add one.",
         ));
         return lines;
     }
@@ -401,7 +403,7 @@ fn chat_details(
                 "Pi agent is {}; waiting for output.",
                 chat.status.label()
             )),
-            Line::from("Press `i` to enter input mode, or `x` to stop."),
+            Line::from("Press `i` to enter input mode."),
         ];
     }
 
@@ -445,12 +447,13 @@ fn terminal_details(
 
     if app.terminal_output_is_blank(terminal_id) {
         let mut lines = vec![match terminal.status {
-            TerminalStatus::Running => Line::from("Terminal is running; waiting for output."),
-            TerminalStatus::Stopped => Line::from("Terminal is stopped. Press `s` to start it."),
+            TerminalStatus::Running => {
+                Line::from("Terminal is running; waiting for output. Press `i` to focus PTY input.")
+            }
+            TerminalStatus::Stopped => {
+                Line::from("Terminal is stopped. Press `i` to start and enter input mode.")
+            }
         }];
-        lines.push(Line::from(
-            "Press `i` to focus PTY input after start, or `x` to stop a running PTY.",
-        ));
         if let TerminalLaunch::Command(command) = &terminal.launch {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
@@ -659,6 +662,51 @@ mod tests {
     }
 
     #[test]
+    fn empty_workspace_hint_matches_current_prefix_controls() {
+        let mut app = App::default();
+        app.project.workspaces[0].chats.clear();
+        app.project.workspaces[0].terminals.clear();
+        let workspace = app.project.workspaces[0].id;
+
+        let text = lines_text(workspace_details(&app, workspace, test_palette()));
+
+        assert!(text.contains("Press `n a`, `n t`, or `n c`"));
+        assert!(!text.contains("Press `c` or `t`"));
+    }
+
+    #[test]
+    fn blank_chat_hint_only_mentions_implemented_input_key() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        let chat = app.project.workspaces[0].chats[0].id;
+        app.project.workspaces[0].chats[0].status = ChatStatus::Waiting;
+
+        let text = lines_text(chat_details(&app, workspace, chat, 10, test_palette()));
+
+        assert!(text.contains("Press `i` to enter input mode."));
+        assert!(!text.contains("`x`"));
+    }
+
+    #[test]
+    fn blank_terminal_hint_only_mentions_implemented_start_key() {
+        let app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        let terminal = app.project.workspaces[0].terminals[0].id;
+
+        let text = lines_text(terminal_details(
+            &app,
+            workspace,
+            terminal,
+            10,
+            test_palette(),
+        ));
+
+        assert!(text.contains("Press `i` to start and enter input mode."));
+        assert!(!text.contains("Press `s`"));
+        assert!(!text.contains("`x`"));
+    }
+
+    #[test]
     fn terminal_output_does_not_wrap_styled_blank_rows() {
         let mut app = App::default();
         let nav_items = app.nav_items();
@@ -703,6 +751,23 @@ mod tests {
             );
         }
         text
+    }
+
+    fn lines_text(lines: Vec<Line<'_>>) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn test_palette() -> Palette {
+        Palette::from_colorscheme(&config::Config::default().colorscheme)
     }
 
     #[test]

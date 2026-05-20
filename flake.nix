@@ -31,10 +31,12 @@
         default = {
           type = "app";
           program = "${self.packages.${system}.default}/bin/mult";
+          meta.description = "Run the mult TUI client";
         };
         server = {
           type = "app";
           program = "${self.packages.${system}.default}/bin/mult-server";
+          meta.description = "Run the persistent mult PTY server";
         };
       });
 

@@ -5,9 +5,9 @@
 Socket path:
 
 - `$XDG_RUNTIME_DIR/mult.sock`
-- fallback: `/tmp/mult-$USER.sock`
+- fallback: `/tmp/mult-$UID.sock`, or `/tmp/mult-$USER.sock` if `UID` is unset; unsafe path characters in the env value are replaced with `_`
 
-The server removes a stale socket file when it starts. If a live server already owns the socket, a second server exits.
+The server removes a stale socket file when it starts, but refuses to remove an existing non-socket path. If a live server already owns the socket, a second server exits. The socket file is chmodded to `0600` after bind. Clients validate the socket protocol version on connect; after upgrading `mult`, restart `mult-server` if the client reports an incompatible protocol version.
 
 ## Recommended: systemd user service on NixOS
 

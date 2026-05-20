@@ -19,7 +19,7 @@ cargo run
 
 Installed `mult` clients autospawn `mult-server` if the socket is missing, but the recommended long-lived setup is a systemd user service; see `docs/DAEMON.md`.
 
-State is auto-saved to `$XDG_DATA_HOME/mult/state.json` or `~/.local/share/mult/state.json`. Override with `MULT_STATE_PATH=/path/to/state.json`. Chat transcripts, terminal definitions, and running/restorable chat-terminal status are persisted with workspace state; terminal scrollback remains in-memory.
+State is auto-saved to `$XDG_DATA_HOME/mult/state.json` or `~/.local/share/mult/state.json`. Override with `MULT_STATE_PATH=/path/to/state.json`. Saved state files are written with owner-only permissions. Chat transcripts, terminal definitions, and running/restorable chat-terminal status are persisted with workspace state; terminal scrollback remains in-memory.
 
 Configuration is loaded from `$XDG_CONFIG_HOME/mult/config.json` or `~/.config/mult/config.json`:
 

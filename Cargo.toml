@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace]
 members = ["crates/protocol"]
+default-members = [".", "crates/protocol"]
 
 [dependencies]
 anyhow = "1.0"

@@ -7,13 +7,13 @@ use crate::{
     agent::{AgentEvent, AgentMessageRole, AgentTarget},
     model::{
         ChatId, ChatMessage, ChatMessageRole, ChatStatus, ProjectState, TerminalId, TerminalStatus,
-        WorkspaceId, DEFAULT_AGENT_CHAT_TITLE,
+        WorkspaceId, DEFAULT_AGENT_CHAT_TITLE, RUNTIME_TERMINAL_ID_FLAG,
     },
 };
 
 pub use mult_protocol::{
-    Cursor, ScreenSnapshot, ScreenUpdate, TerminalCell, TerminalCellStyle, TerminalColor,
-    TerminalRenderLine, TerminalRenderSpan,
+    bounded_screen_dimensions, Cursor, ScreenSnapshot, ScreenUpdate, TerminalCell,
+    TerminalCellStyle, TerminalColor, TerminalRenderLine, TerminalRenderSpan,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +100,7 @@ struct TerminalScreen {
     cols: u16,
     cursor_row: usize,
     cursor_col: usize,
+    wrap_pending: bool,
     saved_cursor: Option<(usize, usize)>,
     current_style: TerminalCellStyle,
     scrollback: VecDeque<Vec<TerminalCell>>,
@@ -112,6 +113,7 @@ enum TerminalParser {
     Ground,
     Escape,
     Csi(String),
+    CsiIgnored,
     Osc {
         esc_seen: bool,
     },
@@ -119,6 +121,7 @@ enum TerminalParser {
 }
 
 const TERMINAL_MAX_SCROLLBACK_LINES: usize = 5_000;
+const TERMINAL_MAX_CSI_SEQUENCE_CHARS: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ChatBuffer {
@@ -147,15 +150,17 @@ impl Default for App {
 }
 
 pub fn chat_agent_terminal_id(chat: ChatId) -> TerminalId {
-    TerminalId(chat.0 | (1 << 63))
+    TerminalId(chat.0 | RUNTIME_TERMINAL_ID_FLAG)
 }
 
 pub fn chat_id_from_agent_terminal_id(terminal: TerminalId) -> Option<ChatId> {
-    ((terminal.0 & (1 << 63)) != 0).then_some(ChatId(terminal.0 & !(1 << 63)))
+    ((terminal.0 & RUNTIME_TERMINAL_ID_FLAG) != 0)
+        .then_some(ChatId(terminal.0 & !RUNTIME_TERMINAL_ID_FLAG))
 }
 
 impl App {
     pub fn new(mut project: ProjectState) -> Self {
+        let ids_normalized = project.normalize_next_ids();
         let titles_normalized = normalize_agent_chat_titles(&mut project);
         let chat_buffers = project
             .workspaces
@@ -174,7 +179,7 @@ impl App {
             terminal_snapshots: BTreeMap::new(),
             chat_buffers,
             should_quit: false,
-            dirty: titles_normalized,
+            dirty: ids_normalized || titles_normalized,
         };
         app.clamp_selection();
         app
@@ -449,15 +454,19 @@ impl App {
 
     pub fn mark_terminal_running(&mut self, terminal: TerminalId) {
         if let Some(terminal) = self.project.terminal_mut_by_id(terminal) {
-            terminal.status = TerminalStatus::Running;
-            self.dirty = true;
+            if terminal.status != TerminalStatus::Running {
+                terminal.status = TerminalStatus::Running;
+                self.dirty = true;
+            }
         }
     }
 
     pub fn mark_terminal_stopped(&mut self, terminal: TerminalId) {
         if let Some(terminal) = self.project.terminal_mut_by_id(terminal) {
-            terminal.status = TerminalStatus::Stopped;
-            self.dirty = true;
+            if terminal.status != TerminalStatus::Stopped {
+                terminal.status = TerminalStatus::Stopped;
+                self.dirty = true;
+            }
         }
     }
 
@@ -665,14 +674,18 @@ impl App {
             }
             AgentEvent::StatusChanged { target, status } => {
                 if let Some(chat) = self.project.chat_mut(target.workspace, target.chat) {
-                    chat.status = status;
-                    self.dirty = true;
+                    if chat.status != status {
+                        chat.status = status;
+                        self.dirty = true;
+                    }
                 }
             }
             AgentEvent::Error { target, message } => {
                 if let Some(chat) = self.project.chat_mut(target.workspace, target.chat) {
-                    chat.status = ChatStatus::Failed;
-                    self.dirty = true;
+                    if chat.status != ChatStatus::Failed {
+                        chat.status = ChatStatus::Failed;
+                        self.dirty = true;
+                    }
                 }
                 self.append_chat_message(target, ChatMessageRole::Error, message);
             }
@@ -764,8 +777,10 @@ impl App {
             .flat_map(|workspace| workspace.chats.iter_mut())
         {
             if chat_session.id == chat {
-                chat_session.status = status;
-                self.dirty = true;
+                if chat_session.status != status {
+                    chat_session.status = status;
+                    self.dirty = true;
+                }
                 return;
             }
         }
@@ -1067,9 +1082,18 @@ impl TerminalBuffer {
                 if ('@'..='~').contains(&ch) {
                     self.apply_csi(&sequence, ch);
                     TerminalParser::Ground
+                } else if sequence.len() >= TERMINAL_MAX_CSI_SEQUENCE_CHARS {
+                    TerminalParser::CsiIgnored
                 } else {
                     sequence.push(ch);
                     TerminalParser::Csi(sequence)
+                }
+            }
+            TerminalParser::CsiIgnored => {
+                if ('@'..='~').contains(&ch) {
+                    TerminalParser::Ground
+                } else {
+                    TerminalParser::CsiIgnored
                 }
             }
             TerminalParser::Osc { esc_seen } => match (esc_seen, ch) {
@@ -1197,13 +1221,13 @@ impl Default for TerminalScreen {
 
 impl TerminalScreen {
     fn new(rows: u16, cols: u16) -> Self {
-        let rows = rows.max(1);
-        let cols = cols.max(1);
+        let (rows, cols) = bounded_terminal_dimensions(rows, cols);
         Self {
             rows,
             cols,
             cursor_row: 0,
             cursor_col: 0,
+            wrap_pending: false,
             saved_cursor: None,
             current_style: TerminalCellStyle::default(),
             scrollback: VecDeque::new(),
@@ -1212,8 +1236,7 @@ impl TerminalScreen {
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
-        let rows = rows.max(1);
-        let cols = cols.max(1);
+        let (rows, cols) = bounded_terminal_dimensions(rows, cols);
         self.rows = rows;
         self.cols = cols;
         let row_len = usize::from(cols);
@@ -1239,7 +1262,10 @@ impl TerminalScreen {
         self.viewport_row_indices(scroll_offset)
             .filter_map(|row_index| {
                 let row = self.row_at(row_index)?;
-                let cursor_col = (cursor_row == Some(row_index)).then_some(self.cursor_col);
+                let cursor_col = (cursor_row == Some(row_index)).then_some(
+                    self.cursor_col
+                        .min(usize::from(self.cols).saturating_sub(1)),
+                );
                 Some(render_terminal_row(row, cursor_col))
             })
             .collect()
@@ -1249,7 +1275,9 @@ impl TerminalScreen {
         let scroll_offset = scroll_offset.min(self.max_scroll_offset());
         let cursor = (scroll_offset == 0).then_some(Cursor {
             row: self.cursor_row as u16,
-            col: self.cursor_col as u16,
+            col: self
+                .cursor_col
+                .min(usize::from(self.cols).saturating_sub(1)) as u16,
             visible: true,
         });
         let mut cells = Vec::with_capacity(usize::from(self.rows) * usize::from(self.cols));
@@ -1303,21 +1331,27 @@ impl TerminalScreen {
     }
 
     fn put_char(&mut self, ch: char) {
-        if self.cursor_col >= usize::from(self.cols) {
+        if self.wrap_pending {
             self.carriage_return();
             self.line_feed();
         }
+
         self.cells[self.cursor_row][self.cursor_col] = TerminalCell {
             ch,
             style: self.current_style,
         };
-        self.cursor_col += 1;
-        if self.cursor_col >= usize::from(self.cols) {
-            self.cursor_col = usize::from(self.cols).saturating_sub(1);
+
+        let last_col = usize::from(self.cols).saturating_sub(1);
+        if self.cursor_col >= last_col {
+            self.wrap_pending = true;
+        } else {
+            self.cursor_col += 1;
+            self.wrap_pending = false;
         }
     }
 
     fn line_feed(&mut self) {
+        self.wrap_pending = false;
         if self.cursor_row + 1 >= usize::from(self.rows) {
             self.scroll_up(1);
         } else {
@@ -1327,38 +1361,53 @@ impl TerminalScreen {
 
     fn carriage_return(&mut self) {
         self.cursor_col = 0;
+        self.wrap_pending = false;
     }
 
     fn tab(&mut self) {
+        self.wrap_pending = false;
         let next_tab = ((self.cursor_col / 8) + 1) * 8;
         self.cursor_col = next_tab.min(usize::from(self.cols).saturating_sub(1));
     }
 
     fn backspace(&mut self) {
+        self.wrap_pending = false;
         self.cursor_col = self.cursor_col.saturating_sub(1);
     }
 
     fn reverse_index(&mut self) {
+        self.wrap_pending = false;
         self.cursor_row = self.cursor_row.saturating_sub(1);
     }
 
     fn move_cursor_up(&mut self, count: usize) {
+        self.wrap_pending = false;
         self.cursor_row = self.cursor_row.saturating_sub(count);
     }
 
     fn move_cursor_down(&mut self, count: usize) {
-        self.cursor_row = (self.cursor_row + count).min(usize::from(self.rows).saturating_sub(1));
+        self.wrap_pending = false;
+        self.cursor_row = self
+            .cursor_row
+            .saturating_add(count)
+            .min(usize::from(self.rows).saturating_sub(1));
     }
 
     fn move_cursor_right(&mut self, count: usize) {
-        self.cursor_col = (self.cursor_col + count).min(usize::from(self.cols).saturating_sub(1));
+        self.wrap_pending = false;
+        self.cursor_col = self
+            .cursor_col
+            .saturating_add(count)
+            .min(usize::from(self.cols).saturating_sub(1));
     }
 
     fn move_cursor_left(&mut self, count: usize) {
+        self.wrap_pending = false;
         self.cursor_col = self.cursor_col.saturating_sub(count);
     }
 
     fn set_cursor_position(&mut self, row: usize, col: usize) {
+        self.wrap_pending = false;
         self.cursor_row = row
             .saturating_sub(1)
             .min(usize::from(self.rows).saturating_sub(1));
@@ -1368,18 +1417,21 @@ impl TerminalScreen {
     }
 
     fn set_cursor_row(&mut self, row: usize) {
+        self.wrap_pending = false;
         self.cursor_row = row
             .saturating_sub(1)
             .min(usize::from(self.rows).saturating_sub(1));
     }
 
     fn set_cursor_col(&mut self, col: usize) {
+        self.wrap_pending = false;
         self.cursor_col = col
             .saturating_sub(1)
             .min(usize::from(self.cols).saturating_sub(1));
     }
 
     fn erase_display(&mut self, mode: usize) {
+        self.wrap_pending = false;
         match mode {
             0 => {
                 self.erase_line_from_cursor();
@@ -1400,6 +1452,7 @@ impl TerminalScreen {
     }
 
     fn erase_line(&mut self, mode: usize) {
+        self.wrap_pending = false;
         match mode {
             0 => self.erase_line_from_cursor(),
             1 => self.erase_line_to_cursor(),
@@ -1409,7 +1462,7 @@ impl TerminalScreen {
     }
 
     fn scroll_up(&mut self, count: usize) {
-        for _ in 0..count.max(1) {
+        for _ in 0..self.visible_scroll_count(count) {
             if !self.cells.is_empty() {
                 let row = self.cells.remove(0);
                 self.push_scrollback(row);
@@ -1420,13 +1473,17 @@ impl TerminalScreen {
     }
 
     fn scroll_down(&mut self, count: usize) {
-        for _ in 0..count.max(1) {
+        for _ in 0..self.visible_scroll_count(count) {
             if !self.cells.is_empty() {
                 self.cells.pop();
                 self.cells
                     .insert(0, vec![TerminalCell::blank(); usize::from(self.cols)]);
             }
         }
+    }
+
+    fn visible_scroll_count(&self, count: usize) -> usize {
+        count.max(1).min(usize::from(self.rows))
     }
 
     fn save_cursor(&mut self) {
@@ -1437,6 +1494,7 @@ impl TerminalScreen {
         if let Some((row, col)) = self.saved_cursor {
             self.cursor_row = row;
             self.cursor_col = col;
+            self.wrap_pending = false;
             self.clamp_cursor();
         }
     }
@@ -1447,6 +1505,7 @@ impl TerminalScreen {
         }
         self.cursor_row = 0;
         self.cursor_col = 0;
+        self.wrap_pending = false;
     }
 
     fn clear_scrollback(&mut self) {
@@ -1472,7 +1531,10 @@ impl TerminalScreen {
     }
 
     fn erase_line_to_cursor(&mut self) {
-        for col in 0..=self.cursor_col {
+        let end = self
+            .cursor_col
+            .min(usize::from(self.cols).saturating_sub(1));
+        for col in 0..=end {
             self.cells[self.cursor_row][col] = TerminalCell::blank();
         }
     }
@@ -1529,7 +1591,12 @@ impl TerminalScreen {
         self.cursor_col = self
             .cursor_col
             .min(usize::from(self.cols).saturating_sub(1));
+        self.wrap_pending = false;
     }
+}
+
+fn bounded_terminal_dimensions(rows: u16, cols: u16) -> (u16, u16) {
+    bounded_screen_dimensions(rows.max(1), cols.max(1))
 }
 
 fn terminal_row_text(row: &[TerminalCell]) -> String {
@@ -1610,10 +1677,10 @@ fn ansi_color(index: usize, bright: bool) -> Option<TerminalColor> {
 
 fn extended_color(params: &[usize]) -> Option<(TerminalColor, usize)> {
     match params {
-        [2, red, green, blue, ..] => {
+        [2, red @ 0..=255, green @ 0..=255, blue @ 0..=255, ..] => {
             Some((TerminalColor::Rgb(*red as u8, *green as u8, *blue as u8), 4))
         }
-        [5, index, ..] => Some((xterm_256_color(*index), 2)),
+        [5, index @ 0..=255, ..] => Some((xterm_256_color(*index), 2)),
         _ => None,
     }
 }
@@ -1969,6 +2036,77 @@ mod tests {
     }
 
     #[test]
+    fn terminal_buffer_wraps_printable_text_at_right_edge() {
+        let mut app = App::default();
+        let terminal = TerminalId(107);
+        app.resize_terminal_buffer(terminal, 2, 3);
+
+        app.append_terminal_output(terminal, "abcd");
+
+        assert_eq!(
+            app.terminal_lines(terminal),
+            vec!["abc".to_string(), "d".to_string()]
+        );
+    }
+
+    #[test]
+    fn terminal_buffer_saturates_large_cursor_moves() {
+        let mut app = App::default();
+        let terminal = TerminalId(110);
+        app.resize_terminal_buffer(terminal, 1, 4);
+        let huge = usize::MAX.to_string();
+
+        app.append_terminal_output(terminal, &format!("a\x1b[{huge}Cz"));
+
+        assert_eq!(app.terminal_lines(terminal), vec!["a  z".to_string()]);
+    }
+
+    #[test]
+    fn terminal_buffer_clamps_large_scroll_counts_to_visible_rows() {
+        let mut app = App::default();
+        let terminal = TerminalId(111);
+        app.resize_terminal_buffer(terminal, 2, 4);
+
+        app.append_terminal_output(terminal, "a\r\nb\x1b[999999S");
+
+        assert_eq!(
+            app.terminal_lines(terminal),
+            vec!["".to_string(), "".to_string()]
+        );
+        assert_eq!(
+            app.terminal_buffers
+                .get(&terminal)
+                .expect("terminal buffer exists")
+                .screen
+                .scrollback
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn terminal_buffer_resize_clamps_huge_dimensions() {
+        let mut app = App::default();
+        let terminal = TerminalId(112);
+
+        app.resize_terminal_buffer(terminal, u16::MAX, u16::MAX);
+
+        let screen = &app
+            .terminal_buffers
+            .get(&terminal)
+            .expect("terminal buffer exists")
+            .screen;
+        assert!(
+            usize::from(screen.rows) * usize::from(screen.cols) <= mult_protocol::MAX_SCREEN_CELLS
+        );
+        assert_eq!(screen.cells.len(), usize::from(screen.rows));
+        assert!(screen
+            .cells
+            .iter()
+            .all(|row| row.len() == usize::from(screen.cols)));
+    }
+
+    #[test]
     fn terminal_buffer_scrolls_back_and_returns_to_bottom() {
         let mut app = App::default();
         let terminal = TerminalId(104);
@@ -2044,6 +2182,31 @@ mod tests {
     }
 
     #[test]
+    fn terminal_buffer_ignores_invalid_extended_sgr_colors() {
+        let mut app = App::default();
+        let terminal = TerminalId(108);
+        app.resize_terminal_buffer(terminal, 1, 16);
+
+        app.append_terminal_output(terminal, "\x1b[38;2;999;0;0mbad");
+
+        let lines = app.terminal_render_lines(terminal);
+        assert_eq!(lines[0].spans[0].text, "bad");
+        assert_eq!(lines[0].spans[0].style, TerminalCellStyle::default());
+    }
+
+    #[test]
+    fn terminal_buffer_ignores_oversized_csi_sequences() {
+        let mut app = App::default();
+        let terminal = TerminalId(109);
+        app.resize_terminal_buffer(terminal, 1, 16);
+        let long_params = "1".repeat(TERMINAL_MAX_CSI_SEQUENCE_CHARS + 1);
+
+        app.append_terminal_output(terminal, &format!("\x1b[{long_params}mOK"));
+
+        assert_eq!(app.terminal_lines(terminal), vec!["OK".to_string()]);
+    }
+
+    #[test]
     fn terminal_render_lines_preserve_styled_trailing_spaces() {
         let mut app = App::default();
         let terminal = TerminalId(102);
@@ -2094,6 +2257,23 @@ mod tests {
             app.project.workspaces[0].chats[0].name,
             DEFAULT_AGENT_CHAT_TITLE
         );
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn app_repairs_low_allocators_on_load() {
+        let state = ProjectState {
+            next_workspace_id: 1,
+            next_chat_id: 1,
+            next_terminal_id: 1,
+            ..ProjectState::default()
+        };
+
+        let app = App::new(state);
+
+        assert_eq!(app.project.next_workspace_id, 3);
+        assert_eq!(app.project.next_chat_id, 4);
+        assert_eq!(app.project.next_terminal_id, 3);
         assert!(app.is_dirty());
     }
 
@@ -2191,6 +2371,20 @@ mod tests {
         }
         assert!(app.project.workspace(workspace).is_none());
         assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn unchanged_status_updates_do_not_mark_dirty() {
+        let mut app = App::default();
+        let terminal = app.project.workspaces[0].terminals[0].id;
+        let chat = app.project.workspaces[0].chats[0].id;
+        let chat_status = app.project.workspaces[0].chats[0].status;
+        app.mark_clean();
+
+        app.mark_terminal_stopped(terminal);
+        app.mark_chat_status_by_id(chat, chat_status);
+
+        assert!(!app.is_dirty());
     }
 
     #[test]

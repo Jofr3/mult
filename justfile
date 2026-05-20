@@ -10,11 +10,11 @@ server:
 
 # Fast feedback during development.
 check:
-    cargo check
+    cargo check --workspace
 
 # Run unit tests.
 test:
-    cargo test
+    cargo test --workspace
 
 # Format Rust sources and Nix files when nixpkgs-fmt is available.
 fmt:
@@ -23,7 +23,11 @@ fmt:
 
 # Lint with warnings treated as errors.
 lint:
-    cargo clippy --all-targets --all-features -- -D warnings
+    cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+# Run dependency advisory checks when cargo-audit is installed.
+audit:
+    if command -v cargo-audit >/dev/null; then cargo audit; else echo "cargo-audit not installed; skipping"; fi
 
 # Re-run cargo check whenever files change.
 watch:

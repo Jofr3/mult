@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    env, io,
+    env, fs, io,
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -13,8 +13,8 @@ use std::{
 };
 
 use mult_protocol::{
-    read_message, write_message, ClientMessage, LaunchSpec, PaneId, ScreenSnapshot, ScreenUpdate,
-    ServerMessage, SessionId, DEFAULT_SOCKET_NAME, PROTOCOL_VERSION,
+    default_socket_path, read_message, write_message, ClientMessage, LaunchSpec, PaneId,
+    ScreenSnapshot, ScreenUpdate, ServerMessage, SessionId, PROTOCOL_VERSION,
 };
 
 use crate::model::TerminalId;
@@ -71,6 +71,8 @@ pub struct PtyRuntime {
     pane_to_terminal: HashMap<PaneId, TerminalId>,
     pending_events: Vec<PtyEvent>,
 }
+
+const SERVER_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct ServerConnection {
     writer: Arc<Mutex<UnixStream>>,
@@ -172,9 +174,12 @@ impl PtyRuntime {
     }
 
     pub fn stop(&mut self, terminal: TerminalId) -> io::Result<bool> {
-        let Some(pane) = self.terminal_to_pane.remove(&terminal) else {
+        let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
             return Ok(false);
         };
+
+        self.send(ClientMessage::Stop { pane })?;
+        self.terminal_to_pane.remove(&terminal);
         self.pane_to_terminal.remove(&pane);
         Ok(true)
     }
@@ -264,7 +269,7 @@ impl PtyRuntime {
     }
 
     fn connect(&mut self) -> io::Result<()> {
-        let stream = connect_or_spawn_server()?;
+        let mut stream = connect_or_spawn_server()?;
         stream.set_nonblocking(false)?;
         let mut writer_stream = stream.try_clone()?;
         write_message(
@@ -273,6 +278,7 @@ impl PtyRuntime {
                 protocol_version: PROTOCOL_VERSION,
             },
         )?;
+        validate_server_hello_with_timeout(&mut stream, SERVER_HELLO_TIMEOUT)?;
 
         let writer = Arc::new(Mutex::new(writer_stream));
         let (sender, receiver) = mpsc::channel();
@@ -356,11 +362,57 @@ impl PtyExit {
     }
 }
 
+fn validate_server_hello_with_timeout(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> io::Result<()> {
+    stream.set_read_timeout(Some(timeout))?;
+    let result = validate_server_hello(stream);
+    let reset_result = stream.set_read_timeout(None);
+
+    if let Err(error) = result {
+        return Err(map_server_hello_error(error, timeout));
+    }
+
+    reset_result
+}
+
+fn map_server_hello_error(error: io::Error, timeout: Duration) -> io::Error {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    ) {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("timed out after {timeout:?} waiting for mult-server hello"),
+        )
+    } else {
+        error
+    }
+}
+
+fn validate_server_hello(reader: &mut impl io::Read) -> io::Result<()> {
+    match read_message::<ServerMessage>(reader)? {
+        ServerMessage::Hello { protocol_version } if protocol_version == PROTOCOL_VERSION => Ok(()),
+        ServerMessage::Hello { protocol_version } => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "mult-server protocol version {protocol_version} is incompatible with client version {PROTOCOL_VERSION}; restart mult-server"
+            ),
+        )),
+        ServerMessage::Error { message } => Err(io::Error::new(io::ErrorKind::InvalidData, message)),
+        message => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected mult-server hello response: {message:?}"),
+        )),
+    }
+}
+
 fn connect_or_spawn_server() -> io::Result<UnixStream> {
-    let path = socket_path();
+    let path = default_socket_path();
     match UnixStream::connect(&path) {
         Ok(stream) => Ok(stream),
-        Err(error) if should_autospawn_server(&error) => {
+        Err(error) if should_autospawn_server(&error, &path) => {
             spawn_server()?;
             wait_for_server(&path).map_err(|wait_error| {
                 io::Error::new(
@@ -375,12 +427,26 @@ fn connect_or_spawn_server() -> io::Result<UnixStream> {
     }
 }
 
-fn should_autospawn_server(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-    ) && autospawn_enabled()
+fn should_autospawn_server(error: &io::Error, path: &Path) -> bool {
+    socket_connect_error_allows_autospawn(error, path)
+        && autospawn_enabled()
         && server_executable().is_some()
+}
+
+fn socket_connect_error_allows_autospawn(error: &io::Error, path: &Path) -> bool {
+    match error.kind() {
+        io::ErrorKind::NotFound => true,
+        io::ErrorKind::ConnectionRefused => path_is_socket(path),
+        _ => false,
+    }
+}
+
+fn path_is_socket(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_socket())
+        .unwrap_or(false)
 }
 
 fn autospawn_enabled() -> bool {
@@ -449,17 +515,6 @@ fn is_disconnected_error(error: &io::Error) -> bool {
     )
 }
 
-fn socket_path() -> PathBuf {
-    if let Some(runtime_dir) = env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join(DEFAULT_SOCKET_NAME);
-    }
-
-    let user = env::var("UID")
-        .or_else(|_| env::var("USER"))
-        .unwrap_or_else(|_| "unknown".to_string());
-    PathBuf::from(format!("/tmp/mult-{user}.sock"))
-}
-
 fn session_for_terminal(terminal: TerminalId) -> SessionId {
     SessionId(terminal.0)
 }
@@ -510,6 +565,11 @@ fn default_shell() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        os::unix::net::UnixListener,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::*;
 
     #[test]
@@ -544,5 +604,120 @@ mod tests {
         };
 
         assert_eq!(exit.label(), "exit 2");
+    }
+
+    #[test]
+    fn validate_server_hello_rejects_incompatible_protocol_version() {
+        let mut bytes = Vec::new();
+        write_message(
+            &mut bytes,
+            &ServerMessage::Hello {
+                protocol_version: PROTOCOL_VERSION + 1,
+            },
+        )
+        .expect("write hello");
+
+        let error = validate_server_hello(&mut bytes.as_slice()).expect_err("reject version");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("restart mult-server"));
+    }
+
+    #[test]
+    fn validate_server_hello_times_out_when_peer_is_silent() {
+        let (mut client, _server) = UnixStream::pair().expect("create socket pair");
+
+        let error = validate_server_hello_with_timeout(&mut client, Duration::from_millis(10))
+            .expect_err("silent peer should time out");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("waiting for mult-server hello"));
+    }
+
+    #[test]
+    fn pty_stop_sends_stop_message_and_clears_local_attachment() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let terminal = TerminalId(7);
+        let pane = PaneId(7);
+        let mut runtime = PtyRuntime {
+            connection: Some(ServerConnection {
+                writer: Arc::new(Mutex::new(client_stream)),
+                receiver,
+            }),
+            terminal_to_pane: HashMap::from([(terminal, pane)]),
+            pane_to_terminal: HashMap::from([(pane, terminal)]),
+            pending_events: Vec::new(),
+        };
+
+        assert!(runtime.stop(terminal).expect("stop terminal"));
+
+        let message: ClientMessage = read_message(&mut server_stream).expect("read stop message");
+        assert_eq!(message, ClientMessage::Stop { pane });
+        assert!(!runtime.is_running(terminal));
+        assert!(!runtime.pane_to_terminal.contains_key(&pane));
+    }
+
+    #[test]
+    fn pty_stop_keeps_local_attachment_when_send_fails() {
+        let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let terminal = TerminalId(7);
+        let pane = PaneId(7);
+        let writer = Arc::new(Mutex::new(client_stream));
+        let poison_writer = writer.clone();
+        let _ = thread::spawn(move || {
+            let _guard = poison_writer.lock().expect("lock writer");
+            panic!("poison writer lock");
+        })
+        .join();
+        let mut runtime = PtyRuntime {
+            connection: Some(ServerConnection { writer, receiver }),
+            terminal_to_pane: HashMap::from([(terminal, pane)]),
+            pane_to_terminal: HashMap::from([(pane, terminal)]),
+            pending_events: Vec::new(),
+        };
+
+        let error = runtime.stop(terminal).expect_err("stop should fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(runtime.is_running(terminal));
+        assert_eq!(runtime.pane_to_terminal.get(&pane), Some(&terminal));
+    }
+
+    #[test]
+    fn autospawn_is_allowed_for_missing_or_stale_socket_paths_only() {
+        let missing = unique_socket_path();
+        let missing_error = io::Error::new(io::ErrorKind::NotFound, "missing");
+        assert!(socket_connect_error_allows_autospawn(
+            &missing_error,
+            &missing
+        ));
+
+        let stale = unique_socket_path();
+        let listener = UnixListener::bind(&stale).expect("bind stale socket");
+        drop(listener);
+        let refused_error = io::Error::new(io::ErrorKind::ConnectionRefused, "refused");
+        assert!(socket_connect_error_allows_autospawn(
+            &refused_error,
+            &stale
+        ));
+        fs::remove_file(&stale).expect("remove stale socket");
+
+        let regular_file = unique_socket_path();
+        fs::write(&regular_file, "not a socket").expect("write collision file");
+        assert!(!socket_connect_error_allows_autospawn(
+            &refused_error,
+            &regular_file
+        ));
+        fs::remove_file(&regular_file).expect("remove collision file");
+    }
+
+    fn unique_socket_path() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        env::temp_dir().join(format!("mult-pty-test-{unique}.sock"))
     }
 }

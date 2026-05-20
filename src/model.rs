@@ -1,9 +1,14 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 use serde::{Deserialize, Serialize};
 
 pub const STATE_VERSION: u32 = 1;
 pub const DEFAULT_AGENT_CHAT_TITLE: &str = "agent";
+pub const RUNTIME_TERMINAL_ID_FLAG: u64 = 1 << 63;
+pub const MAX_DURABLE_SESSION_ID: u64 = RUNTIME_TERMINAL_ID_FLAG - 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectState {
@@ -121,6 +126,87 @@ impl Default for ProjectState {
 }
 
 impl ProjectState {
+    pub fn normalize_next_ids(&mut self) -> bool {
+        let mut changed = false;
+        changed |= self.normalize_existing_ids();
+
+        let required_workspace_id = next_unbounded_after(
+            self.workspaces
+                .iter()
+                .map(|workspace| workspace.id.0)
+                .collect(),
+        );
+        let required_chat_id = next_durable_after(
+            self.workspaces
+                .iter()
+                .flat_map(|workspace| workspace.chats.iter().map(|chat| chat.id.0))
+                .collect(),
+        );
+        let required_terminal_id = next_durable_after(
+            self.workspaces
+                .iter()
+                .flat_map(|workspace| workspace.terminals.iter().map(|terminal| terminal.id.0))
+                .collect(),
+        );
+
+        if self.next_workspace_id < required_workspace_id || self.next_workspace_id == 0 {
+            self.next_workspace_id = required_workspace_id;
+            changed = true;
+        }
+        if self.next_chat_id < required_chat_id || !is_valid_durable_session_id(self.next_chat_id) {
+            self.next_chat_id = required_chat_id;
+            changed = true;
+        }
+        if self.next_terminal_id < required_terminal_id
+            || !is_valid_durable_session_id(self.next_terminal_id)
+        {
+            self.next_terminal_id = required_terminal_id;
+            changed = true;
+        }
+
+        changed
+    }
+
+    fn normalize_existing_ids(&mut self) -> bool {
+        let mut changed = false;
+        let mut workspaces = BTreeSet::new();
+        let mut next_workspace = 1;
+        let mut chats = BTreeSet::new();
+        let mut next_chat = 1;
+        let mut terminals = BTreeSet::new();
+        let mut next_terminal = 1;
+
+        for workspace in &mut self.workspaces {
+            if workspace.id.0 == 0 || !workspaces.insert(workspace.id.0) {
+                workspace.id =
+                    WorkspaceId(take_next_unbounded_id(&workspaces, &mut next_workspace));
+                workspaces.insert(workspace.id.0);
+                changed = true;
+            }
+            next_workspace = next_workspace.max(workspace.id.0.saturating_add(1));
+
+            for chat in &mut workspace.chats {
+                if !is_valid_durable_session_id(chat.id.0) || !chats.insert(chat.id.0) {
+                    chat.id = ChatId(take_next_durable_id(&chats, &mut next_chat));
+                    chats.insert(chat.id.0);
+                    changed = true;
+                }
+                next_chat = next_chat.max(chat.id.0.saturating_add(1));
+            }
+
+            for terminal in &mut workspace.terminals {
+                if !is_valid_durable_session_id(terminal.id.0) || !terminals.insert(terminal.id.0) {
+                    terminal.id = TerminalId(take_next_durable_id(&terminals, &mut next_terminal));
+                    terminals.insert(terminal.id.0);
+                    changed = true;
+                }
+                next_terminal = next_terminal.max(terminal.id.0.saturating_add(1));
+            }
+        }
+
+        changed
+    }
+
     pub fn add_workspace(&mut self, name: String, cwd: Option<PathBuf>) -> WorkspaceId {
         let id = self.allocate_workspace_id();
         self.workspaces.push(Workspace {
@@ -331,15 +417,60 @@ impl ProjectState {
 
     fn allocate_chat_id(&mut self) -> ChatId {
         let id = ChatId(self.next_chat_id);
-        self.next_chat_id += 1;
+        self.next_chat_id = next_durable_candidate(self.next_chat_id.saturating_add(1));
         id
     }
 
     fn allocate_terminal_id(&mut self) -> TerminalId {
         let id = TerminalId(self.next_terminal_id);
-        self.next_terminal_id += 1;
+        self.next_terminal_id = next_durable_candidate(self.next_terminal_id.saturating_add(1));
         id
     }
+}
+
+fn is_valid_durable_session_id(id: u64) -> bool {
+    (1..=MAX_DURABLE_SESSION_ID).contains(&id)
+}
+
+fn next_durable_candidate(candidate: u64) -> u64 {
+    if is_valid_durable_session_id(candidate) {
+        candidate
+    } else {
+        1
+    }
+}
+
+fn take_next_unbounded_id(used: &BTreeSet<u64>, next: &mut u64) -> u64 {
+    while *next == 0 || used.contains(next) {
+        *next = next.saturating_add(1).max(1);
+    }
+    let id = *next;
+    *next = next.saturating_add(1);
+    id
+}
+
+fn take_next_durable_id(used: &BTreeSet<u64>, next: &mut u64) -> u64 {
+    *next = next_durable_candidate(*next);
+    while used.contains(next) {
+        *next = next_durable_candidate(next.saturating_add(1));
+    }
+    let id = *next;
+    *next = next_durable_candidate(next.saturating_add(1));
+    id
+}
+
+fn next_unbounded_after(used: BTreeSet<u64>) -> u64 {
+    used.into_iter().max().unwrap_or(0).saturating_add(1).max(1)
+}
+
+fn next_durable_after(used: BTreeSet<u64>) -> u64 {
+    next_durable_candidate(
+        used.into_iter()
+            .filter(|id| is_valid_durable_session_id(*id))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1),
+    )
 }
 
 impl ChatStatus {
@@ -434,6 +565,71 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].text, "hello world");
         assert_eq!(messages[1].role, ChatMessageRole::System);
+    }
+
+    #[test]
+    fn normalize_next_ids_repairs_low_allocators() {
+        let mut state = ProjectState {
+            next_workspace_id: 1,
+            next_chat_id: 1,
+            next_terminal_id: 1,
+            ..ProjectState::default()
+        };
+
+        assert!(state.normalize_next_ids());
+
+        assert_eq!(state.next_workspace_id, 3);
+        assert_eq!(state.next_chat_id, 4);
+        assert_eq!(state.next_terminal_id, 3);
+        assert_eq!(state.add_workspace("new".to_string(), None), WorkspaceId(3));
+    }
+
+    #[test]
+    fn normalize_next_ids_keeps_higher_allocators() {
+        let mut state = ProjectState {
+            next_workspace_id: 99,
+            next_chat_id: 99,
+            next_terminal_id: 99,
+            ..ProjectState::default()
+        };
+
+        assert!(!state.normalize_next_ids());
+
+        assert_eq!(state.next_workspace_id, 99);
+        assert_eq!(state.next_chat_id, 99);
+        assert_eq!(state.next_terminal_id, 99);
+    }
+
+    #[test]
+    fn normalize_next_ids_repairs_duplicate_and_reserved_session_ids() {
+        let mut state = ProjectState::default();
+        state.workspaces[0].chats[1].id = state.workspaces[0].chats[0].id;
+        state.workspaces[1].chats[0].id = ChatId(RUNTIME_TERMINAL_ID_FLAG | 7);
+        state.workspaces[1].terminals[0].id = state.workspaces[0].terminals[0].id;
+        state.next_chat_id = RUNTIME_TERMINAL_ID_FLAG;
+        state.next_terminal_id = RUNTIME_TERMINAL_ID_FLAG;
+
+        assert!(state.normalize_next_ids());
+
+        let chat_ids = state
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.chats.iter().map(|chat| chat.id.0))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(chat_ids.len(), 3);
+        assert!(chat_ids.iter().all(|id| is_valid_durable_session_id(*id)));
+        assert!(is_valid_durable_session_id(state.next_chat_id));
+
+        let terminal_ids = state
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.terminals.iter().map(|terminal| terminal.id.0))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(terminal_ids.len(), 2);
+        assert!(terminal_ids
+            .iter()
+            .all(|id| is_valid_durable_session_id(*id)));
+        assert!(is_valid_durable_session_id(state.next_terminal_id));
     }
 
     #[test]
