@@ -5,9 +5,13 @@ edition = "2021"
 description = "A terminal UI prototype for multiplexing AI agent workspaces, chats, and terminals."
 license = "MIT OR Apache-2.0"
 
+[workspace]
+members = ["crates/protocol"]
+
 [dependencies]
 anyhow = "1.0"
 crossterm = "0.28"
+mult-protocol = { path = "crates/protocol" }
 portable-pty = "0.9"
 ratatui = "0.29"
 serde = { version = "1.0", features = ["derive"] }

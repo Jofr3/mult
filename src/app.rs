@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     path::{Path, PathBuf},
 };
 
@@ -11,6 +11,11 @@ use crate::{
     },
 };
 
+pub use mult_protocol::{
+    Cursor, ScreenSnapshot, TerminalCell, TerminalCellStyle, TerminalColor, TerminalRenderLine,
+    TerminalRenderSpan,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct App {
     pub project: ProjectState,
@@ -19,6 +24,7 @@ pub struct App {
     pub prompt: Option<Prompt>,
     pub focus: FocusMode,
     pub terminal_buffers: BTreeMap<TerminalId, TerminalBuffer>,
+    pub terminal_snapshots: BTreeMap<TerminalId, ScreenSnapshot>,
     pub chat_buffers: BTreeMap<ChatId, ChatBuffer>,
     pub should_quit: bool,
     dirty: bool,
@@ -85,6 +91,7 @@ pub enum DeleteTarget {
 pub struct TerminalBuffer {
     screen: TerminalScreen,
     parser: TerminalParser,
+    scroll_offset: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +102,7 @@ struct TerminalScreen {
     cursor_col: usize,
     saved_cursor: Option<(usize, usize)>,
     current_style: TerminalCellStyle,
+    scrollback: VecDeque<Vec<TerminalCell>>,
     cells: Vec<Vec<TerminalCell>>,
 }
 
@@ -110,52 +118,7 @@ enum TerminalParser {
     IgnoreOne,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TerminalCellStyle {
-    pub fg: Option<TerminalColor>,
-    pub bg: Option<TerminalColor>,
-    pub bold: bool,
-    pub italic: bool,
-    pub underlined: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TerminalColor {
-    Black,
-    Red,
-    Green,
-    Yellow,
-    Blue,
-    Magenta,
-    Cyan,
-    White,
-    BrightBlack,
-    BrightRed,
-    BrightGreen,
-    BrightYellow,
-    BrightBlue,
-    BrightMagenta,
-    BrightCyan,
-    BrightWhite,
-    Rgb(u8, u8, u8),
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct TerminalCell {
-    ch: char,
-    style: TerminalCellStyle,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalRenderLine {
-    pub spans: Vec<TerminalRenderSpan>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalRenderSpan {
-    pub text: String,
-    pub style: TerminalCellStyle,
-}
+const TERMINAL_MAX_SCROLLBACK_LINES: usize = 5_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ChatBuffer {
@@ -208,6 +171,7 @@ impl App {
             prompt: None,
             focus: FocusMode::Sidebar,
             terminal_buffers: BTreeMap::new(),
+            terminal_snapshots: BTreeMap::new(),
             chat_buffers,
             should_quit: false,
             dirty: titles_normalized,
@@ -312,7 +276,6 @@ impl App {
         }
     }
 
-    #[cfg(test)]
     pub fn nav_items(&self) -> Vec<NavItem> {
         let mut items = Vec::with_capacity(self.nav_len());
 
@@ -434,6 +397,7 @@ impl App {
                     );
                     for terminal in &runtime_terminals {
                         self.terminal_buffers.remove(terminal);
+                        self.terminal_snapshots.remove(terminal);
                     }
                     for chat in workspace.chats {
                         self.chat_buffers.remove(&chat.id);
@@ -446,6 +410,7 @@ impl App {
                     let terminal = chat_agent_terminal_id(chat);
                     runtime_terminals.push(terminal);
                     self.terminal_buffers.remove(&terminal);
+                    self.terminal_snapshots.remove(&terminal);
                     self.chat_buffers.remove(&chat);
                     self.dirty = true;
                 }
@@ -457,6 +422,7 @@ impl App {
                 if self.project.remove_terminal(workspace, terminal).is_some() {
                     runtime_terminals.push(terminal);
                     self.terminal_buffers.remove(&terminal);
+                    self.terminal_snapshots.remove(&terminal);
                     self.dirty = true;
                 }
             }
@@ -496,10 +462,15 @@ impl App {
     }
 
     pub fn append_terminal_output(&mut self, terminal: TerminalId, text: &str) {
+        self.terminal_snapshots.remove(&terminal);
         self.terminal_buffers
             .entry(terminal)
             .or_default()
             .append(text);
+    }
+
+    pub fn set_terminal_snapshot(&mut self, terminal: TerminalId, snapshot: ScreenSnapshot) {
+        self.terminal_snapshots.insert(terminal, snapshot);
     }
 
     pub fn append_terminal_system_line(
@@ -507,6 +478,7 @@ impl App {
         terminal: TerminalId,
         message: impl Into<String>,
     ) {
+        self.terminal_snapshots.remove(&terminal);
         self.terminal_buffers
             .entry(terminal)
             .or_default()
@@ -521,10 +493,91 @@ impl App {
     }
 
     pub fn terminal_render_lines(&self, terminal: TerminalId) -> Vec<TerminalRenderLine> {
-        self.terminal_buffers
+        self.terminal_snapshots
             .get(&terminal)
-            .map(TerminalBuffer::render_lines)
+            .map(ScreenSnapshot::render_lines)
+            .or_else(|| {
+                self.terminal_buffers
+                    .get(&terminal)
+                    .map(TerminalBuffer::render_lines)
+            })
             .unwrap_or_default()
+    }
+
+    pub fn terminal_output_is_blank(&self, terminal: TerminalId) -> bool {
+        self.terminal_snapshots
+            .get(&terminal)
+            .map(ScreenSnapshot::is_blank)
+            .or_else(|| {
+                self.terminal_buffers
+                    .get(&terminal)
+                    .map(TerminalBuffer::is_blank)
+            })
+            .unwrap_or(true)
+    }
+
+    pub fn selected_output_terminal_id(&self) -> Option<TerminalId> {
+        match self.selected_item()? {
+            NavItem::Chat { chat, .. } => Some(chat_agent_terminal_id(chat)),
+            NavItem::Terminal { terminal, .. } => Some(terminal),
+            NavItem::Workspace(_) => None,
+        }
+    }
+
+    pub fn scroll_selected_output_up(&mut self, rows: usize) -> bool {
+        let Some(terminal) = self.selected_output_terminal_id() else {
+            return false;
+        };
+        self.scroll_terminal_output_up(terminal, rows)
+    }
+
+    pub fn scroll_selected_output_down(&mut self, rows: usize) -> bool {
+        let Some(terminal) = self.selected_output_terminal_id() else {
+            return false;
+        };
+        self.scroll_terminal_output_down(terminal, rows)
+    }
+
+    pub fn scroll_selected_output_to_top(&mut self) -> bool {
+        let Some(terminal) = self.selected_output_terminal_id() else {
+            return false;
+        };
+        self.scroll_terminal_output_to_top(terminal)
+    }
+
+    pub fn scroll_selected_output_to_bottom(&mut self) -> bool {
+        let Some(terminal) = self.selected_output_terminal_id() else {
+            return false;
+        };
+        self.scroll_terminal_output_to_bottom(terminal)
+    }
+
+    pub fn scroll_terminal_output_up(&mut self, terminal: TerminalId, rows: usize) -> bool {
+        let Some(buffer) = self.terminal_buffers.get_mut(&terminal) else {
+            return false;
+        };
+        buffer.scroll_view_up(rows)
+    }
+
+    pub fn scroll_terminal_output_down(&mut self, terminal: TerminalId, rows: usize) -> bool {
+        let Some(buffer) = self.terminal_buffers.get_mut(&terminal) else {
+            return false;
+        };
+        buffer.scroll_view_down(rows)
+    }
+
+    pub fn scroll_terminal_output_to_top(&mut self, terminal: TerminalId) -> bool {
+        let Some(buffer) = self.terminal_buffers.get_mut(&terminal) else {
+            return false;
+        };
+        buffer.scroll_view_to_top()
+    }
+
+    pub fn scroll_terminal_output_to_bottom(&mut self, terminal: TerminalId) -> bool {
+        let Some(buffer) = self.terminal_buffers.get_mut(&terminal) else {
+            return false;
+        };
+        buffer.scroll_view_to_bottom()
     }
 
     pub fn resize_terminal_buffer(&mut self, terminal: TerminalId, rows: u16, cols: u16) {
@@ -921,28 +974,81 @@ impl App {
 }
 
 impl TerminalBuffer {
-    fn append(&mut self, text: &str) {
+    pub fn append(&mut self, text: &str) {
+        let old_max_scroll_offset = self.screen.max_scroll_offset();
+        let preserve_scrolled_view = self.scroll_offset > 0;
         for ch in text.chars() {
             self.process_char(ch);
         }
+        if preserve_scrolled_view {
+            self.scroll_offset = self.scroll_offset.saturating_add(
+                self.screen
+                    .max_scroll_offset()
+                    .saturating_sub(old_max_scroll_offset),
+            );
+        }
+        self.clamp_scroll_offset();
     }
 
-    fn resize(&mut self, rows: u16, cols: u16) {
+    pub fn resize(&mut self, rows: u16, cols: u16) {
         self.screen.resize(rows.max(1), cols.max(1));
+        self.clamp_scroll_offset();
     }
 
     fn visible_lines(&self) -> Vec<String> {
-        self.screen.visible_lines()
+        self.screen.visible_lines(self.scroll_offset)
     }
 
-    fn render_lines(&self) -> Vec<TerminalRenderLine> {
-        self.screen.render_lines()
+    pub fn render_lines(&self) -> Vec<TerminalRenderLine> {
+        self.screen.render_lines(self.scroll_offset)
     }
 
-    fn push_line(&mut self, line: String) {
+    pub fn snapshot(&self) -> ScreenSnapshot {
+        self.screen.snapshot(self.scroll_offset)
+    }
+
+    pub fn is_blank(&self) -> bool {
+        self.screen.is_blank()
+    }
+
+    fn scroll_view_up(&mut self, rows: usize) -> bool {
+        if rows == 0 {
+            return false;
+        }
+        let old_offset = self.scroll_offset;
+        self.scroll_offset = (self.scroll_offset + rows).min(self.screen.max_scroll_offset());
+        self.scroll_offset != old_offset
+    }
+
+    fn scroll_view_down(&mut self, rows: usize) -> bool {
+        if rows == 0 {
+            return false;
+        }
+        let old_offset = self.scroll_offset;
+        self.scroll_offset = self.scroll_offset.saturating_sub(rows);
+        self.scroll_offset != old_offset
+    }
+
+    fn scroll_view_to_top(&mut self) -> bool {
+        let old_offset = self.scroll_offset;
+        self.scroll_offset = self.screen.max_scroll_offset();
+        self.scroll_offset != old_offset
+    }
+
+    fn scroll_view_to_bottom(&mut self) -> bool {
+        let old_offset = self.scroll_offset;
+        self.scroll_offset = 0;
+        self.scroll_offset != old_offset
+    }
+
+    fn clamp_scroll_offset(&mut self) {
+        self.scroll_offset = self.scroll_offset.min(self.screen.max_scroll_offset());
+    }
+
+    fn push_line(&mut self, mut line: String) {
+        line.push('\r');
+        line.push('\n');
         self.append(&line);
-        self.screen.carriage_return();
-        self.screen.line_feed();
     }
 
     fn process_char(&mut self, ch: char) {
@@ -1093,6 +1199,7 @@ impl TerminalScreen {
             cursor_col: 0,
             saved_cursor: None,
             current_style: TerminalCellStyle::default(),
+            scrollback: VecDeque::new(),
             cells: vec![vec![TerminalCell::blank(); usize::from(cols)]; usize::from(rows)],
         }
     }
@@ -1111,30 +1218,81 @@ impl TerminalScreen {
         self.clamp_cursor();
     }
 
-    fn visible_lines(&self) -> Vec<String> {
-        self.cells
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|cell| cell.ch)
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
+    fn visible_lines(&self, scroll_offset: usize) -> Vec<String> {
+        self.viewport_row_indices(scroll_offset)
+            .filter_map(|row_index| self.row_at(row_index))
+            .map(terminal_row_text)
+            .collect()
+    }
+
+    fn render_lines(&self, scroll_offset: usize) -> Vec<TerminalRenderLine> {
+        let scroll_offset = scroll_offset.min(self.max_scroll_offset());
+        let cursor_row = (scroll_offset == 0).then_some(self.scrollback.len() + self.cursor_row);
+
+        self.viewport_row_indices(scroll_offset)
+            .filter_map(|row_index| {
+                let row = self.row_at(row_index)?;
+                let cursor_col = (cursor_row == Some(row_index)).then_some(self.cursor_col);
+                Some(render_terminal_row(row, cursor_col))
             })
             .collect()
     }
 
-    fn render_lines(&self) -> Vec<TerminalRenderLine> {
-        self.cells
+    fn snapshot(&self, scroll_offset: usize) -> ScreenSnapshot {
+        let scroll_offset = scroll_offset.min(self.max_scroll_offset());
+        let cursor = (scroll_offset == 0).then_some(Cursor {
+            row: self.cursor_row as u16,
+            col: self.cursor_col as u16,
+            visible: true,
+        });
+        let mut cells = Vec::with_capacity(usize::from(self.rows) * usize::from(self.cols));
+        for row_index in self.viewport_row_indices(scroll_offset) {
+            if let Some(row) = self.row_at(row_index) {
+                cells.extend_from_slice(row);
+            } else {
+                cells.extend(std::iter::repeat_n(
+                    TerminalCell::blank(),
+                    usize::from(self.cols),
+                ));
+            }
+        }
+
+        ScreenSnapshot {
+            rows: self.rows,
+            cols: self.cols,
+            cells,
+            cursor,
+            scrollback_rows: self.scrollback.len() as u32,
+        }
+    }
+
+    fn is_blank(&self) -> bool {
+        self.scrollback
             .iter()
-            .enumerate()
-            .map(|(row_index, row)| {
-                render_terminal_row(
-                    row,
-                    (row_index == self.cursor_row).then_some(self.cursor_col),
-                )
-            })
-            .collect()
+            .chain(self.cells.iter())
+            .all(|row| row.iter().all(|cell| cell.ch == ' '))
+    }
+
+    fn max_scroll_offset(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    fn viewport_row_indices(&self, scroll_offset: usize) -> std::ops::Range<usize> {
+        let rows = usize::from(self.rows);
+        let total_rows = self.scrollback.len() + self.cells.len();
+        let scroll_offset = scroll_offset.min(self.max_scroll_offset());
+        let end = total_rows.saturating_sub(scroll_offset);
+        end.saturating_sub(rows)..end
+    }
+
+    fn row_at(&self, row_index: usize) -> Option<&[TerminalCell]> {
+        if row_index < self.scrollback.len() {
+            self.scrollback.get(row_index).map(Vec::as_slice)
+        } else {
+            self.cells
+                .get(row_index.saturating_sub(self.scrollback.len()))
+                .map(Vec::as_slice)
+        }
     }
 
     fn put_char(&mut self, ch: char) {
@@ -1228,7 +1386,8 @@ impl TerminalScreen {
                 }
                 self.erase_line_to_cursor();
             }
-            2 | 3 => self.clear(),
+            2 => self.clear(),
+            3 => self.clear_scrollback(),
             _ => {}
         }
     }
@@ -1245,7 +1404,8 @@ impl TerminalScreen {
     fn scroll_up(&mut self, count: usize) {
         for _ in 0..count.max(1) {
             if !self.cells.is_empty() {
-                self.cells.remove(0);
+                let row = self.cells.remove(0);
+                self.push_scrollback(row);
                 self.cells
                     .push(vec![TerminalCell::blank(); usize::from(self.cols)]);
             }
@@ -1280,6 +1440,21 @@ impl TerminalScreen {
         }
         self.cursor_row = 0;
         self.cursor_col = 0;
+    }
+
+    fn clear_scrollback(&mut self) {
+        self.scrollback.clear();
+    }
+
+    fn push_scrollback(&mut self, row: Vec<TerminalCell>) {
+        self.scrollback.push_back(row);
+        let overflow = self
+            .scrollback
+            .len()
+            .saturating_sub(TERMINAL_MAX_SCROLLBACK_LINES);
+        for _ in 0..overflow {
+            self.scrollback.pop_front();
+        }
     }
 
     fn erase_line_from_cursor(&mut self) {
@@ -1350,13 +1525,12 @@ impl TerminalScreen {
     }
 }
 
-impl TerminalCell {
-    fn blank() -> Self {
-        Self {
-            ch: ' ',
-            style: TerminalCellStyle::default(),
-        }
-    }
+fn terminal_row_text(row: &[TerminalCell]) -> String {
+    row.iter()
+        .map(|cell| cell.ch)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 fn render_terminal_row(row: &[TerminalCell], cursor_col: Option<usize>) -> TerminalRenderLine {
@@ -1785,6 +1959,64 @@ mod tests {
             app.terminal_lines(terminal),
             vec!["new".to_string(), "".to_string()]
         );
+    }
+
+    #[test]
+    fn terminal_buffer_scrolls_back_and_returns_to_bottom() {
+        let mut app = App::default();
+        let terminal = TerminalId(104);
+        app.resize_terminal_buffer(terminal, 2, 8);
+
+        app.append_terminal_output(terminal, "one\r\ntwo\r\nthree");
+
+        assert_eq!(
+            app.terminal_lines(terminal),
+            vec!["two".to_string(), "three".to_string()]
+        );
+        assert!(app.scroll_terminal_output_up(terminal, 1));
+        assert_eq!(
+            app.terminal_lines(terminal),
+            vec!["one".to_string(), "two".to_string()]
+        );
+        assert!(!app.scroll_terminal_output_up(terminal, 1));
+        assert!(app.scroll_terminal_output_down(terminal, 1));
+        assert_eq!(
+            app.terminal_lines(terminal),
+            vec!["two".to_string(), "three".to_string()]
+        );
+    }
+
+    #[test]
+    fn terminal_buffer_preserves_scrolled_view_when_output_arrives() {
+        let mut app = App::default();
+        let terminal = TerminalId(105);
+        app.resize_terminal_buffer(terminal, 2, 8);
+        app.append_terminal_output(terminal, "one\r\ntwo\r\nthree");
+        app.scroll_terminal_output_up(terminal, 1);
+
+        app.append_terminal_output(terminal, "\r\nfour");
+
+        assert_eq!(
+            app.terminal_lines(terminal),
+            vec!["one".to_string(), "two".to_string()]
+        );
+        app.scroll_terminal_output_to_bottom(terminal);
+        assert_eq!(
+            app.terminal_lines(terminal),
+            vec!["three".to_string(), "four".to_string()]
+        );
+    }
+
+    #[test]
+    fn terminal_output_blank_check_includes_scrollback() {
+        let mut app = App::default();
+        let terminal = TerminalId(106);
+        app.resize_terminal_buffer(terminal, 1, 8);
+
+        app.append_terminal_output(terminal, "old\r\n");
+
+        assert_eq!(app.terminal_lines(terminal), vec!["".to_string()]);
+        assert!(!app.terminal_output_is_blank(terminal));
     }
 
     #[test]

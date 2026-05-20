@@ -6,12 +6,14 @@
 
 ```sh
 nix develop
-just run
+just server   # keep this running in one terminal
+just run      # start/discard TUI clients in another terminal
 ```
 
 Or without `just`:
 
 ```sh
+cargo run --bin mult-server
 cargo run
 ```
 
@@ -52,7 +54,10 @@ Use `MULT_CONFIG_PATH=/path/to/config.json` to point at another config file. `au
 
 - `Enter`: focus the selected chat/terminal pane from the sidebar
 - `Esc`: return focus to the sidebar
-- `j`/`k` or `Up`/`Down`: move selection when the sidebar is focused
+- Mouse wheel over a chat/terminal output pane: scroll that pane without moving the outer terminal history
+- `j`/`k` or `Up`/`Down`: move selection when the sidebar is focused, or scroll the focused output pane by one line
+- `PageUp`/`PageDown`: page the focused chat/terminal output pane
+- `Home`/`End`: jump the focused chat/terminal output pane to top/bottom
 - `n` then `a`: add agent to selected workspace and start/focus its pi agent
 - `n` then `t`: add shell terminal to selected workspace
 - `n` then `c`: add a command/dev-server terminal to selected workspace
@@ -69,6 +74,6 @@ When the open/import or command prompt is active:
 
 Deleting a workspace also deletes its agent chats and terminals; deleting a chat or terminal stops its running PTY if needed.
 
-Focus controls whether the sidebar or selected main pane is active; the inactive pane uses a darker background. Input mode is only for typing into a terminal or pi agent; press Esc to return to normal mode. Esc does not quit mult. Running PTYs are sized from the visible pane instead of a fixed 80x24 size. Chat panes run `pi` by default; set `pi_agent_command` in the config file to override it.
+Focus controls whether the sidebar or selected main pane is active; the inactive pane uses a darker background. Input mode is only for typing into a terminal or pi agent; press Esc to return to normal mode for keyboard scrolling. Mouse wheel scrolling works over the pane under the cursor. Esc does not quit mult. Running PTYs are sized from the visible pane instead of a fixed 80x24 size. Chat panes run `pi` by default; set `pi_agent_command` in the config file to override it.
 
 See `docs/PLAN.md` for the roadmap and `AGENTS.md` for contributor/agent guidance.

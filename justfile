@@ -1,8 +1,12 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
-# Run the TUI.
+# Run the TUI client.
 run:
     cargo run
+
+# Run the persistent terminal server.
+server:
+    cargo run --bin mult-server
 
 # Fast feedback during development.
 check:

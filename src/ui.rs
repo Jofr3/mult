@@ -18,7 +18,7 @@ use crate::{
     },
 };
 
-const FOOTER: &str = "j/k nav • enter pane • esc sidebar • n a agent • n t terminal • n c command • n w workspace • d d delete • i input • q quit";
+const FOOTER: &str = "j/k nav/scroll • wheel/pgup/pgdn output • home/end top/bottom • enter pane • esc sidebar • n a agent • n t terminal • n c command • n w workspace • d d delete • i input • q quit";
 const CHAT_AGENT_HEADER_LINES: u16 = 0;
 const TERMINAL_HEADER_LINES: u16 = 0;
 
@@ -262,8 +262,14 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
 
     let paragraph = Paragraph::new(lines)
         .block(Block::default().style(pane_style(focused, palette)))
-        .style(pane_style(focused, palette))
-        .wrap(Wrap { trim: false });
+        .style(pane_style(focused, palette));
+    // PTY rows are already laid out to the pane width. Re-wrapping them can
+    // turn styled blank rows emitted by nested TUIs into extra visual lines.
+    let paragraph = if matches!(selected_item, Some(NavItem::Workspace(_)) | None) {
+        paragraph.wrap(Wrap { trim: false })
+    } else {
+        paragraph
+    };
     frame.render_widget(paragraph, area);
 }
 
@@ -375,9 +381,9 @@ fn chat_details(
         return vec![Line::from("Missing chat.")];
     };
 
-    let output_plain = app.terminal_lines(chat_agent_terminal_id(chat_id));
-    let output = app.terminal_render_lines(chat_agent_terminal_id(chat_id));
-    if !terminal_plain_output_is_blank(&output_plain) {
+    let terminal_id = chat_agent_terminal_id(chat_id);
+    let output = app.terminal_render_lines(terminal_id);
+    if !app.terminal_output_is_blank(terminal_id) {
         return output
             .into_iter()
             .rev()
@@ -437,8 +443,7 @@ fn terminal_details(
         return vec![Line::from("Missing terminal.")];
     };
 
-    let output_plain = app.terminal_lines(terminal_id);
-    if terminal_plain_output_is_blank(&output_plain) {
+    if app.terminal_output_is_blank(terminal_id) {
         let mut lines = vec![match terminal.status {
             TerminalStatus::Running => Line::from("Terminal is running; waiting for output."),
             TerminalStatus::Stopped => Line::from("Terminal is stopped. Press `s` to start it."),
@@ -530,10 +535,6 @@ fn draw_text_prompt(
     ])
     .style(Style::default().fg(palette.text).bg(palette.base));
     frame.render_widget(prompt, area);
-}
-
-fn terminal_plain_output_is_blank(lines: &[String]) -> bool {
-    lines.iter().all(|line| line.trim().is_empty())
 }
 
 fn terminal_render_line_to_line(line: TerminalRenderLine, palette: Palette) -> Line<'static> {
@@ -655,6 +656,53 @@ mod tests {
         };
 
         assert_eq!(terminal_name_label(&terminal), "ping example.com");
+    }
+
+    #[test]
+    fn terminal_output_does_not_wrap_styled_blank_rows() {
+        let mut app = App::default();
+        let nav_items = app.nav_items();
+        let (selected, terminal_id) = nav_items
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| match item {
+                NavItem::Terminal { terminal, .. } => Some((index, *terminal)),
+                _ => None,
+            })
+            .expect("seed state has a terminal");
+        app.selected = selected;
+
+        let frame_area = Rect::new(0, 0, 50, 6);
+        let (_, output_area) = selected_terminal_output_area(&app, frame_area)
+            .expect("terminal selection has output area");
+        app.resize_terminal_buffer(terminal_id, output_area.height, output_area.width);
+        let spaces = " ".repeat(usize::from(output_area.width));
+        app.append_terminal_output(terminal_id, &format!("\x1b[44m{spaces}\x1b[0m\r\nnext"));
+
+        let backend = TestBackend::new(frame_area.width, frame_area.height);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app, &config::Config::default()))
+            .expect("draw app");
+
+        assert_eq!(
+            buffer_text(terminal.backend(), output_area.x, output_area.y + 1, 4),
+            "next"
+        );
+    }
+
+    fn buffer_text(backend: &TestBackend, x: u16, y: u16, width: u16) -> String {
+        let mut text = String::new();
+        for offset in 0..width {
+            text.push_str(
+                backend
+                    .buffer()
+                    .cell((x + offset, y))
+                    .expect("cell is in bounds")
+                    .symbol(),
+            );
+        }
+        text
     }
 
     #[test]

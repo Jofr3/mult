@@ -1,33 +1,43 @@
-pub mod agent;
-mod app;
-mod config;
-mod model;
-mod pty;
-mod storage;
-mod ui;
-
 use std::{io, time::Duration};
 
-use agent::{AgentBackend, AgentEvent, NoopAgentBackend, ProcessAgentBackend, ProcessAgentCommand};
-use app::{chat_agent_terminal_id, chat_id_from_agent_terminal_id, App, FocusMode, Mode, Prompt};
-use config::Config;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use model::{ChatStatus, TerminalId, TerminalLaunch, TerminalStatus};
-use pty::{PtyDimensions, PtyEvent, PtyRuntime, PtySpawn};
+use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEvent, MouseEventKind,
+    },
+    execute,
+};
+use mult::{
+    agent::{
+        self, AgentBackend, AgentEvent, NoopAgentBackend, ProcessAgentBackend, ProcessAgentCommand,
+    },
+    app::{chat_agent_terminal_id, chat_id_from_agent_terminal_id, App, FocusMode, Mode, Prompt},
+    config::{self, Config},
+    model::{self, ChatStatus, TerminalId, TerminalLaunch, TerminalStatus},
+    pty::{PtyDimensions, PtyEvent, PtyRuntime, PtySpawn},
+    storage, ui,
+};
 use ratatui::{layout::Rect, DefaultTerminal};
 
 fn main() -> io::Result<()> {
     let project = storage::load_or_default()?;
     let config = config::load_or_default()?;
     let mut terminal = ratatui::init();
+    if let Err(error) = execute!(io::stdout(), EnableMouseCapture) {
+        ratatui::restore();
+        return Err(error);
+    }
+
     let result = run(&mut terminal, App::new(project), config);
+    let mouse_result = execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
-    result
+    result.and(mouse_result)
 }
 
 const AGENT_CMD_ENV: &str = "MULT_AGENT_CMD";
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const READY_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(0);
+const MOUSE_SCROLL_ROWS: usize = 3;
 
 enum RuntimeAgentBackend {
     Noop(NoopAgentBackend),
@@ -162,10 +172,12 @@ fn handle_event(
     event: Event,
     frame_area: Rect,
 ) {
-    if let Event::Key(key) = event {
-        if key.kind == KeyEventKind::Press {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
             handle_key(app, pty_runtime, config, normal_prefix, key, frame_area);
         }
+        Event::Mouse(mouse) => handle_mouse(app, normal_prefix, mouse, frame_area),
+        _ => {}
     }
 }
 
@@ -202,6 +214,74 @@ fn handle_key(
     }
 }
 
+fn handle_mouse(
+    app: &mut App,
+    normal_prefix: &mut Option<NormalPrefix>,
+    mouse: MouseEvent,
+    frame_area: Rect,
+) {
+    if app.is_prompt_active() {
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            *normal_prefix = None;
+            scroll_output_at_mouse(app, frame_area, mouse, ScrollDirection::Up);
+        }
+        MouseEventKind::ScrollDown => {
+            *normal_prefix = None;
+            scroll_output_at_mouse(app, frame_area, mouse, ScrollDirection::Down);
+        }
+        _ => {}
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollDirection {
+    Up,
+    Down,
+}
+
+fn scroll_output_at_mouse(
+    app: &mut App,
+    frame_area: Rect,
+    mouse: MouseEvent,
+    direction: ScrollDirection,
+) -> bool {
+    let Some(terminal) = output_terminal_at(app, frame_area, mouse.column, mouse.row) else {
+        return false;
+    };
+
+    match direction {
+        ScrollDirection::Up => app.scroll_terminal_output_up(terminal, MOUSE_SCROLL_ROWS),
+        ScrollDirection::Down => app.scroll_terminal_output_down(terminal, MOUSE_SCROLL_ROWS),
+    }
+}
+
+fn output_terminal_at(app: &App, frame_area: Rect, column: u16, row: u16) -> Option<TerminalId> {
+    if let Some((terminal, area)) = ui::selected_terminal_output_area(app, frame_area) {
+        if rect_contains(area, column, row) {
+            return Some(terminal);
+        }
+    }
+
+    if let Some((chat, area)) = ui::selected_chat_agent_output_area(app, frame_area) {
+        if rect_contains(area, column, row) {
+            return Some(chat_agent_terminal_id(chat));
+        }
+    }
+
+    None
+}
+
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
+
 fn handle_normal_key(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
@@ -225,11 +305,44 @@ fn handle_normal_key(
         KeyCode::Char('k') | KeyCode::Up if app.focus == FocusMode::Sidebar => {
             app.select_previous();
         }
+        KeyCode::Char('k') | KeyCode::Up if output_pane_is_focused(app) => {
+            app.scroll_selected_output_up(1);
+        }
+        KeyCode::Char('j') | KeyCode::Down if output_pane_is_focused(app) => {
+            app.scroll_selected_output_down(1);
+        }
+        KeyCode::PageUp if output_pane_is_focused(app) => {
+            app.scroll_selected_output_up(scroll_page_rows(app, frame_area));
+        }
+        KeyCode::PageDown if output_pane_is_focused(app) => {
+            app.scroll_selected_output_down(scroll_page_rows(app, frame_area));
+        }
+        KeyCode::Home if output_pane_is_focused(app) => {
+            app.scroll_selected_output_to_top();
+        }
+        KeyCode::End if output_pane_is_focused(app) => {
+            app.scroll_selected_output_to_bottom();
+        }
         KeyCode::Char('n') => *normal_prefix = Some(NormalPrefix::New),
         KeyCode::Char('d') => *normal_prefix = Some(NormalPrefix::Delete),
         KeyCode::Char('i') => focus_selected_input(app, pty_runtime, config, frame_area),
         _ => {}
     }
+}
+
+fn output_pane_is_focused(app: &App) -> bool {
+    matches!(app.focus, FocusMode::Chat | FocusMode::Terminal)
+        && app.selected_output_terminal_id().is_some()
+}
+
+fn scroll_page_rows(app: &App, frame_area: Rect) -> usize {
+    let height = ui::selected_terminal_output_area(app, frame_area)
+        .map(|(_, area)| area.height)
+        .or_else(|| {
+            ui::selected_chat_agent_output_area(app, frame_area).map(|(_, area)| area.height)
+        })
+        .unwrap_or(1);
+    usize::from(height.saturating_sub(1).max(1))
 }
 
 fn handle_normal_prefix_key(
@@ -338,8 +451,8 @@ fn start_terminal(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     frame_area: Rect,
-    workspace_id: crate::model::WorkspaceId,
-    terminal_id: crate::model::TerminalId,
+    workspace_id: model::WorkspaceId,
+    terminal_id: model::TerminalId,
 ) -> bool {
     if pty_runtime.is_running(terminal_id) {
         app.append_terminal_system_line(terminal_id, "PTY already running");
@@ -417,8 +530,8 @@ fn start_or_focus_chat_agent(
     pty_runtime: &mut PtyRuntime,
     config: &Config,
     frame_area: Rect,
-    workspace_id: crate::model::WorkspaceId,
-    chat_id: crate::model::ChatId,
+    workspace_id: model::WorkspaceId,
+    chat_id: model::ChatId,
     focus_after_start: bool,
 ) {
     let terminal_id = chat_agent_terminal_id(chat_id);
@@ -517,9 +630,7 @@ fn auto_start_selected_chat_agent(
 }
 
 fn terminal_output_is_blank(app: &App, terminal_id: TerminalId) -> bool {
-    app.terminal_lines(terminal_id)
-        .iter()
-        .all(|line| line.trim().is_empty())
+    app.terminal_output_is_blank(terminal_id)
 }
 
 fn pi_command(config: &Config) -> String {
@@ -586,7 +697,7 @@ fn resize_visible_chat_agent(app: &mut App, pty_runtime: &mut PtyRuntime, frame_
 fn selected_terminal_dimensions(
     app: &App,
     frame_area: Rect,
-    terminal_id: crate::model::TerminalId,
+    terminal_id: model::TerminalId,
 ) -> Option<PtyDimensions> {
     ui::selected_terminal_output_area(app, frame_area)
         .filter(|(selected_terminal, _)| *selected_terminal == terminal_id)
@@ -596,7 +707,7 @@ fn selected_terminal_dimensions(
 fn selected_chat_agent_dimensions(
     app: &App,
     frame_area: Rect,
-    chat_id: crate::model::ChatId,
+    chat_id: model::ChatId,
 ) -> Option<PtyDimensions> {
     ui::selected_chat_agent_output_area(app, frame_area)
         .filter(|(selected_chat, _)| *selected_chat == chat_id)
@@ -613,6 +724,9 @@ fn pty_dimensions_from_area(area: Rect) -> PtyDimensions {
 fn drain_pty_events(app: &mut App, pty_runtime: &mut PtyRuntime) {
     for event in pty_runtime.drain_events() {
         match event {
+            PtyEvent::Snapshot { terminal, snapshot } => {
+                app.set_terminal_snapshot(terminal, snapshot)
+            }
             PtyEvent::Output { terminal, text } => app.append_terminal_output(terminal, &text),
             PtyEvent::Exited { terminal, status } => {
                 if let Some(chat_id) = chat_id_from_agent_terminal_id(terminal) {
@@ -847,6 +961,113 @@ mod tests {
             frame_area,
         );
         assert_eq!(app.focus, FocusMode::Sidebar);
+    }
+
+    #[test]
+    fn normal_mode_scroll_keys_scroll_focused_output_pane() {
+        let mut app = App::default();
+        let (selected, terminal_id) = app
+            .nav_items()
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| match item {
+                mult::app::NavItem::Terminal { terminal, .. } => Some((index, *terminal)),
+                _ => None,
+            })
+            .expect("seed state has a terminal");
+        app.selected = selected;
+        assert!(app.focus_selected_main());
+        app.resize_terminal_buffer(terminal_id, 2, 8);
+        app.append_terminal_output(terminal_id, "one\r\ntwo\r\nthree");
+        let mut pty_runtime = PtyRuntime::default();
+        let config = Config::default();
+        let frame_area = Rect::new(0, 0, 120, 40);
+        let mut normal_prefix = None;
+
+        handle_normal_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &mut normal_prefix,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            frame_area,
+        );
+        assert_eq!(
+            app.terminal_lines(terminal_id),
+            vec!["one".to_string(), "two".to_string()]
+        );
+
+        handle_normal_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &mut normal_prefix,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            frame_area,
+        );
+        assert_eq!(
+            app.terminal_lines(terminal_id),
+            vec!["two".to_string(), "three".to_string()]
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_output_under_cursor() {
+        let mut app = App::default();
+        let (selected, terminal_id) = app
+            .nav_items()
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| match item {
+                mult::app::NavItem::Terminal { terminal, .. } => Some((index, *terminal)),
+                _ => None,
+            })
+            .expect("seed state has a terminal");
+        app.selected = selected;
+        app.resize_terminal_buffer(terminal_id, 2, 8);
+        app.append_terminal_output(terminal_id, "one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        let mut pty_runtime = PtyRuntime::default();
+        let config = Config::default();
+        let frame_area = Rect::new(0, 0, 120, 40);
+        let (_, output_area) = ui::selected_terminal_output_area(&app, frame_area)
+            .expect("terminal selection has output area");
+        let mut normal_prefix = None;
+
+        handle_event(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &mut normal_prefix,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: output_area.x,
+                row: output_area.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            frame_area,
+        );
+        assert_eq!(
+            app.terminal_lines(terminal_id),
+            vec!["one".to_string(), "two".to_string()]
+        );
+
+        handle_event(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &mut normal_prefix,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: output_area.x,
+                row: output_area.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            frame_area,
+        );
+        assert_eq!(
+            app.terminal_lines(terminal_id),
+            vec!["four".to_string(), "five".to_string()]
+        );
     }
 
     #[test]

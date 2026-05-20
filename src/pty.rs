@@ -1,15 +1,19 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    io::{self, Read, Write},
+    env, io,
+    os::unix::net::UnixStream,
     path::PathBuf,
     sync::{
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Receiver},
         Arc, Mutex,
     },
     thread,
 };
 
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use mult_protocol::{
+    read_message, write_message, ClientMessage, LaunchSpec, PaneId, ScreenSnapshot, ServerMessage,
+    SessionId, DEFAULT_SOCKET_NAME, PROTOCOL_VERSION,
+};
 
 use crate::model::TerminalId;
 
@@ -31,6 +35,10 @@ pub struct PtyDimensions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PtyEvent {
+    Snapshot {
+        terminal: TerminalId,
+        snapshot: ScreenSnapshot,
+    },
     Output {
         terminal: TerminalId,
         text: String,
@@ -52,27 +60,32 @@ pub struct PtyExit {
 }
 
 pub struct PtyRuntime {
-    sessions: HashMap<TerminalId, PtySession>,
-    sender: Sender<PtyEvent>,
-    receiver: Receiver<PtyEvent>,
+    connection: Option<ServerConnection>,
+    terminal_to_pane: HashMap<TerminalId, PaneId>,
+    pane_to_terminal: HashMap<PaneId, TerminalId>,
+    pending_events: Vec<PtyEvent>,
 }
 
-type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
-
-struct PtySession {
-    master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
-    writer: SharedPtyWriter,
+struct ServerConnection {
+    writer: Arc<Mutex<UnixStream>>,
+    receiver: Receiver<ServerMessage>,
 }
 
 impl Default for PtyRuntime {
     fn default() -> Self {
-        let (sender, receiver) = mpsc::channel();
-        Self {
-            sessions: HashMap::new(),
-            sender,
-            receiver,
+        let mut runtime = Self {
+            connection: None,
+            terminal_to_pane: HashMap::new(),
+            pane_to_terminal: HashMap::new(),
+            pending_events: Vec::new(),
+        };
+        if let Err(error) = runtime.connect() {
+            runtime.pending_events.push(PtyEvent::Error {
+                terminal: TerminalId(0),
+                message: format!("failed to connect to mult-server: {error}"),
+            });
         }
+        runtime
     }
 }
 
@@ -115,150 +128,204 @@ impl Default for PtyDimensions {
     }
 }
 
-impl From<PtyDimensions> for PtySize {
-    fn from(size: PtyDimensions) -> Self {
-        Self {
-            rows: size.rows,
-            cols: size.cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        }
-    }
-}
-
 impl PtyRuntime {
     pub fn is_running(&self, terminal: TerminalId) -> bool {
-        self.sessions.contains_key(&terminal)
+        self.terminal_to_pane.contains_key(&terminal)
     }
 
     pub fn start(&mut self, spawn: PtySpawn) -> io::Result<()> {
         if self.is_running(spawn.terminal) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "terminal already has a running PTY",
+                "terminal already has a server attachment",
             ));
         }
 
-        let pty_system = native_pty_system();
-        let pair = pty_system.openpty(spawn.size.into()).map_err(error_to_io)?;
-
-        let mut command = CommandBuilder::new(&spawn.program);
-        command.args(&spawn.args);
-        if let Some(cwd) = &spawn.cwd {
-            command.cwd(cwd.as_os_str());
-        }
-        for (key, value) in &spawn.env {
-            command.env(key, value);
-        }
-
-        let child = pair.slave.spawn_command(command).map_err(error_to_io)?;
-        let reader = pair.master.try_clone_reader().map_err(error_to_io)?;
-        let writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(error_to_io)?));
-        spawn_reader(
-            spawn.terminal,
-            reader,
-            self.sender.clone(),
-            Arc::clone(&writer),
-        );
-
-        self.sessions.insert(
-            spawn.terminal,
-            PtySession {
-                master: pair.master,
-                child,
-                writer,
-            },
-        );
-
+        self.ensure_connected()?;
+        let session = session_for_terminal(spawn.terminal);
+        let pane = pane_for_terminal(spawn.terminal);
+        let launch = launch_spec(&spawn);
+        let name = session_name(&spawn, &launch);
+        self.send(ClientMessage::CreateSession {
+            requested_id: Some(session),
+            name,
+            cwd: spawn.cwd.clone(),
+            env: spawn.env.clone(),
+            launch,
+            rows: spawn.size.rows,
+            cols: spawn.size.cols,
+        })?;
+        self.send(ClientMessage::Attach {
+            session,
+            rows: spawn.size.rows,
+            cols: spawn.size.cols,
+        })?;
+        self.terminal_to_pane.insert(spawn.terminal, pane);
+        self.pane_to_terminal.insert(pane, spawn.terminal);
         Ok(())
     }
 
     pub fn stop(&mut self, terminal: TerminalId) -> io::Result<bool> {
-        let Some(mut session) = self.sessions.remove(&terminal) else {
+        let Some(pane) = self.terminal_to_pane.remove(&terminal) else {
             return Ok(false);
         };
-
-        session.child.kill()?;
+        self.pane_to_terminal.remove(&pane);
         Ok(true)
     }
 
     pub fn send_input(&mut self, terminal: TerminalId, input: &[u8]) -> io::Result<bool> {
-        let Some(session) = self.sessions.get_mut(&terminal) else {
+        let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
             return Ok(false);
         };
-
-        let mut writer = session
-            .writer
-            .lock()
-            .map_err(|_| io::Error::other("PTY writer lock poisoned"))?;
-        writer.write_all(input)?;
-        writer.flush()?;
+        self.send(ClientMessage::Input {
+            pane,
+            bytes: input.to_vec(),
+        })?;
         Ok(true)
     }
 
     pub fn resize(&mut self, terminal: TerminalId, size: PtyDimensions) -> io::Result<()> {
-        let Some(session) = self.sessions.get(&terminal) else {
+        let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
             return Ok(());
         };
-
-        session.master.resize(size.into()).map_err(error_to_io)
+        self.send(ClientMessage::Resize {
+            pane,
+            rows: size.rows,
+            cols: size.cols,
+        })
     }
 
     pub fn drain_events(&mut self) -> Vec<PtyEvent> {
-        let mut events = Vec::new();
-        while let Ok(event) = self.receiver.try_recv() {
-            events.push(event);
-        }
+        let mut events = std::mem::take(&mut self.pending_events);
+        let mut disconnected = false;
 
-        let mut exited = Vec::new();
-        for (terminal, session) in &mut self.sessions {
-            match session.child.try_wait() {
-                Ok(Some(status)) => exited.push((*terminal, PtyExit::from(status))),
-                Ok(None) => {}
-                Err(error) => {
-                    events.push(PtyEvent::Error {
-                        terminal: *terminal,
-                        message: format!("failed to poll child: {error}"),
-                    });
-                    exited.push((*terminal, PtyExit::failed()));
+        if let Some(connection) = &self.connection {
+            while let Ok(message) = connection.receiver.try_recv() {
+                match message {
+                    ServerMessage::Hello { .. }
+                    | ServerMessage::Sessions(_)
+                    | ServerMessage::Attached { .. } => {}
+                    ServerMessage::Snapshot { pane, snapshot }
+                    | ServerMessage::Update { pane, snapshot } => {
+                        if let Some(terminal) = self.pane_to_terminal.get(&pane).copied() {
+                            events.push(PtyEvent::Snapshot { terminal, snapshot });
+                        }
+                    }
+                    ServerMessage::PaneExited { pane, exit } => {
+                        if let Some(terminal) = self.pane_to_terminal.remove(&pane) {
+                            self.terminal_to_pane.remove(&terminal);
+                            events.push(PtyEvent::Exited {
+                                terminal,
+                                status: PtyExit {
+                                    code: exit.code,
+                                    signal: exit.signal,
+                                },
+                            });
+                        }
+                    }
+                    ServerMessage::Error { message } => {
+                        let terminal = self
+                            .pane_to_terminal
+                            .values()
+                            .next()
+                            .copied()
+                            .unwrap_or(TerminalId(0));
+                        events.push(PtyEvent::Error { terminal, message });
+                    }
                 }
             }
+        } else {
+            disconnected = true;
         }
 
-        for (terminal, status) in exited {
-            self.sessions.remove(&terminal);
-            events.push(PtyEvent::Exited { terminal, status });
+        if disconnected {
+            self.terminal_to_pane.clear();
+            self.pane_to_terminal.clear();
         }
 
         events
+    }
+
+    fn ensure_connected(&mut self) -> io::Result<()> {
+        if self.connection.is_some() {
+            return Ok(());
+        }
+        self.connect()
+    }
+
+    fn connect(&mut self) -> io::Result<()> {
+        let stream = UnixStream::connect(socket_path())?;
+        stream.set_nonblocking(false)?;
+        let mut writer_stream = stream.try_clone()?;
+        write_message(
+            &mut writer_stream,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+            },
+        )?;
+
+        let writer = Arc::new(Mutex::new(writer_stream));
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = stream;
+            loop {
+                match read_message::<ServerMessage>(&mut reader) {
+                    Ok(message) => {
+                        if sender.send(message).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::UnexpectedEof
+                                | io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::BrokenPipe
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = sender.send(ServerMessage::Error {
+                            message: format!("failed to read from mult-server: {error}"),
+                        });
+                        break;
+                    }
+                }
+            }
+        });
+
+        self.connection = Some(ServerConnection { writer, receiver });
+        Ok(())
+    }
+
+    fn send(&mut self, message: ClientMessage) -> io::Result<()> {
+        self.ensure_connected()?;
+        let Some(connection) = &self.connection else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "not connected to mult-server",
+            ));
+        };
+        let mut writer = connection
+            .writer
+            .lock()
+            .map_err(|_| io::Error::other("server socket writer lock poisoned"))?;
+        write_message(&mut *writer, &message)
     }
 }
 
 impl Drop for PtyRuntime {
     fn drop(&mut self) {
-        for (_, mut session) in self.sessions.drain() {
-            let _ = session.child.kill();
-        }
-    }
-}
-
-impl From<portable_pty::ExitStatus> for PtyExit {
-    fn from(status: portable_pty::ExitStatus) -> Self {
-        Self {
-            code: status.exit_code(),
-            signal: status.signal().map(ToOwned::to_owned),
+        if let Some(connection) = &self.connection {
+            if let Ok(mut writer) = connection.writer.lock() {
+                let _ = write_message(&mut *writer, &ClientMessage::Detach);
+            }
         }
     }
 }
 
 impl PtyExit {
-    fn failed() -> Self {
-        Self {
-            code: 1,
-            signal: None,
-        }
-    }
-
     pub fn label(&self) -> String {
         match &self.signal {
             Some(signal) => format!("terminated by {signal}"),
@@ -267,113 +334,39 @@ impl PtyExit {
     }
 }
 
-fn spawn_reader(
-    terminal: TerminalId,
-    mut reader: Box<dyn Read + Send>,
-    sender: Sender<PtyEvent>,
-    writer: SharedPtyWriter,
-) {
-    thread::spawn(move || {
-        let mut buffer = [0; 8192];
-        let mut query_tail = Vec::new();
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(n) => {
-                    write_terminal_query_responses(&buffer[..n], &mut query_tail, &writer);
-                    let text = String::from_utf8_lossy(&buffer[..n]).into_owned();
-                    if sender.send(PtyEvent::Output { terminal, text }).is_err() {
-                        break;
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => {
-                    let _ = sender.send(PtyEvent::Error {
-                        terminal,
-                        message: format!("failed to read PTY output: {error}"),
-                    });
-                    break;
-                }
-            }
-        }
-    });
+fn socket_path() -> PathBuf {
+    if let Some(runtime_dir) = env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime_dir).join(DEFAULT_SOCKET_NAME);
+    }
+
+    let user = env::var("UID")
+        .or_else(|_| env::var("USER"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    PathBuf::from(format!("/tmp/mult-{user}.sock"))
 }
 
-const TERMINAL_QUERY_TAIL_BYTES: usize = 16;
-const PRIMARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[?1;2c";
-
-fn write_terminal_query_responses(
-    bytes: &[u8],
-    query_tail: &mut Vec<u8>,
-    writer: &SharedPtyWriter,
-) {
-    let already_seen = query_tail.len();
-    let mut scan = Vec::with_capacity(already_seen + bytes.len());
-    scan.extend_from_slice(query_tail);
-    scan.extend_from_slice(bytes);
-
-    let response_count = primary_device_attribute_query_count(&scan, already_seen);
-    if response_count > 0 {
-        if let Ok(mut writer) = writer.lock() {
-            for _ in 0..response_count {
-                let _ = writer.write_all(PRIMARY_DEVICE_ATTRIBUTES_RESPONSE);
-            }
-            let _ = writer.flush();
-        }
-    }
-
-    query_tail.clear();
-    let keep = scan.len().min(TERMINAL_QUERY_TAIL_BYTES);
-    query_tail.extend_from_slice(&scan[scan.len().saturating_sub(keep)..]);
+fn session_for_terminal(terminal: TerminalId) -> SessionId {
+    SessionId(terminal.0)
 }
 
-fn primary_device_attribute_query_count(bytes: &[u8], already_seen: usize) -> usize {
-    let mut count = 0;
-    let mut index = 0;
-    while index < bytes.len() {
-        let Some((end, is_query)) = primary_device_attribute_query_at(bytes, index) else {
-            index += 1;
-            continue;
-        };
-
-        if is_query && end > already_seen {
-            count += 1;
-        }
-        index = end;
-    }
-
-    count
+fn pane_for_terminal(terminal: TerminalId) -> PaneId {
+    PaneId(terminal.0)
 }
 
-fn primary_device_attribute_query_at(bytes: &[u8], index: usize) -> Option<(usize, bool)> {
-    if bytes.get(index) != Some(&0x1b) {
-        return None;
-    }
+fn launch_spec(spawn: &PtySpawn) -> LaunchSpec {
+    spawn
+        .args
+        .last()
+        .cloned()
+        .map(LaunchSpec::Command)
+        .unwrap_or(LaunchSpec::Shell)
+}
 
-    if bytes.get(index + 1) == Some(&b'Z') {
-        return Some((index + 2, true));
+fn session_name(spawn: &PtySpawn, launch: &LaunchSpec) -> String {
+    match launch {
+        LaunchSpec::Shell => format!("shell {}", spawn.terminal.0),
+        LaunchSpec::Command(command) => command.clone(),
     }
-
-    if bytes.get(index + 1) != Some(&b'[') {
-        return None;
-    }
-
-    let mut final_index = index + 2;
-    while let Some(byte) = bytes.get(final_index) {
-        if (0x40..=0x7e).contains(byte) {
-            break;
-        }
-        final_index += 1;
-    }
-
-    let final_byte = bytes.get(final_index)?;
-    if *final_byte != b'c' {
-        return Some((final_index + 1, false));
-    }
-
-    let params = &bytes[index + 2..final_index];
-    let is_primary_query = params.is_empty() || params == b"0";
-    Some((final_index + 1, is_primary_query))
 }
 
 fn shell_command_args(command: String) -> Vec<String> {
@@ -398,10 +391,6 @@ fn default_shell() -> String {
     {
         std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
     }
-}
-
-fn error_to_io(error: anyhow::Error) -> io::Error {
-    io::Error::other(error.to_string())
 }
 
 #[cfg(test)]
@@ -440,19 +429,5 @@ mod tests {
         };
 
         assert_eq!(exit.label(), "exit 2");
-    }
-
-    #[test]
-    fn primary_device_attribute_queries_are_detected() {
-        assert_eq!(primary_device_attribute_query_count(b"\x1b[c", 0), 1);
-        assert_eq!(primary_device_attribute_query_count(b"\x1b[0c", 0), 1);
-        assert_eq!(primary_device_attribute_query_count(b"\x1bZ", 0), 1);
-        assert_eq!(primary_device_attribute_query_count(b"\x1b[?1;2c", 0), 0);
-    }
-
-    #[test]
-    fn split_primary_device_attribute_query_is_detected_once() {
-        assert_eq!(primary_device_attribute_query_count(b"\x1b[c", 2), 1);
-        assert_eq!(primary_device_attribute_query_count(b"\x1b[c", 3), 0);
     }
 }

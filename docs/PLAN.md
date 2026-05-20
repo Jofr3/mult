@@ -8,12 +8,12 @@
 - Durable JSON project state at `$XDG_DATA_HOME/mult/state.json` or `~/.local/share/mult/state.json`.
 - Workspaces have stable IDs, optional cwd, environment metadata, agent chats, and terminal definitions.
 - Chat transcripts, terminal definitions, and restorable running chat/terminal status are persisted; PTY process memory and terminal output are not persisted.
-- PTYs are managed in-memory with `portable-pty`, visible-pane resizing, shell terminals, and command/dev-server terminals.
+- PTYs are managed in-memory with `portable-pty`, visible-pane resizing, in-memory scrollback, shell terminals, and command/dev-server terminals.
 - Selected chat panes can run an embedded `pi` process through a PTY. Config is loaded from `$XDG_CONFIG_HOME/mult/config.json` or `~/.config/mult/config.json`.
 - The default UI palette is Rosé Pine Moon, with per-color `colorscheme` config overrides.
 - Workspace/chat/terminal deletion uses a two-key `d d` chord and stops related running PTYs.
 - Normal mode covers workspace/chat/terminal management; input mode is only for typing into the selected terminal or pi agent.
-- Focus is explicit for sidebar, chat pane, and terminal pane. `Tab`/`Shift-Tab`, `Enter`, and `Left`/`Right` move focus; the unfocused pane uses a darker background.
+- Focus is explicit for sidebar, chat pane, and terminal pane. `Enter` moves from the sidebar into the selected pane, `Esc` returns to the sidebar, and the unfocused pane uses a darker background.
 
 ## Product shape
 
@@ -55,7 +55,7 @@ Goal: prove the app skeleton and UX layout.
 - [x] Track terminal process lifecycle and exit codes.
 - [x] Support resizing from visible pane dimensions instead of fixed 80x24.
 
-Notes for future M4/M5 work: current terminal buffers model the visible screen, not durable scrollback. Full scrollback, paging, and search remain future work.
+Notes for future M4/M5 work: terminal buffers keep in-memory scrollback for paging, but do not persist it. Search/filter remains future work.
 
 ### M3 — Agent runtime groundwork (done for now)
 
@@ -78,11 +78,12 @@ Completed in this milestone:
 - [x] Keep sidebar navigation scoped to sidebar focus.
 - [x] Collapse user-visible modes to normal mode and input mode.
 - [x] Restart persisted running chat agents and terminals on app start.
+- [x] Add in-memory terminal scrollback paging for chat-agent, command, and shell panes.
 
 Remaining M4 workflow polish, to do incrementally:
 
 - [ ] Add a command palette for workspace/session/terminal actions.
-- [ ] Add terminal scrollback paging, then search/filter over terminal output and chat transcripts.
+- [ ] Add search/filter over terminal output and chat transcripts.
 - [ ] Add split panes/tabs per workspace after a pane layout model exists.
 
 ### M5 — Safety and collaboration features (future)

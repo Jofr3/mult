@@ -55,6 +55,10 @@
 
             RUST_BACKTRACE = "1";
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+
+            shellHook = ''
+              export PATH="$HOME/.cargo/bin:$PATH"
+            '';
           };
         });
     };
