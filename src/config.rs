@@ -16,6 +16,8 @@ pub struct Config {
     pub auto_start_pi_agent: bool,
     #[serde(default = "default_auto_start_terminals")]
     pub auto_start_terminals: bool,
+    #[serde(default = "default_mouse_capture")]
+    pub mouse_capture: bool,
     #[serde(default)]
     pub colorscheme: ColorSchemeConfig,
 }
@@ -66,6 +68,7 @@ impl Default for Config {
             pi_agent_command: default_pi_agent_command(),
             auto_start_pi_agent: default_auto_start_pi_agent(),
             auto_start_terminals: default_auto_start_terminals(),
+            mouse_capture: default_mouse_capture(),
             colorscheme: ColorSchemeConfig::default(),
         }
     }
@@ -132,6 +135,10 @@ fn default_auto_start_pi_agent() -> bool {
 }
 
 fn default_auto_start_terminals() -> bool {
+    true
+}
+
+fn default_mouse_capture() -> bool {
     true
 }
 
@@ -227,6 +234,7 @@ mod tests {
         assert_eq!(config.pi_agent_command, "pi");
         assert!(config.auto_start_pi_agent);
         assert!(config.auto_start_terminals);
+        assert!(config.mouse_capture);
         assert_eq!(config.colorscheme.base, "#232136");
         assert_eq!(config.colorscheme.nc, "#1f1d30");
     }
@@ -252,6 +260,7 @@ mod tests {
         assert_eq!(config.pi_agent_command, "pi -c");
         assert!(config.auto_start_pi_agent);
         assert!(config.auto_start_terminals);
+        assert!(config.mouse_capture);
         assert_eq!(config.colorscheme.text, "#e0def4");
     }
 
@@ -269,6 +278,16 @@ mod tests {
         assert_eq!(config.pi_agent_command, "pi");
         assert!(!config.auto_start_pi_agent);
         assert!(!config.auto_start_terminals);
+    }
+
+    #[test]
+    fn config_loads_mouse_capture_flag_from_json() {
+        let path = unique_temp_file();
+        fs::write(&path, r#"{"mouse_capture":false}"#).expect("write config");
+
+        let config = load_from_path(&path).expect("load config");
+
+        assert!(!config.mouse_capture);
     }
 
     #[test]

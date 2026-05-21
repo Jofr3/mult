@@ -1,9 +1,13 @@
-use std::{io, time::Duration};
+use std::{
+    io::{self, Write},
+    time::Duration,
+};
 
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute,
 };
@@ -12,7 +16,8 @@ use mult::{
         self, AgentBackend, AgentEvent, NoopAgentBackend, ProcessAgentBackend, ProcessAgentCommand,
     },
     app::{
-        chat_agent_terminal_id, chat_id_from_agent_terminal_id, App, CommandAction, NavItem, Prompt,
+        chat_agent_terminal_id, chat_id_from_agent_terminal_id, App, CommandAction, NavItem,
+        Prompt, SelectionCell, TextSelection,
     },
     config::{self, Config},
     model::{self, ChatStatus, TerminalId, TerminalLaunch, TerminalStatus},
@@ -24,16 +29,33 @@ use ratatui::{layout::Rect, DefaultTerminal};
 fn main() -> io::Result<()> {
     let project = storage::load_or_default()?;
     let config = config::load_or_default()?;
+    let mouse_capture = config.mouse_capture;
     let mut terminal = ratatui::init();
-    if let Err(error) = execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste) {
+    if let Err(error) = enable_terminal_features(mouse_capture) {
         ratatui::restore();
         return Err(error);
     }
 
     let result = run(&mut terminal, App::new(project), config);
-    let mouse_result = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
+    let terminal_features_result = disable_terminal_features(mouse_capture);
     ratatui::restore();
-    result.and(mouse_result)
+    result.and(terminal_features_result)
+}
+
+fn enable_terminal_features(mouse_capture: bool) -> io::Result<()> {
+    if mouse_capture {
+        execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)
+    } else {
+        execute!(io::stdout(), EnableBracketedPaste)
+    }
+}
+
+fn disable_terminal_features(mouse_capture: bool) -> io::Result<()> {
+    if mouse_capture {
+        execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture)
+    } else {
+        execute!(io::stdout(), DisableBracketedPaste)
+    }
 }
 
 const AGENT_CMD_ENV: &str = "MULT_AGENT_CMD";
@@ -94,8 +116,8 @@ fn run(terminal: &mut DefaultTerminal, mut app: App, config: Config) -> io::Resu
         drain_pty_events(&mut app, &mut pty_runtime);
         drain_agent_events(&mut app, &mut agent_backend);
         save_if_dirty(&mut app)?;
-        resize_visible_terminal(&mut app, &mut pty_runtime, frame_area);
-        resize_visible_chat_agent(&mut app, &mut pty_runtime, frame_area);
+        resize_visible_terminal(&mut app, &mut pty_runtime, &config, frame_area);
+        resize_visible_chat_agent(&mut app, &mut pty_runtime, &config, frame_area);
         auto_start_selected_terminal(&mut app, &mut pty_runtime, &config, frame_area);
         auto_start_selected_chat_agent(&mut app, &mut pty_runtime, &config, frame_area);
         frame_area = terminal
@@ -145,7 +167,7 @@ fn restore_persisted_sessions(
         .collect::<Vec<_>>();
 
     for (workspace, terminal) in terminals {
-        start_terminal(app, pty_runtime, frame_area, workspace, terminal);
+        start_terminal(app, pty_runtime, config, frame_area, workspace, terminal);
     }
 
     let chats = app
@@ -176,7 +198,7 @@ fn handle_event(
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             handle_key(app, pty_runtime, config, key, frame_area);
         }
-        Event::Mouse(mouse) => handle_mouse(app, pty_runtime, mouse, frame_area),
+        Event::Mouse(mouse) => handle_mouse(app, pty_runtime, config, mouse, frame_area),
         Event::Paste(text) => handle_paste(app, pty_runtime, config, text, frame_area),
         _ => {}
     }
@@ -205,17 +227,46 @@ fn handle_key(
     }
 }
 
-fn handle_mouse(app: &mut App, pty_runtime: &mut PtyRuntime, mouse: MouseEvent, frame_area: Rect) {
+fn handle_mouse(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    config: &Config,
+    mouse: MouseEvent,
+    frame_area: Rect,
+) {
     if app.is_prompt_active() {
         return;
     }
 
     match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            begin_text_selection_at_mouse(app, frame_area, mouse);
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            update_text_selection_at_mouse(app, frame_area, mouse);
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            finish_text_selection_at_mouse(app, pty_runtime, frame_area, mouse);
+        }
         MouseEventKind::ScrollUp => {
-            scroll_output_at_mouse(app, pty_runtime, frame_area, mouse, ScrollDirection::Up);
+            scroll_output_at_mouse(
+                app,
+                pty_runtime,
+                config,
+                frame_area,
+                mouse,
+                ScrollDirection::Up,
+            );
         }
         MouseEventKind::ScrollDown => {
-            scroll_output_at_mouse(app, pty_runtime, frame_area, mouse, ScrollDirection::Down);
+            scroll_output_at_mouse(
+                app,
+                pty_runtime,
+                config,
+                frame_area,
+                mouse,
+                ScrollDirection::Down,
+            );
         }
         _ => {}
     }
@@ -252,6 +303,143 @@ fn handle_paste(
     }
 }
 
+fn begin_text_selection_at_mouse(app: &mut App, frame_area: Rect, mouse: MouseEvent) -> bool {
+    let Some((terminal, area)) = selected_output_area(app, frame_area) else {
+        app.clear_text_selection();
+        return false;
+    };
+    if !rect_contains(area, mouse.column, mouse.row) {
+        app.clear_text_selection();
+        return false;
+    }
+    let Some(cell) = mouse_cell_in_area(area, mouse.column, mouse.row) else {
+        return false;
+    };
+    app.begin_text_selection(terminal, cell);
+    true
+}
+
+fn update_text_selection_at_mouse(app: &mut App, frame_area: Rect, mouse: MouseEvent) -> bool {
+    let Some((terminal, cell)) = active_selection_cell_at_mouse(app, frame_area, mouse) else {
+        return false;
+    };
+    app.update_text_selection(terminal, cell)
+}
+
+fn finish_text_selection_at_mouse(
+    app: &mut App,
+    pty_runtime: &PtyRuntime,
+    frame_area: Rect,
+    mouse: MouseEvent,
+) -> bool {
+    let Some((terminal, cell)) = active_selection_cell_at_mouse(app, frame_area, mouse) else {
+        return false;
+    };
+    let Some(selection) = app.end_text_selection(terminal, cell) else {
+        return false;
+    };
+    if selection.anchor == selection.focus {
+        app.clear_text_selection();
+        return false;
+    }
+    if let Some(text) = selected_text(pty_runtime, selection) {
+        let _ = copy_text_to_clipboard(&text);
+    }
+    true
+}
+
+fn active_selection_cell_at_mouse(
+    app: &App,
+    frame_area: Rect,
+    mouse: MouseEvent,
+) -> Option<(TerminalId, SelectionCell)> {
+    let selection = app.text_selection?;
+    let (terminal, area) = selected_output_area(app, frame_area)?;
+    if terminal != selection.terminal {
+        return None;
+    }
+    mouse_cell_in_area(area, mouse.column, mouse.row).map(|cell| (terminal, cell))
+}
+
+fn selected_output_area(app: &App, frame_area: Rect) -> Option<(TerminalId, Rect)> {
+    if let Some((terminal, area)) = ui::selected_terminal_output_area(app, frame_area) {
+        return Some((terminal, area));
+    }
+    ui::selected_chat_agent_output_area(app, frame_area)
+        .map(|(chat, area)| (chat_agent_terminal_id(chat), area))
+}
+
+fn mouse_cell_in_area(area: Rect, column: u16, row: u16) -> Option<SelectionCell> {
+    if area.is_empty() {
+        return None;
+    }
+    Some(SelectionCell {
+        row: row
+            .saturating_sub(area.y)
+            .min(area.height.saturating_sub(1)),
+        col: column
+            .saturating_sub(area.x)
+            .min(area.width.saturating_sub(1)),
+    })
+}
+
+fn selected_text(pty_runtime: &PtyRuntime, selection: TextSelection) -> Option<String> {
+    let parser = pty_runtime.parser(selection.terminal)?;
+    let screen = parser.screen();
+    let (rows, cols) = screen.size();
+    if rows == 0 || cols == 0 {
+        return None;
+    }
+
+    let range = selection.normalized_range();
+    let start_row = range.start.row.min(rows.saturating_sub(1));
+    let end_row = range.end.row.min(rows.saturating_sub(1));
+    let start_col = range.start.col.min(cols.saturating_sub(1));
+    let end_col = range.end.col.min(cols.saturating_sub(1));
+    let end_col_exclusive = end_col.saturating_add(1).min(cols);
+    if start_row == end_row && start_col >= end_col_exclusive {
+        return None;
+    }
+
+    let text = screen.contents_between(start_row, start_col, end_row, end_col_exclusive);
+    (!text.is_empty()).then_some(text)
+}
+
+fn copy_text_to_clipboard(text: &str) -> io::Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let encoded = base64_encode(text.as_bytes());
+    let mut stdout = io::stdout();
+    write!(stdout, "\x1b]52;c;{encoded}\x07")?;
+    stdout.flush()
+}
+
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        let bits = ((first as u32) << 16) | ((second as u32) << 8) | third as u32;
+
+        output.push(TABLE[((bits >> 18) & 0x3f) as usize] as char);
+        output.push(TABLE[((bits >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(TABLE[((bits >> 6) & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[(bits & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScrollDirection {
     Up,
@@ -261,11 +449,13 @@ enum ScrollDirection {
 fn scroll_output_at_mouse(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
+    config: &Config,
     frame_area: Rect,
     mouse: MouseEvent,
     direction: ScrollDirection,
 ) -> bool {
-    let Some(terminal) = output_terminal_at(app, frame_area, mouse.column, mouse.row) else {
+    let Some(terminal) = output_terminal_at(app, config, frame_area, mouse.column, mouse.row)
+    else {
         return false;
     };
 
@@ -279,7 +469,13 @@ fn scroll_output_at_mouse(
     }
 }
 
-fn output_terminal_at(app: &App, frame_area: Rect, column: u16, row: u16) -> Option<TerminalId> {
+fn output_terminal_at(
+    app: &App,
+    _config: &Config,
+    frame_area: Rect,
+    column: u16,
+    row: u16,
+) -> Option<TerminalId> {
     if let Some((terminal, area)) = ui::selected_terminal_output_area(app, frame_area) {
         if rect_contains(area, column, row) {
             return Some(terminal);
@@ -482,7 +678,7 @@ fn start_selected_pty_if_needed(
             terminal,
         } => {
             if !pty_runtime.is_running(terminal) {
-                start_terminal(app, pty_runtime, frame_area, workspace, terminal);
+                start_terminal(app, pty_runtime, config, frame_area, workspace, terminal);
             }
             if pty_runtime.is_running(terminal) {
                 app.begin_terminal_input();
@@ -589,17 +785,30 @@ fn execute_command_action(
     }
 }
 
-fn start_selected_terminal(app: &mut App, pty_runtime: &mut PtyRuntime, frame_area: Rect) {
+fn start_selected_terminal(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    config: &Config,
+    frame_area: Rect,
+) {
     let Some((workspace_id, terminal_id)) = app.selected_terminal_id() else {
         return;
     };
 
-    start_terminal(app, pty_runtime, frame_area, workspace_id, terminal_id);
+    start_terminal(
+        app,
+        pty_runtime,
+        config,
+        frame_area,
+        workspace_id,
+        terminal_id,
+    );
 }
 
 fn start_terminal(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
+    config: &Config,
     frame_area: Rect,
     workspace_id: model::WorkspaceId,
     terminal_id: model::TerminalId,
@@ -634,7 +843,8 @@ fn start_terminal(
             workspace.environment.clone(),
         ),
     };
-    spawn.size = selected_terminal_dimensions(app, frame_area, terminal_id).unwrap_or_default();
+    spawn.size =
+        selected_terminal_dimensions(app, config, frame_area, terminal_id).unwrap_or_default();
 
     match pty_runtime.start(spawn) {
         Ok(()) => {
@@ -707,7 +917,8 @@ fn start_or_focus_chat_agent(
         workspace.cwd.clone(),
         workspace.environment.clone(),
     );
-    spawn.size = selected_chat_agent_dimensions(app, frame_area, chat_id).unwrap_or_default();
+    spawn.size =
+        selected_chat_agent_dimensions(app, config, frame_area, chat_id).unwrap_or_default();
 
     match pty_runtime.start(spawn) {
         Ok(()) => {
@@ -743,7 +954,7 @@ fn auto_start_selected_terminal(
         return;
     }
 
-    start_selected_terminal(app, pty_runtime, frame_area);
+    start_selected_terminal(app, pty_runtime, config, frame_area);
 }
 
 fn auto_start_selected_chat_agent(
@@ -793,17 +1004,22 @@ fn focus_selected_input(
     if app.selected_chat_id().is_some() {
         start_or_focus_selected_chat_agent(app, pty_runtime, config, frame_area);
     } else if app.selected_terminal_id().is_some() {
-        start_or_focus_selected_terminal(app, pty_runtime, frame_area);
+        start_or_focus_selected_terminal(app, pty_runtime, config, frame_area);
     }
 }
 
-fn start_or_focus_selected_terminal(app: &mut App, pty_runtime: &mut PtyRuntime, frame_area: Rect) {
+fn start_or_focus_selected_terminal(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    config: &Config,
+    frame_area: Rect,
+) {
     let Some((_, terminal_id)) = app.selected_terminal_id() else {
         return;
     };
 
     if !pty_runtime.is_running(terminal_id) {
-        start_selected_terminal(app, pty_runtime, frame_area);
+        start_selected_terminal(app, pty_runtime, config, frame_area);
     }
 
     if pty_runtime.is_running(terminal_id) {
@@ -811,7 +1027,12 @@ fn start_or_focus_selected_terminal(app: &mut App, pty_runtime: &mut PtyRuntime,
     }
 }
 
-fn resize_visible_terminal(app: &mut App, pty_runtime: &mut PtyRuntime, frame_area: Rect) {
+fn resize_visible_terminal(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    _config: &Config,
+    frame_area: Rect,
+) {
     let Some((terminal_id, area)) = ui::selected_terminal_output_area(app, frame_area) else {
         return;
     };
@@ -819,7 +1040,12 @@ fn resize_visible_terminal(app: &mut App, pty_runtime: &mut PtyRuntime, frame_ar
     let _ = pty_runtime.resize(terminal_id, size);
 }
 
-fn resize_visible_chat_agent(app: &mut App, pty_runtime: &mut PtyRuntime, frame_area: Rect) {
+fn resize_visible_chat_agent(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    _config: &Config,
+    frame_area: Rect,
+) {
     let Some((chat_id, area)) = ui::selected_chat_agent_output_area(app, frame_area) else {
         return;
     };
@@ -830,6 +1056,7 @@ fn resize_visible_chat_agent(app: &mut App, pty_runtime: &mut PtyRuntime, frame_
 
 fn selected_terminal_dimensions(
     app: &App,
+    _config: &Config,
     frame_area: Rect,
     terminal_id: model::TerminalId,
 ) -> Option<PtyDimensions> {
@@ -840,6 +1067,7 @@ fn selected_terminal_dimensions(
 
 fn selected_chat_agent_dimensions(
     app: &App,
+    _config: &Config,
     frame_area: Rect,
     chat_id: model::ChatId,
 ) -> Option<PtyDimensions> {
@@ -996,6 +1224,7 @@ mod tests {
                 pi_agent_command: "pi -c".to_string(),
                 auto_start_pi_agent: false,
                 auto_start_terminals: false,
+                mouse_capture: false,
                 colorscheme: Default::default(),
             }),
             "pi -c"
@@ -1005,6 +1234,7 @@ mod tests {
                 pi_agent_command: "   ".to_string(),
                 auto_start_pi_agent: false,
                 auto_start_terminals: false,
+                mouse_capture: false,
                 colorscheme: Default::default(),
             }),
             "pi"
@@ -1085,7 +1315,10 @@ mod tests {
             .resize(terminal_id, PtyDimensions { rows: 2, cols: 8 })
             .expect("resize parser");
         pty_runtime.process_terminal_output(terminal_id, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
-        let config = Config::default();
+        let config = Config {
+            mouse_capture: true,
+            ..Config::default()
+        };
         let frame_area = Rect::new(0, 0, 120, 40);
         let (_, output_area) = ui::selected_terminal_output_area(&app, frame_area)
             .expect("terminal selection has output area");
@@ -1123,6 +1356,36 @@ mod tests {
             pty_runtime.terminal_lines(terminal_id),
             vec!["four".to_string(), "five".to_string()]
         );
+    }
+
+    #[test]
+    fn terminal_text_selection_extracts_visible_pane_text() {
+        let terminal = TerminalId(77);
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime
+            .resize(terminal, PtyDimensions { rows: 2, cols: 8 })
+            .expect("resize parser");
+        pty_runtime.process_terminal_output(terminal, b"abc\r\ndef");
+
+        let selection = TextSelection {
+            terminal,
+            anchor: SelectionCell { row: 0, col: 1 },
+            focus: SelectionCell { row: 1, col: 0 },
+            dragging: false,
+        };
+
+        assert_eq!(
+            selected_text(&pty_runtime, selection).as_deref(),
+            Some("bc\nd")
+        );
+    }
+
+    #[test]
+    fn base64_encode_pads_clipboard_payloads() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
     }
 
     #[test]

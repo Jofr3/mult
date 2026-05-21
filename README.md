@@ -28,6 +28,7 @@ Configuration is loaded from `$XDG_CONFIG_HOME/mult/config.json` or `~/.config/m
   "pi_agent_command": "pi",
   "auto_start_pi_agent": true,
   "auto_start_terminals": true,
+  "mouse_capture": true,
   "colorscheme": {
     "_nc": "#1f1d30",
     "base": "#232136",
@@ -50,7 +51,7 @@ Configuration is loaded from `$XDG_CONFIG_HOME/mult/config.json` or `~/.config/m
 }
 ```
 
-Use `MULT_CONFIG_PATH=/path/to/config.json` to point at another config file. `auto_start_pi_agent` and `auto_start_terminals` default to `true`; set either to `false` if you want panes to wait for manual start. The default colorscheme is Rosé Pine Moon; any color key can be overridden with a `#rrggbb` value.
+Use `MULT_CONFIG_PATH=/path/to/config.json` to point at another config file. `auto_start_pi_agent` and `auto_start_terminals` default to `true`; set either to `false` if you want panes to wait for manual start. `mouse_capture` defaults to `true` so the left sidebar stays visible while mouse wheel scrolling and pane-local drag selection both work. Dragging in the selected chat/terminal pane highlights text and copies it through OSC 52 on release. Set `mouse_capture` to `false` to disable app mouse handling and fall back to your terminal emulator's native selection. The default colorscheme is Rosé Pine Moon; any color key can be overridden with a `#rrggbb` value.
 
 ## Current controls
 
@@ -64,6 +65,7 @@ mult is always in input mode: ordinary keys go to the selected terminal or agent
 - `Ctrl-T`: add a shell terminal to the selected workspace
 - `Ctrl-C`: add a command/dev-server terminal to the selected workspace
 - `Ctrl-F`: open/import a workspace by directory path
+- Drag within the selected chat/terminal pane: select visible pane text and copy it on release
 - Mouse wheel over a chat/terminal output pane: scroll that pane without moving the outer terminal history
 
 When the open/import or command prompt is active:

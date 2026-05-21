@@ -19,6 +19,7 @@ pub struct App {
     pub focus: FocusMode,
     pub chat_buffers: BTreeMap<ChatId, ChatBuffer>,
     pub active_search: Option<SearchState>,
+    pub text_selection: Option<TextSelection>,
     pub should_quit: bool,
     dirty: bool,
 }
@@ -68,6 +69,44 @@ pub struct SearchPrompt {
 pub struct SearchState {
     pub query: String,
     pub scope: SearchScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionCell {
+    pub row: u16,
+    pub col: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextSelection {
+    pub terminal: TerminalId,
+    pub anchor: SelectionCell,
+    pub focus: SelectionCell,
+    pub dragging: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextSelectionRange {
+    pub start: SelectionCell,
+    pub end: SelectionCell,
+}
+
+impl TextSelection {
+    pub fn normalized_range(self) -> TextSelectionRange {
+        let anchor_key = (self.anchor.row, self.anchor.col);
+        let focus_key = (self.focus.row, self.focus.col);
+        if anchor_key <= focus_key {
+            TextSelectionRange {
+                start: self.anchor,
+                end: self.focus,
+            }
+        } else {
+            TextSelectionRange {
+                start: self.focus,
+                end: self.anchor,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +203,7 @@ impl App {
             focus: FocusMode::Sidebar,
             chat_buffers,
             active_search: None,
+            text_selection: None,
             should_quit: false,
             dirty: ids_normalized || titles_normalized,
         };
@@ -275,6 +315,52 @@ impl App {
 
     pub fn clear_search(&mut self) {
         self.active_search = None;
+    }
+
+    pub fn begin_text_selection(&mut self, terminal: TerminalId, cell: SelectionCell) {
+        self.text_selection = Some(TextSelection {
+            terminal,
+            anchor: cell,
+            focus: cell,
+            dragging: true,
+        });
+    }
+
+    pub fn update_text_selection(&mut self, terminal: TerminalId, cell: SelectionCell) -> bool {
+        let Some(selection) = &mut self.text_selection else {
+            return false;
+        };
+        if selection.terminal != terminal {
+            return false;
+        }
+        selection.focus = cell;
+        true
+    }
+
+    pub fn end_text_selection(
+        &mut self,
+        terminal: TerminalId,
+        cell: SelectionCell,
+    ) -> Option<TextSelection> {
+        if !self.update_text_selection(terminal, cell) {
+            return None;
+        }
+        if let Some(selection) = &mut self.text_selection {
+            selection.dragging = false;
+            Some(*selection)
+        } else {
+            None
+        }
+    }
+
+    pub fn clear_text_selection(&mut self) {
+        self.text_selection = None;
+    }
+
+    pub fn text_selection_for(&self, terminal: TerminalId) -> Option<&TextSelection> {
+        self.text_selection
+            .as_ref()
+            .filter(|selection| selection.terminal == terminal)
     }
 
     pub fn search_status(&self) -> Option<String> {

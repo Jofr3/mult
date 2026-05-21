@@ -10,6 +10,7 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 use crate::{
     app::{
         chat_agent_terminal_id, App, CommandPaletteEntry, FocusMode, NavItem, Prompt, SearchScope,
+        TextSelection,
     },
     config::{self, ColorSchemeConfig},
     model::{
@@ -19,7 +20,8 @@ use crate::{
     pty::PtyRuntime,
 };
 
-const FOOTER: &str = "Ctrl-j/k navigate • mouse wheel scroll • shift-drag select • Ctrl-a agent • Ctrl-t terminal • Ctrl-c command • Ctrl-f workspace • Ctrl-q delete • Ctrl-Shift-q quit";
+const FOOTER_NATIVE_SELECTION: &str = "Ctrl-j/k navigate • drag select • Ctrl-a agent • Ctrl-t terminal • Ctrl-c command • Ctrl-f workspace • Ctrl-q delete • Ctrl-Shift-q quit";
+const FOOTER_MOUSE_CAPTURE: &str = "Ctrl-j/k navigate • mouse wheel scroll • drag select/copy • Ctrl-a agent • Ctrl-t terminal • Ctrl-c command • Ctrl-f workspace • Ctrl-q delete • Ctrl-Shift-q quit";
 const CHAT_AGENT_HEADER_LINES: u16 = 0;
 const TERMINAL_HEADER_LINES: u16 = 0;
 const CURSOR_COLOR: Color = Color::Rgb(255, 255, 255);
@@ -132,7 +134,14 @@ pub fn draw(frame: &mut Frame, app: &App, pty_runtime: &PtyRuntime, config: &con
 
     draw_sidebar(frame, app, layout.sidebar, palette);
     draw_main(frame, app, pty_runtime, layout.main, palette);
-    draw_footer(frame, app, pty_runtime, layout.footer, palette);
+    draw_footer(
+        frame,
+        app,
+        pty_runtime,
+        layout.footer,
+        palette,
+        config.mouse_capture,
+    );
 }
 
 pub fn selected_terminal_output_area(app: &App, frame_area: Rect) -> Option<(TerminalId, Rect)> {
@@ -496,7 +505,14 @@ fn draw_chat_details(
     let terminal_id = chat_agent_terminal_id(chat_id);
     if !pty_runtime.terminal_output_is_blank(terminal_id) {
         if let Some(parser) = pty_runtime.parser(terminal_id) {
-            render_terminal_parser(frame, area, parser, focused, palette);
+            render_terminal_parser(
+                frame,
+                area,
+                parser,
+                focused,
+                palette,
+                app.text_selection_for(terminal_id),
+            );
             return;
         }
     }
@@ -610,7 +626,14 @@ fn draw_terminal_details(
     }
 
     if let Some(parser) = pty_runtime.parser(terminal_id) {
-        render_terminal_parser(frame, area, parser, focused, palette);
+        render_terminal_parser(
+            frame,
+            area,
+            parser,
+            focused,
+            palette,
+            app.text_selection_for(terminal_id),
+        );
     }
 }
 
@@ -620,6 +643,7 @@ fn render_terminal_parser(
     parser: &vt100::Parser,
     focused: bool,
     palette: Palette,
+    selection: Option<&TextSelection>,
 ) {
     let cursor_style = Style::default().fg(CURSOR_COLOR).bg(palette.base);
     let cursor_overlay_style = Style::default().fg(palette.nc).bg(CURSOR_COLOR);
@@ -632,6 +656,48 @@ fn render_terminal_parser(
         .block(Block::default().style(pane_style(focused, palette)))
         .cursor(cursor);
     frame.render_widget(pseudo_term, area);
+    if let Some(selection) = selection {
+        render_text_selection(frame, area, selection, palette);
+    }
+}
+
+fn render_text_selection(
+    frame: &mut Frame,
+    area: Rect,
+    selection: &TextSelection,
+    palette: Palette,
+) {
+    if area.is_empty() {
+        return;
+    }
+
+    let range = selection.normalized_range();
+    let start_row = range.start.row.min(area.height.saturating_sub(1));
+    let end_row = range.end.row.min(area.height.saturating_sub(1));
+    let start_col = range.start.col.min(area.width.saturating_sub(1));
+    let end_col = range.end.col.min(area.width.saturating_sub(1));
+    let style = Style::default().fg(palette.nc).bg(palette.foam);
+
+    for row in start_row..=end_row {
+        let row_start_col = if row == start_row { start_col } else { 0 };
+        let row_end_col = if row == end_row {
+            end_col
+        } else {
+            area.width.saturating_sub(1)
+        };
+        if row_start_col > row_end_col {
+            continue;
+        }
+        frame.buffer_mut().set_style(
+            Rect::new(
+                area.x.saturating_add(row_start_col),
+                area.y.saturating_add(row),
+                row_end_col.saturating_sub(row_start_col).saturating_add(1),
+                1,
+            ),
+            style,
+        );
+    }
 }
 
 fn search_result_lines(
@@ -680,6 +746,7 @@ fn draw_footer(
     pty_runtime: &PtyRuntime,
     area: Rect,
     palette: Palette,
+    mouse_capture: bool,
 ) {
     if let Some(prompt) = &app.prompt {
         match prompt {
@@ -722,22 +789,36 @@ fn draw_footer(
         return;
     }
 
-    let footer = footer_line(app, pty_runtime, palette);
+    let footer = footer_line(app, pty_runtime, palette, mouse_capture);
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().bg(palette.base)),
         area,
     );
 }
 
-fn footer_line(app: &App, pty_runtime: &PtyRuntime, palette: Palette) -> Line<'static> {
+fn footer_line(
+    app: &App,
+    pty_runtime: &PtyRuntime,
+    palette: Palette,
+    mouse_capture: bool,
+) -> Line<'static> {
+    let footer = footer_text(mouse_capture);
     if let Some(status) = search_status(app, pty_runtime) {
         Line::from(vec![
-            Span::styled(FOOTER, Style::default().fg(palette.muted)),
+            Span::styled(footer, Style::default().fg(palette.muted)),
             Span::styled(" • ", Style::default().fg(palette.muted)),
             Span::styled(status, Style::default().fg(palette.gold)),
         ])
     } else {
-        Line::styled(FOOTER, Style::default().fg(palette.muted))
+        Line::styled(footer, Style::default().fg(palette.muted))
+    }
+}
+
+fn footer_text(mouse_capture: bool) -> &'static str {
+    if mouse_capture {
+        FOOTER_MOUSE_CAPTURE
+    } else {
+        FOOTER_NATIVE_SELECTION
     }
 }
 
@@ -895,6 +976,7 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     use super::*;
+    use crate::app::SelectionCell;
 
     #[test]
     fn draw_handles_empty_workspace_list() {
@@ -979,6 +1061,36 @@ mod tests {
     }
 
     #[test]
+    fn footer_mentions_native_selection_when_mouse_capture_is_disabled() {
+        let app = App::default();
+        let pty_runtime = PtyRuntime::new_offline();
+        let config = config::Config {
+            mouse_capture: false,
+            ..config::Config::default()
+        };
+
+        let text = draw_text_with_config(&app, &pty_runtime, &config, 180, 30);
+
+        assert!(text.contains("drag select"));
+        assert!(!text.contains("select/copy"));
+    }
+
+    #[test]
+    fn footer_mentions_scroll_and_app_selection_when_mouse_capture_is_enabled() {
+        let app = App::default();
+        let pty_runtime = PtyRuntime::new_offline();
+        let config = config::Config {
+            mouse_capture: true,
+            ..config::Config::default()
+        };
+
+        let text = draw_text_with_config(&app, &pty_runtime, &config, 180, 30);
+
+        assert!(text.contains("mouse wheel scroll"));
+        assert!(text.contains("drag select/copy"));
+    }
+
+    #[test]
     fn scrolled_terminal_output_hides_cursor() {
         let mut app = App::default();
         let (selected, terminal_id) = app
@@ -1051,6 +1163,54 @@ mod tests {
     }
 
     #[test]
+    fn terminal_text_selection_is_highlighted_in_main_pane() {
+        let mut app = App::default();
+        let nav_items = app.nav_items();
+        let (selected, terminal_id) = nav_items
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| match item {
+                NavItem::Terminal { terminal, .. } => Some((index, *terminal)),
+                _ => None,
+            })
+            .expect("seed state has a terminal");
+        app.selected = selected;
+        app.begin_text_selection(terminal_id, SelectionCell { row: 0, col: 0 });
+        app.update_text_selection(terminal_id, SelectionCell { row: 0, col: 1 });
+
+        let frame_area = Rect::new(0, 0, 50, 6);
+        let (_, output_area) = selected_terminal_output_area(&app, frame_area)
+            .expect("terminal selection has output area");
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime
+            .resize(
+                terminal_id,
+                crate::pty::PtyDimensions {
+                    rows: output_area.height,
+                    cols: output_area.width,
+                },
+            )
+            .expect("resize parser");
+        pty_runtime.process_terminal_output(terminal_id, b"xy");
+
+        let backend = TestBackend::new(frame_area.width, frame_area.height);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app, &pty_runtime, &config::Config::default()))
+            .expect("draw app");
+
+        let palette = test_palette();
+        let selected_cell = terminal
+            .backend()
+            .buffer()
+            .cell((output_area.x, output_area.y))
+            .expect("selected cell is in bounds");
+        assert_eq!(selected_cell.symbol(), "x");
+        assert_eq!(selected_cell.fg, palette.nc);
+        assert_eq!(selected_cell.bg, palette.foam);
+    }
+
+    #[test]
     fn terminal_output_does_not_wrap_styled_blank_rows() {
         let mut app = App::default();
         let nav_items = app.nav_items();
@@ -1110,10 +1270,20 @@ mod tests {
     }
 
     fn draw_text(app: &App, pty_runtime: &PtyRuntime, width: u16, height: u16) -> String {
+        draw_text_with_config(app, pty_runtime, &config::Config::default(), width, height)
+    }
+
+    fn draw_text_with_config(
+        app: &App,
+        pty_runtime: &PtyRuntime,
+        config: &config::Config,
+        width: u16,
+        height: u16,
+    ) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
-            .draw(|frame| draw(frame, app, pty_runtime, &config::Config::default()))
+            .draw(|frame| draw(frame, app, pty_runtime, config))
             .expect("draw app");
         format!("{:?}", terminal.backend().buffer())
     }
@@ -1147,6 +1317,8 @@ mod tests {
         let (_, area) = selected_terminal_output_area(&app, Rect::new(0, 0, 120, 40))
             .expect("terminal selection has output area");
 
+        assert_eq!(area.x, 34);
+        assert_eq!(area.y, 0);
         assert_eq!(area.width, 86);
         assert_eq!(area.height, 39);
     }
@@ -1173,6 +1345,8 @@ mod tests {
         let (_, area) = selected_chat_agent_output_area(&app, Rect::new(0, 0, 120, 40))
             .expect("chat selection has pi output area");
 
+        assert_eq!(area.x, 34);
+        assert_eq!(area.y, 0);
         assert_eq!(area.width, 86);
         assert_eq!(area.height, 39);
     }
