@@ -11,11 +11,11 @@
 - PTYs are managed in-memory with `portable-pty`, visible-pane resizing, in-memory scrollback, shell terminals, and command/dev-server terminals.
 - Selected chat panes can run an embedded `pi` process through a PTY. Config is loaded from `$XDG_CONFIG_HOME/mult/config.json` or `~/.config/mult/config.json`.
 - The default UI palette is Rosé Pine Moon, with per-color `colorscheme` config overrides.
-- Workspace/chat/terminal deletion uses a two-key `d d` chord and stops related running PTYs.
-- Normal mode covers workspace/chat/terminal management; input mode is only for typing into the selected terminal or pi agent.
-- Focus is explicit for sidebar, chat pane, and terminal pane. `Enter` moves from the sidebar into the selected pane, `Esc` returns to the sidebar, and the unfocused pane uses a darker background.
-- `:` opens a command palette for workspace, chat, terminal, focus, search, and quit actions.
-- `/` searches/filters the selected terminal output or persisted chat transcript; filters are in-memory UI state.
+- Workspace/chat/terminal deletion uses `Ctrl-Q` and stops related running PTYs.
+- The UI is always in input mode: ordinary keys go to the selected terminal or pi-agent PTY, while workspace actions use Ctrl chords.
+- Selection drives the active pane highlight; the inactive pane uses a darker background.
+- `Ctrl-J`/`Ctrl-K` navigate the sidebar selection, `Ctrl-A`/`Ctrl-T`/`Ctrl-C` create agent/shell/command sessions, `Ctrl-F` imports workspaces, and `Ctrl-Shift-Q` quits.
+- Search/filter state remains in-memory UI state.
 
 ## Product shape
 
@@ -53,7 +53,7 @@ Goal: prove the app skeleton and UX layout.
 - [x] Spawn shells with workspace cwd/env.
 - [x] Spawn named command/dev-server terminals.
 - [x] Stream PTY output into in-memory terminal screen buffers.
-- [x] Handle keyboard input routing when a terminal pane is in PTY input mode.
+- [x] Handle keyboard input routing to selected terminal panes.
 - [x] Track terminal process lifecycle and exit codes.
 - [x] Support resizing from visible pane dimensions instead of fixed 80x24.
 
@@ -74,11 +74,11 @@ Completed in this milestone:
 
 - [x] Render a pi agent directly in selected chat panes via PTY.
 - [x] Load user config from `~/.config/mult/config.json`, including colorscheme overrides.
-- [x] Delete workspaces, agent chats, and terminals with a two-key `d d` chord.
-- [x] Add explicit focus modes for sidebar/chat/terminal without changing PTY backend behavior.
-- [x] Use borderless panes with darker backgrounds for unfocused panes.
-- [x] Keep sidebar navigation scoped to sidebar focus.
-- [x] Collapse user-visible modes to normal mode and input mode.
+- [x] Delete workspaces, agent chats, and terminals with `Ctrl-Q`.
+- [x] Add active pane highlighting without changing PTY backend behavior.
+- [x] Use borderless panes with darker backgrounds for inactive panes.
+- [x] Use Ctrl-based workspace actions so ordinary keys can always go to PTY input.
+- [x] Collapse user-visible modes to always-on input.
 - [x] Restart persisted running chat agents and terminals on app start.
 - [x] Add in-memory terminal scrollback paging for chat-agent, command, and shell panes.
 

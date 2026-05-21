@@ -15,31 +15,12 @@ use crate::{
 pub struct App {
     pub project: ProjectState,
     pub selected: usize,
-    pub mode: Mode,
     pub prompt: Option<Prompt>,
     pub focus: FocusMode,
     pub chat_buffers: BTreeMap<ChatId, ChatBuffer>,
     pub active_search: Option<SearchState>,
     pub should_quit: bool,
     dirty: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    Normal,
-    Input(InputTarget),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InputTarget {
-    Terminal {
-        workspace: WorkspaceId,
-        terminal: TerminalId,
-    },
-    ChatAgent {
-        workspace: WorkspaceId,
-        chat: ChatId,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,7 +160,6 @@ impl App {
         let mut app = Self {
             project,
             selected: 0,
-            mode: Mode::Normal,
             prompt: None,
             focus: FocusMode::Sidebar,
             chat_buffers,
@@ -188,6 +168,7 @@ impl App {
             dirty: ids_normalized || titles_normalized,
         };
         app.clamp_selection();
+        app.sync_focus_to_selection();
         app
     }
 
@@ -362,6 +343,7 @@ impl App {
         self.focus = available[next];
     }
 
+    #[cfg(test)]
     fn available_focus_modes(&self) -> Vec<FocusMode> {
         let mut modes = vec![FocusMode::Sidebar];
         if let Some(focus) = self.selected_main_focus() {
@@ -379,9 +361,11 @@ impl App {
     }
 
     fn normalize_focus(&mut self) {
-        if !self.available_focus_modes().contains(&self.focus) {
-            self.focus = FocusMode::Sidebar;
-        }
+        self.sync_focus_to_selection();
+    }
+
+    fn sync_focus_to_selection(&mut self) {
+        self.focus = self.selected_main_focus().unwrap_or(FocusMode::Sidebar);
     }
 
     fn available_command_palette_entries(&self) -> Vec<CommandPaletteEntry> {
@@ -399,8 +383,8 @@ impl App {
             });
             entries.push(CommandPaletteEntry {
                 action: CommandAction::StartInput,
-                label: "Start or focus input",
-                help: "start the selected chat/terminal PTY and enter input mode",
+                label: "Start selected PTY",
+                help: "start the selected chat/terminal PTY for immediate input",
             });
             entries.push(CommandPaletteEntry {
                 action: CommandAction::SearchSelectedPane,
@@ -485,18 +469,11 @@ impl App {
     }
 
     pub fn terminal_input_target(&self) -> Option<TerminalId> {
-        match self.mode {
-            Mode::Input(InputTarget::Terminal { terminal, .. }) => Some(terminal),
-            _ => None,
-        }
+        self.selected_terminal_id().map(|(_, terminal)| terminal)
     }
 
     pub fn pty_input_target(&self) -> Option<TerminalId> {
-        match self.mode {
-            Mode::Input(InputTarget::Terminal { terminal, .. }) => Some(terminal),
-            Mode::Input(InputTarget::ChatAgent { chat, .. }) => Some(chat_agent_terminal_id(chat)),
-            Mode::Normal => None,
-        }
+        self.selected_output_terminal_id()
     }
 
     pub fn nav_items(&self) -> Vec<NavItem> {
@@ -904,36 +881,29 @@ impl App {
     }
 
     pub fn begin_terminal_input(&mut self) -> bool {
-        let Some((workspace, terminal)) = self.selected_terminal_id() else {
+        if self.selected_terminal_id().is_none() {
             return false;
-        };
+        }
 
         self.focus = FocusMode::Terminal;
-        self.mode = Mode::Input(InputTarget::Terminal {
-            workspace,
-            terminal,
-        });
         true
     }
 
     pub fn begin_chat_agent_input(&mut self) -> bool {
-        let Some((workspace, chat)) = self.selected_chat_id() else {
+        if self.selected_chat_id().is_none() {
             return false;
-        };
+        }
 
         self.focus = FocusMode::Chat;
-        self.mode = Mode::Input(InputTarget::ChatAgent { workspace, chat });
         true
     }
 
     pub fn end_terminal_input(&mut self) {
-        self.mode = Mode::Normal;
-        self.focus = FocusMode::Sidebar;
+        self.sync_focus_to_selection();
     }
 
     pub fn end_pty_input(&mut self) {
-        self.mode = Mode::Normal;
-        self.focus = FocusMode::Sidebar;
+        self.sync_focus_to_selection();
     }
 
     pub fn mark_chat_status_by_id(&mut self, chat: ChatId, status: ChatStatus) {
@@ -1418,7 +1388,7 @@ mod tests {
                 terminal: terminal.id,
             })
         );
-        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.focus, FocusMode::Terminal);
         assert!(app.is_dirty());
     }
 
@@ -1506,7 +1476,6 @@ mod tests {
 
         assert_eq!(runtime_terminals, vec![terminal]);
         assert!(app.project.terminal(workspace, terminal).is_none());
-        assert_eq!(app.mode, Mode::Normal);
         assert!(app.is_dirty());
     }
 
@@ -1563,11 +1532,11 @@ mod tests {
     }
 
     #[test]
-    fn non_terminal_selection_does_not_enter_input_mode() {
+    fn non_terminal_selection_is_not_a_terminal_input_target() {
         let mut app = App::default();
 
         assert!(!app.begin_terminal_input());
-        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.pty_input_target(), None);
     }
 
     #[test]
@@ -1701,7 +1670,7 @@ mod tests {
         assert_eq!(imported.terminals.len(), 1);
         assert_eq!(app.selected_item(), Some(NavItem::Workspace(imported.id)));
         assert_eq!(app.prompt, None);
-        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.focus, FocusMode::Sidebar);
         assert!(app.is_dirty());
     }
 

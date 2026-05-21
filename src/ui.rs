@@ -9,8 +9,7 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::{
     app::{
-        chat_agent_terminal_id, App, CommandPaletteEntry, FocusMode, Mode, NavItem, Prompt,
-        SearchScope,
+        chat_agent_terminal_id, App, CommandPaletteEntry, FocusMode, NavItem, Prompt, SearchScope,
     },
     config::{self, ColorSchemeConfig},
     model::{
@@ -20,7 +19,7 @@ use crate::{
     pty::PtyRuntime,
 };
 
-const FOOTER: &str = "j/k nav/scroll • mouse wheel scroll • shift-drag select • : commands • / search • enter pane • esc sidebar • n a agent • n t terminal • n c command • n w workspace • d d delete • i input • q quit";
+const FOOTER: &str = "Ctrl-j/k navigate • mouse wheel scroll • shift-drag select • Ctrl-a agent • Ctrl-t terminal • Ctrl-c command • Ctrl-f workspace • Ctrl-q delete • Ctrl-Shift-q quit";
 const CHAT_AGENT_HEADER_LINES: u16 = 0;
 const TERMINAL_HEADER_LINES: u16 = 0;
 
@@ -402,7 +401,7 @@ fn workspace_details(app: &App, workspace_id: WorkspaceId, palette: Palette) -> 
     let rows = workspace.chats.len().max(workspace.terminals.len());
     if rows == 0 {
         lines.push(Line::from(
-            "No chats or terminals. Press `n a`, `n t`, or `n c` to add one.",
+            "No chats or terminals. Press Ctrl-a, Ctrl-t, or Ctrl-c to add one.",
         ));
         return lines;
     }
@@ -507,11 +506,11 @@ fn draw_chat_details(
                 "Pi agent is {}; waiting for output.",
                 chat.status.label()
             )),
-            Line::from("Press `i` to enter input mode."),
+            Line::from("Type to send input to the selected agent PTY."),
         ]
     } else {
         let mut lines = vec![
-            Line::from("Pi agent not started. Press `i` to start and enter input mode."),
+            Line::from("Pi agent not started. Type to start it and send input."),
             Line::from("Set `pi_agent_command`/`auto_start_pi_agent` in:"),
             Line::from(config::config_path().display().to_string()),
         ];
@@ -592,10 +591,10 @@ fn draw_terminal_details(
     if pty_runtime.terminal_output_is_blank(terminal_id) {
         let mut lines = vec![match terminal.status {
             TerminalStatus::Running => {
-                Line::from("Terminal is running; waiting for output. Press `i` to focus PTY input.")
+                Line::from("Terminal is running; waiting for output. Type to send PTY input.")
             }
             TerminalStatus::Stopped => {
-                Line::from("Terminal is stopped. Press `i` to start and enter input mode.")
+                Line::from("Terminal is stopped. Type to start it and send input.")
             }
         }];
         if let TerminalLaunch::Command(command) = &terminal.launch {
@@ -720,20 +719,14 @@ fn draw_footer(
         return;
     }
 
-    let footer = match app.mode {
-        Mode::Normal => normal_footer(app, pty_runtime, palette),
-        Mode::Input(_) => Line::styled(
-            "input mode • typing goes to selected PTY • Esc returns to normal mode • Ctrl-C sends interrupt",
-            Style::default().fg(palette.gold),
-        ),
-    };
+    let footer = footer_line(app, pty_runtime, palette);
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().bg(palette.base)),
         area,
     );
 }
 
-fn normal_footer(app: &App, pty_runtime: &PtyRuntime, palette: Palette) -> Line<'static> {
+fn footer_line(app: &App, pty_runtime: &PtyRuntime, palette: Palette) -> Line<'static> {
     if let Some(status) = search_status(app, pty_runtime) {
         Line::from(vec![
             Span::styled(FOOTER, Style::default().fg(palette.muted)),
@@ -927,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_workspace_hint_matches_current_prefix_controls() {
+    fn empty_workspace_hint_matches_current_ctrl_controls() {
         let mut app = App::default();
         app.project.workspaces[0].chats.clear();
         app.project.workspaces[0].terminals.clear();
@@ -935,12 +928,12 @@ mod tests {
 
         let text = lines_text(workspace_details(&app, workspace, test_palette()));
 
-        assert!(text.contains("Press `n a`, `n t`, or `n c`"));
-        assert!(!text.contains("Press `c` or `t`"));
+        assert!(text.contains("Press Ctrl-a, Ctrl-t, or Ctrl-c"));
+        assert!(!text.contains("Press `n a`"));
     }
 
     #[test]
-    fn blank_chat_hint_only_mentions_implemented_input_key() {
+    fn blank_chat_hint_mentions_always_on_input() {
         let mut app = App::default();
         let workspace = app.project.workspaces[0].id;
         let chat = app.project.workspaces[0].chats[0].id;
@@ -953,12 +946,12 @@ mod tests {
             .expect("chat exists");
         let text = draw_text(&app, &PtyRuntime::new_offline(), 100, 30);
 
-        assert!(text.contains("Press `i` to enter input mode."));
-        assert!(!text.contains("`x`"));
+        assert!(text.contains("Type to send input to the selected agent PTY."));
+        assert!(!text.contains("input mode"));
     }
 
     #[test]
-    fn blank_terminal_hint_only_mentions_implemented_start_key() {
+    fn blank_terminal_hint_mentions_always_on_input() {
         let app = App::default();
         let workspace = app.project.workspaces[0].id;
         let terminal = app.project.workspaces[0].terminals[0].id;
@@ -977,9 +970,9 @@ mod tests {
             .expect("terminal exists");
         let text = draw_text(&app, &PtyRuntime::new_offline(), 100, 30);
 
-        assert!(text.contains("Press `i` to start and enter input mode."));
-        assert!(!text.contains("Press `s`"));
-        assert!(!text.contains("`x`"));
+        assert!(text.contains("Type to start it and send input."));
+        assert!(!text.contains("Press `i`"));
+        assert!(!text.contains("input mode"));
     }
 
     #[test]

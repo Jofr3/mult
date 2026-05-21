@@ -54,38 +54,26 @@ Use `MULT_CONFIG_PATH=/path/to/config.json` to point at another config file. `au
 
 ## Current controls
 
-- `:`: open the command palette for workspace, chat, terminal, focus, search, and quit actions
-- `/`: search/filter the selected terminal output or chat transcript; empty Enter clears the filter
-- `Ctrl-L`: clear the active search/filter
-- `Enter`: focus the selected chat/terminal pane from the sidebar
-- `Esc`: return focus to the sidebar
+mult is always in input mode: ordinary keys go to the selected terminal or agent PTY. Workspace actions use Ctrl chords:
+
+- `Ctrl-J`: navigate down
+- `Ctrl-K`: navigate up
+- `Ctrl-Q`: delete the selected workspace, agent chat, terminal, or command terminal immediately
+- `Ctrl-Shift-Q`: quit mult
+- `Ctrl-A`: add an agent chat to the selected workspace and start/focus its pi agent
+- `Ctrl-T`: add a shell terminal to the selected workspace
+- `Ctrl-C`: add a command/dev-server terminal to the selected workspace
+- `Ctrl-F`: open/import a workspace by directory path
 - Mouse wheel over a chat/terminal output pane: scroll that pane without moving the outer terminal history
-- `j`/`k` or `Up`/`Down`: move selection when the sidebar is focused, or scroll the focused output pane by one line
-- `PageUp`/`PageDown`: page the focused chat/terminal output pane
-- `Home`/`End`: jump the focused chat/terminal output pane to top/bottom
-- `n` then `a`: add agent to selected workspace and start/focus its pi agent
-- `n` then `t`: add shell terminal to selected workspace
-- `n` then `c`: add a command/dev-server terminal to selected workspace
-- `n` then `w`: open/import workspace by directory path
-- `d` then `d`: delete selected workspace, agent chat, or terminal immediately
-- `i`: start/focus terminal or pi-agent input for the selected pane
-- `q`: quit
 
-When the command palette is active:
+When the open/import or command prompt is active:
 
-- Type to filter commands
-- Up/Down: move the highlighted command
-- Enter: run it through the same state transitions as the normal keybindings
-- Esc or Ctrl-C: cancel
-
-When the open/import, command, or search prompt is active:
-
-- Type a directory path, command, or search query
+- Type a directory path or command
 - Enter: submit it
 - Esc or Ctrl-C: cancel
 
 Deleting a workspace also deletes its agent chats and terminals; deleting a chat or terminal stops its running PTY if needed.
 
-Focus controls whether the sidebar or selected main pane is active; the inactive pane uses a darker background. Input mode is only for typing into a terminal or pi agent; press Esc to return to normal mode for keyboard scrolling. Mouse wheel scrolling works over the pane under the cursor. Esc does not quit mult. Running PTYs are sized from the visible pane instead of a fixed 80x24 size. Chat panes run `pi` by default; set `pi_agent_command` in the config file to override it.
+The selected chat/terminal pane receives keyboard input directly. If its PTY is not running, typing into it starts the PTY first. Mouse wheel scrolling works over the pane under the cursor. Running PTYs are sized from the visible pane instead of a fixed 80x24 size. Chat panes run `pi` by default; set `pi_agent_command` in the config file to override it.
 
 See `docs/PLAN.md` for the roadmap and `AGENTS.md` for contributor/agent guidance.
