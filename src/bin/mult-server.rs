@@ -9,11 +9,10 @@ use std::{
     time::Duration,
 };
 
-use mult::app::TerminalBuffer;
 use mult_protocol::{
     bounded_screen_dimensions, default_socket_path, read_message, write_message, ClientMessage,
-    ExitInfo, LaunchSpec, PaneId, PaneInfo, ScreenSnapshot, ScreenUpdate, ServerMessage, SessionId,
-    SessionInfo, PROTOCOL_VERSION,
+    ExitInfo, LaunchSpec, PaneId, PaneInfo, ServerMessage, SessionId, SessionInfo,
+    MAX_MESSAGE_BYTES, PROTOCOL_VERSION,
 };
 use portable_pty::{native_pty_system, Child, CommandBuilder, ExitStatus, MasterPty, PtySize};
 
@@ -25,6 +24,8 @@ type SharedMasterPty = Arc<Mutex<Box<dyn MasterPty + Send>>>;
 type ClientSender = mpsc::Sender<ServerMessage>;
 
 const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
+const RAW_HISTORY_MAX_BYTES: usize = MAX_MESSAGE_BYTES * 2;
+const RAW_HISTORY_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 struct ClientHandle {
@@ -43,8 +44,9 @@ struct PaneState {
     pane: PaneId,
     name: String,
     title: String,
-    terminal: TerminalBuffer,
-    last_snapshot: Option<ScreenSnapshot>,
+    rows: u16,
+    cols: u16,
+    raw_history: Vec<u8>,
     master: SharedMasterPty,
     writer: SharedPtyWriter,
     child: Option<Box<dyn Child + Send + Sync>>,
@@ -254,10 +256,6 @@ fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SpawnedPane
     let reader = pair.master.try_clone_reader().map_err(error_to_io)?;
     let writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(error_to_io)?));
     let master = Arc::new(Mutex::new(pair.master));
-
-    let mut terminal = TerminalBuffer::default();
-    terminal.resize(rows, cols);
-    let last_snapshot = Some(terminal.snapshot());
     let title = pane_title(&shell, &spec.launch);
 
     let pane = Arc::new(Mutex::new(PaneState {
@@ -265,8 +263,9 @@ fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SpawnedPane
         pane: PaneId(session.0),
         name: spec.name,
         title,
-        terminal,
-        last_snapshot,
+        rows,
+        cols,
+        raw_history: Vec::new(),
         master,
         writer,
         child: Some(child),
@@ -376,7 +375,7 @@ fn handle_client_messages(
                     continue;
                 };
 
-                let (pane_info, snapshot) = {
+                let (pane_info, pane_id, history) = {
                     let mut pane = pane.lock().map_err(lock_error)?;
                     if pane.clients.iter().any(|existing| existing.id != client.id) {
                         let _ = client.sender.send(ServerMessage::Error {
@@ -388,19 +387,14 @@ fn handle_client_messages(
                     if !pane.clients.iter().any(|existing| existing.id == client.id) {
                         pane.clients.push(client.clone());
                     }
-                    let snapshot = pane.terminal.snapshot();
-                    pane.last_snapshot = Some(snapshot.clone());
-                    (pane.pane_info(), snapshot)
+                    (pane.pane_info(), pane.pane, pane.raw_history.clone())
                 };
 
                 let _ = client.sender.send(ServerMessage::Attached {
                     session,
                     panes: vec![pane_info],
                 });
-                let _ = client.sender.send(ServerMessage::Snapshot {
-                    pane: PaneId(session.0),
-                    snapshot,
-                });
+                send_pty_scrollback(&client, pane_id, &history);
             }
             ClientMessage::Input { pane, bytes } => {
                 let pane = { server.lock().map_err(lock_error)?.pane_by_id(pane) };
@@ -412,60 +406,17 @@ fn handle_client_messages(
             ClientMessage::Paste { pane, text } => {
                 let pane = { server.lock().map_err(lock_error)?.pane_by_id(pane) };
                 if let Some(pane) = pane {
-                    let (writer, bytes) = {
-                        let pane = pane.lock().map_err(lock_error)?;
-                        (Arc::clone(&pane.writer), pane.terminal.paste_bytes(&text))
-                    };
-                    write_pty_input(&writer, &bytes)?;
+                    let writer = { Arc::clone(&pane.lock().map_err(lock_error)?.writer) };
+                    write_pty_input(&writer, text.as_bytes())?;
                 }
             }
-            ClientMessage::Scroll { pane, rows } => {
-                let pane = { server.lock().map_err(lock_error)?.pane_by_id(pane) };
-                if let Some(pane) = pane {
-                    if let Some((pane_id, snapshot)) = scroll_pane(&pane, rows)? {
-                        let _ = client.sender.send(ServerMessage::Snapshot {
-                            pane: pane_id,
-                            snapshot,
-                        });
-                    }
-                }
-            }
-            ClientMessage::ScrollToTop { pane } => {
-                let pane = { server.lock().map_err(lock_error)?.pane_by_id(pane) };
-                if let Some(pane) = pane {
-                    if let Some((pane_id, snapshot)) = scroll_pane_to_top(&pane)? {
-                        let _ = client.sender.send(ServerMessage::Snapshot {
-                            pane: pane_id,
-                            snapshot,
-                        });
-                    }
-                }
-            }
-            ClientMessage::ScrollToBottom { pane } => {
-                let pane = { server.lock().map_err(lock_error)?.pane_by_id(pane) };
-                if let Some(pane) = pane {
-                    if let Some((pane_id, snapshot)) = scroll_pane_to_bottom(&pane)? {
-                        let _ = client.sender.send(ServerMessage::Snapshot {
-                            pane: pane_id,
-                            snapshot,
-                        });
-                    }
-                }
-            }
+            ClientMessage::Scroll { .. }
+            | ClientMessage::ScrollToTop { .. }
+            | ClientMessage::ScrollToBottom { .. } => {}
             ClientMessage::Resize { pane, rows, cols } => {
                 let pane = { server.lock().map_err(lock_error)?.pane_by_id(pane) };
                 if let Some(pane) = pane {
-                    let (pane_id, snapshot) = {
-                        let mut pane = pane.lock().map_err(lock_error)?;
-                        pane.resize(rows, cols)?;
-                        let snapshot = pane.terminal.snapshot();
-                        pane.last_snapshot = Some(snapshot.clone());
-                        (pane.pane, snapshot)
-                    };
-                    let _ = client.sender.send(ServerMessage::Snapshot {
-                        pane: pane_id,
-                        snapshot,
-                    });
+                    pane.lock().map_err(lock_error)?.resize(rows, cols)?;
                 }
             }
             ClientMessage::Detach => break,
@@ -562,29 +513,15 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, pane: SharedPane, server: Shar
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let text = String::from_utf8_lossy(&buffer[..n]).into_owned();
-                    let (pane_id, update, clients, writer, responses) = match pane.lock() {
+                    let bytes = buffer[..n].to_vec();
+                    let (pane_id, clients) = match pane.lock() {
                         Ok(mut pane) => {
-                            let responses = pane.terminal.append_and_collect_responses(&text);
-                            let snapshot = pane.terminal.snapshot();
-                            let update = pane
-                                .last_snapshot
-                                .as_ref()
-                                .map(|previous| ScreenUpdate::diff(previous, &snapshot))
-                                .unwrap_or_else(|| ScreenUpdate::from_snapshot(&snapshot));
-                            pane.last_snapshot = Some(snapshot);
-                            (
-                                pane.pane,
-                                update,
-                                pane.clients.clone(),
-                                Arc::clone(&pane.writer),
-                                responses,
-                            )
+                            pane.append_raw_history(&bytes);
+                            (pane.pane, pane.clients.clone())
                         }
                         Err(_) => break,
                     };
-                    write_pty_responses(&writer, responses);
-                    broadcast_update(pane_id, update, clients);
+                    broadcast_pty_output(pane_id, bytes, clients);
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
@@ -642,6 +579,23 @@ fn exit_info(status: ExitStatus) -> ExitInfo {
     }
 }
 
+fn send_pty_scrollback(client: &ClientHandle, pane: PaneId, bytes: &[u8]) {
+    if bytes.is_empty() {
+        let _ = client.sender.send(ServerMessage::PtyScrollback {
+            pane,
+            bytes: Vec::new(),
+        });
+        return;
+    }
+
+    for chunk in bytes.chunks(RAW_HISTORY_CHUNK_BYTES) {
+        let _ = client.sender.send(ServerMessage::PtyScrollback {
+            pane,
+            bytes: chunk.to_vec(),
+        });
+    }
+}
+
 fn broadcast_exit(pane: PaneId, exit: ExitInfo, clients: Vec<ClientHandle>) {
     for client in clients {
         let _ = client.sender.send(ServerMessage::PaneExited {
@@ -651,11 +605,11 @@ fn broadcast_exit(pane: PaneId, exit: ExitInfo, clients: Vec<ClientHandle>) {
     }
 }
 
-fn broadcast_update(pane: PaneId, update: ScreenUpdate, clients: Vec<ClientHandle>) {
+fn broadcast_pty_output(pane: PaneId, bytes: Vec<u8>, clients: Vec<ClientHandle>) {
     for client in clients {
-        let _ = client.sender.send(ServerMessage::Update {
+        let _ = client.sender.send(ServerMessage::PtyOutput {
             pane,
-            update: update.clone(),
+            bytes: bytes.clone(),
         });
     }
 }
@@ -671,18 +625,18 @@ impl PaneState {
     }
 
     fn pane_info(&self) -> PaneInfo {
-        let snapshot = self.terminal.snapshot();
         PaneInfo {
             id: self.pane,
             title: self.title.clone(),
-            rows: snapshot.rows,
-            cols: snapshot.cols,
+            rows: self.rows,
+            cols: self.cols,
         }
     }
 
     fn resize(&mut self, rows: u16, cols: u16) -> io::Result<()> {
         let (rows, cols) = bounded_pty_dimensions(rows, cols);
-        self.terminal.resize(rows, cols);
+        self.rows = rows;
+        self.cols = cols;
         self.master
             .lock()
             .map_err(|_| io::Error::other("PTY master lock poisoned"))?
@@ -704,6 +658,14 @@ impl PaneState {
         }
         Ok(())
     }
+
+    fn append_raw_history(&mut self, bytes: &[u8]) {
+        self.raw_history.extend_from_slice(bytes);
+        let overflow = self.raw_history.len().saturating_sub(RAW_HISTORY_MAX_BYTES);
+        if overflow > 0 {
+            self.raw_history.drain(..overflow);
+        }
+    }
 }
 
 fn bounded_pty_dimensions(rows: u16, cols: u16) -> (u16, u16) {
@@ -716,56 +678,6 @@ fn write_pty_input(writer: &SharedPtyWriter, bytes: &[u8]) -> io::Result<()> {
         .map_err(|_| io::Error::other("PTY writer lock poisoned"))?;
     writer.write_all(bytes)?;
     writer.flush()
-}
-
-fn write_pty_responses(writer: &SharedPtyWriter, responses: Vec<Vec<u8>>) {
-    if responses.is_empty() {
-        return;
-    }
-
-    if let Ok(mut writer) = writer.lock() {
-        for response in responses {
-            let _ = writer.write_all(&response);
-        }
-        let _ = writer.flush();
-    }
-}
-
-fn scroll_pane(pane: &SharedPane, rows: i32) -> io::Result<Option<(PaneId, ScreenSnapshot)>> {
-    let amount = rows.unsigned_abs() as usize;
-    if amount == 0 {
-        return Ok(None);
-    }
-
-    let mut pane = pane.lock().map_err(lock_error)?;
-    let changed = if rows > 0 {
-        pane.terminal.scroll_view_up(amount)
-    } else {
-        pane.terminal.scroll_view_down(amount)
-    };
-    Ok(changed.then(|| snapshot_for_pane_scroll(&mut pane)))
-}
-
-fn scroll_pane_to_top(pane: &SharedPane) -> io::Result<Option<(PaneId, ScreenSnapshot)>> {
-    let mut pane = pane.lock().map_err(lock_error)?;
-    Ok(pane
-        .terminal
-        .scroll_view_to_top()
-        .then(|| snapshot_for_pane_scroll(&mut pane)))
-}
-
-fn scroll_pane_to_bottom(pane: &SharedPane) -> io::Result<Option<(PaneId, ScreenSnapshot)>> {
-    let mut pane = pane.lock().map_err(lock_error)?;
-    Ok(pane
-        .terminal
-        .scroll_view_to_bottom()
-        .then(|| snapshot_for_pane_scroll(&mut pane)))
-}
-
-fn snapshot_for_pane_scroll(pane: &mut PaneState) -> (PaneId, ScreenSnapshot) {
-    let snapshot = pane.terminal.snapshot();
-    pane.last_snapshot = Some(snapshot.clone());
-    (pane.pane, snapshot)
 }
 
 fn shell_command_args(command: String) -> Vec<String> {
@@ -891,6 +803,14 @@ mod tests {
     }
 
     #[test]
+    fn raw_history_is_capped() {
+        let mut pane = test_pane_state();
+        pane.append_raw_history(&vec![b'a'; RAW_HISTORY_MAX_BYTES + 10]);
+
+        assert_eq!(pane.raw_history.len(), RAW_HISTORY_MAX_BYTES);
+    }
+
+    #[test]
     fn bind_socket_path_refuses_to_remove_existing_non_socket_path() {
         let path = unique_socket_path();
         fs::write(&path, "do not remove").expect("write collision file");
@@ -914,6 +834,31 @@ mod tests {
         bind_socket_path(&path).expect("remove stale socket");
 
         assert!(!path.exists());
+    }
+
+    fn test_pane_state() -> PaneState {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 1,
+                cols: 1,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open test pty");
+        PaneState {
+            session: SessionId(1),
+            pane: PaneId(1),
+            name: "test".to_string(),
+            title: "test".to_string(),
+            rows: 1,
+            cols: 1,
+            raw_history: Vec::new(),
+            master: Arc::new(Mutex::new(pair.master)),
+            writer: Arc::new(Mutex::new(Box::new(io::sink()))),
+            child: None,
+            clients: Vec::new(),
+        }
     }
 
     fn unique_socket_path() -> PathBuf {

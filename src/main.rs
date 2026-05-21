@@ -100,7 +100,9 @@ fn run(terminal: &mut DefaultTerminal, mut app: App, config: Config) -> io::Resu
         resize_visible_chat_agent(&mut app, &mut pty_runtime, frame_area);
         auto_start_selected_terminal(&mut app, &mut pty_runtime, &config, frame_area);
         auto_start_selected_chat_agent(&mut app, &mut pty_runtime, &config, frame_area);
-        frame_area = terminal.draw(|frame| ui::draw(frame, &app, &config))?.area;
+        frame_area = terminal
+            .draw(|frame| ui::draw(frame, &app, &pty_runtime, &config))?
+            .area;
 
         if event::poll(EVENT_POLL_INTERVAL)? {
             handle_event(
@@ -276,11 +278,12 @@ fn handle_paste(
     match pty_runtime.send_paste(terminal_id, &text) {
         Ok(true) => {}
         Ok(false) => {
-            app.append_terminal_system_line(terminal_id, "PTY is not running");
+            pty_runtime.append_terminal_system_line(terminal_id, "PTY is not running");
             app.end_pty_input();
         }
         Err(error) => {
-            app.append_terminal_system_line(terminal_id, format!("failed to paste: {error}"));
+            pty_runtime
+                .append_terminal_system_line(terminal_id, format!("failed to paste: {error}"));
             app.end_pty_input();
         }
     }
@@ -412,48 +415,32 @@ fn scroll_selected_output_to_top(app: &mut App, pty_runtime: &mut PtyRuntime) ->
     let Some(terminal) = app.selected_output_terminal_id() else {
         return false;
     };
-    if pty_runtime.is_running(terminal) {
-        return pty_runtime.scroll_to_top(terminal).unwrap_or(false);
-    }
-
-    app.scroll_terminal_output_to_top(terminal)
+    pty_runtime.scroll_to_top(terminal).unwrap_or(false)
 }
 
 fn scroll_selected_output_to_bottom(app: &mut App, pty_runtime: &mut PtyRuntime) -> bool {
     let Some(terminal) = app.selected_output_terminal_id() else {
         return false;
     };
-    if pty_runtime.is_running(terminal) {
-        return pty_runtime.scroll_to_bottom(terminal).unwrap_or(false);
-    }
-
-    app.scroll_terminal_output_to_bottom(terminal)
+    pty_runtime.scroll_to_bottom(terminal).unwrap_or(false)
 }
 
 fn scroll_terminal_output_up(
-    app: &mut App,
+    _app: &mut App,
     pty_runtime: &mut PtyRuntime,
     terminal: TerminalId,
     rows: usize,
 ) -> bool {
-    if pty_runtime.is_running(terminal) {
-        return pty_runtime.scroll_up(terminal, rows).unwrap_or(false);
-    }
-
-    app.scroll_terminal_output_up(terminal, rows)
+    pty_runtime.scroll_up(terminal, rows).unwrap_or(false)
 }
 
 fn scroll_terminal_output_down(
-    app: &mut App,
+    _app: &mut App,
     pty_runtime: &mut PtyRuntime,
     terminal: TerminalId,
     rows: usize,
 ) -> bool {
-    if pty_runtime.is_running(terminal) {
-        return pty_runtime.scroll_down(terminal, rows).unwrap_or(false);
-    }
-
-    app.scroll_terminal_output_down(terminal, rows)
+    pty_runtime.scroll_down(terminal, rows).unwrap_or(false)
 }
 
 fn scroll_page_rows(app: &App, frame_area: Rect) -> usize {
@@ -503,6 +490,7 @@ fn add_agent_to_selected_workspace(
 fn delete_selected_now(app: &mut App, pty_runtime: &mut PtyRuntime) {
     for terminal in app.delete_selected_immediately() {
         let _ = pty_runtime.stop(terminal);
+        pty_runtime.remove_terminal(terminal);
     }
 }
 
@@ -524,11 +512,12 @@ fn handle_pty_input_key(app: &mut App, pty_runtime: &mut PtyRuntime, key: KeyEve
     match pty_runtime.send_input(terminal_id, &bytes) {
         Ok(true) => {}
         Ok(false) => {
-            app.append_terminal_system_line(terminal_id, "PTY is not running");
+            pty_runtime.append_terminal_system_line(terminal_id, "PTY is not running");
             app.end_pty_input();
         }
         Err(error) => {
-            app.append_terminal_system_line(terminal_id, format!("failed to send input: {error}"));
+            pty_runtime
+                .append_terminal_system_line(terminal_id, format!("failed to send input: {error}"));
             app.end_pty_input();
         }
     }
@@ -644,7 +633,7 @@ fn start_terminal(
     terminal_id: model::TerminalId,
 ) -> bool {
     if pty_runtime.is_running(terminal_id) {
-        app.append_terminal_system_line(terminal_id, "PTY already running");
+        pty_runtime.append_terminal_system_line(terminal_id, "PTY already running");
         return true;
     }
 
@@ -674,8 +663,6 @@ fn start_terminal(
         ),
     };
     spawn.size = selected_terminal_dimensions(app, frame_area, terminal_id).unwrap_or_default();
-    let size = spawn.size;
-    app.resize_terminal_buffer(terminal_id, size.rows, size.cols);
 
     match pty_runtime.start(spawn) {
         Ok(()) => {
@@ -683,7 +670,7 @@ fn start_terminal(
             true
         }
         Err(error) => {
-            app.append_terminal_system_line(
+            pty_runtime.append_terminal_system_line(
                 terminal_id,
                 format!("failed to start terminal `{terminal_name}`: {error}"),
             );
@@ -749,8 +736,6 @@ fn start_or_focus_chat_agent(
         workspace.environment.clone(),
     );
     spawn.size = selected_chat_agent_dimensions(app, frame_area, chat_id).unwrap_or_default();
-    let size = spawn.size;
-    app.resize_terminal_buffer(terminal_id, size.rows, size.cols);
 
     match pty_runtime.start(spawn) {
         Ok(()) => {
@@ -761,7 +746,7 @@ fn start_or_focus_chat_agent(
         }
         Err(error) => {
             app.mark_chat_status_by_id(chat_id, ChatStatus::Failed);
-            app.append_terminal_system_line(
+            pty_runtime.append_terminal_system_line(
                 terminal_id,
                 format!("failed to start pi agent for `{chat_name}`: {error}"),
             );
@@ -782,7 +767,7 @@ fn auto_start_selected_terminal(
     let Some((_, terminal_id)) = app.selected_terminal_id() else {
         return;
     };
-    if pty_runtime.is_running(terminal_id) || !terminal_output_is_blank(app, terminal_id) {
+    if pty_runtime.is_running(terminal_id) || !pty_runtime.terminal_output_is_blank(terminal_id) {
         return;
     }
 
@@ -803,7 +788,7 @@ fn auto_start_selected_chat_agent(
         return;
     };
     let terminal_id = chat_agent_terminal_id(chat_id);
-    if pty_runtime.is_running(terminal_id) || !terminal_output_is_blank(app, terminal_id) {
+    if pty_runtime.is_running(terminal_id) || !pty_runtime.terminal_output_is_blank(terminal_id) {
         return;
     }
 
@@ -816,10 +801,6 @@ fn auto_start_selected_chat_agent(
         chat_id,
         false,
     );
-}
-
-fn terminal_output_is_blank(app: &App, terminal_id: TerminalId) -> bool {
-    app.terminal_output_is_blank(terminal_id)
 }
 
 fn pi_command(config: &Config) -> String {
@@ -863,11 +844,7 @@ fn resize_visible_terminal(app: &mut App, pty_runtime: &mut PtyRuntime, frame_ar
         return;
     };
     let size = pty_dimensions_from_area(area);
-    app.resize_terminal_buffer(terminal_id, size.rows, size.cols);
-
-    if pty_runtime.is_running(terminal_id) {
-        let _ = pty_runtime.resize(terminal_id, size);
-    }
+    let _ = pty_runtime.resize(terminal_id, size);
 }
 
 fn resize_visible_chat_agent(app: &mut App, pty_runtime: &mut PtyRuntime, frame_area: Rect) {
@@ -876,11 +853,7 @@ fn resize_visible_chat_agent(app: &mut App, pty_runtime: &mut PtyRuntime, frame_
     };
     let terminal_id = chat_agent_terminal_id(chat_id);
     let size = pty_dimensions_from_area(area);
-    app.resize_terminal_buffer(terminal_id, size.rows, size.cols);
-
-    if pty_runtime.is_running(terminal_id) {
-        let _ = pty_runtime.resize(terminal_id, size);
-    }
+    let _ = pty_runtime.resize(terminal_id, size);
 }
 
 fn selected_terminal_dimensions(
@@ -913,11 +886,7 @@ fn pty_dimensions_from_area(area: Rect) -> PtyDimensions {
 fn drain_pty_events(app: &mut App, pty_runtime: &mut PtyRuntime) {
     for event in pty_runtime.drain_events() {
         match event {
-            PtyEvent::Snapshot { terminal, snapshot } => {
-                app.set_terminal_snapshot(terminal, snapshot)
-            }
-            PtyEvent::Update { terminal, update } => app.apply_terminal_update(terminal, update),
-            PtyEvent::Output { terminal, text } => app.append_terminal_output(terminal, &text),
+            PtyEvent::Scrollback { .. } | PtyEvent::Output { .. } => {}
             PtyEvent::Exited { terminal, status } => {
                 if let Some(chat_id) = chat_id_from_agent_terminal_id(terminal) {
                     let chat_status = if status.code == 0 {
@@ -930,18 +899,18 @@ fn drain_pty_events(app: &mut App, pty_runtime: &mut PtyRuntime) {
                         app.end_pty_input();
                     }
                     let exit_message = format!("pi agent exited: {}", status.label());
-                    app.append_terminal_system_line(terminal, exit_message.as_str());
+                    pty_runtime.append_terminal_system_line(terminal, exit_message.as_str());
                 } else {
                     app.mark_terminal_stopped(terminal);
                     if app.terminal_input_target() == Some(terminal) {
                         app.end_terminal_input();
                     }
                     let exit_message = format!("PTY exited: {}", status.label());
-                    app.append_terminal_system_line(terminal, exit_message.as_str());
+                    pty_runtime.append_terminal_system_line(terminal, exit_message.as_str());
                 }
             }
             PtyEvent::Error { terminal, message } => {
-                app.append_terminal_system_line(terminal, message.as_str());
+                pty_runtime.append_terminal_system_line(terminal, message.as_str());
             }
         }
     }
@@ -1167,9 +1136,11 @@ mod tests {
             .expect("seed state has a terminal");
         app.selected = selected;
         assert!(app.focus_selected_main());
-        app.resize_terminal_buffer(terminal_id, 2, 8);
-        app.append_terminal_output(terminal_id, "one\r\ntwo\r\nthree");
-        let mut pty_runtime = PtyRuntime::default();
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime
+            .resize(terminal_id, PtyDimensions { rows: 2, cols: 8 })
+            .expect("resize parser");
+        pty_runtime.process_terminal_output(terminal_id, b"one\r\ntwo\r\nthree");
         let config = Config::default();
         let frame_area = Rect::new(0, 0, 120, 40);
         let mut normal_prefix = None;
@@ -1183,7 +1154,7 @@ mod tests {
             frame_area,
         );
         assert_eq!(
-            app.terminal_lines(terminal_id),
+            pty_runtime.terminal_lines(terminal_id),
             vec!["one".to_string(), "two".to_string()]
         );
 
@@ -1196,7 +1167,7 @@ mod tests {
             frame_area,
         );
         assert_eq!(
-            app.terminal_lines(terminal_id),
+            pty_runtime.terminal_lines(terminal_id),
             vec!["two".to_string(), "three".to_string()]
         );
     }
@@ -1214,9 +1185,11 @@ mod tests {
             })
             .expect("seed state has a terminal");
         app.selected = selected;
-        app.resize_terminal_buffer(terminal_id, 2, 8);
-        app.append_terminal_output(terminal_id, "one\r\ntwo\r\nthree\r\nfour\r\nfive");
-        let mut pty_runtime = PtyRuntime::default();
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime
+            .resize(terminal_id, PtyDimensions { rows: 2, cols: 8 })
+            .expect("resize parser");
+        pty_runtime.process_terminal_output(terminal_id, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
         let config = Config::default();
         let frame_area = Rect::new(0, 0, 120, 40);
         let (_, output_area) = ui::selected_terminal_output_area(&app, frame_area)
@@ -1237,8 +1210,8 @@ mod tests {
             frame_area,
         );
         assert_eq!(
-            app.terminal_lines(terminal_id),
-            vec!["one".to_string(), "two".to_string()]
+            pty_runtime.terminal_lines(terminal_id),
+            vec!["two".to_string(), "three".to_string()]
         );
 
         handle_event(
@@ -1255,7 +1228,7 @@ mod tests {
             frame_area,
         );
         assert_eq!(
-            app.terminal_lines(terminal_id),
+            pty_runtime.terminal_lines(terminal_id),
             vec!["four".to_string(), "five".to_string()]
         );
     }

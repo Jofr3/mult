@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs, io,
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
@@ -14,8 +14,9 @@ use std::{
 
 use mult_protocol::{
     default_socket_path, read_message, write_message, ClientMessage, LaunchSpec, PaneId,
-    ScreenSnapshot, ScreenUpdate, ServerMessage, SessionId, PROTOCOL_VERSION, SOCKET_PATH_ENV,
+    ServerMessage, SessionId, PROTOCOL_VERSION, SOCKET_PATH_ENV,
 };
+use vt100::Parser;
 
 use crate::model::TerminalId;
 
@@ -37,17 +38,13 @@ pub struct PtyDimensions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PtyEvent {
-    Snapshot {
+    Scrollback {
         terminal: TerminalId,
-        snapshot: ScreenSnapshot,
-    },
-    Update {
-        terminal: TerminalId,
-        update: ScreenUpdate,
+        bytes: Vec<u8>,
     },
     Output {
         terminal: TerminalId,
-        text: String,
+        bytes: Vec<u8>,
     },
     Exited {
         terminal: TerminalId,
@@ -70,14 +67,41 @@ pub struct PtyRuntime {
     connection: Option<ServerConnection>,
     terminal_to_pane: HashMap<TerminalId, PaneId>,
     pane_to_terminal: HashMap<PaneId, TerminalId>,
+    parsers: HashMap<TerminalId, Parser>,
+    responders: HashMap<TerminalId, TerminalResponseDetector>,
+    terminals_with_output: HashSet<TerminalId>,
     pending_events: Vec<PtyEvent>,
 }
 
 const SERVER_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
+const TERMINAL_SCROLLBACK_LINES: usize = 5_000;
+const TERMINAL_MAX_CSI_SEQUENCE_BYTES: usize = 128;
+const PRIMARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[?1;2c";
+const DEVICE_STATUS_OK_RESPONSE: &[u8] = b"\x1b[0n";
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
 struct ServerConnection {
     writer: Arc<Mutex<UnixStream>>,
     receiver: Receiver<ServerMessage>,
+}
+
+#[derive(Debug, Default)]
+struct TerminalResponseDetector {
+    state: TerminalResponseState,
+}
+
+#[derive(Debug, Default)]
+enum TerminalResponseState {
+    #[default]
+    Ground,
+    Escape,
+    Csi(Vec<u8>),
+    CsiIgnored,
+    String {
+        esc_seen: bool,
+    },
+    IgnoreOne,
 }
 
 impl Default for PtyRuntime {
@@ -91,32 +115,40 @@ impl PtyRuntime {
         Self::with_socket_path(default_socket_path())
     }
 
+    pub fn new_offline() -> Self {
+        Self::disconnected(default_socket_path(), Vec::new())
+    }
+
     pub fn with_socket_path(socket_path: PathBuf) -> Self {
         match Self::connect_to_socket(socket_path.clone()) {
             Ok(runtime) => runtime,
-            Err(error) => Self {
+            Err(error) => Self::disconnected(
                 socket_path,
-                connection: None,
-                terminal_to_pane: HashMap::new(),
-                pane_to_terminal: HashMap::new(),
-                pending_events: vec![PtyEvent::Error {
+                vec![PtyEvent::Error {
                     terminal: TerminalId(0),
                     message: format!("failed to connect to mult-server: {error}"),
                 }],
-            },
+            ),
         }
     }
 
     pub fn connect_to_socket(socket_path: PathBuf) -> io::Result<Self> {
-        let mut runtime = Self {
+        let mut runtime = Self::disconnected(socket_path, Vec::new());
+        runtime.connect()?;
+        Ok(runtime)
+    }
+
+    fn disconnected(socket_path: PathBuf, pending_events: Vec<PtyEvent>) -> Self {
+        Self {
             socket_path,
             connection: None,
             terminal_to_pane: HashMap::new(),
             pane_to_terminal: HashMap::new(),
-            pending_events: Vec::new(),
-        };
-        runtime.connect()?;
-        Ok(runtime)
+            parsers: HashMap::new(),
+            responders: HashMap::new(),
+            terminals_with_output: HashSet::new(),
+            pending_events,
+        }
     }
 }
 
@@ -164,6 +196,107 @@ impl PtyRuntime {
         self.terminal_to_pane.contains_key(&terminal)
     }
 
+    pub fn parser(&self, terminal: TerminalId) -> Option<&Parser> {
+        self.parsers.get(&terminal)
+    }
+
+    pub fn ensure_parser(&mut self, terminal: TerminalId, size: PtyDimensions) {
+        self.parsers.entry(terminal).or_insert_with(|| {
+            Parser::new(
+                size.rows.max(1),
+                size.cols.max(1),
+                TERMINAL_SCROLLBACK_LINES,
+            )
+        });
+        self.resize_parser(terminal, size);
+    }
+
+    pub fn reset_parser(&mut self, terminal: TerminalId, size: PtyDimensions) {
+        self.parsers.insert(
+            terminal,
+            Parser::new(
+                size.rows.max(1),
+                size.cols.max(1),
+                TERMINAL_SCROLLBACK_LINES,
+            ),
+        );
+        self.responders.remove(&terminal);
+        self.terminals_with_output.remove(&terminal);
+    }
+
+    pub fn remove_terminal(&mut self, terminal: TerminalId) {
+        if let Some(pane) = self.terminal_to_pane.remove(&terminal) {
+            self.pane_to_terminal.remove(&pane);
+        }
+        self.parsers.remove(&terminal);
+        self.responders.remove(&terminal);
+        self.terminals_with_output.remove(&terminal);
+    }
+
+    pub fn process_terminal_output(&mut self, terminal: TerminalId, bytes: &[u8]) {
+        self.feed_terminal_output(terminal, bytes, false);
+    }
+
+    fn feed_terminal_output(&mut self, terminal: TerminalId, bytes: &[u8], respond: bool) {
+        if bytes.is_empty() {
+            return;
+        }
+
+        let responses = {
+            let parser = self
+                .parsers
+                .entry(terminal)
+                .or_insert_with(|| Parser::new(24, 80, TERMINAL_SCROLLBACK_LINES));
+            let responder = self.responders.entry(terminal).or_default();
+            let mut responses = Vec::new();
+            for byte in bytes {
+                parser.process(std::slice::from_ref(byte));
+                if respond {
+                    if let Some(response) = responder.advance(*byte, parser.screen()) {
+                        responses.push(response);
+                    }
+                }
+            }
+            clamp_parser_scrollback(parser);
+            responses
+        };
+
+        self.terminals_with_output.insert(terminal);
+        for response in responses {
+            let _ = self.send_input(terminal, &response);
+        }
+    }
+
+    pub fn append_terminal_system_line(&mut self, terminal: TerminalId, message: impl AsRef<str>) {
+        let line = format!("[mult] {}\r\n", message.as_ref());
+        self.process_terminal_output(terminal, line.as_bytes());
+    }
+
+    pub fn terminal_lines(&self, terminal: TerminalId) -> Vec<String> {
+        let Some(parser) = self.parsers.get(&terminal) else {
+            return Vec::new();
+        };
+        terminal_screen_rows(parser)
+    }
+
+    pub fn terminal_all_lines(&self, terminal: TerminalId) -> Vec<String> {
+        self.terminal_lines(terminal)
+    }
+
+    pub fn terminal_output_is_blank(&self, terminal: TerminalId) -> bool {
+        if self.terminals_with_output.contains(&terminal) {
+            return false;
+        }
+        self.parsers
+            .get(&terminal)
+            .map(|parser| {
+                terminal_screen_rows(parser)
+                    .iter()
+                    .all(|line| line.is_empty())
+            })
+            .unwrap_or(true)
+    }
+
     pub fn start(&mut self, spawn: PtySpawn) -> io::Result<()> {
         if self.is_running(spawn.terminal) {
             return Err(io::Error::new(
@@ -173,27 +306,37 @@ impl PtyRuntime {
         }
 
         self.ensure_connected()?;
+        self.reset_parser(spawn.terminal, spawn.size);
         let session = session_for_terminal(spawn.terminal);
         let pane = pane_for_terminal(spawn.terminal);
         let launch = launch_spec(&spawn);
         let name = session_name(&spawn, &launch);
-        self.send(ClientMessage::CreateSession {
-            requested_id: Some(session),
-            name,
-            cwd: spawn.cwd.clone(),
-            env: spawn.env.clone(),
-            launch,
-            rows: spawn.size.rows,
-            cols: spawn.size.cols,
-        })?;
-        self.send(ClientMessage::Attach {
-            session,
-            rows: spawn.size.rows,
-            cols: spawn.size.cols,
-        })?;
         self.terminal_to_pane.insert(spawn.terminal, pane);
         self.pane_to_terminal.insert(pane, spawn.terminal);
-        Ok(())
+
+        let result = self
+            .send(ClientMessage::CreateSession {
+                requested_id: Some(session),
+                name,
+                cwd: spawn.cwd.clone(),
+                env: spawn.env.clone(),
+                launch,
+                rows: spawn.size.rows,
+                cols: spawn.size.cols,
+            })
+            .and_then(|()| {
+                self.send(ClientMessage::Attach {
+                    session,
+                    rows: spawn.size.rows,
+                    cols: spawn.size.cols,
+                })
+            });
+
+        if result.is_err() {
+            self.terminal_to_pane.remove(&spawn.terminal);
+            self.pane_to_terminal.remove(&pane);
+        }
+        result
     }
 
     pub fn stop(&mut self, terminal: TerminalId) -> io::Result<bool> {
@@ -211,6 +354,11 @@ impl PtyRuntime {
         let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
             return Ok(false);
         };
+        if !input.is_empty() {
+            if let Some(parser) = self.parsers.get_mut(&terminal) {
+                parser.set_scrollback(0);
+            }
+        }
         self.send(ClientMessage::Input {
             pane,
             bytes: input.to_vec(),
@@ -219,41 +367,43 @@ impl PtyRuntime {
     }
 
     pub fn send_paste(&mut self, terminal: TerminalId, text: &str) -> io::Result<bool> {
-        let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
-            return Ok(false);
-        };
-        self.send(ClientMessage::Paste {
-            pane,
-            text: text.to_string(),
-        })?;
-        Ok(true)
+        let use_bracketed = self
+            .parsers
+            .get(&terminal)
+            .is_some_and(|parser| parser.screen().bracketed_paste());
+        let bytes = terminal_paste_bytes(text, use_bracketed);
+        self.send_input(terminal, &bytes)
     }
 
     pub fn scroll_up(&mut self, terminal: TerminalId, rows: usize) -> io::Result<bool> {
-        self.scroll(terminal, rows.min(i32::MAX as usize) as i32)
+        Ok(self.scroll_parser(terminal, rows as i32))
     }
 
     pub fn scroll_down(&mut self, terminal: TerminalId, rows: usize) -> io::Result<bool> {
-        self.scroll(terminal, -(rows.min(i32::MAX as usize) as i32))
+        Ok(self.scroll_parser(terminal, -(rows.min(i32::MAX as usize) as i32)))
     }
 
     pub fn scroll_to_top(&mut self, terminal: TerminalId) -> io::Result<bool> {
-        let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
+        let Some(parser) = self.parsers.get_mut(&terminal) else {
             return Ok(false);
         };
-        self.send(ClientMessage::ScrollToTop { pane })?;
-        Ok(true)
+        let old = parser.screen().scrollback();
+        parser.set_scrollback(max_safe_scrollback_offset(parser));
+        clamp_parser_scrollback(parser);
+        Ok(parser.screen().scrollback() != old)
     }
 
     pub fn scroll_to_bottom(&mut self, terminal: TerminalId) -> io::Result<bool> {
-        let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
+        let Some(parser) = self.parsers.get_mut(&terminal) else {
             return Ok(false);
         };
-        self.send(ClientMessage::ScrollToBottom { pane })?;
-        Ok(true)
+        let old = parser.screen().scrollback();
+        parser.set_scrollback(0);
+        Ok(old != 0)
     }
 
     pub fn resize(&mut self, terminal: TerminalId, size: PtyDimensions) -> io::Result<()> {
+        self.resize_parser(terminal, size);
         let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
             return Ok(());
         };
@@ -292,19 +442,48 @@ impl PtyRuntime {
         events
     }
 
+    fn resize_parser(&mut self, terminal: TerminalId, size: PtyDimensions) {
+        let parser = self
+            .parsers
+            .entry(terminal)
+            .or_insert_with(|| Parser::new(24, 80, TERMINAL_SCROLLBACK_LINES));
+        parser.set_size(size.rows.max(1), size.cols.max(1));
+        clamp_parser_scrollback(parser);
+    }
+
+    fn scroll_parser(&mut self, terminal: TerminalId, rows: i32) -> bool {
+        if rows == 0 {
+            return false;
+        }
+        let Some(parser) = self.parsers.get_mut(&terminal) else {
+            return false;
+        };
+        let old = parser.screen().scrollback();
+        let next = if rows > 0 {
+            old.saturating_add(rows as usize)
+        } else {
+            old.saturating_sub(rows.unsigned_abs() as usize)
+        };
+        parser.set_scrollback(next.min(max_safe_scrollback_offset(parser)));
+        clamp_parser_scrollback(parser);
+        parser.screen().scrollback() != old
+    }
+
     fn handle_server_message(&mut self, message: ServerMessage, events: &mut Vec<PtyEvent>) {
         match message {
             ServerMessage::Hello { .. }
             | ServerMessage::Sessions(_)
             | ServerMessage::Attached { .. } => {}
-            ServerMessage::Snapshot { pane, snapshot } => {
-                if let Some(terminal) = self.pane_to_terminal.get(&pane).copied() {
-                    events.push(PtyEvent::Snapshot { terminal, snapshot });
+            ServerMessage::PtyScrollback { pane, bytes } => {
+                if let Some(terminal) = self.terminal_for_pane(pane) {
+                    self.feed_terminal_output(terminal, &bytes, false);
+                    events.push(PtyEvent::Scrollback { terminal, bytes });
                 }
             }
-            ServerMessage::Update { pane, update } => {
-                if let Some(terminal) = self.pane_to_terminal.get(&pane).copied() {
-                    events.push(PtyEvent::Update { terminal, update });
+            ServerMessage::PtyOutput { pane, bytes } => {
+                if let Some(terminal) = self.terminal_for_pane(pane) {
+                    self.feed_terminal_output(terminal, &bytes, true);
+                    events.push(PtyEvent::Output { terminal, bytes });
                 }
             }
             ServerMessage::PaneExited { pane, exit } => {
@@ -331,15 +510,11 @@ impl PtyRuntime {
         }
     }
 
-    fn scroll(&mut self, terminal: TerminalId, rows: i32) -> io::Result<bool> {
-        if rows == 0 {
-            return Ok(false);
-        }
-        let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
-            return Ok(false);
-        };
-        self.send(ClientMessage::Scroll { pane, rows })?;
-        Ok(true)
+    fn terminal_for_pane(&self, pane: PaneId) -> Option<TerminalId> {
+        self.pane_to_terminal
+            .get(&pane)
+            .copied()
+            .or(Some(TerminalId(pane.0)))
     }
 
     fn ensure_connected(&mut self) -> io::Result<()> {
@@ -441,6 +616,139 @@ impl PtyExit {
             None => format!("exit {}", self.code),
         }
     }
+}
+
+fn terminal_screen_rows(parser: &Parser) -> Vec<String> {
+    let (_, cols) = parser.screen().size();
+    parser
+        .screen()
+        .rows(0, cols)
+        .map(|row| row.trim_end().to_string())
+        .collect()
+}
+
+fn max_safe_scrollback_offset(parser: &Parser) -> usize {
+    // vt100 0.15 panics in debug builds when scrollback offset exceeds the
+    // screen height. Keep local scroll offsets inside the safe range.
+    usize::from(parser.screen().size().0)
+}
+
+fn clamp_parser_scrollback(parser: &mut Parser) {
+    let max = max_safe_scrollback_offset(parser);
+    if parser.screen().scrollback() > max {
+        parser.set_scrollback(max);
+    }
+}
+
+fn terminal_paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    if !bracketed {
+        return text.as_bytes().to_vec();
+    }
+
+    let mut bytes =
+        Vec::with_capacity(BRACKETED_PASTE_START.len() + text.len() + BRACKETED_PASTE_END.len());
+    bytes.extend_from_slice(BRACKETED_PASTE_START);
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(BRACKETED_PASTE_END);
+    bytes
+}
+
+impl TerminalResponseDetector {
+    fn advance(&mut self, byte: u8, screen: &vt100::Screen) -> Option<Vec<u8>> {
+        let state = std::mem::take(&mut self.state);
+        let (next, response) = match state {
+            TerminalResponseState::Ground => match byte {
+                0x1b => (TerminalResponseState::Escape, None),
+                _ => (TerminalResponseState::Ground, None),
+            },
+            TerminalResponseState::Escape => match byte {
+                b'[' => (TerminalResponseState::Csi(Vec::new()), None),
+                b']' | b'P' | b'_' | b'^' | b'X' => {
+                    (TerminalResponseState::String { esc_seen: false }, None)
+                }
+                b'(' | b')' | b'*' | b'+' => (TerminalResponseState::IgnoreOne, None),
+                b'Z' => (
+                    TerminalResponseState::Ground,
+                    Some(PRIMARY_DEVICE_ATTRIBUTES_RESPONSE.to_vec()),
+                ),
+                _ => (TerminalResponseState::Ground, None),
+            },
+            TerminalResponseState::Csi(mut sequence) => {
+                if (0x40..=0x7e).contains(&byte) {
+                    let response = csi_terminal_response(&sequence, byte as char, screen);
+                    (TerminalResponseState::Ground, response)
+                } else if sequence.len() >= TERMINAL_MAX_CSI_SEQUENCE_BYTES {
+                    (TerminalResponseState::CsiIgnored, None)
+                } else {
+                    sequence.push(byte);
+                    (TerminalResponseState::Csi(sequence), None)
+                }
+            }
+            TerminalResponseState::CsiIgnored => {
+                if (0x40..=0x7e).contains(&byte) {
+                    (TerminalResponseState::Ground, None)
+                } else {
+                    (TerminalResponseState::CsiIgnored, None)
+                }
+            }
+            TerminalResponseState::String { esc_seen } => match (esc_seen, byte) {
+                (_, 0x07) | (true, b'\\') => (TerminalResponseState::Ground, None),
+                (_, 0x1b) => (TerminalResponseState::String { esc_seen: true }, None),
+                _ => (TerminalResponseState::String { esc_seen: false }, None),
+            },
+            TerminalResponseState::IgnoreOne => (TerminalResponseState::Ground, None),
+        };
+        self.state = next;
+        response
+    }
+}
+
+fn csi_terminal_response(
+    sequence: &[u8],
+    final_char: char,
+    screen: &vt100::Screen,
+) -> Option<Vec<u8>> {
+    let private = sequence.contains(&b'?');
+    let params = parse_csi_params(sequence);
+    match final_char {
+        'c' if !private && param_or_default(&params, 0, 0) == 0 => {
+            Some(PRIMARY_DEVICE_ATTRIBUTES_RESPONSE.to_vec())
+        }
+        'n' if !private => match param_or_default(&params, 0, 0) {
+            5 => Some(DEVICE_STATUS_OK_RESPONSE.to_vec()),
+            6 => Some(cursor_position_report(screen, false)),
+            _ => None,
+        },
+        'n' if private && param_or_default(&params, 0, 0) == 6 => {
+            Some(cursor_position_report(screen, true))
+        }
+        _ => None,
+    }
+}
+
+fn cursor_position_report(screen: &vt100::Screen, private: bool) -> Vec<u8> {
+    let (row, col) = screen.cursor_position();
+    if private {
+        format!("\x1b[?{};{}R", row + 1, col + 1).into_bytes()
+    } else {
+        format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
+    }
+}
+
+fn parse_csi_params(sequence: &[u8]) -> Vec<usize> {
+    String::from_utf8_lossy(sequence)
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse().ok())
+        .collect()
+}
+
+fn param_or_default(params: &[usize], index: usize, default: usize) -> usize {
+    params
+        .get(index)
+        .copied()
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 fn validate_server_hello_with_timeout(
@@ -688,6 +996,67 @@ mod tests {
     }
 
     #[test]
+    fn parser_processes_output_and_preserves_scrollback_cap() {
+        let mut runtime = PtyRuntime::new_offline();
+        let terminal = TerminalId(9);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
+        runtime.process_terminal_output(terminal, b"one\r\ntwo\r\nthree");
+
+        assert_eq!(
+            runtime.terminal_lines(terminal),
+            vec!["two".to_string(), "three".to_string()]
+        );
+        assert!(runtime.parser(terminal).is_some());
+        assert!(!runtime.terminal_output_is_blank(terminal));
+    }
+
+    #[test]
+    fn parser_resize_updates_screen_size() {
+        let mut runtime = PtyRuntime::new_offline();
+        let terminal = TerminalId(9);
+
+        runtime
+            .resize(terminal, PtyDimensions { rows: 5, cols: 12 })
+            .expect("resize parser");
+
+        assert_eq!(runtime.parser(terminal).unwrap().screen().size(), (5, 12));
+    }
+
+    #[test]
+    fn send_paste_wraps_when_parser_reports_bracketed_paste() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let terminal = TerminalId(7);
+        let pane = PaneId(7);
+        let mut runtime = PtyRuntime {
+            socket_path: unique_socket_path(),
+            connection: Some(ServerConnection {
+                writer: Arc::new(Mutex::new(client_stream)),
+                receiver,
+            }),
+            terminal_to_pane: HashMap::from([(terminal, pane)]),
+            pane_to_terminal: HashMap::from([(pane, terminal)]),
+            parsers: HashMap::new(),
+            responders: HashMap::new(),
+            terminals_with_output: HashSet::new(),
+            pending_events: Vec::new(),
+        };
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
+        runtime.process_terminal_output(terminal, b"\x1b[?2004h");
+
+        assert!(runtime.send_paste(terminal, "one\ntwo").expect("paste"));
+
+        let message: ClientMessage = read_message(&mut server_stream).expect("read paste input");
+        assert_eq!(
+            message,
+            ClientMessage::Input {
+                pane,
+                bytes: b"\x1b[200~one\ntwo\x1b[201~".to_vec(),
+            }
+        );
+    }
+
+    #[test]
     fn validate_server_hello_rejects_incompatible_protocol_version() {
         let mut bytes = Vec::new();
         write_message(
@@ -721,16 +1090,7 @@ mod tests {
         let (_sender, receiver) = mpsc::channel();
         let terminal = TerminalId(7);
         let pane = PaneId(7);
-        let mut runtime = PtyRuntime {
-            socket_path: unique_socket_path(),
-            connection: Some(ServerConnection {
-                writer: Arc::new(Mutex::new(client_stream)),
-                receiver,
-            }),
-            terminal_to_pane: HashMap::from([(terminal, pane)]),
-            pane_to_terminal: HashMap::from([(pane, terminal)]),
-            pending_events: Vec::new(),
-        };
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
 
         assert!(runtime.stop(terminal).expect("stop terminal"));
 
@@ -741,43 +1101,52 @@ mod tests {
     }
 
     #[test]
-    fn pty_scroll_and_paste_send_control_messages() {
+    fn input_returns_scrolled_parser_to_bottom() {
         let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
         let (_sender, receiver) = mpsc::channel();
         let terminal = TerminalId(7);
         let pane = PaneId(7);
-        let mut runtime = PtyRuntime {
-            socket_path: unique_socket_path(),
-            connection: Some(ServerConnection {
-                writer: Arc::new(Mutex::new(client_stream)),
-                receiver,
-            }),
-            terminal_to_pane: HashMap::from([(terminal, pane)]),
-            pane_to_terminal: HashMap::from([(pane, terminal)]),
-            pending_events: Vec::new(),
-        };
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
+        runtime.process_terminal_output(terminal, b"one\r\ntwo\r\nthree");
+        assert!(runtime.scroll_up(terminal, 1).expect("scroll up"));
+        assert!(runtime.parser(terminal).unwrap().screen().scrollback() > 0);
 
-        assert!(runtime.scroll_up(terminal, 3).expect("scroll up"));
-        assert!(runtime.scroll_down(terminal, 2).expect("scroll down"));
-        assert!(runtime.scroll_to_top(terminal).expect("scroll top"));
-        assert!(runtime.scroll_to_bottom(terminal).expect("scroll bottom"));
+        assert!(runtime.send_input(terminal, b"x").expect("send input"));
+
+        assert_eq!(runtime.parser(terminal).unwrap().screen().scrollback(), 0);
+        let message: ClientMessage = read_message(&mut server_stream).expect("read input");
+        assert_eq!(
+            message,
+            ClientMessage::Input {
+                pane,
+                bytes: b"x".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn pty_scroll_is_local_and_paste_sends_input_message() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let terminal = TerminalId(7);
+        let pane = PaneId(7);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
+        runtime.process_terminal_output(terminal, b"one\r\ntwo\r\nthree");
+
+        assert!(runtime.scroll_up(terminal, 1).expect("scroll up"));
+        assert!(runtime.scroll_down(terminal, 1).expect("scroll down"));
+        assert!(!runtime.scroll_to_top(TerminalId(99)).expect("missing"));
         assert!(runtime.send_paste(terminal, "one\ntwo").expect("paste"));
 
-        let messages = (0..5)
-            .map(|_| read_message(&mut server_stream).expect("read client message"))
-            .collect::<Vec<ClientMessage>>();
+        let message: ClientMessage = read_message(&mut server_stream).expect("read client message");
         assert_eq!(
-            messages,
-            vec![
-                ClientMessage::Scroll { pane, rows: 3 },
-                ClientMessage::Scroll { pane, rows: -2 },
-                ClientMessage::ScrollToTop { pane },
-                ClientMessage::ScrollToBottom { pane },
-                ClientMessage::Paste {
-                    pane,
-                    text: "one\ntwo".to_string(),
-                },
-            ]
+            message,
+            ClientMessage::Input {
+                pane,
+                bytes: b"one\ntwo".to_vec(),
+            }
         );
     }
 
@@ -799,6 +1168,9 @@ mod tests {
             connection: Some(ServerConnection { writer, receiver }),
             terminal_to_pane: HashMap::from([(terminal, pane)]),
             pane_to_terminal: HashMap::from([(pane, terminal)]),
+            parsers: HashMap::new(),
+            responders: HashMap::new(),
+            terminals_with_output: HashSet::new(),
             pending_events: Vec::new(),
         };
 
@@ -815,16 +1187,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let terminal = TerminalId(9);
         let pane = PaneId(9);
-        let mut runtime = PtyRuntime {
-            socket_path: unique_socket_path(),
-            connection: Some(ServerConnection {
-                writer: Arc::new(Mutex::new(client_stream)),
-                receiver,
-            }),
-            terminal_to_pane: HashMap::from([(terminal, pane)]),
-            pane_to_terminal: HashMap::from([(pane, terminal)]),
-            pending_events: Vec::new(),
-        };
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
 
         sender
             .send(ServerMessage::PaneExited {
@@ -853,21 +1216,76 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_receiver_clears_registries_for_reconnect() {
+    fn live_output_answers_primary_device_attributes_query() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (sender, receiver) = mpsc::channel();
+        let terminal = TerminalId(9);
+        let pane = PaneId(9);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
+
+        sender
+            .send(ServerMessage::PtyOutput {
+                pane,
+                bytes: b"\x1b[c".to_vec(),
+            })
+            .expect("send terminal query");
+
+        let events = runtime.drain_events();
+        let message: ClientMessage = read_message(&mut server_stream).expect("read DA response");
+
+        assert_eq!(
+            events,
+            vec![PtyEvent::Output {
+                terminal,
+                bytes: b"\x1b[c".to_vec(),
+            }]
+        );
+        assert_eq!(
+            message,
+            ClientMessage::Input {
+                pane,
+                bytes: PRIMARY_DEVICE_ATTRIBUTES_RESPONSE.to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn output_event_feeds_matching_parser() {
+        let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
+        let (sender, receiver) = mpsc::channel();
+        let terminal = TerminalId(9);
+        let pane = PaneId(9);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
+
+        sender
+            .send(ServerMessage::PtyOutput {
+                pane,
+                bytes: b"hello".to_vec(),
+            })
+            .expect("send output event");
+
+        let events = runtime.drain_events();
+
+        assert_eq!(
+            events,
+            vec![PtyEvent::Output {
+                terminal,
+                bytes: b"hello".to_vec(),
+            }]
+        );
+        assert_eq!(runtime.terminal_lines(terminal)[0], "hello");
+    }
+
+    #[test]
+    fn disconnected_receiver_clears_registries_for_reconnect_but_keeps_parser() {
         let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
         let (sender, receiver) = mpsc::channel();
         let terminal = TerminalId(10);
         let pane = PaneId(10);
-        let mut runtime = PtyRuntime {
-            socket_path: unique_socket_path(),
-            connection: Some(ServerConnection {
-                writer: Arc::new(Mutex::new(client_stream)),
-                receiver,
-            }),
-            terminal_to_pane: HashMap::from([(terminal, pane)]),
-            pane_to_terminal: HashMap::from([(pane, terminal)]),
-            pending_events: Vec::new(),
-        };
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
         drop(sender);
 
         assert!(runtime.drain_events().is_empty());
@@ -875,6 +1293,7 @@ mod tests {
         assert!(runtime.connection.is_none());
         assert!(!runtime.is_running(terminal));
         assert!(runtime.pane_to_terminal.is_empty());
+        assert!(runtime.parser(terminal).is_some());
     }
 
     #[test]
@@ -903,6 +1322,27 @@ mod tests {
             &regular_file
         ));
         fs::remove_file(&regular_file).expect("remove collision file");
+    }
+
+    fn test_runtime(
+        client_stream: UnixStream,
+        receiver: Receiver<ServerMessage>,
+        terminal: TerminalId,
+        pane: PaneId,
+    ) -> PtyRuntime {
+        PtyRuntime {
+            socket_path: unique_socket_path(),
+            connection: Some(ServerConnection {
+                writer: Arc::new(Mutex::new(client_stream)),
+                receiver,
+            }),
+            terminal_to_pane: HashMap::from([(terminal, pane)]),
+            pane_to_terminal: HashMap::from([(pane, terminal)]),
+            parsers: HashMap::new(),
+            responders: HashMap::new(),
+            terminals_with_output: HashSet::new(),
+            pending_events: Vec::new(),
+        }
     }
 
     fn unique_socket_path() -> PathBuf {

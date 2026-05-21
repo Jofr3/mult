@@ -11,7 +11,7 @@ use std::{
 };
 
 use mult::{
-    app::{chat_agent_terminal_id, App},
+    app::chat_agent_terminal_id,
     model::{ChatId, TerminalId},
     pty::{PtyDimensions, PtyEvent, PtyExit, PtyRuntime, PtySpawn},
 };
@@ -33,7 +33,7 @@ impl Drop for ServerGuard {
 }
 
 #[test]
-fn client_receives_snapshot_updates_and_real_exit_from_server_pty() {
+fn client_receives_scrollback_output_and_real_exit_from_server_pty() {
     if integration_tests_are_skipped() {
         return;
     }
@@ -49,10 +49,10 @@ fn client_receives_snapshot_updates_and_real_exit_from_server_pty() {
         .expect("short-lived command should produce output and exit");
 
     assert!(
-        observed.saw_snapshot,
-        "server should send an initial snapshot"
+        observed.saw_scrollback,
+        "server should send an initial raw scrollback replay"
     );
-    assert!(observed.saw_update, "server should send an output update");
+    assert!(observed.saw_output, "server should send raw PTY output");
     assert_eq!(observed.exit.code, 7);
     assert_eq!(observed.exit.signal, None);
     assert!(
@@ -61,6 +61,32 @@ fn client_receives_snapshot_updates_and_real_exit_from_server_pty() {
         observed.output
     );
     assert!(!runtime.is_running(terminal));
+}
+
+#[test]
+fn reconnect_replays_raw_scrollback_into_fresh_parser() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let Some(server) = start_isolated_server() else {
+        return;
+    };
+    let terminal = TerminalId(7003);
+
+    {
+        let mut runtime = PtyRuntime::connect_to_socket(server.socket_path.clone())
+            .expect("connect to isolated mult-server");
+        start_short_lived_command(&mut runtime, terminal, "printf replayed; sleep 2");
+        wait_for_output(&mut runtime, terminal, "replayed")
+            .expect("first client should receive output before detach");
+    }
+
+    let mut reconnected = PtyRuntime::connect_to_socket(server.socket_path.clone())
+        .expect("reconnect to isolated mult-server");
+    start_short_lived_command(&mut reconnected, terminal, "printf should-not-run");
+    wait_for_output(&mut reconnected, terminal, "replayed")
+        .expect("reattach should replay buffered raw PTY output");
+    assert!(reconnected.stop(terminal).expect("stop replayed terminal"));
 }
 
 #[test]
@@ -97,8 +123,8 @@ fn rapid_stop_restart_and_chat_runtime_ids_keep_client_registry_consistent() {
 }
 
 struct ObservedTerminal {
-    saw_snapshot: bool,
-    saw_update: bool,
+    saw_scrollback: bool,
+    saw_output: bool,
     exit: PtyExit,
     output: String,
 }
@@ -109,42 +135,58 @@ fn start_short_lived_command(runtime: &mut PtyRuntime, terminal: TerminalId, com
     runtime.start(spawn).expect("start PTY command");
 }
 
+fn wait_for_output(runtime: &mut PtyRuntime, terminal: TerminalId, needle: &str) -> Option<()> {
+    let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    while Instant::now() < deadline {
+        for event in runtime.drain_events() {
+            if let PtyEvent::Error { terminal, message } = event {
+                panic!("server reported PTY error for terminal {terminal:?}: {message}");
+            }
+        }
+        if runtime
+            .terminal_all_lines(terminal)
+            .join("\n")
+            .contains(needle)
+        {
+            return Some(());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
 fn wait_for_terminal_exit(
     runtime: &mut PtyRuntime,
     terminal: TerminalId,
 ) -> Option<ObservedTerminal> {
-    let mut app = App::default();
-    app.resize_terminal_buffer(terminal, 6, 40);
     let deadline = Instant::now() + INTEGRATION_TIMEOUT;
-    let mut saw_snapshot = false;
-    let mut saw_update = false;
+    let mut saw_scrollback = false;
+    let mut saw_output = false;
 
     while Instant::now() < deadline {
         for event in runtime.drain_events() {
             match event {
-                PtyEvent::Snapshot {
+                PtyEvent::Scrollback {
                     terminal: event_terminal,
-                    snapshot,
+                    ..
                 } if event_terminal == terminal => {
-                    saw_snapshot = true;
-                    app.set_terminal_snapshot(terminal, snapshot);
+                    saw_scrollback = true;
                 }
-                PtyEvent::Update {
+                PtyEvent::Output {
                     terminal: event_terminal,
-                    update,
+                    ..
                 } if event_terminal == terminal => {
-                    saw_update = true;
-                    app.apply_terminal_update(terminal, update);
+                    saw_output = true;
                 }
                 PtyEvent::Exited {
                     terminal: event_terminal,
                     status,
                 } if event_terminal == terminal => {
                     return Some(ObservedTerminal {
-                        saw_snapshot,
-                        saw_update,
+                        saw_scrollback,
+                        saw_output,
                         exit: status,
-                        output: app.terminal_all_lines(terminal).join("\n"),
+                        output: runtime.terminal_all_lines(terminal).join("\n"),
                     });
                 }
                 PtyEvent::Error { terminal, message } => {

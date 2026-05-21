@@ -5,20 +5,22 @@ use ratatui::{
     widgets::{Block, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
+use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::{
     app::{
         chat_agent_terminal_id, App, CommandPaletteEntry, FocusMode, Mode, NavItem, Prompt,
-        SearchScope, TerminalCellStyle, TerminalColor, TerminalRenderLine,
+        SearchScope,
     },
     config::{self, ColorSchemeConfig},
     model::{
         ChatId, ChatStatus, TerminalId, TerminalLaunch, TerminalSession, TerminalStatus,
         WorkspaceId,
     },
+    pty::PtyRuntime,
 };
 
-const FOOTER: &str = "j/k nav/scroll • : commands • / search • enter pane • esc sidebar • n a agent • n t terminal • n c command • n w workspace • d d delete • i input • q quit";
+const FOOTER: &str = "j/k nav/scroll • mouse wheel scroll • shift-drag select • : commands • / search • enter pane • esc sidebar • n a agent • n t terminal • n c command • n w workspace • d d delete • i input • q quit";
 const CHAT_AGENT_HEADER_LINES: u16 = 0;
 const TERMINAL_HEADER_LINES: u16 = 0;
 
@@ -118,13 +120,19 @@ struct LayoutAreas {
     footer: Rect,
 }
 
-pub fn draw(frame: &mut Frame, app: &App, config: &config::Config) {
+#[derive(Debug, Clone, Copy)]
+struct PaneRenderStyle {
+    focused: bool,
+    palette: Palette,
+}
+
+pub fn draw(frame: &mut Frame, app: &App, pty_runtime: &PtyRuntime, config: &config::Config) {
     let layout = layout_areas(app, frame.area());
     let palette = Palette::from_colorscheme(&config.colorscheme);
 
     draw_sidebar(frame, app, layout.sidebar, palette);
-    draw_main(frame, app, layout.main, palette);
-    draw_footer(frame, app, layout.footer, palette);
+    draw_main(frame, app, pty_runtime, layout.main, palette);
+    draw_footer(frame, app, pty_runtime, layout.footer, palette);
 }
 
 pub fn selected_terminal_output_area(app: &App, frame_area: Rect) -> Option<(TerminalId, Rect)> {
@@ -275,31 +283,66 @@ fn sidebar_items(app: &App, palette: Palette) -> Vec<ListItem<'static>> {
         .collect()
 }
 
-fn draw_main(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
+fn draw_main(frame: &mut Frame, app: &App, pty_runtime: &PtyRuntime, area: Rect, palette: Palette) {
     let selected_item = app.selected_item();
     let pane_focus = selected_item.and_then(main_pane_focus);
     let focused = pane_focus.is_some_and(|focus| focus_is_active(app, focus));
 
-    let terminal_output_rows = usize::from(terminal_output_area(area).height.max(1));
-    let chat_agent_output_rows = usize::from(chat_agent_output_area(area).height.max(1));
-    let lines = match selected_item {
-        Some(NavItem::Workspace(workspace)) => workspace_details(app, workspace, palette),
+    match selected_item {
+        Some(NavItem::Workspace(workspace)) => render_lines_pane(
+            frame,
+            area,
+            workspace_details(app, workspace, palette),
+            focused,
+            palette,
+            true,
+        ),
         Some(NavItem::Chat { workspace, chat }) => {
-            chat_details(app, workspace, chat, chat_agent_output_rows, palette)
+            draw_chat_details(
+                frame,
+                app,
+                pty_runtime,
+                workspace,
+                chat,
+                area,
+                PaneRenderStyle { focused, palette },
+            );
         }
         Some(NavItem::Terminal {
             workspace,
             terminal,
-        }) => terminal_details(app, workspace, terminal, terminal_output_rows, palette),
-        None => vec![Line::from("No workspaces yet.")],
-    };
+        }) => draw_terminal_details(
+            frame,
+            app,
+            pty_runtime,
+            workspace,
+            terminal,
+            area,
+            PaneRenderStyle { focused, palette },
+        ),
+        None => render_lines_pane(
+            frame,
+            area,
+            vec![Line::from("No workspaces yet.")],
+            focused,
+            palette,
+            true,
+        ),
+    }
+}
 
+fn render_lines_pane(
+    frame: &mut Frame,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    focused: bool,
+    palette: Palette,
+    wrap: bool,
+) {
     let paragraph = Paragraph::new(lines)
         .block(Block::default().style(pane_style(focused, palette)))
         .style(pane_style(focused, palette));
-    // PTY rows are already laid out to the pane width. Re-wrapping them can
-    // turn styled blank rows emitted by nested TUIs into extra visual lines.
-    let paragraph = if matches!(selected_item, Some(NavItem::Workspace(_)) | None) {
+    let paragraph = if wrap {
         paragraph.wrap(Wrap { trim: false })
     } else {
         paragraph
@@ -401,97 +444,152 @@ fn pad_cell(value: &str, width: usize) -> String {
     format!("{value:<width$}")
 }
 
-fn chat_details(
+fn draw_chat_details(
+    frame: &mut Frame,
     app: &App,
+    pty_runtime: &PtyRuntime,
     workspace_id: WorkspaceId,
     chat_id: crate::model::ChatId,
-    output_rows: usize,
-    palette: Palette,
-) -> Vec<Line<'static>> {
+    area: Rect,
+    render_style: PaneRenderStyle,
+) {
+    let PaneRenderStyle { focused, palette } = render_style;
+    let output_rows = usize::from(chat_agent_output_area(area).height.max(1));
     if app.project.workspace(workspace_id).is_none() {
-        return vec![Line::from("Missing workspace.")];
+        render_lines_pane(
+            frame,
+            area,
+            vec![Line::from("Missing workspace.")],
+            focused,
+            palette,
+            false,
+        );
+        return;
     }
     let Some(chat) = app.project.chat(workspace_id, chat_id) else {
-        return vec![Line::from("Missing chat.")];
+        render_lines_pane(
+            frame,
+            area,
+            vec![Line::from("Missing chat.")],
+            focused,
+            palette,
+            false,
+        );
+        return;
     };
 
     if let Some(lines) = app.filtered_chat_lines(chat_id) {
         let query = app
             .active_search_query_for_chat(chat_id)
             .unwrap_or_default();
-        return search_result_lines("chat transcript", query, lines, output_rows, palette);
+        render_lines_pane(
+            frame,
+            area,
+            search_result_lines("chat transcript", query, lines, output_rows, palette),
+            focused,
+            palette,
+            false,
+        );
+        return;
     }
 
     let terminal_id = chat_agent_terminal_id(chat_id);
-    let output = app.terminal_render_lines(terminal_id);
-    if !app.terminal_output_is_blank(terminal_id) {
-        return output
-            .into_iter()
-            .rev()
-            .take(output_rows)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .map(|line| terminal_render_line_to_line(line, palette))
-            .collect();
+    if !pty_runtime.terminal_output_is_blank(terminal_id) {
+        if let Some(parser) = pty_runtime.parser(terminal_id) {
+            render_terminal_parser(frame, area, parser, focused, palette);
+            return;
+        }
     }
 
-    if matches!(chat.status, ChatStatus::Thinking | ChatStatus::Waiting) {
-        return vec![
+    let lines = if matches!(chat.status, ChatStatus::Thinking | ChatStatus::Waiting) {
+        vec![
             Line::from(format!(
                 "Pi agent is {}; waiting for output.",
                 chat.status.label()
             )),
             Line::from("Press `i` to enter input mode."),
+        ]
+    } else {
+        let mut lines = vec![
+            Line::from("Pi agent not started. Press `i` to start and enter input mode."),
+            Line::from("Set `pi_agent_command`/`auto_start_pi_agent` in:"),
+            Line::from(config::config_path().display().to_string()),
         ];
-    }
-
-    let mut lines = vec![
-        Line::from("Pi agent not started. Press `i` to start and enter input mode."),
-        Line::from("Set `pi_agent_command`/`auto_start_pi_agent` in:"),
-        Line::from(config::config_path().display().to_string()),
-    ];
-    let transcript = app.chat_lines(chat_id);
-    if !transcript.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from("Saved transcript"));
-        lines.extend(
-            transcript
-                .into_iter()
-                .rev()
-                .take(output_rows.saturating_sub(5))
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .map(Line::from),
-        );
-    }
-
-    lines
+        let transcript = app.chat_lines(chat_id);
+        if !transcript.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from("Saved transcript"));
+            lines.extend(
+                transcript
+                    .into_iter()
+                    .rev()
+                    .take(output_rows.saturating_sub(5))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .map(Line::from),
+            );
+        }
+        lines
+    };
+    render_lines_pane(frame, area, lines, focused, palette, false);
 }
 
-fn terminal_details(
+fn draw_terminal_details(
+    frame: &mut Frame,
     app: &App,
+    pty_runtime: &PtyRuntime,
     workspace_id: WorkspaceId,
     terminal_id: crate::model::TerminalId,
-    output_rows: usize,
-    palette: Palette,
-) -> Vec<Line<'static>> {
+    area: Rect,
+    render_style: PaneRenderStyle,
+) {
+    let PaneRenderStyle { focused, palette } = render_style;
+    let output_rows = usize::from(terminal_output_area(area).height.max(1));
     if app.project.workspace(workspace_id).is_none() {
-        return vec![Line::from("Missing workspace.")];
+        render_lines_pane(
+            frame,
+            area,
+            vec![Line::from("Missing workspace.")],
+            focused,
+            palette,
+            false,
+        );
+        return;
     }
     let Some(terminal) = app.project.terminal(workspace_id, terminal_id) else {
-        return vec![Line::from("Missing terminal.")];
+        render_lines_pane(
+            frame,
+            area,
+            vec![Line::from("Missing terminal.")],
+            focused,
+            palette,
+            false,
+        );
+        return;
     };
 
-    if let Some(lines) = app.filtered_terminal_lines(terminal_id) {
+    if let Some(lines) =
+        app.terminal_search_matches(terminal_id, pty_runtime.terminal_all_lines(terminal_id))
+    {
         let query = app
-            .active_search_query_for_terminal(terminal_id)
+            .active_search
+            .as_ref()
+            .filter(|search| search.scope == SearchScope::Terminal(terminal_id))
+            .map(|search| search.query.as_str())
             .unwrap_or_default();
-        return search_result_lines("terminal", query, lines, output_rows, palette);
+        render_lines_pane(
+            frame,
+            area,
+            search_result_lines("terminal", query, lines, output_rows, palette),
+            focused,
+            palette,
+            false,
+        );
+        return;
     }
 
-    if app.terminal_output_is_blank(terminal_id) {
+    if pty_runtime.terminal_output_is_blank(terminal_id) {
         let mut lines = vec![match terminal.status {
             TerminalStatus::Running => {
                 Line::from("Terminal is running; waiting for output. Press `i` to focus PTY input.")
@@ -507,18 +605,31 @@ fn terminal_details(
                 Span::raw(command.clone()),
             ]));
         }
-        return lines;
+        render_lines_pane(frame, area, lines, focused, palette, false);
+        return;
     }
 
-    app.terminal_render_lines(terminal_id)
-        .into_iter()
-        .rev()
-        .take(output_rows)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .map(|line| terminal_render_line_to_line(line, palette))
-        .collect()
+    if let Some(parser) = pty_runtime.parser(terminal_id) {
+        render_terminal_parser(frame, area, parser, focused, palette);
+    }
+}
+
+fn render_terminal_parser(
+    frame: &mut Frame,
+    area: Rect,
+    parser: &vt100::Parser,
+    focused: bool,
+    palette: Palette,
+) {
+    let cursor_style = Style::default().fg(palette.nc).bg(palette.text);
+    let cursor = Cursor::default()
+        .symbol("█")
+        .style(cursor_style)
+        .visibility(parser.screen().scrollback() == 0);
+    let pseudo_term = PseudoTerminal::new(parser.screen())
+        .block(Block::default().style(pane_style(focused, palette)))
+        .cursor(cursor);
+    frame.render_widget(pseudo_term, area);
 }
 
 fn search_result_lines(
@@ -561,7 +672,13 @@ fn search_result_lines(
     output
 }
 
-fn draw_footer(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
+fn draw_footer(
+    frame: &mut Frame,
+    app: &App,
+    pty_runtime: &PtyRuntime,
+    area: Rect,
+    palette: Palette,
+) {
     if let Some(prompt) = &app.prompt {
         match prompt {
             Prompt::OpenWorkspace(prompt) => draw_text_prompt(
@@ -604,7 +721,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
     }
 
     let footer = match app.mode {
-        Mode::Normal => normal_footer(app, palette),
+        Mode::Normal => normal_footer(app, pty_runtime, palette),
         Mode::Input(_) => Line::styled(
             "input mode • typing goes to selected PTY • Esc returns to normal mode • Ctrl-C sends interrupt",
             Style::default().fg(palette.gold),
@@ -616,8 +733,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
     );
 }
 
-fn normal_footer(app: &App, palette: Palette) -> Line<'static> {
-    if let Some(status) = app.search_status() {
+fn normal_footer(app: &App, pty_runtime: &PtyRuntime, palette: Palette) -> Line<'static> {
+    if let Some(status) = search_status(app, pty_runtime) {
         Line::from(vec![
             Span::styled(FOOTER, Style::default().fg(palette.muted)),
             Span::styled(" • ", Style::default().fg(palette.muted)),
@@ -625,6 +742,16 @@ fn normal_footer(app: &App, palette: Palette) -> Line<'static> {
         ])
     } else {
         Line::styled(FOOTER, Style::default().fg(palette.muted))
+    }
+}
+
+fn search_status(app: &App, pty_runtime: &PtyRuntime) -> Option<String> {
+    let search = app.active_search.as_ref()?;
+    match search.scope {
+        SearchScope::Chat(_) => app.chat_search_status(),
+        SearchScope::Terminal(terminal) => {
+            app.terminal_search_status(terminal, pty_runtime.terminal_all_lines(terminal))
+        }
     }
 }
 
@@ -729,61 +856,6 @@ fn draw_text_prompt(
     frame.render_widget(prompt, area);
 }
 
-fn terminal_render_line_to_line(line: TerminalRenderLine, palette: Palette) -> Line<'static> {
-    Line::from(
-        line.spans
-            .into_iter()
-            .map(|span| Span::styled(span.text, terminal_style(span.style, palette)))
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn terminal_style(style: TerminalCellStyle, palette: Palette) -> Style {
-    let mut output = Style::default();
-    if let Some(fg) = style.fg {
-        output = output.fg(terminal_color(fg, palette));
-    }
-    if let Some(bg) = style.bg {
-        output = output.bg(terminal_color(bg, palette));
-    }
-    if style.bold {
-        output = output.add_modifier(Modifier::BOLD);
-    }
-    if style.italic {
-        output = output.add_modifier(Modifier::ITALIC);
-    }
-    if style.reversed {
-        output = output.add_modifier(Modifier::REVERSED);
-    }
-    // Many prompts use underline for decorative path segments. It reads as a
-    // selection/cursor artifact inside nested panes, so mult intentionally
-    // suppresses underline when rendering embedded PTYs.
-    let _ = style.underlined;
-    output
-}
-
-fn terminal_color(color: TerminalColor, palette: Palette) -> Color {
-    match color {
-        TerminalColor::Black => palette.base,
-        TerminalColor::Red => palette.love,
-        TerminalColor::Green => palette.leaf,
-        TerminalColor::Yellow => palette.gold,
-        TerminalColor::Blue => palette.pine,
-        TerminalColor::Magenta => palette.iris,
-        TerminalColor::Cyan => palette.foam,
-        TerminalColor::White => palette.text,
-        TerminalColor::BrightBlack => palette.muted,
-        TerminalColor::BrightRed => palette.love,
-        TerminalColor::BrightGreen => palette.leaf,
-        TerminalColor::BrightYellow => palette.gold,
-        TerminalColor::BrightBlue => palette.pine,
-        TerminalColor::BrightMagenta => palette.iris,
-        TerminalColor::BrightCyan => palette.foam,
-        TerminalColor::BrightWhite => palette.text,
-        TerminalColor::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
-    }
-}
-
 fn terminal_name_label(terminal: &TerminalSession) -> String {
     match &terminal.launch {
         TerminalLaunch::Command(command) if terminal.name.starts_with("cmd: ") => {
@@ -835,9 +907,10 @@ mod tests {
         app.selected = 0;
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let pty_runtime = PtyRuntime::new_offline();
 
         terminal
-            .draw(|frame| draw(frame, &app, &config::Config::default()))
+            .draw(|frame| draw(frame, &app, &pty_runtime, &config::Config::default()))
             .expect("draw app");
     }
 
@@ -873,7 +946,12 @@ mod tests {
         let chat = app.project.workspaces[0].chats[0].id;
         app.project.workspaces[0].chats[0].status = ChatStatus::Waiting;
 
-        let text = lines_text(chat_details(&app, workspace, chat, 10, test_palette()));
+        app.selected = app
+            .nav_items()
+            .iter()
+            .position(|item| *item == NavItem::Chat { workspace, chat })
+            .expect("chat exists");
+        let text = draw_text(&app, &PtyRuntime::new_offline(), 100, 30);
 
         assert!(text.contains("Press `i` to enter input mode."));
         assert!(!text.contains("`x`"));
@@ -885,17 +963,48 @@ mod tests {
         let workspace = app.project.workspaces[0].id;
         let terminal = app.project.workspaces[0].terminals[0].id;
 
-        let text = lines_text(terminal_details(
-            &app,
-            workspace,
-            terminal,
-            10,
-            test_palette(),
-        ));
+        let mut app = app;
+        app.selected = app
+            .nav_items()
+            .iter()
+            .position(|item| {
+                *item
+                    == NavItem::Terminal {
+                        workspace,
+                        terminal,
+                    }
+            })
+            .expect("terminal exists");
+        let text = draw_text(&app, &PtyRuntime::new_offline(), 100, 30);
 
         assert!(text.contains("Press `i` to start and enter input mode."));
         assert!(!text.contains("Press `s`"));
         assert!(!text.contains("`x`"));
+    }
+
+    #[test]
+    fn scrolled_terminal_output_hides_cursor() {
+        let mut app = App::default();
+        let (selected, terminal_id) = app
+            .nav_items()
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| match item {
+                NavItem::Terminal { terminal, .. } => Some((index, *terminal)),
+                _ => None,
+            })
+            .expect("seed state has a terminal");
+        app.selected = selected;
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime
+            .resize(terminal_id, crate::pty::PtyDimensions { rows: 2, cols: 8 })
+            .expect("resize parser");
+        pty_runtime.process_terminal_output(terminal_id, b"one\r\ntwo\r\nthree");
+        assert!(pty_runtime.scroll_up(terminal_id, 1).expect("scroll up"));
+
+        let text = draw_text(&app, &pty_runtime, 50, 6);
+
+        assert!(!text.contains('█'));
     }
 
     #[test]
@@ -915,14 +1024,26 @@ mod tests {
         let frame_area = Rect::new(0, 0, 50, 6);
         let (_, output_area) = selected_terminal_output_area(&app, frame_area)
             .expect("terminal selection has output area");
-        app.resize_terminal_buffer(terminal_id, output_area.height, output_area.width);
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime
+            .resize(
+                terminal_id,
+                crate::pty::PtyDimensions {
+                    rows: output_area.height,
+                    cols: output_area.width,
+                },
+            )
+            .expect("resize parser");
         let spaces = " ".repeat(usize::from(output_area.width));
-        app.append_terminal_output(terminal_id, &format!("\x1b[44m{spaces}\x1b[0m\r\nnext"));
+        pty_runtime.process_terminal_output(
+            terminal_id,
+            format!("\x1b[44m{spaces}\x1b[0m\r\nnext").as_bytes(),
+        );
 
         let backend = TestBackend::new(frame_area.width, frame_area.height);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
-            .draw(|frame| draw(frame, &app, &config::Config::default()))
+            .draw(|frame| draw(frame, &app, &pty_runtime, &config::Config::default()))
             .expect("draw app");
 
         assert_eq!(
@@ -943,6 +1064,15 @@ mod tests {
             );
         }
         text
+    }
+
+    fn draw_text(app: &App, pty_runtime: &PtyRuntime, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| draw(frame, app, pty_runtime, &config::Config::default()))
+            .expect("draw app");
+        format!("{:?}", terminal.backend().buffer())
     }
 
     fn lines_text(lines: Vec<Line<'_>>) -> String {
