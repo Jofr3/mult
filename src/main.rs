@@ -2,8 +2,8 @@ use std::{io, time::Duration};
 
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
 };
@@ -11,7 +11,10 @@ use mult::{
     agent::{
         self, AgentBackend, AgentEvent, NoopAgentBackend, ProcessAgentBackend, ProcessAgentCommand,
     },
-    app::{chat_agent_terminal_id, chat_id_from_agent_terminal_id, App, FocusMode, Mode, Prompt},
+    app::{
+        chat_agent_terminal_id, chat_id_from_agent_terminal_id, App, CommandAction, FocusMode,
+        Mode, Prompt,
+    },
     config::{self, Config},
     model::{self, ChatStatus, TerminalId, TerminalLaunch, TerminalStatus},
     pty::{PtyDimensions, PtyEvent, PtyRuntime, PtySpawn},
@@ -23,13 +26,13 @@ fn main() -> io::Result<()> {
     let project = storage::load_or_default()?;
     let config = config::load_or_default()?;
     let mut terminal = ratatui::init();
-    if let Err(error) = execute!(io::stdout(), EnableMouseCapture) {
+    if let Err(error) = execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste) {
         ratatui::restore();
         return Err(error);
     }
 
     let result = run(&mut terminal, App::new(project), config);
-    let mouse_result = execute!(io::stdout(), DisableMouseCapture);
+    let mouse_result = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
     ratatui::restore();
     result.and(mouse_result)
 }
@@ -176,7 +179,8 @@ fn handle_event(
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             handle_key(app, pty_runtime, config, normal_prefix, key, frame_area);
         }
-        Event::Mouse(mouse) => handle_mouse(app, normal_prefix, mouse, frame_area),
+        Event::Mouse(mouse) => handle_mouse(app, pty_runtime, normal_prefix, mouse, frame_area),
+        Event::Paste(text) => handle_paste(app, pty_runtime, normal_prefix, text),
         _ => {}
     }
 }
@@ -204,6 +208,14 @@ fn handle_key(
             *normal_prefix = None;
             handle_terminal_command_key(app, key);
         }
+        (Some(Prompt::CommandPalette(_)), _) => {
+            *normal_prefix = None;
+            handle_command_palette_key(app, pty_runtime, config, key, frame_area);
+        }
+        (Some(Prompt::Search(_)), _) => {
+            *normal_prefix = None;
+            handle_search_key(app, key);
+        }
         (None, Mode::Input(_)) => {
             *normal_prefix = None;
             handle_pty_input_key(app, pty_runtime, key);
@@ -216,6 +228,7 @@ fn handle_key(
 
 fn handle_mouse(
     app: &mut App,
+    pty_runtime: &mut PtyRuntime,
     normal_prefix: &mut Option<NormalPrefix>,
     mouse: MouseEvent,
     frame_area: Rect,
@@ -227,13 +240,49 @@ fn handle_mouse(
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             *normal_prefix = None;
-            scroll_output_at_mouse(app, frame_area, mouse, ScrollDirection::Up);
+            scroll_output_at_mouse(app, pty_runtime, frame_area, mouse, ScrollDirection::Up);
         }
         MouseEventKind::ScrollDown => {
             *normal_prefix = None;
-            scroll_output_at_mouse(app, frame_area, mouse, ScrollDirection::Down);
+            scroll_output_at_mouse(app, pty_runtime, frame_area, mouse, ScrollDirection::Down);
         }
         _ => {}
+    }
+}
+
+fn handle_paste(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    normal_prefix: &mut Option<NormalPrefix>,
+    text: String,
+) {
+    *normal_prefix = None;
+    if app.is_prompt_active() {
+        for ch in text.chars().filter(|ch| !ch.is_control()) {
+            app.push_prompt_char(ch);
+        }
+        return;
+    }
+
+    if !matches!(app.mode, Mode::Input(_)) {
+        return;
+    }
+
+    let Some(terminal_id) = app.pty_input_target() else {
+        app.end_pty_input();
+        return;
+    };
+
+    match pty_runtime.send_paste(terminal_id, &text) {
+        Ok(true) => {}
+        Ok(false) => {
+            app.append_terminal_system_line(terminal_id, "PTY is not running");
+            app.end_pty_input();
+        }
+        Err(error) => {
+            app.append_terminal_system_line(terminal_id, format!("failed to paste: {error}"));
+            app.end_pty_input();
+        }
     }
 }
 
@@ -245,6 +294,7 @@ enum ScrollDirection {
 
 fn scroll_output_at_mouse(
     app: &mut App,
+    pty_runtime: &mut PtyRuntime,
     frame_area: Rect,
     mouse: MouseEvent,
     direction: ScrollDirection,
@@ -254,8 +304,12 @@ fn scroll_output_at_mouse(
     };
 
     match direction {
-        ScrollDirection::Up => app.scroll_terminal_output_up(terminal, MOUSE_SCROLL_ROWS),
-        ScrollDirection::Down => app.scroll_terminal_output_down(terminal, MOUSE_SCROLL_ROWS),
+        ScrollDirection::Up => {
+            scroll_terminal_output_up(app, pty_runtime, terminal, MOUSE_SCROLL_ROWS)
+        }
+        ScrollDirection::Down => {
+            scroll_terminal_output_down(app, pty_runtime, terminal, MOUSE_SCROLL_ROWS)
+        }
     }
 }
 
@@ -297,6 +351,11 @@ fn handle_normal_key(
 
     match key.code {
         KeyCode::Char('q') => app.quit(),
+        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => app.clear_search(),
+        KeyCode::Char(':') => app.begin_command_palette(),
+        KeyCode::Char('/') => {
+            app.begin_search();
+        }
         KeyCode::Esc => app.focus_sidebar(),
         KeyCode::Enter if app.focus == FocusMode::Sidebar => {
             app.focus_selected_main();
@@ -306,22 +365,22 @@ fn handle_normal_key(
             app.select_previous();
         }
         KeyCode::Char('k') | KeyCode::Up if output_pane_is_focused(app) => {
-            app.scroll_selected_output_up(1);
+            scroll_selected_output_up(app, pty_runtime, 1);
         }
         KeyCode::Char('j') | KeyCode::Down if output_pane_is_focused(app) => {
-            app.scroll_selected_output_down(1);
+            scroll_selected_output_down(app, pty_runtime, 1);
         }
         KeyCode::PageUp if output_pane_is_focused(app) => {
-            app.scroll_selected_output_up(scroll_page_rows(app, frame_area));
+            scroll_selected_output_up(app, pty_runtime, scroll_page_rows(app, frame_area));
         }
         KeyCode::PageDown if output_pane_is_focused(app) => {
-            app.scroll_selected_output_down(scroll_page_rows(app, frame_area));
+            scroll_selected_output_down(app, pty_runtime, scroll_page_rows(app, frame_area));
         }
         KeyCode::Home if output_pane_is_focused(app) => {
-            app.scroll_selected_output_to_top();
+            scroll_selected_output_to_top(app, pty_runtime);
         }
         KeyCode::End if output_pane_is_focused(app) => {
-            app.scroll_selected_output_to_bottom();
+            scroll_selected_output_to_bottom(app, pty_runtime);
         }
         KeyCode::Char('n') => *normal_prefix = Some(NormalPrefix::New),
         KeyCode::Char('d') => *normal_prefix = Some(NormalPrefix::Delete),
@@ -333,6 +392,68 @@ fn handle_normal_key(
 fn output_pane_is_focused(app: &App) -> bool {
     matches!(app.focus, FocusMode::Chat | FocusMode::Terminal)
         && app.selected_output_terminal_id().is_some()
+}
+
+fn scroll_selected_output_up(app: &mut App, pty_runtime: &mut PtyRuntime, rows: usize) -> bool {
+    let Some(terminal) = app.selected_output_terminal_id() else {
+        return false;
+    };
+    scroll_terminal_output_up(app, pty_runtime, terminal, rows)
+}
+
+fn scroll_selected_output_down(app: &mut App, pty_runtime: &mut PtyRuntime, rows: usize) -> bool {
+    let Some(terminal) = app.selected_output_terminal_id() else {
+        return false;
+    };
+    scroll_terminal_output_down(app, pty_runtime, terminal, rows)
+}
+
+fn scroll_selected_output_to_top(app: &mut App, pty_runtime: &mut PtyRuntime) -> bool {
+    let Some(terminal) = app.selected_output_terminal_id() else {
+        return false;
+    };
+    if pty_runtime.is_running(terminal) {
+        return pty_runtime.scroll_to_top(terminal).unwrap_or(false);
+    }
+
+    app.scroll_terminal_output_to_top(terminal)
+}
+
+fn scroll_selected_output_to_bottom(app: &mut App, pty_runtime: &mut PtyRuntime) -> bool {
+    let Some(terminal) = app.selected_output_terminal_id() else {
+        return false;
+    };
+    if pty_runtime.is_running(terminal) {
+        return pty_runtime.scroll_to_bottom(terminal).unwrap_or(false);
+    }
+
+    app.scroll_terminal_output_to_bottom(terminal)
+}
+
+fn scroll_terminal_output_up(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    terminal: TerminalId,
+    rows: usize,
+) -> bool {
+    if pty_runtime.is_running(terminal) {
+        return pty_runtime.scroll_up(terminal, rows).unwrap_or(false);
+    }
+
+    app.scroll_terminal_output_up(terminal, rows)
+}
+
+fn scroll_terminal_output_down(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    terminal: TerminalId,
+    rows: usize,
+) -> bool {
+    if pty_runtime.is_running(terminal) {
+        return pty_runtime.scroll_down(terminal, rows).unwrap_or(false);
+    }
+
+    app.scroll_terminal_output_down(terminal, rows)
 }
 
 fn scroll_page_rows(app: &App, frame_area: Rect) -> usize {
@@ -436,6 +557,74 @@ fn handle_terminal_command_key(app: &mut App, key: KeyEvent) {
             app.push_prompt_char(c);
         }
         _ => {}
+    }
+}
+
+fn handle_command_palette_key(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    config: &Config,
+    key: KeyEvent,
+    frame_area: Rect,
+) {
+    match key.code {
+        KeyCode::Esc => app.cancel_prompt(),
+        KeyCode::Enter => {
+            if let Some(action) = app.submit_command_palette() {
+                execute_command_action(app, pty_runtime, config, action, frame_area);
+            }
+        }
+        KeyCode::Up => app.select_previous_command_palette_entry(),
+        KeyCode::Down => app.select_next_command_palette_entry(),
+        KeyCode::Backspace => app.pop_prompt_char(),
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cancel_prompt(),
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.push_prompt_char(c);
+        }
+        _ => {}
+    }
+}
+
+fn handle_search_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel_prompt(),
+        KeyCode::Enter => app.submit_search(),
+        KeyCode::Backspace => app.pop_prompt_char(),
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cancel_prompt(),
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.push_prompt_char(c);
+        }
+        _ => {}
+    }
+}
+
+fn execute_command_action(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    config: &Config,
+    action: CommandAction,
+    frame_area: Rect,
+) {
+    match action {
+        CommandAction::FocusSidebar => app.focus_sidebar(),
+        CommandAction::FocusSelectedPane => {
+            app.focus_selected_main();
+        }
+        CommandAction::StartInput => focus_selected_input(app, pty_runtime, config, frame_area),
+        CommandAction::AddAgentChat => {
+            add_agent_to_selected_workspace(app, pty_runtime, config, frame_area);
+        }
+        CommandAction::AddShellTerminal => app.add_terminal_to_selected_workspace(),
+        CommandAction::AddCommandTerminal => {
+            app.begin_new_terminal_command();
+        }
+        CommandAction::OpenWorkspace => app.begin_open_workspace(),
+        CommandAction::DeleteSelected => delete_selected_now(app, pty_runtime),
+        CommandAction::SearchSelectedPane => {
+            app.begin_search();
+        }
+        CommandAction::ClearSearch => app.clear_search(),
+        CommandAction::Quit => app.quit(),
     }
 }
 

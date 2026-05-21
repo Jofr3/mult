@@ -26,6 +26,7 @@ pub struct App {
     pub terminal_buffers: BTreeMap<TerminalId, TerminalBuffer>,
     pub terminal_snapshots: BTreeMap<TerminalId, ScreenSnapshot>,
     pub chat_buffers: BTreeMap<ChatId, ChatBuffer>,
+    pub active_search: Option<SearchState>,
     pub should_quit: bool,
     dirty: bool,
 }
@@ -52,6 +53,8 @@ pub enum InputTarget {
 pub enum Prompt {
     OpenWorkspace(OpenWorkspacePrompt),
     NewTerminalCommand(TerminalCommandPrompt),
+    CommandPalette(CommandPalettePrompt),
+    Search(SearchPrompt),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -72,6 +75,53 @@ pub struct OpenWorkspacePrompt {
 pub struct TerminalCommandPrompt {
     pub input: String,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandPalettePrompt {
+    pub input: String,
+    pub selected: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchPrompt {
+    pub input: String,
+    pub scope: SearchScope,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchState {
+    pub query: String,
+    pub scope: SearchScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchScope {
+    Terminal(TerminalId),
+    Chat(ChatId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandAction {
+    FocusSidebar,
+    FocusSelectedPane,
+    StartInput,
+    AddAgentChat,
+    AddShellTerminal,
+    AddCommandTerminal,
+    OpenWorkspace,
+    DeleteSelected,
+    SearchSelectedPane,
+    ClearSearch,
+    Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandPaletteEntry {
+    pub action: CommandAction,
+    pub label: &'static str,
+    pub help: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,9 +150,29 @@ struct TerminalScreen {
     cols: u16,
     cursor_row: usize,
     cursor_col: usize,
+    cursor_visible: bool,
     wrap_pending: bool,
     saved_cursor: Option<(usize, usize)>,
     current_style: TerminalCellStyle,
+    application_cursor_keys: bool,
+    bracketed_paste: bool,
+    scroll_top: usize,
+    scroll_bottom: usize,
+    scrollback: VecDeque<Vec<TerminalCell>>,
+    cells: Vec<Vec<TerminalCell>>,
+    alternate_saved: Option<TerminalScreenState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalScreenState {
+    cursor_row: usize,
+    cursor_col: usize,
+    cursor_visible: bool,
+    wrap_pending: bool,
+    saved_cursor: Option<(usize, usize)>,
+    current_style: TerminalCellStyle,
+    scroll_top: usize,
+    scroll_bottom: usize,
     scrollback: VecDeque<Vec<TerminalCell>>,
     cells: Vec<Vec<TerminalCell>>,
 }
@@ -122,6 +192,10 @@ enum TerminalParser {
 
 const TERMINAL_MAX_SCROLLBACK_LINES: usize = 5_000;
 const TERMINAL_MAX_CSI_SEQUENCE_CHARS: usize = 128;
+const PRIMARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[?1;2c";
+const DEVICE_STATUS_OK_RESPONSE: &[u8] = b"\x1b[0n";
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ChatBuffer {
@@ -178,6 +252,7 @@ impl App {
             terminal_buffers: BTreeMap::new(),
             terminal_snapshots: BTreeMap::new(),
             chat_buffers,
+            active_search: None,
             should_quit: false,
             dirty: ids_normalized || titles_normalized,
         };
@@ -199,6 +274,109 @@ impl App {
 
     pub fn is_prompt_active(&self) -> bool {
         self.prompt.is_some()
+    }
+
+    pub fn begin_command_palette(&mut self) {
+        self.prompt = Some(Prompt::CommandPalette(CommandPalettePrompt {
+            input: String::new(),
+            selected: 0,
+        }));
+    }
+
+    pub fn command_palette_entries_for(&self, query: &str) -> Vec<CommandPaletteEntry> {
+        let entries = self.available_command_palette_entries();
+        let query = query.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            return entries;
+        }
+
+        let terms = query.split_whitespace().collect::<Vec<_>>();
+        entries
+            .into_iter()
+            .filter(|entry| {
+                let haystack = format!("{} {}", entry.label, entry.help).to_ascii_lowercase();
+                terms.iter().all(|term| haystack.contains(term))
+            })
+            .collect()
+    }
+
+    pub fn active_command_palette_entries(&self) -> Vec<CommandPaletteEntry> {
+        match &self.prompt {
+            Some(Prompt::CommandPalette(prompt)) => self.command_palette_entries_for(&prompt.input),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn select_next_command_palette_entry(&mut self) {
+        self.move_command_palette_selection(1);
+    }
+
+    pub fn select_previous_command_palette_entry(&mut self) {
+        self.move_command_palette_selection(-1);
+    }
+
+    pub fn submit_command_palette(&mut self) -> Option<CommandAction> {
+        let Some(Prompt::CommandPalette(prompt)) = &self.prompt else {
+            return None;
+        };
+        let entries = self.command_palette_entries_for(&prompt.input);
+        let action = entries
+            .get(prompt.selected.min(entries.len().saturating_sub(1)))
+            .map(|entry| entry.action);
+        self.prompt = None;
+        action
+    }
+
+    pub fn begin_search(&mut self) -> bool {
+        let Some(scope) = self.selected_search_scope() else {
+            return false;
+        };
+        let input = self
+            .active_search
+            .as_ref()
+            .filter(|search| search.scope == scope)
+            .map(|search| search.query.clone())
+            .unwrap_or_default();
+        self.prompt = Some(Prompt::Search(SearchPrompt {
+            input,
+            scope,
+            error: None,
+        }));
+        true
+    }
+
+    pub fn submit_search(&mut self) {
+        let Some(Prompt::Search(prompt)) = &self.prompt else {
+            return;
+        };
+        let query = prompt.input.trim().to_string();
+        if query.is_empty() {
+            self.active_search = None;
+        } else {
+            self.active_search = Some(SearchState {
+                query,
+                scope: prompt.scope,
+            });
+        }
+        self.prompt = None;
+    }
+
+    pub fn clear_search(&mut self) {
+        self.active_search = None;
+    }
+
+    pub fn search_status(&self) -> Option<String> {
+        let search = self.active_search.as_ref()?;
+        let count = self.search_match_count(search);
+        let scope = match search.scope {
+            SearchScope::Terminal(_) => "terminal",
+            SearchScope::Chat(_) => "chat",
+        };
+        Some(format!(
+            "search {scope}: {count} match{} for `{}`",
+            if count == 1 { "" } else { "es" },
+            search.query
+        ))
     }
 
     #[cfg(test)]
@@ -263,6 +441,117 @@ impl App {
     fn normalize_focus(&mut self) {
         if !self.available_focus_modes().contains(&self.focus) {
             self.focus = FocusMode::Sidebar;
+        }
+    }
+
+    fn available_command_palette_entries(&self) -> Vec<CommandPaletteEntry> {
+        let mut entries = Vec::new();
+        entries.push(CommandPaletteEntry {
+            action: CommandAction::FocusSidebar,
+            label: "Focus sidebar",
+            help: "return keyboard focus to workspace navigation",
+        });
+        if self.selected_main_focus().is_some() {
+            entries.push(CommandPaletteEntry {
+                action: CommandAction::FocusSelectedPane,
+                label: "Focus selected pane",
+                help: "move keyboard focus from sidebar to the selected chat or terminal",
+            });
+            entries.push(CommandPaletteEntry {
+                action: CommandAction::StartInput,
+                label: "Start or focus input",
+                help: "start the selected chat/terminal PTY and enter input mode",
+            });
+            entries.push(CommandPaletteEntry {
+                action: CommandAction::SearchSelectedPane,
+                label: "Search selected pane",
+                help: "filter terminal output or chat transcript lines",
+            });
+        }
+        if self.selected_workspace_id().is_some() {
+            entries.push(CommandPaletteEntry {
+                action: CommandAction::AddAgentChat,
+                label: "New agent chat",
+                help: "add an agent chat to the selected workspace",
+            });
+            entries.push(CommandPaletteEntry {
+                action: CommandAction::AddShellTerminal,
+                label: "New shell terminal",
+                help: "add a shell terminal to the selected workspace",
+            });
+            entries.push(CommandPaletteEntry {
+                action: CommandAction::AddCommandTerminal,
+                label: "New command terminal",
+                help: "add a command/dev-server terminal to the selected workspace",
+            });
+        }
+        entries.push(CommandPaletteEntry {
+            action: CommandAction::OpenWorkspace,
+            label: "Open workspace",
+            help: "import a workspace directory",
+        });
+        if self.selected_item_can_be_deleted() {
+            entries.push(CommandPaletteEntry {
+                action: CommandAction::DeleteSelected,
+                label: "Delete selected item",
+                help: "delete the selected workspace, chat, or terminal",
+            });
+        }
+        if self.active_search.is_some() {
+            entries.push(CommandPaletteEntry {
+                action: CommandAction::ClearSearch,
+                label: "Clear search",
+                help: "clear the active search/filter",
+            });
+        }
+        entries.push(CommandPaletteEntry {
+            action: CommandAction::Quit,
+            label: "Quit mult",
+            help: "save state and exit",
+        });
+        entries
+    }
+
+    fn move_command_palette_selection(&mut self, delta: isize) {
+        let Some(Prompt::CommandPalette(prompt)) = &self.prompt else {
+            return;
+        };
+        let len = self.command_palette_entries_for(&prompt.input).len();
+        if len == 0 {
+            if let Some(Prompt::CommandPalette(prompt)) = &mut self.prompt {
+                prompt.selected = 0;
+            }
+            return;
+        }
+
+        if let Some(Prompt::CommandPalette(prompt)) = &mut self.prompt {
+            if delta.is_negative() {
+                let delta = delta.unsigned_abs() % len;
+                prompt.selected = prompt.selected.checked_sub(delta).unwrap_or(len - delta);
+            } else {
+                prompt.selected = (prompt.selected + delta as usize) % len;
+            }
+        }
+    }
+
+    fn clamp_command_palette_selection(&mut self) {
+        let Some(Prompt::CommandPalette(prompt)) = &self.prompt else {
+            return;
+        };
+        let len = self.command_palette_entries_for(&prompt.input).len();
+        if let Some(Prompt::CommandPalette(prompt)) = &mut self.prompt {
+            prompt.selected = prompt.selected.min(len.saturating_sub(1));
+        }
+    }
+
+    fn search_match_count(&self, search: &SearchState) -> usize {
+        match search.scope {
+            SearchScope::Terminal(terminal) => {
+                filter_lines(self.terminal_all_lines(terminal), &search.query).len()
+            }
+            SearchScope::Chat(chat) => {
+                filter_lines(self.chat_transcript_lines(chat), &search.query).len()
+            }
         }
     }
 
@@ -377,6 +666,26 @@ impl App {
             Some(NavItem::Chat { workspace, chat }) => Some((workspace, chat)),
             _ => None,
         }
+    }
+
+    pub fn selected_search_scope(&self) -> Option<SearchScope> {
+        match self.selected_item()? {
+            NavItem::Chat { chat, .. } => Some(SearchScope::Chat(chat)),
+            NavItem::Terminal { terminal, .. } => Some(SearchScope::Terminal(terminal)),
+            NavItem::Workspace(_) => None,
+        }
+    }
+
+    pub fn selected_item_can_be_deleted(&self) -> bool {
+        self.selected_delete_target().is_some()
+    }
+
+    pub fn selected_item_can_start_input(&self) -> bool {
+        self.selected_chat_id().is_some() || self.selected_terminal_id().is_some()
+    }
+
+    pub fn selected_item_can_search(&self) -> bool {
+        self.selected_search_scope().is_some()
     }
 
     pub fn delete_selected_immediately(&mut self) -> Vec<TerminalId> {
@@ -508,15 +817,51 @@ impl App {
             .unwrap_or_default()
     }
 
-    pub fn terminal_render_lines(&self, terminal: TerminalId) -> Vec<TerminalRenderLine> {
+    pub fn terminal_all_lines(&self, terminal: TerminalId) -> Vec<String> {
         self.terminal_snapshots
             .get(&terminal)
-            .map(ScreenSnapshot::render_lines)
+            .map(screen_snapshot_lines)
             .or_else(|| {
                 self.terminal_buffers
                     .get(&terminal)
-                    .map(TerminalBuffer::render_lines)
+                    .map(TerminalBuffer::all_lines)
             })
+            .unwrap_or_default()
+    }
+
+    pub fn filtered_terminal_lines(&self, terminal: TerminalId) -> Option<Vec<String>> {
+        let search = self.active_search.as_ref()?;
+        if search.scope != SearchScope::Terminal(terminal) {
+            return None;
+        }
+        Some(filter_lines(
+            self.terminal_all_lines(terminal),
+            &search.query,
+        ))
+    }
+
+    pub fn active_search_query_for_terminal(&self, terminal: TerminalId) -> Option<&str> {
+        self.active_search
+            .as_ref()
+            .filter(|search| search.scope == SearchScope::Terminal(terminal))
+            .map(|search| search.query.as_str())
+    }
+
+    pub fn terminal_render_lines(&self, terminal: TerminalId) -> Vec<TerminalRenderLine> {
+        let force_cursor_visible = self.pty_input_target() == Some(terminal);
+        if let Some(snapshot) = self.terminal_snapshots.get(&terminal) {
+            let mut snapshot = snapshot.clone();
+            if force_cursor_visible {
+                if let Some(cursor) = snapshot.cursor.as_mut() {
+                    cursor.visible = true;
+                }
+            }
+            return snapshot.render_lines();
+        }
+
+        self.terminal_buffers
+            .get(&terminal)
+            .map(|buffer| buffer.render_lines_with_forced_cursor(force_cursor_visible))
             .unwrap_or_default()
     }
 
@@ -608,6 +953,39 @@ impl App {
             .get(&chat)
             .map(ChatBuffer::visible_lines)
             .unwrap_or_default()
+    }
+
+    pub fn chat_transcript_lines(&self, chat: ChatId) -> Vec<String> {
+        let mut lines = self
+            .project
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.chats.iter())
+            .find(|session| session.id == chat)
+            .map(|session| transcript_lines(&session.messages))
+            .unwrap_or_default();
+        if lines.is_empty() {
+            lines = self.chat_lines(chat);
+        }
+        lines
+    }
+
+    pub fn filtered_chat_lines(&self, chat: ChatId) -> Option<Vec<String>> {
+        let search = self.active_search.as_ref()?;
+        if search.scope != SearchScope::Chat(chat) {
+            return None;
+        }
+        Some(filter_lines(
+            self.chat_transcript_lines(chat),
+            &search.query,
+        ))
+    }
+
+    pub fn active_search_query_for_chat(&self, chat: ChatId) -> Option<&str> {
+        self.active_search
+            .as_ref()
+            .filter(|search| search.scope == SearchScope::Chat(chat))
+            .map(|search| search.query.as_str())
     }
 
     fn append_chat_message(
@@ -796,8 +1174,17 @@ impl App {
                 prompt.input.push(c);
                 prompt.error = None;
             }
+            Some(Prompt::CommandPalette(prompt)) => {
+                prompt.input.push(c);
+                prompt.selected = 0;
+            }
+            Some(Prompt::Search(prompt)) => {
+                prompt.input.push(c);
+                prompt.error = None;
+            }
             _ => {}
         }
+        self.clamp_command_palette_selection();
     }
 
     pub fn pop_prompt_char(&mut self) {
@@ -810,8 +1197,17 @@ impl App {
                 prompt.input.pop();
                 prompt.error = None;
             }
+            Some(Prompt::CommandPalette(prompt)) => {
+                prompt.input.pop();
+                prompt.selected = 0;
+            }
+            Some(Prompt::Search(prompt)) => {
+                prompt.input.pop();
+                prompt.error = None;
+            }
             _ => {}
         }
+        self.clamp_command_palette_selection();
     }
 
     pub fn submit_open_workspace(&mut self) {
@@ -997,10 +1393,15 @@ impl App {
 
 impl TerminalBuffer {
     pub fn append(&mut self, text: &str) {
+        let _ = self.append_and_collect_responses(text);
+    }
+
+    pub fn append_and_collect_responses(&mut self, text: &str) -> Vec<Vec<u8>> {
         let old_max_scroll_offset = self.screen.max_scroll_offset();
         let preserve_scrolled_view = self.scroll_offset > 0;
+        let mut responses = Vec::new();
         for ch in text.chars() {
-            self.process_char(ch);
+            self.process_char(ch, &mut responses);
         }
         if preserve_scrolled_view {
             self.scroll_offset = self.scroll_offset.saturating_add(
@@ -1010,10 +1411,12 @@ impl TerminalBuffer {
             );
         }
         self.clamp_scroll_offset();
+        responses
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.screen.resize(rows.max(1), cols.max(1));
+        self.screen
+            .resize(rows.max(1), cols.max(1), self.scroll_offset == 0);
         self.clamp_scroll_offset();
     }
 
@@ -1021,8 +1424,20 @@ impl TerminalBuffer {
         self.screen.visible_lines(self.scroll_offset)
     }
 
+    pub fn all_lines(&self) -> Vec<String> {
+        self.screen.all_lines()
+    }
+
     pub fn render_lines(&self) -> Vec<TerminalRenderLine> {
         self.screen.render_lines(self.scroll_offset)
+    }
+
+    fn render_lines_with_forced_cursor(
+        &self,
+        force_cursor_visible: bool,
+    ) -> Vec<TerminalRenderLine> {
+        self.screen
+            .render_lines_with_forced_cursor(self.scroll_offset, force_cursor_visible)
     }
 
     pub fn snapshot(&self) -> ScreenSnapshot {
@@ -1033,7 +1448,19 @@ impl TerminalBuffer {
         self.screen.is_blank()
     }
 
-    fn scroll_view_up(&mut self, rows: usize) -> bool {
+    pub fn application_cursor_keys_enabled(&self) -> bool {
+        self.screen.application_cursor_keys
+    }
+
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.screen.bracketed_paste
+    }
+
+    pub fn paste_bytes(&self, text: &str) -> Vec<u8> {
+        terminal_paste_bytes(text, self.screen.bracketed_paste)
+    }
+
+    pub fn scroll_view_up(&mut self, rows: usize) -> bool {
         if rows == 0 {
             return false;
         }
@@ -1042,7 +1469,7 @@ impl TerminalBuffer {
         self.scroll_offset != old_offset
     }
 
-    fn scroll_view_down(&mut self, rows: usize) -> bool {
+    pub fn scroll_view_down(&mut self, rows: usize) -> bool {
         if rows == 0 {
             return false;
         }
@@ -1051,13 +1478,13 @@ impl TerminalBuffer {
         self.scroll_offset != old_offset
     }
 
-    fn scroll_view_to_top(&mut self) -> bool {
+    pub fn scroll_view_to_top(&mut self) -> bool {
         let old_offset = self.scroll_offset;
         self.scroll_offset = self.screen.max_scroll_offset();
         self.scroll_offset != old_offset
     }
 
-    fn scroll_view_to_bottom(&mut self) -> bool {
+    pub fn scroll_view_to_bottom(&mut self) -> bool {
         let old_offset = self.scroll_offset;
         self.scroll_offset = 0;
         self.scroll_offset != old_offset
@@ -1073,14 +1500,14 @@ impl TerminalBuffer {
         self.append(&line);
     }
 
-    fn process_char(&mut self, ch: char) {
+    fn process_char(&mut self, ch: char, responses: &mut Vec<Vec<u8>>) {
         let state = std::mem::take(&mut self.parser);
         self.parser = match state {
             TerminalParser::Ground => self.process_ground_char(ch),
-            TerminalParser::Escape => self.process_escape_char(ch),
+            TerminalParser::Escape => self.process_escape_char(ch, responses),
             TerminalParser::Csi(mut sequence) => {
                 if ('@'..='~').contains(&ch) {
-                    self.apply_csi(&sequence, ch);
+                    self.apply_csi(&sequence, ch, responses);
                     TerminalParser::Ground
                 } else if sequence.len() >= TERMINAL_MAX_CSI_SEQUENCE_CHARS {
                     TerminalParser::CsiIgnored
@@ -1133,13 +1560,17 @@ impl TerminalBuffer {
         }
     }
 
-    fn process_escape_char(&mut self, ch: char) -> TerminalParser {
+    fn process_escape_char(&mut self, ch: char, responses: &mut Vec<Vec<u8>>) -> TerminalParser {
         match ch {
             '[' => TerminalParser::Csi(String::new()),
             ']' => TerminalParser::Osc { esc_seen: false },
             '(' | ')' | '*' | '+' => TerminalParser::IgnoreOne,
             'c' => {
-                self.screen.clear();
+                self.screen.reset();
+                TerminalParser::Ground
+            }
+            'Z' => {
+                responses.push(PRIMARY_DEVICE_ATTRIBUTES_RESPONSE.to_vec());
                 TerminalParser::Ground
             }
             '7' => {
@@ -1167,7 +1598,7 @@ impl TerminalBuffer {
         }
     }
 
-    fn apply_csi(&mut self, sequence: &str, final_char: char) {
+    fn apply_csi(&mut self, sequence: &str, final_char: char, responses: &mut Vec<Vec<u8>>) {
         let private = sequence.contains('?');
         let params = parse_csi_params(sequence);
         match final_char {
@@ -1188,26 +1619,26 @@ impl TerminalBuffer {
             ),
             'J' => self.screen.erase_display(param_or_default(&params, 0, 0)),
             'K' => self.screen.erase_line(param_or_default(&params, 0, 0)),
+            'c' if !private && param_or_default(&params, 0, 0) == 0 => {
+                responses.push(PRIMARY_DEVICE_ATTRIBUTES_RESPONSE.to_vec());
+            }
             'm' => self.screen.apply_sgr(&params),
+            'n' if !private => match param_or_default(&params, 0, 0) {
+                5 => responses.push(DEVICE_STATUS_OK_RESPONSE.to_vec()),
+                6 => responses.push(self.screen.cursor_position_report(false)),
+                _ => {}
+            },
+            'n' if private && param_or_default(&params, 0, 0) == 6 => {
+                responses.push(self.screen.cursor_position_report(true));
+            }
+            'r' => self.screen.set_scroll_region_from_params(&params),
             'S' => self.screen.scroll_up(param_or_default(&params, 0, 1)),
             'T' => self.screen.scroll_down(param_or_default(&params, 0, 1)),
             'd' => self.screen.set_cursor_row(param_or_default(&params, 0, 1)),
             's' => self.screen.save_cursor(),
             'u' => self.screen.restore_cursor(),
-            'h' if private
-                && params
-                    .iter()
-                    .any(|param| matches!(*param, 47 | 1047 | 1049)) =>
-            {
-                self.screen.clear();
-            }
-            'l' if private
-                && params
-                    .iter()
-                    .any(|param| matches!(*param, 47 | 1047 | 1049)) =>
-            {
-                self.screen.clear();
-            }
+            'h' if private => self.screen.set_private_modes(&params, true),
+            'l' if private => self.screen.set_private_modes(&params, false),
             _ => {}
         }
     }
@@ -1227,25 +1658,88 @@ impl TerminalScreen {
             cols,
             cursor_row: 0,
             cursor_col: 0,
+            cursor_visible: true,
             wrap_pending: false,
             saved_cursor: None,
             current_style: TerminalCellStyle::default(),
+            application_cursor_keys: false,
+            bracketed_paste: false,
+            scroll_top: 0,
+            scroll_bottom: usize::from(rows).saturating_sub(1),
             scrollback: VecDeque::new(),
             cells: vec![vec![TerminalCell::blank(); usize::from(cols)]; usize::from(rows)],
+            alternate_saved: None,
         }
     }
 
-    fn resize(&mut self, rows: u16, cols: u16) {
+    fn resize(&mut self, rows: u16, cols: u16, preserve_bottom: bool) {
+        let old_scroll_region_was_full_screen =
+            self.scroll_top == 0 && self.scroll_bottom + 1 == self.cells.len();
         let (rows, cols) = bounded_terminal_dimensions(rows, cols);
         self.rows = rows;
         self.cols = cols;
         let row_len = usize::from(cols);
         let row_count = usize::from(rows);
-        self.cells.resize(row_count, Vec::new());
+
+        for row in &mut self.scrollback {
+            row.resize(row_len, TerminalCell::blank());
+        }
         for row in &mut self.cells {
             row.resize(row_len, TerminalCell::blank());
         }
+
+        if preserve_bottom && old_scroll_region_was_full_screen {
+            self.resize_rows_preserving_bottom(row_count);
+        } else {
+            self.cells.resize(row_count, blank_terminal_row(row_len));
+        }
+
+        if old_scroll_region_was_full_screen {
+            self.reset_scroll_region();
+        } else {
+            self.clamp_scroll_region();
+        }
         self.clamp_cursor();
+    }
+
+    fn resize_rows_preserving_bottom(&mut self, row_count: usize) {
+        let old_row_count = self.cells.len();
+        match row_count.cmp(&old_row_count) {
+            std::cmp::Ordering::Greater => {
+                let added_rows = row_count - old_row_count;
+                let pulled_scrollback_rows = added_rows.min(self.scrollback.len());
+                let blank_rows = added_rows - pulled_scrollback_rows;
+                let mut cells = Vec::with_capacity(row_count);
+                cells.extend(
+                    std::iter::repeat_with(|| blank_terminal_row(usize::from(self.cols)))
+                        .take(blank_rows),
+                );
+                if pulled_scrollback_rows > 0 {
+                    let split_at = self.scrollback.len() - pulled_scrollback_rows;
+                    cells.extend(self.scrollback.drain(split_at..));
+                }
+                cells.append(&mut self.cells);
+                self.cells = cells;
+                self.cursor_row = self
+                    .cursor_row
+                    .saturating_add(added_rows)
+                    .min(row_count.saturating_sub(1));
+            }
+            std::cmp::Ordering::Less => {
+                let removed_rows = old_row_count - row_count;
+                let removed = self.cells.drain(..removed_rows).collect::<Vec<_>>();
+                for row in removed {
+                    if !terminal_row_is_blank(&row) {
+                        self.push_scrollback(row);
+                    }
+                }
+                self.cursor_row = self
+                    .cursor_row
+                    .saturating_sub(removed_rows)
+                    .min(row_count.saturating_sub(1));
+            }
+            std::cmp::Ordering::Equal => {}
+        }
     }
 
     fn visible_lines(&self, scroll_offset: usize) -> Vec<String> {
@@ -1255,9 +1749,27 @@ impl TerminalScreen {
             .collect()
     }
 
+    fn all_lines(&self) -> Vec<String> {
+        self.scrollback
+            .iter()
+            .chain(self.cells.iter())
+            .map(|row| terminal_row_text(row))
+            .collect()
+    }
+
     fn render_lines(&self, scroll_offset: usize) -> Vec<TerminalRenderLine> {
+        self.render_lines_with_forced_cursor(scroll_offset, false)
+    }
+
+    fn render_lines_with_forced_cursor(
+        &self,
+        scroll_offset: usize,
+        force_cursor_visible: bool,
+    ) -> Vec<TerminalRenderLine> {
         let scroll_offset = scroll_offset.min(self.max_scroll_offset());
-        let cursor_row = (scroll_offset == 0).then_some(self.scrollback.len() + self.cursor_row);
+        let cursor_visible = self.cursor_visible || force_cursor_visible;
+        let cursor_row = (scroll_offset == 0 && cursor_visible)
+            .then_some(self.scrollback.len() + self.cursor_row);
 
         self.viewport_row_indices(scroll_offset)
             .filter_map(|row_index| {
@@ -1278,7 +1790,7 @@ impl TerminalScreen {
             col: self
                 .cursor_col
                 .min(usize::from(self.cols).saturating_sub(1)) as u16,
-            visible: true,
+            visible: self.cursor_visible,
         });
         let mut cells = Vec::with_capacity(usize::from(self.rows) * usize::from(self.cols));
         for row_index in self.viewport_row_indices(scroll_offset) {
@@ -1352,9 +1864,9 @@ impl TerminalScreen {
 
     fn line_feed(&mut self) {
         self.wrap_pending = false;
-        if self.cursor_row + 1 >= usize::from(self.rows) {
+        if self.cursor_row == self.scroll_bottom {
             self.scroll_up(1);
-        } else {
+        } else if self.cursor_row + 1 < usize::from(self.rows) {
             self.cursor_row += 1;
         }
     }
@@ -1377,7 +1889,11 @@ impl TerminalScreen {
 
     fn reverse_index(&mut self) {
         self.wrap_pending = false;
-        self.cursor_row = self.cursor_row.saturating_sub(1);
+        if self.cursor_row == self.scroll_top {
+            self.scroll_down(1);
+        } else {
+            self.cursor_row = self.cursor_row.saturating_sub(1);
+        }
     }
 
     fn move_cursor_up(&mut self, count: usize) {
@@ -1462,28 +1978,66 @@ impl TerminalScreen {
     }
 
     fn scroll_up(&mut self, count: usize) {
-        for _ in 0..self.visible_scroll_count(count) {
-            if !self.cells.is_empty() {
-                let row = self.cells.remove(0);
-                self.push_scrollback(row);
-                self.cells
-                    .push(vec![TerminalCell::blank(); usize::from(self.cols)]);
+        for _ in 0..self.scroll_region_count(count) {
+            if self.cells.is_empty() {
+                return;
             }
+            let row = self.cells.remove(self.scroll_top);
+            if self.scroll_top == 0 {
+                self.push_scrollback(row);
+            }
+            self.cells.insert(
+                self.scroll_bottom,
+                vec![TerminalCell::blank(); usize::from(self.cols)],
+            );
         }
     }
 
     fn scroll_down(&mut self, count: usize) {
-        for _ in 0..self.visible_scroll_count(count) {
-            if !self.cells.is_empty() {
-                self.cells.pop();
-                self.cells
-                    .insert(0, vec![TerminalCell::blank(); usize::from(self.cols)]);
+        for _ in 0..self.scroll_region_count(count) {
+            if self.cells.is_empty() {
+                return;
             }
+            self.cells.remove(self.scroll_bottom);
+            self.cells.insert(
+                self.scroll_top,
+                vec![TerminalCell::blank(); usize::from(self.cols)],
+            );
         }
     }
 
-    fn visible_scroll_count(&self, count: usize) -> usize {
-        count.max(1).min(usize::from(self.rows))
+    fn scroll_region_count(&self, count: usize) -> usize {
+        let region_rows = self.scroll_bottom.saturating_sub(self.scroll_top) + 1;
+        count.max(1).min(region_rows)
+    }
+
+    fn set_scroll_region_from_params(&mut self, params: &[usize]) {
+        if params.is_empty() {
+            self.reset_scroll_region();
+            return;
+        }
+
+        let top = param_or_default(params, 0, 1).saturating_sub(1);
+        let bottom = param_or_default(params, 1, usize::from(self.rows)).saturating_sub(1);
+        if top < bottom && bottom < usize::from(self.rows) {
+            self.scroll_top = top;
+            self.scroll_bottom = bottom;
+            self.set_cursor_position(1, 1);
+        }
+    }
+
+    fn reset_scroll_region(&mut self) {
+        self.scroll_top = 0;
+        self.scroll_bottom = usize::from(self.rows).saturating_sub(1);
+    }
+
+    fn clamp_scroll_region(&mut self) {
+        let last_row = usize::from(self.rows).saturating_sub(1);
+        self.scroll_top = self.scroll_top.min(last_row);
+        self.scroll_bottom = self.scroll_bottom.min(last_row);
+        if self.scroll_top >= self.scroll_bottom {
+            self.reset_scroll_region();
+        }
     }
 
     fn save_cursor(&mut self) {
@@ -1506,6 +2060,87 @@ impl TerminalScreen {
         self.cursor_row = 0;
         self.cursor_col = 0;
         self.wrap_pending = false;
+    }
+
+    fn reset(&mut self) {
+        self.clear();
+        self.clear_scrollback();
+        self.reset_scroll_region();
+        self.current_style = TerminalCellStyle::default();
+        self.cursor_visible = true;
+        self.application_cursor_keys = false;
+        self.bracketed_paste = false;
+        self.saved_cursor = None;
+        self.alternate_saved = None;
+    }
+
+    fn cursor_position_report(&self, private: bool) -> Vec<u8> {
+        if private {
+            format!("\x1b[?{};{}R", self.cursor_row + 1, self.cursor_col + 1).into_bytes()
+        } else {
+            format!("\x1b[{};{}R", self.cursor_row + 1, self.cursor_col + 1).into_bytes()
+        }
+    }
+
+    fn set_private_modes(&mut self, params: &[usize], enabled: bool) {
+        for param in params {
+            match *param {
+                1 => self.application_cursor_keys = enabled,
+                25 => self.cursor_visible = enabled,
+                47 | 1047 | 1049 if enabled => self.enter_alternate_screen(),
+                47 | 1047 | 1049 => self.leave_alternate_screen(),
+                2004 => self.bracketed_paste = enabled,
+                _ => {}
+            }
+        }
+    }
+
+    fn enter_alternate_screen(&mut self) {
+        if self.alternate_saved.is_none() {
+            self.alternate_saved = Some(self.save_screen_state());
+        }
+        self.clear();
+        self.clear_scrollback();
+        self.reset_scroll_region();
+    }
+
+    fn leave_alternate_screen(&mut self) {
+        if let Some(state) = self.alternate_saved.take() {
+            self.restore_screen_state(state);
+        } else {
+            self.clear();
+            self.clear_scrollback();
+            self.reset_scroll_region();
+        }
+    }
+
+    fn save_screen_state(&self) -> TerminalScreenState {
+        TerminalScreenState {
+            cursor_row: self.cursor_row,
+            cursor_col: self.cursor_col,
+            cursor_visible: self.cursor_visible,
+            wrap_pending: self.wrap_pending,
+            saved_cursor: self.saved_cursor,
+            current_style: self.current_style,
+            scroll_top: self.scroll_top,
+            scroll_bottom: self.scroll_bottom,
+            scrollback: self.scrollback.clone(),
+            cells: self.cells.clone(),
+        }
+    }
+
+    fn restore_screen_state(&mut self, state: TerminalScreenState) {
+        self.cursor_row = state.cursor_row;
+        self.cursor_col = state.cursor_col;
+        self.cursor_visible = state.cursor_visible;
+        self.wrap_pending = state.wrap_pending;
+        self.saved_cursor = state.saved_cursor;
+        self.current_style = state.current_style;
+        self.scroll_top = state.scroll_top;
+        self.scroll_bottom = state.scroll_bottom;
+        self.scrollback = state.scrollback;
+        self.cells = state.cells;
+        self.resize(self.rows, self.cols, true);
     }
 
     fn clear_scrollback(&mut self) {
@@ -1558,9 +2193,11 @@ impl TerminalScreen {
                 1 => self.current_style.bold = true,
                 3 => self.current_style.italic = true,
                 4 => self.current_style.underlined = true,
+                7 => self.current_style.reversed = true,
                 22 => self.current_style.bold = false,
                 23 => self.current_style.italic = false,
                 24 => self.current_style.underlined = false,
+                27 => self.current_style.reversed = false,
                 30..=37 => self.current_style.fg = ansi_color(params[index] - 30, false),
                 39 => self.current_style.fg = None,
                 40..=47 => self.current_style.bg = ansi_color(params[index] - 40, false),
@@ -1597,6 +2234,14 @@ impl TerminalScreen {
 
 fn bounded_terminal_dimensions(rows: u16, cols: u16) -> (u16, u16) {
     bounded_screen_dimensions(rows.max(1), cols.max(1))
+}
+
+fn blank_terminal_row(cols: usize) -> Vec<TerminalCell> {
+    vec![TerminalCell::blank(); cols]
+}
+
+fn terminal_row_is_blank(row: &[TerminalCell]) -> bool {
+    row.iter().all(|cell| *cell == TerminalCell::blank())
 }
 
 fn terminal_row_text(row: &[TerminalCell]) -> String {
@@ -1647,10 +2292,24 @@ fn render_terminal_row(row: &[TerminalCell], cursor_col: Option<usize>) -> Termi
 }
 
 fn cursor_style(mut style: TerminalCellStyle) -> TerminalCellStyle {
-    style.fg = Some(TerminalColor::BrightWhite);
-    style.bg = None;
+    style.fg = Some(TerminalColor::Black);
+    style.bg = Some(TerminalColor::BrightWhite);
     style.underlined = false;
+    style.reversed = false;
     style
+}
+
+fn terminal_paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    if !bracketed {
+        return text.as_bytes().to_vec();
+    }
+
+    let mut bytes =
+        Vec::with_capacity(BRACKETED_PASTE_START.len() + text.len() + BRACKETED_PASTE_END.len());
+    bytes.extend_from_slice(BRACKETED_PASTE_START);
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(BRACKETED_PASTE_END);
+    bytes
 }
 
 fn ansi_color(index: usize, bright: bool) -> Option<TerminalColor> {
@@ -1728,6 +2387,47 @@ fn param_or_default(params: &[usize], index: usize, default: usize) -> usize {
         .copied()
         .filter(|value| *value > 0)
         .unwrap_or(default)
+}
+
+fn screen_snapshot_lines(snapshot: &ScreenSnapshot) -> Vec<String> {
+    snapshot
+        .render_lines()
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.text)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+fn transcript_lines(messages: &[ChatMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .flat_map(|message| {
+            let prefix = format!("{} > ", message.role.label());
+            message
+                .text
+                .lines()
+                .map(move |line| format!("{prefix}{line}"))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn filter_lines(lines: Vec<String>, query: &str) -> Vec<String> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return lines;
+    }
+
+    lines
+        .into_iter()
+        .filter(|line| line.to_lowercase().contains(&query))
+        .collect()
 }
 
 impl ChatBuffer {
@@ -1867,6 +2567,14 @@ mod tests {
     };
 
     use super::*;
+
+    fn rendered_text(lines: Vec<TerminalRenderLine>) -> String {
+        lines
+            .into_iter()
+            .flat_map(|line| line.spans)
+            .map(|span| span.text)
+            .collect()
+    }
 
     #[test]
     fn navigation_contains_nested_workspace_items_with_stable_ids() {
@@ -2107,6 +2815,44 @@ mod tests {
     }
 
     #[test]
+    fn terminal_buffer_resize_grow_keeps_bottom_view_anchored() {
+        let mut app = App::default();
+        let terminal = TerminalId(120);
+        app.resize_terminal_buffer(terminal, 2, 8);
+        app.append_terminal_output(terminal, "one\r\ntwo\r\nthree");
+
+        app.resize_terminal_buffer(terminal, 4, 8);
+
+        assert_eq!(
+            app.terminal_lines(terminal),
+            vec![
+                "".to_string(),
+                "one".to_string(),
+                "two".to_string(),
+                "three".to_string(),
+            ]
+        );
+        let screen = &app
+            .terminal_buffers
+            .get(&terminal)
+            .expect("terminal buffer exists")
+            .screen;
+        assert_eq!(screen.cursor_row, 3);
+        assert_eq!(screen.scroll_bottom, 3);
+    }
+
+    #[test]
+    fn terminal_buffer_resize_shrink_ignores_discarded_blank_rows() {
+        let mut app = App::default();
+        let terminal = TerminalId(121);
+
+        app.resize_terminal_buffer(terminal, 4, 8);
+        app.resize_terminal_buffer(terminal, 2, 8);
+
+        assert!(!app.scroll_terminal_output_up(terminal, 1));
+    }
+
+    #[test]
     fn terminal_buffer_scrolls_back_and_returns_to_bottom() {
         let mut app = App::default();
         let terminal = TerminalId(104);
@@ -2207,6 +2953,97 @@ mod tests {
     }
 
     #[test]
+    fn terminal_buffer_handles_tabs() {
+        let mut app = App::default();
+        let terminal = TerminalId(113);
+        app.resize_terminal_buffer(terminal, 1, 12);
+
+        app.append_terminal_output(terminal, "a\tb");
+
+        assert_eq!(app.terminal_lines(terminal), vec!["a       b".to_string()]);
+    }
+
+    #[test]
+    fn terminal_buffer_saves_and_restores_cursor() {
+        let mut app = App::default();
+        let terminal = TerminalId(114);
+        app.resize_terminal_buffer(terminal, 1, 8);
+
+        app.append_terminal_output(terminal, "ab\x1b7\x1b[1;5Hxy\x1b8Z");
+
+        assert_eq!(app.terminal_lines(terminal), vec!["abZ xy".to_string()]);
+    }
+
+    #[test]
+    fn terminal_buffer_applies_erase_modes() {
+        let mut app = App::default();
+        let terminal = TerminalId(115);
+        app.resize_terminal_buffer(terminal, 2, 8);
+
+        app.append_terminal_output(
+            terminal,
+            "abcdef\x1b[1;3H\x1b[K\x1b[2;1Hzzzz\x1b[2;3H\x1b[1K",
+        );
+
+        assert_eq!(
+            app.terminal_lines(terminal),
+            vec!["ab".to_string(), "   z".to_string()]
+        );
+    }
+
+    #[test]
+    fn terminal_buffer_resets_sgr_attributes_selectively() {
+        let mut app = App::default();
+        let terminal = TerminalId(116);
+        app.resize_terminal_buffer(terminal, 1, 16);
+
+        app.append_terminal_output(terminal, "\x1b[31;1mred\x1b[22;39mplain");
+
+        let lines = app.terminal_render_lines(terminal);
+        assert_eq!(lines[0].spans[0].text, "red");
+        assert_eq!(lines[0].spans[0].style.fg, Some(TerminalColor::Red));
+        assert!(lines[0].spans[0].style.bold);
+        assert_eq!(lines[0].spans[1].text, "plain");
+        assert_eq!(lines[0].spans[1].style, TerminalCellStyle::default());
+    }
+
+    #[test]
+    fn terminal_buffer_respects_scroll_regions() {
+        let mut app = App::default();
+        let terminal = TerminalId(117);
+        app.resize_terminal_buffer(terminal, 4, 8);
+
+        app.append_terminal_output(
+            terminal,
+            "one\r\ntwo\r\nthree\r\nfour\x1b[2;3r\x1b[3;1HXX\r\nYY",
+        );
+
+        assert_eq!(
+            app.terminal_lines(terminal),
+            vec![
+                "one".to_string(),
+                "XXree".to_string(),
+                "YY".to_string(),
+                "four".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_buffer_restores_main_screen_after_alternate_screen() {
+        let mut app = App::default();
+        let terminal = TerminalId(118);
+        app.resize_terminal_buffer(terminal, 2, 8);
+
+        app.append_terminal_output(terminal, "main\r\nkeep\x1b[?1049halt\x1b[?1049l");
+
+        assert_eq!(
+            app.terminal_lines(terminal),
+            vec!["main".to_string(), "keep".to_string()]
+        );
+    }
+
+    #[test]
     fn terminal_render_lines_preserve_styled_trailing_spaces() {
         let mut app = App::default();
         let terminal = TerminalId(102);
@@ -2230,8 +3067,104 @@ mod tests {
         let lines = app.terminal_render_lines(terminal);
         assert_eq!(lines[0].spans[0].text, "ok");
         assert_eq!(lines[0].spans[1].text, "▌");
-        assert_eq!(lines[0].spans[1].style.fg, Some(TerminalColor::BrightWhite));
-        assert_eq!(lines[0].spans[1].style.bg, None);
+        assert_eq!(lines[0].spans[1].style.fg, Some(TerminalColor::Black));
+        assert_eq!(lines[0].spans[1].style.bg, Some(TerminalColor::BrightWhite));
+    }
+
+    #[test]
+    fn terminal_buffer_tracks_cursor_visibility_mode() {
+        let mut buffer = TerminalBuffer::default();
+        buffer.resize(1, 4);
+        buffer.append("ok\x1b[?25l");
+
+        assert_eq!(buffer.render_lines()[0].spans[0].text, "ok");
+        assert!(!buffer.snapshot().cursor.unwrap().visible);
+
+        buffer.append("\x1b[?25h");
+
+        assert!(buffer.snapshot().cursor.unwrap().visible);
+        assert_eq!(buffer.render_lines()[0].spans[1].text, "▌");
+    }
+
+    #[test]
+    fn selected_input_terminal_forces_cursor_visible() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        let terminal = app.project.workspaces[0].terminals[0].id;
+        app.select_item(NavItem::Terminal {
+            workspace,
+            terminal,
+        });
+        app.resize_terminal_buffer(terminal, 1, 4);
+        app.append_terminal_output(terminal, "ok\x1b[?25l");
+
+        assert_eq!(rendered_text(app.terminal_render_lines(terminal)), "ok");
+
+        assert!(app.begin_terminal_input());
+
+        assert_eq!(rendered_text(app.terminal_render_lines(terminal)), "ok▌");
+    }
+
+    #[test]
+    fn terminal_buffer_preserves_reverse_video_style() {
+        let mut app = App::default();
+        let terminal = TerminalId(119);
+        app.resize_terminal_buffer(terminal, 1, 8);
+
+        app.append_terminal_output(terminal, "a\x1b[7mb\x1b[27mc");
+
+        let lines = app.terminal_render_lines(terminal);
+        assert_eq!(lines[0].spans[0].text, "a");
+        assert!(!lines[0].spans[0].style.reversed);
+        assert_eq!(lines[0].spans[1].text, "b");
+        assert!(lines[0].spans[1].style.reversed);
+        assert_eq!(lines[0].spans[2].text, "c");
+        assert!(!lines[0].spans[2].style.reversed);
+    }
+
+    #[test]
+    fn terminal_buffer_reports_device_status_and_cursor_position() {
+        let mut buffer = TerminalBuffer::default();
+        buffer.resize(3, 8);
+
+        let responses = buffer.append_and_collect_responses("ab\x1b[2;4H\x1b[5n\x1b[6n\x1b[c\x1bZ");
+
+        assert_eq!(
+            responses,
+            vec![
+                b"\x1b[0n".to_vec(),
+                b"\x1b[2;4R".to_vec(),
+                b"\x1b[?1;2c".to_vec(),
+                b"\x1b[?1;2c".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_buffer_wraps_paste_when_bracketed_paste_is_enabled() {
+        let mut buffer = TerminalBuffer::default();
+
+        assert_eq!(buffer.paste_bytes("one\ntwo"), b"one\ntwo".to_vec());
+
+        buffer.append("\x1b[?2004h");
+        assert_eq!(
+            buffer.paste_bytes("one\ntwo"),
+            b"\x1b[200~one\ntwo\x1b[201~".to_vec()
+        );
+
+        buffer.append("\x1b[?2004l");
+        assert_eq!(buffer.paste_bytes("one\ntwo"), b"one\ntwo".to_vec());
+    }
+
+    #[test]
+    fn terminal_buffer_tracks_application_cursor_key_mode() {
+        let mut buffer = TerminalBuffer::default();
+
+        assert!(!buffer.application_cursor_keys_enabled());
+        buffer.append("\x1b[?1h");
+        assert!(buffer.application_cursor_keys_enabled());
+        buffer.append("\x1b[?1l");
+        assert!(!buffer.application_cursor_keys_enabled());
     }
 
     #[test]
@@ -2310,6 +3243,76 @@ mod tests {
         );
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn command_palette_filters_and_returns_existing_actions() {
+        let mut app = App::default();
+
+        app.begin_command_palette();
+        for ch in "dev-server".chars() {
+            app.push_prompt_char(ch);
+        }
+
+        let entries = app.active_command_palette_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action, CommandAction::AddCommandTerminal);
+        assert_eq!(
+            app.submit_command_palette(),
+            Some(CommandAction::AddCommandTerminal)
+        );
+        assert_eq!(app.prompt, None);
+    }
+
+    #[test]
+    fn terminal_search_filters_all_scrollback_lines() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        let terminal = app.project.workspaces[0].terminals[0].id;
+        app.select_item(NavItem::Terminal {
+            workspace,
+            terminal,
+        });
+        app.resize_terminal_buffer(terminal, 2, 12);
+        app.append_terminal_output(terminal, "alpha\r\nbeta\r\ngamma");
+
+        assert!(app.begin_search());
+        for ch in "alp".chars() {
+            app.push_prompt_char(ch);
+        }
+        app.submit_search();
+
+        assert_eq!(
+            app.filtered_terminal_lines(terminal),
+            Some(vec!["alpha".to_string()])
+        );
+        assert!(app.search_status().unwrap().contains("1 match"));
+    }
+
+    #[test]
+    fn chat_search_filters_persisted_transcript_lines() {
+        let mut state = ProjectState::default();
+        let workspace = state.workspaces[0].id;
+        let chat = state.workspaces[0].chats[0].id;
+        state.append_chat_message(
+            workspace,
+            chat,
+            ChatMessageRole::Assistant,
+            "first\nneedle here".to_string(),
+        );
+        let mut app = App::new(state);
+        app.select_item(NavItem::Chat { workspace, chat });
+
+        assert!(app.begin_search());
+        for ch in "needle".chars() {
+            app.push_prompt_char(ch);
+        }
+        app.submit_search();
+
+        assert_eq!(
+            app.filtered_chat_lines(chat),
+            Some(vec!["agent > needle here".to_string()])
+        );
     }
 
     #[test]

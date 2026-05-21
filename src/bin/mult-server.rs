@@ -409,6 +409,49 @@ fn handle_client_messages(
                     write_pty_input(&writer, &bytes)?;
                 }
             }
+            ClientMessage::Paste { pane, text } => {
+                let pane = { server.lock().map_err(lock_error)?.pane_by_id(pane) };
+                if let Some(pane) = pane {
+                    let (writer, bytes) = {
+                        let pane = pane.lock().map_err(lock_error)?;
+                        (Arc::clone(&pane.writer), pane.terminal.paste_bytes(&text))
+                    };
+                    write_pty_input(&writer, &bytes)?;
+                }
+            }
+            ClientMessage::Scroll { pane, rows } => {
+                let pane = { server.lock().map_err(lock_error)?.pane_by_id(pane) };
+                if let Some(pane) = pane {
+                    if let Some((pane_id, snapshot)) = scroll_pane(&pane, rows)? {
+                        let _ = client.sender.send(ServerMessage::Snapshot {
+                            pane: pane_id,
+                            snapshot,
+                        });
+                    }
+                }
+            }
+            ClientMessage::ScrollToTop { pane } => {
+                let pane = { server.lock().map_err(lock_error)?.pane_by_id(pane) };
+                if let Some(pane) = pane {
+                    if let Some((pane_id, snapshot)) = scroll_pane_to_top(&pane)? {
+                        let _ = client.sender.send(ServerMessage::Snapshot {
+                            pane: pane_id,
+                            snapshot,
+                        });
+                    }
+                }
+            }
+            ClientMessage::ScrollToBottom { pane } => {
+                let pane = { server.lock().map_err(lock_error)?.pane_by_id(pane) };
+                if let Some(pane) = pane {
+                    if let Some((pane_id, snapshot)) = scroll_pane_to_bottom(&pane)? {
+                        let _ = client.sender.send(ServerMessage::Snapshot {
+                            pane: pane_id,
+                            snapshot,
+                        });
+                    }
+                }
+            }
             ClientMessage::Resize { pane, rows, cols } => {
                 let pane = { server.lock().map_err(lock_error)?.pane_by_id(pane) };
                 if let Some(pane) = pane {
@@ -515,21 +558,14 @@ fn create_session(server: &SharedServer, spec: SessionCreateSpec) -> io::Result<
 fn spawn_reader(mut reader: Box<dyn Read + Send>, pane: SharedPane, server: SharedServer) {
     thread::spawn(move || {
         let mut buffer = [0; 8192];
-        let mut query_tail = Vec::new();
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let writer = match pane.lock() {
-                        Ok(pane) => Arc::clone(&pane.writer),
-                        Err(_) => break,
-                    };
-                    write_terminal_query_responses(&buffer[..n], &mut query_tail, &writer);
-
                     let text = String::from_utf8_lossy(&buffer[..n]).into_owned();
-                    let (pane_id, update, clients) = match pane.lock() {
+                    let (pane_id, update, clients, writer, responses) = match pane.lock() {
                         Ok(mut pane) => {
-                            pane.terminal.append(&text);
+                            let responses = pane.terminal.append_and_collect_responses(&text);
                             let snapshot = pane.terminal.snapshot();
                             let update = pane
                                 .last_snapshot
@@ -537,10 +573,17 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, pane: SharedPane, server: Shar
                                 .map(|previous| ScreenUpdate::diff(previous, &snapshot))
                                 .unwrap_or_else(|| ScreenUpdate::from_snapshot(&snapshot));
                             pane.last_snapshot = Some(snapshot);
-                            (pane.pane, update, pane.clients.clone())
+                            (
+                                pane.pane,
+                                update,
+                                pane.clients.clone(),
+                                Arc::clone(&pane.writer),
+                                responses,
+                            )
                         }
                         Err(_) => break,
                     };
+                    write_pty_responses(&writer, responses);
                     broadcast_update(pane_id, update, clients);
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -653,11 +696,13 @@ impl PaneState {
     }
 
     fn stop(&mut self) -> io::Result<()> {
-        if let Some(child) = &mut self.child {
-            child.kill()
-        } else {
-            Ok(())
+        if let Some(child) = self.child.as_mut() {
+            child.kill()?;
         }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait();
+        }
+        Ok(())
     }
 }
 
@@ -673,81 +718,54 @@ fn write_pty_input(writer: &SharedPtyWriter, bytes: &[u8]) -> io::Result<()> {
     writer.flush()
 }
 
-const TERMINAL_QUERY_TAIL_BYTES: usize = 16;
-const PRIMARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[?1;2c";
-
-fn write_terminal_query_responses(
-    bytes: &[u8],
-    query_tail: &mut Vec<u8>,
-    writer: &SharedPtyWriter,
-) {
-    let already_seen = query_tail.len();
-    let mut scan = Vec::with_capacity(already_seen + bytes.len());
-    scan.extend_from_slice(query_tail);
-    scan.extend_from_slice(bytes);
-
-    let response_count = primary_device_attribute_query_count(&scan, already_seen);
-    if response_count > 0 {
-        if let Ok(mut writer) = writer.lock() {
-            for _ in 0..response_count {
-                let _ = writer.write_all(PRIMARY_DEVICE_ATTRIBUTES_RESPONSE);
-            }
-            let _ = writer.flush();
-        }
+fn write_pty_responses(writer: &SharedPtyWriter, responses: Vec<Vec<u8>>) {
+    if responses.is_empty() {
+        return;
     }
 
-    query_tail.clear();
-    let keep = scan.len().min(TERMINAL_QUERY_TAIL_BYTES);
-    query_tail.extend_from_slice(&scan[scan.len().saturating_sub(keep)..]);
+    if let Ok(mut writer) = writer.lock() {
+        for response in responses {
+            let _ = writer.write_all(&response);
+        }
+        let _ = writer.flush();
+    }
 }
 
-fn primary_device_attribute_query_count(bytes: &[u8], already_seen: usize) -> usize {
-    let mut count = 0;
-    let mut index = 0;
-    while index < bytes.len() {
-        let Some((end, is_query)) = primary_device_attribute_query_at(bytes, index) else {
-            index += 1;
-            continue;
-        };
-
-        if is_query && end > already_seen {
-            count += 1;
-        }
-        index = end;
+fn scroll_pane(pane: &SharedPane, rows: i32) -> io::Result<Option<(PaneId, ScreenSnapshot)>> {
+    let amount = rows.unsigned_abs() as usize;
+    if amount == 0 {
+        return Ok(None);
     }
 
-    count
+    let mut pane = pane.lock().map_err(lock_error)?;
+    let changed = if rows > 0 {
+        pane.terminal.scroll_view_up(amount)
+    } else {
+        pane.terminal.scroll_view_down(amount)
+    };
+    Ok(changed.then(|| snapshot_for_pane_scroll(&mut pane)))
 }
 
-fn primary_device_attribute_query_at(bytes: &[u8], index: usize) -> Option<(usize, bool)> {
-    if bytes.get(index) != Some(&0x1b) {
-        return None;
-    }
+fn scroll_pane_to_top(pane: &SharedPane) -> io::Result<Option<(PaneId, ScreenSnapshot)>> {
+    let mut pane = pane.lock().map_err(lock_error)?;
+    Ok(pane
+        .terminal
+        .scroll_view_to_top()
+        .then(|| snapshot_for_pane_scroll(&mut pane)))
+}
 
-    if bytes.get(index + 1) == Some(&b'Z') {
-        return Some((index + 2, true));
-    }
+fn scroll_pane_to_bottom(pane: &SharedPane) -> io::Result<Option<(PaneId, ScreenSnapshot)>> {
+    let mut pane = pane.lock().map_err(lock_error)?;
+    Ok(pane
+        .terminal
+        .scroll_view_to_bottom()
+        .then(|| snapshot_for_pane_scroll(&mut pane)))
+}
 
-    if bytes.get(index + 1) != Some(&b'[') {
-        return None;
-    }
-
-    let mut final_index = index + 2;
-    while let Some(byte) = bytes.get(final_index) {
-        if (0x40..=0x7e).contains(byte) {
-            break;
-        }
-        final_index += 1;
-    }
-
-    let final_byte = bytes.get(final_index)?;
-    if *final_byte != b'c' {
-        return Some((final_index + 1, false));
-    }
-
-    let params = &bytes[index + 2..final_index];
-    let is_primary_query = params.is_empty() || params == b"0";
-    Some((final_index + 1, is_primary_query))
+fn snapshot_for_pane_scroll(pane: &mut PaneState) -> (PaneId, ScreenSnapshot) {
+    let snapshot = pane.terminal.snapshot();
+    pane.last_snapshot = Some(snapshot.clone());
+    (pane.pane, snapshot)
 }
 
 fn shell_command_args(command: String) -> Vec<String> {

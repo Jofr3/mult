@@ -4,6 +4,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::model::ProjectState;
@@ -11,13 +12,7 @@ use crate::model::ProjectState;
 const STATE_PATH_ENV: &str = "MULT_STATE_PATH";
 
 pub fn load_or_default() -> io::Result<ProjectState> {
-    let path = state_path();
-
-    match fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(invalid_data),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ProjectState::default()),
-        Err(error) => Err(error),
-    }
+    load_from_path(&state_path())
 }
 
 pub fn save(state: &ProjectState) -> io::Result<()> {
@@ -32,11 +27,54 @@ pub fn state_path() -> PathBuf {
     data_home().join("mult").join("state.json")
 }
 
+fn load_from_path(path: &Path) -> io::Result<ProjectState> {
+    match fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(state) => Ok(state),
+            Err(error) => backup_invalid_state_and_reset(path, error),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ProjectState::default()),
+        Err(error) => Err(error),
+    }
+}
+
 fn save_to_path(state: &ProjectState, path: &Path) -> io::Result<()> {
     ensure_parent_dir(path)?;
 
     let json = serde_json::to_string_pretty(state).map_err(invalid_data)?;
     write_atomically(path, format!("{json}\n").as_bytes())
+}
+
+fn backup_invalid_state_and_reset(
+    path: &Path,
+    decode_error: serde_json::Error,
+) -> io::Result<ProjectState> {
+    let backup = corrupt_backup_path(path);
+    fs::rename(path, &backup).map_err(|rename_error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "state JSON is invalid ({decode_error}); failed to move {} to {}: {rename_error}",
+                path.display(),
+                backup.display()
+            ),
+        )
+    })?;
+    Ok(ProjectState::default())
+}
+
+fn corrupt_backup_path(path: &Path) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    for attempt in 0..16 {
+        let candidate = path.with_extension(format!("json.corrupt-{timestamp}-{attempt}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    path.with_extension(format!("json.corrupt-{timestamp}"))
 }
 
 fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
@@ -185,6 +223,33 @@ mod tests {
         let decoded: ProjectState = serde_json::from_slice(&bytes).expect("decode state");
         assert_eq!(decoded.workspaces[0].name, "saved");
         assert!(!temp_save_path(&path, 0).exists());
+    }
+
+    #[test]
+    fn invalid_state_json_is_backed_up_and_reset() {
+        let path = unique_temp_file();
+        fs::write(&path, "{not json").expect("write corrupt state");
+
+        let state = load_from_path(&path).expect("recover corrupt state");
+
+        assert_eq!(state, ProjectState::default());
+        assert!(!path.exists());
+        let parent = path.parent().expect("temp path has parent");
+        let stem = path.file_stem().unwrap().to_string_lossy();
+        let backups = fs::read_dir(parent)
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{stem}.json.corrupt-"))
+            })
+            .collect::<Vec<_>>();
+        assert!(!backups.is_empty());
+        for backup in backups {
+            let _ = fs::remove_file(backup.path());
+        }
     }
 
     #[test]

@@ -8,8 +8,8 @@ use ratatui::{
 
 use crate::{
     app::{
-        chat_agent_terminal_id, App, FocusMode, Mode, NavItem, Prompt, TerminalCellStyle,
-        TerminalColor, TerminalRenderLine,
+        chat_agent_terminal_id, App, CommandPaletteEntry, FocusMode, Mode, NavItem, Prompt,
+        SearchScope, TerminalCellStyle, TerminalColor, TerminalRenderLine,
     },
     config::{self, ColorSchemeConfig},
     model::{
@@ -18,7 +18,7 @@ use crate::{
     },
 };
 
-const FOOTER: &str = "j/k nav/scroll • wheel/pgup/pgdn output • home/end top/bottom • enter pane • esc sidebar • n a agent • n t terminal • n c command • n w workspace • d d delete • i input • q quit";
+const FOOTER: &str = "j/k nav/scroll • : commands • / search • enter pane • esc sidebar • n a agent • n t terminal • n c command • n w workspace • d d delete • i input • q quit";
 const CHAT_AGENT_HEADER_LINES: u16 = 0;
 const TERMINAL_HEADER_LINES: u16 = 0;
 
@@ -105,6 +105,13 @@ fn parse_color(input: &str) -> Option<Color> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneLayout {
+    sidebar_width: u16,
+    min_main_width: u16,
+    footer_height: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LayoutAreas {
     sidebar: Rect,
     main: Rect,
@@ -139,16 +146,41 @@ pub fn selected_chat_agent_output_area(app: &App, frame_area: Rect) -> Option<(C
 }
 
 fn layout_areas(app: &App, frame_area: Rect) -> LayoutAreas {
-    let footer_height = if app.is_prompt_active() { 3 } else { 1 };
-    let [body, footer] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)]).areas(frame_area);
-    let [sidebar, main] =
-        Layout::horizontal([Constraint::Length(34), Constraint::Min(40)]).areas(body);
+    PaneLayout::for_app(app).areas(frame_area)
+}
 
-    LayoutAreas {
-        sidebar,
-        main,
-        footer,
+impl PaneLayout {
+    fn for_app(app: &App) -> Self {
+        Self {
+            sidebar_width: 34,
+            min_main_width: 40,
+            footer_height: footer_height(app),
+        }
+    }
+
+    fn areas(self, frame_area: Rect) -> LayoutAreas {
+        let [body, footer] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(self.footer_height)])
+                .areas(frame_area);
+        let [sidebar, main] = Layout::horizontal([
+            Constraint::Length(self.sidebar_width),
+            Constraint::Min(self.min_main_width),
+        ])
+        .areas(body);
+
+        LayoutAreas {
+            sidebar,
+            main,
+            footer,
+        }
+    }
+}
+
+fn footer_height(app: &App) -> u16 {
+    match &app.prompt {
+        Some(Prompt::CommandPalette(_)) => 7,
+        Some(_) => 3,
+        None => 1,
     }
 }
 
@@ -383,6 +415,13 @@ fn chat_details(
         return vec![Line::from("Missing chat.")];
     };
 
+    if let Some(lines) = app.filtered_chat_lines(chat_id) {
+        let query = app
+            .active_search_query_for_chat(chat_id)
+            .unwrap_or_default();
+        return search_result_lines("chat transcript", query, lines, output_rows, palette);
+    }
+
     let terminal_id = chat_agent_terminal_id(chat_id);
     let output = app.terminal_render_lines(terminal_id);
     if !app.terminal_output_is_blank(terminal_id) {
@@ -445,6 +484,13 @@ fn terminal_details(
         return vec![Line::from("Missing terminal.")];
     };
 
+    if let Some(lines) = app.filtered_terminal_lines(terminal_id) {
+        let query = app
+            .active_search_query_for_terminal(terminal_id)
+            .unwrap_or_default();
+        return search_result_lines("terminal", query, lines, output_rows, palette);
+    }
+
     if app.terminal_output_is_blank(terminal_id) {
         let mut lines = vec![match terminal.status {
             TerminalStatus::Running => {
@@ -475,6 +521,46 @@ fn terminal_details(
         .collect()
 }
 
+fn search_result_lines(
+    scope: &'static str,
+    query: &str,
+    lines: Vec<String>,
+    output_rows: usize,
+    palette: Palette,
+) -> Vec<Line<'static>> {
+    let mut output = vec![Line::from(vec![
+        Span::styled("Search ", Style::default().fg(palette.muted)),
+        Span::styled(scope, Style::default().fg(palette.foam)),
+        Span::styled(": ", Style::default().fg(palette.muted)),
+        Span::styled(query.to_string(), Style::default().fg(palette.gold)),
+        Span::styled(
+            format!(
+                " ({} match{})",
+                lines.len(),
+                if lines.len() == 1 { "" } else { "es" }
+            ),
+            Style::default().fg(palette.muted),
+        ),
+    ])];
+
+    if lines.is_empty() {
+        output.push(Line::from("No matches."));
+        return output;
+    }
+
+    output.extend(
+        lines
+            .into_iter()
+            .rev()
+            .take(output_rows.saturating_sub(1))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(Line::from),
+    );
+    output
+}
+
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
     if let Some(prompt) = &app.prompt {
         match prompt {
@@ -496,12 +582,29 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
                 prompt.error.as_deref(),
                 "enter adds command terminal • esc/ctrl-c cancels",
             ),
+            Prompt::CommandPalette(prompt) => draw_command_palette_prompt(
+                frame,
+                area,
+                palette,
+                &prompt.input,
+                prompt.selected,
+                app.active_command_palette_entries(),
+            ),
+            Prompt::Search(prompt) => draw_text_prompt(
+                frame,
+                area,
+                palette,
+                search_prompt_label(prompt.scope),
+                &prompt.input,
+                prompt.error.as_deref(),
+                "enter applies filter • empty enter clears • esc/ctrl-c cancels",
+            ),
         }
         return;
     }
 
     let footer = match app.mode {
-        Mode::Normal => Line::styled(FOOTER, Style::default().fg(palette.muted)),
+        Mode::Normal => normal_footer(app, palette),
         Mode::Input(_) => Line::styled(
             "input mode • typing goes to selected PTY • Esc returns to normal mode • Ctrl-C sends interrupt",
             Style::default().fg(palette.gold),
@@ -511,6 +614,92 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
         Paragraph::new(footer).style(Style::default().bg(palette.base)),
         area,
     );
+}
+
+fn normal_footer(app: &App, palette: Palette) -> Line<'static> {
+    if let Some(status) = app.search_status() {
+        Line::from(vec![
+            Span::styled(FOOTER, Style::default().fg(palette.muted)),
+            Span::styled(" • ", Style::default().fg(palette.muted)),
+            Span::styled(status, Style::default().fg(palette.gold)),
+        ])
+    } else {
+        Line::styled(FOOTER, Style::default().fg(palette.muted))
+    }
+}
+
+fn search_prompt_label(scope: SearchScope) -> &'static str {
+    match scope {
+        SearchScope::Terminal(_) => "Search terminal: ",
+        SearchScope::Chat(_) => "Search chat: ",
+    }
+}
+
+fn draw_command_palette_prompt(
+    frame: &mut Frame,
+    area: Rect,
+    palette: Palette,
+    input: &str,
+    selected: usize,
+    entries: Vec<CommandPaletteEntry>,
+) {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Command: ", Style::default().fg(palette.muted)),
+            Span::raw(input.to_string()),
+            Span::styled("▌", Style::default().fg(palette.gold)),
+        ]),
+        Line::from(Span::styled(
+            "type to filter • ↑/↓ select • enter runs • esc cancels".to_string(),
+            Style::default().fg(palette.muted),
+        )),
+    ];
+
+    if entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No matching commands".to_string(),
+            Style::default().fg(palette.love),
+        )));
+    } else {
+        let max_entries = usize::from(area.height.saturating_sub(2)).max(1);
+        let start = selected.saturating_sub(max_entries.saturating_sub(1));
+        lines.extend(
+            entries
+                .into_iter()
+                .enumerate()
+                .skip(start)
+                .take(max_entries)
+                .map(|(index, entry)| command_palette_line(entry, index == selected, palette)),
+        );
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(palette.text).bg(palette.base)),
+        area,
+    );
+}
+
+fn command_palette_line(
+    entry: CommandPaletteEntry,
+    selected: bool,
+    palette: Palette,
+) -> Line<'static> {
+    let marker = if selected { "› " } else { "  " };
+    let style = if selected {
+        Style::default()
+            .fg(palette.text)
+            .bg(palette.highlight_med)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.text)
+    };
+
+    Line::from(vec![
+        Span::styled(marker, style),
+        Span::styled(entry.label, style),
+        Span::styled(" — ", Style::default().fg(palette.muted)),
+        Span::styled(entry.help, Style::default().fg(palette.muted)),
+    ])
 }
 
 fn draw_text_prompt(
@@ -562,6 +751,9 @@ fn terminal_style(style: TerminalCellStyle, palette: Palette) -> Style {
     }
     if style.italic {
         output = output.add_modifier(Modifier::ITALIC);
+    }
+    if style.reversed {
+        output = output.add_modifier(Modifier::REVERSED);
     }
     // Many prompts use underline for decorative path segments. It reads as a
     // selection/cursor artifact inside nested panes, so mult intentionally

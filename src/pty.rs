@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        mpsc::{self, Receiver},
+        mpsc::{self, Receiver, TryRecvError},
         Arc, Mutex,
     },
     thread,
@@ -14,7 +14,7 @@ use std::{
 
 use mult_protocol::{
     default_socket_path, read_message, write_message, ClientMessage, LaunchSpec, PaneId,
-    ScreenSnapshot, ScreenUpdate, ServerMessage, SessionId, PROTOCOL_VERSION,
+    ScreenSnapshot, ScreenUpdate, ServerMessage, SessionId, PROTOCOL_VERSION, SOCKET_PATH_ENV,
 };
 
 use crate::model::TerminalId;
@@ -66,6 +66,7 @@ pub struct PtyExit {
 }
 
 pub struct PtyRuntime {
+    socket_path: PathBuf,
     connection: Option<ServerConnection>,
     terminal_to_pane: HashMap<TerminalId, PaneId>,
     pane_to_terminal: HashMap<PaneId, TerminalId>,
@@ -81,19 +82,41 @@ struct ServerConnection {
 
 impl Default for PtyRuntime {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PtyRuntime {
+    pub fn new() -> Self {
+        Self::with_socket_path(default_socket_path())
+    }
+
+    pub fn with_socket_path(socket_path: PathBuf) -> Self {
+        match Self::connect_to_socket(socket_path.clone()) {
+            Ok(runtime) => runtime,
+            Err(error) => Self {
+                socket_path,
+                connection: None,
+                terminal_to_pane: HashMap::new(),
+                pane_to_terminal: HashMap::new(),
+                pending_events: vec![PtyEvent::Error {
+                    terminal: TerminalId(0),
+                    message: format!("failed to connect to mult-server: {error}"),
+                }],
+            },
+        }
+    }
+
+    pub fn connect_to_socket(socket_path: PathBuf) -> io::Result<Self> {
         let mut runtime = Self {
+            socket_path,
             connection: None,
             terminal_to_pane: HashMap::new(),
             pane_to_terminal: HashMap::new(),
             pending_events: Vec::new(),
         };
-        if let Err(error) = runtime.connect() {
-            runtime.pending_events.push(PtyEvent::Error {
-                terminal: TerminalId(0),
-                message: format!("failed to connect to mult-server: {error}"),
-            });
-        }
-        runtime
+        runtime.connect()?;
+        Ok(runtime)
     }
 }
 
@@ -195,6 +218,41 @@ impl PtyRuntime {
         Ok(true)
     }
 
+    pub fn send_paste(&mut self, terminal: TerminalId, text: &str) -> io::Result<bool> {
+        let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
+            return Ok(false);
+        };
+        self.send(ClientMessage::Paste {
+            pane,
+            text: text.to_string(),
+        })?;
+        Ok(true)
+    }
+
+    pub fn scroll_up(&mut self, terminal: TerminalId, rows: usize) -> io::Result<bool> {
+        self.scroll(terminal, rows.min(i32::MAX as usize) as i32)
+    }
+
+    pub fn scroll_down(&mut self, terminal: TerminalId, rows: usize) -> io::Result<bool> {
+        self.scroll(terminal, -(rows.min(i32::MAX as usize) as i32))
+    }
+
+    pub fn scroll_to_top(&mut self, terminal: TerminalId) -> io::Result<bool> {
+        let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
+            return Ok(false);
+        };
+        self.send(ClientMessage::ScrollToTop { pane })?;
+        Ok(true)
+    }
+
+    pub fn scroll_to_bottom(&mut self, terminal: TerminalId) -> io::Result<bool> {
+        let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
+            return Ok(false);
+        };
+        self.send(ClientMessage::ScrollToBottom { pane })?;
+        Ok(true)
+    }
+
     pub fn resize(&mut self, terminal: TerminalId, size: PtyDimensions) -> io::Result<()> {
         let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
             return Ok(());
@@ -208,57 +266,80 @@ impl PtyRuntime {
 
     pub fn drain_events(&mut self) -> Vec<PtyEvent> {
         let mut events = std::mem::take(&mut self.pending_events);
-        let mut disconnected = false;
+        let mut disconnected = self.connection.is_none();
 
-        if let Some(connection) = &self.connection {
-            while let Ok(message) = connection.receiver.try_recv() {
-                match message {
-                    ServerMessage::Hello { .. }
-                    | ServerMessage::Sessions(_)
-                    | ServerMessage::Attached { .. } => {}
-                    ServerMessage::Snapshot { pane, snapshot } => {
-                        if let Some(terminal) = self.pane_to_terminal.get(&pane).copied() {
-                            events.push(PtyEvent::Snapshot { terminal, snapshot });
-                        }
-                    }
-                    ServerMessage::Update { pane, update } => {
-                        if let Some(terminal) = self.pane_to_terminal.get(&pane).copied() {
-                            events.push(PtyEvent::Update { terminal, update });
-                        }
-                    }
-                    ServerMessage::PaneExited { pane, exit } => {
-                        if let Some(terminal) = self.pane_to_terminal.remove(&pane) {
-                            self.terminal_to_pane.remove(&terminal);
-                            events.push(PtyEvent::Exited {
-                                terminal,
-                                status: PtyExit {
-                                    code: exit.code,
-                                    signal: exit.signal,
-                                },
-                            });
-                        }
-                    }
-                    ServerMessage::Error { message } => {
-                        let terminal = self
-                            .pane_to_terminal
-                            .values()
-                            .next()
-                            .copied()
-                            .unwrap_or(TerminalId(0));
-                        events.push(PtyEvent::Error { terminal, message });
-                    }
+        while self.connection.is_some() {
+            let message = self
+                .connection
+                .as_ref()
+                .map(|connection| connection.receiver.try_recv());
+            match message {
+                Some(Ok(message)) => self.handle_server_message(message, &mut events),
+                Some(Err(TryRecvError::Empty)) => break,
+                Some(Err(TryRecvError::Disconnected)) | None => {
+                    disconnected = true;
+                    break;
                 }
             }
-        } else {
-            disconnected = true;
         }
 
         if disconnected {
+            self.connection = None;
             self.terminal_to_pane.clear();
             self.pane_to_terminal.clear();
         }
 
         events
+    }
+
+    fn handle_server_message(&mut self, message: ServerMessage, events: &mut Vec<PtyEvent>) {
+        match message {
+            ServerMessage::Hello { .. }
+            | ServerMessage::Sessions(_)
+            | ServerMessage::Attached { .. } => {}
+            ServerMessage::Snapshot { pane, snapshot } => {
+                if let Some(terminal) = self.pane_to_terminal.get(&pane).copied() {
+                    events.push(PtyEvent::Snapshot { terminal, snapshot });
+                }
+            }
+            ServerMessage::Update { pane, update } => {
+                if let Some(terminal) = self.pane_to_terminal.get(&pane).copied() {
+                    events.push(PtyEvent::Update { terminal, update });
+                }
+            }
+            ServerMessage::PaneExited { pane, exit } => {
+                if let Some(terminal) = self.pane_to_terminal.remove(&pane) {
+                    self.terminal_to_pane.remove(&terminal);
+                    events.push(PtyEvent::Exited {
+                        terminal,
+                        status: PtyExit {
+                            code: exit.code,
+                            signal: exit.signal,
+                        },
+                    });
+                }
+            }
+            ServerMessage::Error { message } => {
+                let terminal = self
+                    .pane_to_terminal
+                    .values()
+                    .next()
+                    .copied()
+                    .unwrap_or(TerminalId(0));
+                events.push(PtyEvent::Error { terminal, message });
+            }
+        }
+    }
+
+    fn scroll(&mut self, terminal: TerminalId, rows: i32) -> io::Result<bool> {
+        if rows == 0 {
+            return Ok(false);
+        }
+        let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
+            return Ok(false);
+        };
+        self.send(ClientMessage::Scroll { pane, rows })?;
+        Ok(true)
     }
 
     fn ensure_connected(&mut self) -> io::Result<()> {
@@ -269,7 +350,7 @@ impl PtyRuntime {
     }
 
     fn connect(&mut self) -> io::Result<()> {
-        let mut stream = connect_or_spawn_server()?;
+        let mut stream = connect_or_spawn_server(&self.socket_path)?;
         stream.set_nonblocking(false)?;
         let mut writer_stream = stream.try_clone()?;
         write_message(
@@ -408,13 +489,12 @@ fn validate_server_hello(reader: &mut impl io::Read) -> io::Result<()> {
     }
 }
 
-fn connect_or_spawn_server() -> io::Result<UnixStream> {
-    let path = default_socket_path();
-    match UnixStream::connect(&path) {
+fn connect_or_spawn_server(path: &Path) -> io::Result<UnixStream> {
+    match UnixStream::connect(path) {
         Ok(stream) => Ok(stream),
-        Err(error) if should_autospawn_server(&error, &path) => {
-            spawn_server()?;
-            wait_for_server(&path).map_err(|wait_error| {
+        Err(error) if should_autospawn_server(&error, path) => {
+            spawn_server(path)?;
+            wait_for_server(path).map_err(|wait_error| {
                 io::Error::new(
                     wait_error.kind(),
                     format!(
@@ -456,7 +536,7 @@ fn autospawn_enabled() -> bool {
     )
 }
 
-fn spawn_server() -> io::Result<()> {
+fn spawn_server(socket_path: &Path) -> io::Result<()> {
     let server = server_executable().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -465,6 +545,7 @@ fn spawn_server() -> io::Result<()> {
     })?;
 
     Command::new(server)
+        .env(SOCKET_PATH_ENV, socket_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -641,6 +722,7 @@ mod tests {
         let terminal = TerminalId(7);
         let pane = PaneId(7);
         let mut runtime = PtyRuntime {
+            socket_path: unique_socket_path(),
             connection: Some(ServerConnection {
                 writer: Arc::new(Mutex::new(client_stream)),
                 receiver,
@@ -659,6 +741,47 @@ mod tests {
     }
 
     #[test]
+    fn pty_scroll_and_paste_send_control_messages() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let terminal = TerminalId(7);
+        let pane = PaneId(7);
+        let mut runtime = PtyRuntime {
+            socket_path: unique_socket_path(),
+            connection: Some(ServerConnection {
+                writer: Arc::new(Mutex::new(client_stream)),
+                receiver,
+            }),
+            terminal_to_pane: HashMap::from([(terminal, pane)]),
+            pane_to_terminal: HashMap::from([(pane, terminal)]),
+            pending_events: Vec::new(),
+        };
+
+        assert!(runtime.scroll_up(terminal, 3).expect("scroll up"));
+        assert!(runtime.scroll_down(terminal, 2).expect("scroll down"));
+        assert!(runtime.scroll_to_top(terminal).expect("scroll top"));
+        assert!(runtime.scroll_to_bottom(terminal).expect("scroll bottom"));
+        assert!(runtime.send_paste(terminal, "one\ntwo").expect("paste"));
+
+        let messages = (0..5)
+            .map(|_| read_message(&mut server_stream).expect("read client message"))
+            .collect::<Vec<ClientMessage>>();
+        assert_eq!(
+            messages,
+            vec![
+                ClientMessage::Scroll { pane, rows: 3 },
+                ClientMessage::Scroll { pane, rows: -2 },
+                ClientMessage::ScrollToTop { pane },
+                ClientMessage::ScrollToBottom { pane },
+                ClientMessage::Paste {
+                    pane,
+                    text: "one\ntwo".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn pty_stop_keeps_local_attachment_when_send_fails() {
         let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
         let (_sender, receiver) = mpsc::channel();
@@ -672,6 +795,7 @@ mod tests {
         })
         .join();
         let mut runtime = PtyRuntime {
+            socket_path: unique_socket_path(),
             connection: Some(ServerConnection { writer, receiver }),
             terminal_to_pane: HashMap::from([(terminal, pane)]),
             pane_to_terminal: HashMap::from([(pane, terminal)]),
@@ -683,6 +807,74 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert!(runtime.is_running(terminal));
         assert_eq!(runtime.pane_to_terminal.get(&pane), Some(&terminal));
+    }
+
+    #[test]
+    fn pane_exit_event_clears_local_attachment() {
+        let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
+        let (sender, receiver) = mpsc::channel();
+        let terminal = TerminalId(9);
+        let pane = PaneId(9);
+        let mut runtime = PtyRuntime {
+            socket_path: unique_socket_path(),
+            connection: Some(ServerConnection {
+                writer: Arc::new(Mutex::new(client_stream)),
+                receiver,
+            }),
+            terminal_to_pane: HashMap::from([(terminal, pane)]),
+            pane_to_terminal: HashMap::from([(pane, terminal)]),
+            pending_events: Vec::new(),
+        };
+
+        sender
+            .send(ServerMessage::PaneExited {
+                pane,
+                exit: mult_protocol::ExitInfo {
+                    code: 3,
+                    signal: None,
+                },
+            })
+            .expect("send exit event");
+
+        let events = runtime.drain_events();
+
+        assert_eq!(
+            events,
+            vec![PtyEvent::Exited {
+                terminal,
+                status: PtyExit {
+                    code: 3,
+                    signal: None,
+                },
+            }]
+        );
+        assert!(!runtime.is_running(terminal));
+        assert!(!runtime.pane_to_terminal.contains_key(&pane));
+    }
+
+    #[test]
+    fn disconnected_receiver_clears_registries_for_reconnect() {
+        let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
+        let (sender, receiver) = mpsc::channel();
+        let terminal = TerminalId(10);
+        let pane = PaneId(10);
+        let mut runtime = PtyRuntime {
+            socket_path: unique_socket_path(),
+            connection: Some(ServerConnection {
+                writer: Arc::new(Mutex::new(client_stream)),
+                receiver,
+            }),
+            terminal_to_pane: HashMap::from([(terminal, pane)]),
+            pane_to_terminal: HashMap::from([(pane, terminal)]),
+            pending_events: Vec::new(),
+        };
+        drop(sender);
+
+        assert!(runtime.drain_events().is_empty());
+
+        assert!(runtime.connection.is_none());
+        assert!(!runtime.is_running(terminal));
+        assert!(runtime.pane_to_terminal.is_empty());
     }
 
     #[test]

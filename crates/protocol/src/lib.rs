@@ -7,14 +7,19 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const DEFAULT_SOCKET_NAME: &str = "mult.sock";
+pub const SOCKET_PATH_ENV: &str = "MULT_SOCKET_PATH";
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SCREEN_ROWS: u16 = 1_000;
 pub const MAX_SCREEN_COLS: u16 = 1_000;
 pub const MAX_SCREEN_CELLS: usize = 200_000;
 
 pub fn default_socket_path() -> PathBuf {
+    if let Some(path) = env::var_os(SOCKET_PATH_ENV) {
+        return PathBuf::from(path);
+    }
+
     if let Some(runtime_dir) = env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(runtime_dir).join(DEFAULT_SOCKET_NAME);
     }
@@ -119,6 +124,7 @@ pub struct TerminalCellStyle {
     pub bold: bool,
     pub italic: bool,
     pub underlined: bool,
+    pub reversed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +188,20 @@ pub enum ClientMessage {
     Input {
         pane: PaneId,
         bytes: Vec<u8>,
+    },
+    Paste {
+        pane: PaneId,
+        text: String,
+    },
+    Scroll {
+        pane: PaneId,
+        rows: i32,
+    },
+    ScrollToTop {
+        pane: PaneId,
+    },
+    ScrollToBottom {
+        pane: PaneId,
     },
     Resize {
         pane: PaneId,
@@ -459,9 +479,10 @@ fn render_terminal_row(row: &[TerminalCell], cursor_col: Option<usize>) -> Termi
 }
 
 fn cursor_style(mut style: TerminalCellStyle) -> TerminalCellStyle {
-    style.fg = Some(TerminalColor::BrightWhite);
-    style.bg = None;
+    style.fg = Some(TerminalColor::Black);
+    style.bg = Some(TerminalColor::BrightWhite);
     style.underlined = false;
+    style.reversed = false;
     style
 }
 
@@ -499,6 +520,16 @@ mod tests {
         assert_eq!(sanitize_socket_path_component("user-1000"), "user-1000");
         assert_eq!(sanitize_socket_path_component("../bad/user"), "___bad_user");
         assert_eq!(sanitize_socket_path_component(""), "unknown");
+    }
+
+    #[test]
+    fn socket_path_can_be_overridden_by_environment() {
+        let path = PathBuf::from("/tmp/mult-test-override.sock");
+        std::env::set_var(SOCKET_PATH_ENV, &path);
+
+        assert_eq!(default_socket_path(), path);
+
+        std::env::remove_var(SOCKET_PATH_ENV);
     }
 
     #[test]

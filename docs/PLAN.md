@@ -14,6 +14,8 @@
 - Workspace/chat/terminal deletion uses a two-key `d d` chord and stops related running PTYs.
 - Normal mode covers workspace/chat/terminal management; input mode is only for typing into the selected terminal or pi agent.
 - Focus is explicit for sidebar, chat pane, and terminal pane. `Enter` moves from the sidebar into the selected pane, `Esc` returns to the sidebar, and the unfocused pane uses a darker background.
+- `:` opens a command palette for workspace, chat, terminal, focus, search, and quit actions.
+- `/` searches/filters the selected terminal output or persisted chat transcript; filters are in-memory UI state.
 
 ## Product shape
 
@@ -80,11 +82,15 @@ Completed in this milestone:
 - [x] Restart persisted running chat agents and terminals on app start.
 - [x] Add in-memory terminal scrollback paging for chat-agent, command, and shell panes.
 
-Remaining M4 workflow polish, to do incrementally:
+Completed M4 workflow polish:
 
-- [ ] Add a command palette for workspace/session/terminal actions.
-- [ ] Add search/filter over terminal output and chat transcripts.
-- [ ] Add split panes/tabs per workspace after a pane layout model exists.
+- [x] Add a command palette for workspace/session/terminal actions.
+- [x] Add search/filter over terminal output and chat transcripts.
+- [x] Add a small pane layout model as groundwork for future split panes/tabs.
+
+Future M4/M5 layout expansion:
+
+- [ ] Add split panes/tabs per workspace on top of the pane layout model.
 
 ### M5 — Safety and collaboration features (future)
 

@@ -19,7 +19,7 @@ cargo run
 
 Installed `mult` clients autospawn `mult-server` if the socket is missing, but the recommended long-lived setup is a systemd user service; see `docs/DAEMON.md`.
 
-State is auto-saved to `$XDG_DATA_HOME/mult/state.json` or `~/.local/share/mult/state.json`. Override with `MULT_STATE_PATH=/path/to/state.json`. Saved state files are written with owner-only permissions. Chat transcripts, terminal definitions, and running/restorable chat-terminal status are persisted with workspace state; terminal scrollback remains in-memory.
+State is auto-saved to `$XDG_DATA_HOME/mult/state.json` or `~/.local/share/mult/state.json`. Override with `MULT_STATE_PATH=/path/to/state.json`. Saved state files are written with owner-only permissions. Chat transcripts, terminal definitions, and running/restorable chat-terminal status are persisted with workspace state; terminal scrollback remains in-memory. If state JSON is corrupt, mult moves it aside to a `*.corrupt-*` backup and starts from default state.
 
 Configuration is loaded from `$XDG_CONFIG_HOME/mult/config.json` or `~/.config/mult/config.json`:
 
@@ -54,6 +54,9 @@ Use `MULT_CONFIG_PATH=/path/to/config.json` to point at another config file. `au
 
 ## Current controls
 
+- `:`: open the command palette for workspace, chat, terminal, focus, search, and quit actions
+- `/`: search/filter the selected terminal output or chat transcript; empty Enter clears the filter
+- `Ctrl-L`: clear the active search/filter
 - `Enter`: focus the selected chat/terminal pane from the sidebar
 - `Esc`: return focus to the sidebar
 - Mouse wheel over a chat/terminal output pane: scroll that pane without moving the outer terminal history
@@ -68,9 +71,16 @@ Use `MULT_CONFIG_PATH=/path/to/config.json` to point at another config file. `au
 - `i`: start/focus terminal or pi-agent input for the selected pane
 - `q`: quit
 
-When the open/import or command prompt is active:
+When the command palette is active:
 
-- Type a directory path or command
+- Type to filter commands
+- Up/Down: move the highlighted command
+- Enter: run it through the same state transitions as the normal keybindings
+- Esc or Ctrl-C: cancel
+
+When the open/import, command, or search prompt is active:
+
+- Type a directory path, command, or search query
 - Enter: submit it
 - Esc or Ctrl-C: cancel
 

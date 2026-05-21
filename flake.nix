@@ -56,6 +56,7 @@
               rustfmt
 
               cargo-watch
+              cargo-audit
               just
             ];
 
