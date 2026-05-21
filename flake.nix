@@ -24,6 +24,10 @@
             version = "0.1.0";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
+            MULT_TEST_SHELL = "${pkgs.runtimeShell}";
+            # buildRustPackage runs inside a Nix sandbox where PTY-backed
+            # integration tests cannot reliably create interactive devices.
+            MULT_SKIP_PTY_INTEGRATION = "1";
           };
         });
 

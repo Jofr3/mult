@@ -22,6 +22,7 @@ use crate::{
 const FOOTER: &str = "Ctrl-j/k navigate • mouse wheel scroll • shift-drag select • Ctrl-a agent • Ctrl-t terminal • Ctrl-c command • Ctrl-f workspace • Ctrl-q delete • Ctrl-Shift-q quit";
 const CHAT_AGENT_HEADER_LINES: u16 = 0;
 const TERMINAL_HEADER_LINES: u16 = 0;
+const CURSOR_COLOR: Color = Color::Rgb(255, 255, 255);
 
 #[allow(dead_code)]
 mod moon {
@@ -620,10 +621,12 @@ fn render_terminal_parser(
     focused: bool,
     palette: Palette,
 ) {
-    let cursor_style = Style::default().fg(palette.nc).bg(palette.text);
+    let cursor_style = Style::default().fg(CURSOR_COLOR).bg(palette.base);
+    let cursor_overlay_style = Style::default().fg(palette.nc).bg(CURSOR_COLOR);
     let cursor = Cursor::default()
         .symbol("█")
         .style(cursor_style)
+        .overlay_style(cursor_overlay_style)
         .visibility(parser.screen().scrollback() == 0);
     let pseudo_term = PseudoTerminal::new(parser.screen())
         .block(Block::default().style(pane_style(focused, palette)))
@@ -767,7 +770,7 @@ fn draw_command_palette_prompt(
         Line::from(vec![
             Span::styled("Command: ", Style::default().fg(palette.muted)),
             Span::raw(input.to_string()),
-            Span::styled("▌", Style::default().fg(palette.gold)),
+            Span::styled("▌", Style::default().fg(CURSOR_COLOR)),
         ]),
         Line::from(Span::styled(
             "type to filter • ↑/↓ select • enter runs • esc cancels".to_string(),
@@ -841,7 +844,7 @@ fn draw_text_prompt(
         Line::from(vec![
             Span::styled(label, Style::default().fg(palette.muted)),
             Span::raw(input.to_string()),
-            Span::styled("▌", Style::default().fg(palette.gold)),
+            Span::styled("▌", Style::default().fg(CURSOR_COLOR)),
         ]),
         Line::from(Span::styled(message.to_string(), message_style)),
     ])
@@ -998,6 +1001,53 @@ mod tests {
         let text = draw_text(&app, &pty_runtime, 50, 6);
 
         assert!(!text.contains('█'));
+    }
+
+    #[test]
+    fn terminal_cursor_uses_white_on_blank_cell() {
+        let mut app = App::default();
+        let nav_items = app.nav_items();
+        let (selected, terminal_id) = nav_items
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| match item {
+                NavItem::Terminal { terminal, .. } => Some((index, *terminal)),
+                _ => None,
+            })
+            .expect("seed state has a terminal");
+        app.selected = selected;
+
+        let frame_area = Rect::new(0, 0, 50, 6);
+        let (_, output_area) = selected_terminal_output_area(&app, frame_area)
+            .expect("terminal selection has output area");
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime
+            .resize(
+                terminal_id,
+                crate::pty::PtyDimensions {
+                    rows: output_area.height,
+                    cols: output_area.width,
+                },
+            )
+            .expect("resize parser");
+        pty_runtime.process_terminal_output(terminal_id, b"x");
+
+        let backend = TestBackend::new(frame_area.width, frame_area.height);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app, &pty_runtime, &config::Config::default()))
+            .expect("draw app");
+
+        let palette = test_palette();
+        let cursor_cell = terminal
+            .backend()
+            .buffer()
+            .cell((output_area.x + 1, output_area.y))
+            .expect("cursor cell is in bounds");
+        assert_eq!(cursor_cell.symbol(), "█");
+        assert_eq!(cursor_cell.fg, CURSOR_COLOR);
+        assert_eq!(cursor_cell.bg, palette.base);
+        assert_ne!(cursor_cell.fg, palette.nc);
     }
 
     #[test]

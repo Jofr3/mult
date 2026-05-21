@@ -218,7 +218,7 @@ fn start_isolated_server() -> Option<ServerGuard> {
     let socket_path = unique_socket_path();
     let mut child = match Command::new(server_bin)
         .env(SOCKET_PATH_ENV, &socket_path)
-        .env("SHELL", "/bin/sh")
+        .env("SHELL", integration_test_shell())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -249,6 +249,17 @@ fn start_isolated_server() -> Option<ServerGuard> {
     let _ = child.wait();
     eprintln!("skipping PTY integration tests: mult-server did not create a usable socket in time");
     None
+}
+
+fn integration_test_shell() -> PathBuf {
+    std::env::var_os("MULT_TEST_SHELL")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let path = PathBuf::from("/bin/sh");
+            path.exists().then_some(path)
+        })
+        .or_else(|| std::env::var_os("SHELL").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("sh"))
 }
 
 fn unique_socket_path() -> PathBuf {
