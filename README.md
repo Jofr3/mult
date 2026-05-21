@@ -60,10 +60,9 @@ mult is always in input mode: ordinary keys go to the selected terminal or agent
 - `Ctrl-J`: navigate down
 - `Ctrl-K`: navigate up
 - `Ctrl-Q`: delete the selected workspace, agent chat, terminal, or command terminal immediately
-- `Ctrl-Shift-Q`: quit mult
+- `Ctrl-Esc`: quit mult
 - `Ctrl-A`: add an agent chat to the selected workspace and start/focus its pi agent
 - `Ctrl-T`: add a shell terminal to the selected workspace
-- `Ctrl-C`: add a command/dev-server terminal to the selected workspace
 - `Ctrl-F`: open/import a workspace by directory path
 - Drag within the selected chat/terminal pane: select visible pane text and copy it on release
 - Mouse wheel over a chat/terminal output pane: scroll that pane without moving the outer terminal history

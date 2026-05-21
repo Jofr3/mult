@@ -20,8 +20,6 @@ use crate::{
     pty::PtyRuntime,
 };
 
-const FOOTER_NATIVE_SELECTION: &str = "Ctrl-j/k navigate • drag select • Ctrl-a agent • Ctrl-t terminal • Ctrl-c command • Ctrl-f workspace • Ctrl-q delete • Ctrl-Shift-q quit";
-const FOOTER_MOUSE_CAPTURE: &str = "Ctrl-j/k navigate • mouse wheel scroll • drag select/copy • Ctrl-a agent • Ctrl-t terminal • Ctrl-c command • Ctrl-f workspace • Ctrl-q delete • Ctrl-Shift-q quit";
 const CHAT_AGENT_HEADER_LINES: u16 = 0;
 const TERMINAL_HEADER_LINES: u16 = 0;
 const CURSOR_COLOR: Color = Color::Rgb(255, 255, 255);
@@ -112,14 +110,14 @@ fn parse_color(input: &str) -> Option<Color> {
 struct PaneLayout {
     sidebar_width: u16,
     min_main_width: u16,
-    footer_height: u16,
+    prompt_height: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LayoutAreas {
     sidebar: Rect,
     main: Rect,
-    footer: Rect,
+    prompt: Rect,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -134,14 +132,7 @@ pub fn draw(frame: &mut Frame, app: &App, pty_runtime: &PtyRuntime, config: &con
 
     draw_sidebar(frame, app, layout.sidebar, palette);
     draw_main(frame, app, pty_runtime, layout.main, palette);
-    draw_footer(
-        frame,
-        app,
-        pty_runtime,
-        layout.footer,
-        palette,
-        config.mouse_capture,
-    );
+    draw_prompt_area(frame, app, layout.prompt, palette);
 }
 
 pub fn selected_terminal_output_area(app: &App, frame_area: Rect) -> Option<(TerminalId, Rect)> {
@@ -171,13 +162,13 @@ impl PaneLayout {
         Self {
             sidebar_width: 34,
             min_main_width: 40,
-            footer_height: footer_height(app),
+            prompt_height: prompt_height(app),
         }
     }
 
     fn areas(self, frame_area: Rect) -> LayoutAreas {
-        let [body, footer] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(self.footer_height)])
+        let [body, prompt] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(self.prompt_height)])
                 .areas(frame_area);
         let [sidebar, main] = Layout::horizontal([
             Constraint::Length(self.sidebar_width),
@@ -188,16 +179,16 @@ impl PaneLayout {
         LayoutAreas {
             sidebar,
             main,
-            footer,
+            prompt,
         }
     }
 }
 
-fn footer_height(app: &App) -> u16 {
+fn prompt_height(app: &App) -> u16 {
     match &app.prompt {
         Some(Prompt::CommandPalette(_)) => 7,
         Some(_) => 3,
-        None => 1,
+        None => 0,
     }
 }
 
@@ -411,7 +402,7 @@ fn workspace_details(app: &App, workspace_id: WorkspaceId, palette: Palette) -> 
     let rows = workspace.chats.len().max(workspace.terminals.len());
     if rows == 0 {
         lines.push(Line::from(
-            "No chats or terminals. Press Ctrl-a, Ctrl-t, or Ctrl-c to add one.",
+            "No chats or terminals. Press Ctrl-a or Ctrl-t to add one.",
         ));
         return lines;
     }
@@ -740,95 +731,47 @@ fn search_result_lines(
     output
 }
 
-fn draw_footer(
-    frame: &mut Frame,
-    app: &App,
-    pty_runtime: &PtyRuntime,
-    area: Rect,
-    palette: Palette,
-    mouse_capture: bool,
-) {
-    if let Some(prompt) = &app.prompt {
-        match prompt {
-            Prompt::OpenWorkspace(prompt) => draw_text_prompt(
-                frame,
-                area,
-                palette,
-                "Path: ",
-                &prompt.input,
-                prompt.error.as_deref(),
-                "enter imports • esc/ctrl-c cancels",
-            ),
-            Prompt::NewTerminalCommand(prompt) => draw_text_prompt(
-                frame,
-                area,
-                palette,
-                "Command: ",
-                &prompt.input,
-                prompt.error.as_deref(),
-                "enter adds command terminal • esc/ctrl-c cancels",
-            ),
-            Prompt::CommandPalette(prompt) => draw_command_palette_prompt(
-                frame,
-                area,
-                palette,
-                &prompt.input,
-                prompt.selected,
-                app.active_command_palette_entries(),
-            ),
-            Prompt::Search(prompt) => draw_text_prompt(
-                frame,
-                area,
-                palette,
-                search_prompt_label(prompt.scope),
-                &prompt.input,
-                prompt.error.as_deref(),
-                "enter applies filter • empty enter clears • esc/ctrl-c cancels",
-            ),
-        }
+fn draw_prompt_area(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
+    let Some(prompt) = &app.prompt else {
         return;
-    }
+    };
 
-    let footer = footer_line(app, pty_runtime, palette, mouse_capture);
-    frame.render_widget(
-        Paragraph::new(footer).style(Style::default().bg(palette.base)),
-        area,
-    );
-}
-
-fn footer_line(
-    app: &App,
-    pty_runtime: &PtyRuntime,
-    palette: Palette,
-    mouse_capture: bool,
-) -> Line<'static> {
-    let footer = footer_text(mouse_capture);
-    if let Some(status) = search_status(app, pty_runtime) {
-        Line::from(vec![
-            Span::styled(footer, Style::default().fg(palette.muted)),
-            Span::styled(" • ", Style::default().fg(palette.muted)),
-            Span::styled(status, Style::default().fg(palette.gold)),
-        ])
-    } else {
-        Line::styled(footer, Style::default().fg(palette.muted))
-    }
-}
-
-fn footer_text(mouse_capture: bool) -> &'static str {
-    if mouse_capture {
-        FOOTER_MOUSE_CAPTURE
-    } else {
-        FOOTER_NATIVE_SELECTION
-    }
-}
-
-fn search_status(app: &App, pty_runtime: &PtyRuntime) -> Option<String> {
-    let search = app.active_search.as_ref()?;
-    match search.scope {
-        SearchScope::Chat(_) => app.chat_search_status(),
-        SearchScope::Terminal(terminal) => {
-            app.terminal_search_status(terminal, pty_runtime.terminal_all_lines(terminal))
-        }
+    match prompt {
+        Prompt::OpenWorkspace(prompt) => draw_text_prompt(
+            frame,
+            area,
+            palette,
+            "Path: ",
+            &prompt.input,
+            prompt.error.as_deref(),
+            "enter imports • esc/ctrl-c cancels",
+        ),
+        Prompt::NewTerminalCommand(prompt) => draw_text_prompt(
+            frame,
+            area,
+            palette,
+            "Command: ",
+            &prompt.input,
+            prompt.error.as_deref(),
+            "enter adds command terminal • esc/ctrl-c cancels",
+        ),
+        Prompt::CommandPalette(prompt) => draw_command_palette_prompt(
+            frame,
+            area,
+            palette,
+            &prompt.input,
+            prompt.selected,
+            app.active_command_palette_entries(),
+        ),
+        Prompt::Search(prompt) => draw_text_prompt(
+            frame,
+            area,
+            palette,
+            search_prompt_label(prompt.scope),
+            &prompt.input,
+            prompt.error.as_deref(),
+            "enter applies filter • empty enter clears • esc/ctrl-c cancels",
+        ),
     }
 }
 
@@ -1013,7 +956,8 @@ mod tests {
 
         let text = lines_text(workspace_details(&app, workspace, test_palette()));
 
-        assert!(text.contains("Press Ctrl-a, Ctrl-t, or Ctrl-c"));
+        assert!(text.contains("Press Ctrl-a or Ctrl-t"));
+        assert!(!text.contains("Ctrl-c command"));
         assert!(!text.contains("Press `n a`"));
     }
 
@@ -1061,33 +1005,14 @@ mod tests {
     }
 
     #[test]
-    fn footer_mentions_native_selection_when_mouse_capture_is_disabled() {
+    fn keybinding_help_line_is_not_rendered() {
         let app = App::default();
         let pty_runtime = PtyRuntime::new_offline();
-        let config = config::Config {
-            mouse_capture: false,
-            ..config::Config::default()
-        };
 
-        let text = draw_text_with_config(&app, &pty_runtime, &config, 180, 30);
+        let text = draw_text(&app, &pty_runtime, 180, 30);
 
-        assert!(text.contains("drag select"));
-        assert!(!text.contains("select/copy"));
-    }
-
-    #[test]
-    fn footer_mentions_scroll_and_app_selection_when_mouse_capture_is_enabled() {
-        let app = App::default();
-        let pty_runtime = PtyRuntime::new_offline();
-        let config = config::Config {
-            mouse_capture: true,
-            ..config::Config::default()
-        };
-
-        let text = draw_text_with_config(&app, &pty_runtime, &config, 180, 30);
-
-        assert!(text.contains("mouse wheel scroll"));
-        assert!(text.contains("drag select/copy"));
+        assert!(!text.contains("Ctrl-j/k navigate"));
+        assert!(!text.contains("mouse wheel scroll"));
     }
 
     #[test]
@@ -1320,7 +1245,7 @@ mod tests {
         assert_eq!(area.x, 34);
         assert_eq!(area.y, 0);
         assert_eq!(area.width, 86);
-        assert_eq!(area.height, 39);
+        assert_eq!(area.height, 40);
     }
 
     #[test]
@@ -1348,6 +1273,6 @@ mod tests {
         assert_eq!(area.x, 34);
         assert_eq!(area.y, 0);
         assert_eq!(area.width, 86);
-        assert_eq!(area.height, 39);
+        assert_eq!(area.height, 40);
     }
 }

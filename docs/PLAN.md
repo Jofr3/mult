@@ -14,7 +14,7 @@
 - Workspace/chat/terminal deletion uses `Ctrl-Q` and stops related running PTYs.
 - The UI is always in input mode: ordinary keys go to the selected terminal or pi-agent PTY, while workspace actions use Ctrl chords.
 - Selection drives the active pane highlight; the inactive pane uses a darker background.
-- `Ctrl-J`/`Ctrl-K` navigate the sidebar selection, `Ctrl-A`/`Ctrl-T`/`Ctrl-C` create agent/shell/command sessions, `Ctrl-F` imports workspaces, and `Ctrl-Shift-Q` quits.
+- `Ctrl-J`/`Ctrl-K` navigate the sidebar selection, `Ctrl-A`/`Ctrl-T` create agent/shell sessions, `Ctrl-F` imports workspaces, and `Ctrl-Esc` quits.
 - Search/filter state remains in-memory UI state.
 
 ## Product shape
@@ -35,7 +35,7 @@ Goal: prove the app skeleton and UX layout.
 - [x] Rust binary using Ratatui and Crossterm.
 - [x] Nix flake dev shell with `cargo`, `rust-analyzer`, `clippy`, `rustfmt`, `just`, and `cargo-watch`.
 - [x] Static in-memory seed state for workspaces, chats, terminals, and status.
-- [x] Sidebar tree + detail pane + footer keybindings.
+- [x] Sidebar tree + detail pane + keyboard controls.
 - [x] Basic navigation and mutation.
 
 ### M1 — Durable project model (done)

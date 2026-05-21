@@ -539,10 +539,6 @@ fn handle_control_key(
         app.add_terminal_to_selected_workspace();
         return true;
     }
-    if is_unshifted_control_char(key, 'c') {
-        app.begin_new_terminal_command();
-        return true;
-    }
     if is_unshifted_control_char(key, 'f') {
         app.begin_open_workspace();
         return true;
@@ -552,13 +548,7 @@ fn handle_control_key(
 }
 
 fn is_quit_key(key: KeyEvent) -> bool {
-    let KeyCode::Char(ch) = key.code else {
-        return false;
-    };
-
-    is_control_key(key)
-        && ch.eq_ignore_ascii_case(&'q')
-        && (key.modifiers.contains(KeyModifiers::SHIFT) || ch == 'Q')
+    matches!(key.code, KeyCode::Esc) && is_control_key(key)
 }
 
 fn is_control_down_key(key: KeyEvent) -> bool {
@@ -1418,6 +1408,15 @@ mod tests {
             ),
             frame_area,
         );
+        assert!(!app.should_quit);
+
+        handle_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL),
+            frame_area,
+        );
         assert!(app.should_quit);
         assert_eq!(
             app.project.workspaces[0].terminals.len(),
@@ -1437,11 +1436,12 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_keys_open_prompts() {
+    fn ctrl_c_is_not_a_command_terminal_shortcut() {
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
         let config = Config::default();
         let frame_area = Rect::new(0, 0, 120, 40);
+        let initial_terminals = app.project.workspaces[0].terminals.len();
 
         handle_unprompted_key(
             &mut app,
@@ -1450,8 +1450,17 @@ mod tests {
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
             frame_area,
         );
-        assert!(matches!(app.prompt, Some(Prompt::NewTerminalCommand(_))));
-        app.cancel_prompt();
+
+        assert_eq!(app.prompt, None);
+        assert_eq!(app.project.workspaces[0].terminals.len(), initial_terminals);
+    }
+
+    #[test]
+    fn ctrl_f_opens_workspace_prompt() {
+        let mut app = App::default();
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let config = Config::default();
+        let frame_area = Rect::new(0, 0, 120, 40);
 
         handle_unprompted_key(
             &mut app,
