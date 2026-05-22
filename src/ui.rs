@@ -5,7 +5,9 @@ use ratatui::{
     widgets::{Block, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
-use tui_term::widget::{Cursor, PseudoTerminal};
+use tui_term::widget::{
+    Cell as TerminalCellWidget, Cursor, PseudoTerminal, Screen as TerminalScreenWidget,
+};
 
 use crate::{
     app::{
@@ -757,12 +759,138 @@ fn render_terminal_parser(
         .style(cursor_style)
         .overlay_style(cursor_overlay_style)
         .visibility(parser.screen().scrollback() == 0);
-    let pseudo_term = PseudoTerminal::new(parser.screen())
+    let terminal_screen = TerminalScreen::from_vt100(parser.screen());
+    let pseudo_term = PseudoTerminal::new(&terminal_screen)
         .block(Block::default().style(pane_style(focused, palette)))
         .cursor(cursor);
     frame.render_widget(pseudo_term, area);
     if let Some(selection) = selection {
         render_text_selection(frame, area, selection, palette);
+    }
+}
+
+#[derive(Debug)]
+struct TerminalScreen {
+    rows: u16,
+    cols: u16,
+    cursor_position: (u16, u16),
+    hide_cursor: bool,
+    cells: Vec<TerminalCell>,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalCell {
+    symbol: String,
+    has_contents: bool,
+    style: Style,
+}
+
+impl TerminalScreen {
+    fn from_vt100(screen: &vt100::Screen) -> Self {
+        let (rows, cols) = screen.size();
+        let cells = (0..rows)
+            .flat_map(|row| {
+                (0..cols).map(move |col| {
+                    screen
+                        .cell(row, col)
+                        .map(TerminalCell::from_vt100)
+                        .unwrap_or_default()
+                })
+            })
+            .collect();
+        let (cursor_row, cursor_col) = screen.cursor_position();
+        let scrollback = u16::try_from(screen.scrollback()).unwrap_or(u16::MAX);
+
+        Self {
+            rows,
+            cols,
+            cursor_position: (cursor_row.saturating_add(scrollback), cursor_col),
+            hide_cursor: screen.hide_cursor(),
+            cells,
+        }
+    }
+
+    fn cell_index(&self, row: u16, col: u16) -> Option<usize> {
+        if row >= self.rows || col >= self.cols {
+            return None;
+        }
+
+        Some(usize::from(row) * usize::from(self.cols) + usize::from(col))
+    }
+}
+
+impl Default for TerminalCell {
+    fn default() -> Self {
+        Self {
+            symbol: String::new(),
+            has_contents: false,
+            style: Style::reset(),
+        }
+    }
+}
+
+impl TerminalCell {
+    fn from_vt100(cell: &vt100::Cell) -> Self {
+        let mut modifier = Modifier::empty();
+        if cell.bold() {
+            modifier |= Modifier::BOLD;
+        }
+        if cell.italic() {
+            modifier |= Modifier::ITALIC;
+        }
+        if cell.underline() {
+            modifier |= Modifier::UNDERLINED;
+        }
+        if cell.inverse() {
+            modifier |= Modifier::REVERSED;
+        }
+
+        Self {
+            symbol: cell.contents().to_string(),
+            has_contents: cell.has_contents(),
+            style: Style::reset()
+                .fg(vt100_color_to_ratatui(cell.fgcolor()))
+                .bg(vt100_color_to_ratatui(cell.bgcolor()))
+                .add_modifier(modifier),
+        }
+    }
+}
+
+impl TerminalScreenWidget for TerminalScreen {
+    type C = TerminalCell;
+
+    fn cell(&self, row: u16, col: u16) -> Option<&Self::C> {
+        self.cell_index(row, col)
+            .and_then(|index| self.cells.get(index))
+    }
+
+    fn hide_cursor(&self) -> bool {
+        self.hide_cursor
+    }
+
+    fn cursor_position(&self) -> (u16, u16) {
+        self.cursor_position
+    }
+}
+
+impl TerminalCellWidget for TerminalCell {
+    fn has_contents(&self) -> bool {
+        self.has_contents
+    }
+
+    fn apply(&self, cell: &mut ratatui::buffer::Cell) {
+        if self.has_contents {
+            cell.set_symbol(&self.symbol);
+        }
+        cell.set_style(self.style);
+    }
+}
+
+fn vt100_color_to_ratatui(color: vt100::Color) -> Color {
+    match color {
+        vt100::Color::Default => Color::Reset,
+        vt100::Color::Idx(index) => Color::Indexed(index),
+        vt100::Color::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
     }
 }
 

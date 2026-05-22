@@ -1360,7 +1360,7 @@ mod tests {
         );
         assert_eq!(
             pty_runtime.terminal_lines(terminal_id),
-            vec!["two".to_string(), "three".to_string()]
+            vec!["one".to_string(), "two".to_string()]
         );
 
         handle_event(

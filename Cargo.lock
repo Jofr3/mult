@@ -181,6 +181,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fnug-vt100"
+version = "0.15.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d8e1ff93e609cab5bc741da6d70204fd612b72c53dd829e4fe88e8d628aebd3"
+dependencies = [
+ "itoa",
+ "log",
+ "unicode-width 0.1.14",
+ "vte",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -312,13 +324,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
+ "fnug-vt100",
  "mult-protocol",
  "portable-pty",
  "ratatui",
  "serde",
  "serde_json",
  "tui-term",
- "vt100",
 ]
 
 [[package]]
@@ -649,7 +661,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72af159125ce32b02ceaced6cffae6394b0e6b6dfd4dc164a6c59a2db9b3c0b0"
 dependencies = [
  "ratatui",
- "vt100",
 ]
 
 [[package]]
@@ -692,18 +703,6 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
-
-[[package]]
-name = "vt100"
-version = "0.15.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84cd863bf0db7e392ba3bd04994be3473491b31e66340672af5d11943c6274de"
-dependencies = [
- "itoa",
- "log",
- "unicode-width 0.1.14",
- "vte",
-]
 
 [[package]]
 name = "vte"

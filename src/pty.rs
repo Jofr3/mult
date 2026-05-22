@@ -388,7 +388,7 @@ impl PtyRuntime {
             return Ok(false);
         };
         let old = parser.screen().scrollback();
-        parser.set_scrollback(max_safe_scrollback_offset(parser));
+        parser.set_scrollback(TERMINAL_SCROLLBACK_LINES);
         clamp_parser_scrollback(parser);
         Ok(parser.screen().scrollback() != old)
     }
@@ -464,7 +464,7 @@ impl PtyRuntime {
         } else {
             old.saturating_sub(rows.unsigned_abs() as usize)
         };
-        parser.set_scrollback(next.min(max_safe_scrollback_offset(parser)));
+        parser.set_scrollback(next.min(TERMINAL_SCROLLBACK_LINES));
         clamp_parser_scrollback(parser);
         parser.screen().scrollback() != old
     }
@@ -627,17 +627,11 @@ fn terminal_screen_rows(parser: &Parser) -> Vec<String> {
         .collect()
 }
 
-fn max_safe_scrollback_offset(parser: &Parser) -> usize {
-    // vt100 0.15 panics in debug builds when scrollback offset exceeds the
-    // screen height. Keep local scroll offsets inside the safe range.
-    usize::from(parser.screen().size().0)
-}
-
 fn clamp_parser_scrollback(parser: &mut Parser) {
-    let max = max_safe_scrollback_offset(parser);
-    if parser.screen().scrollback() > max {
-        parser.set_scrollback(max);
-    }
+    // Re-apply the current offset so vt100 clamps it to the available
+    // in-memory scrollback after resizes, screen switches, or history trims.
+    let current = parser.screen().scrollback();
+    parser.set_scrollback(current);
 }
 
 fn terminal_paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
@@ -1122,6 +1116,22 @@ mod tests {
                 pane,
                 bytes: b"x".to_vec(),
             }
+        );
+    }
+
+    #[test]
+    fn parser_scrolls_beyond_visible_screen_height() {
+        let mut runtime = PtyRuntime::new_offline();
+        let terminal = TerminalId(7);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
+        runtime.process_terminal_output(terminal, b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix");
+
+        assert!(runtime.scroll_up(terminal, 4).expect("scroll up"));
+
+        assert_eq!(runtime.parser(terminal).unwrap().screen().scrollback(), 4);
+        assert_eq!(
+            runtime.terminal_lines(terminal),
+            vec!["one".to_string(), "two".to_string()]
         );
     }
 
