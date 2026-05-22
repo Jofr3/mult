@@ -1,6 +1,6 @@
 use std::{
     io::{self, Write},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -20,6 +20,7 @@ use mult::{
         Prompt, SelectionCell, TextSelection,
     },
     config::{self, Config},
+    git,
     model::{self, ChatStatus, TerminalId, TerminalLaunch, TerminalStatus},
     pty::{PtyDimensions, PtyEvent, PtyRuntime, PtySpawn},
     storage, ui,
@@ -61,6 +62,7 @@ fn disable_terminal_features(mouse_capture: bool) -> io::Result<()> {
 const AGENT_CMD_ENV: &str = "MULT_AGENT_CMD";
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const READY_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(0);
+const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const MOUSE_SCROLL_ROWS: usize = 3;
 
 enum RuntimeAgentBackend {
@@ -111,8 +113,14 @@ fn run(terminal: &mut DefaultTerminal, mut app: App, config: Config) -> io::Resu
     let size = terminal.size()?;
     let mut frame_area = Rect::new(0, 0, size.width, size.height);
     restore_persisted_sessions(&mut app, &mut pty_runtime, &config, frame_area);
+    refresh_workspace_git_branches(&mut app);
+    let mut last_git_branch_refresh = Instant::now();
 
     while !app.should_quit {
+        if last_git_branch_refresh.elapsed() >= GIT_BRANCH_REFRESH_INTERVAL {
+            refresh_workspace_git_branches(&mut app);
+            last_git_branch_refresh = Instant::now();
+        }
         drain_pty_events(&mut app, &mut pty_runtime);
         drain_agent_events(&mut app, &mut agent_backend);
         save_if_dirty(&mut app)?;
@@ -147,6 +155,19 @@ fn run(terminal: &mut DefaultTerminal, mut app: App, config: Config) -> io::Resu
 
     save_if_dirty(&mut app)?;
     Ok(())
+}
+
+fn refresh_workspace_git_branches(app: &mut App) {
+    let branches = app
+        .project
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            let branch = workspace.cwd.as_deref().and_then(git::current_branch);
+            (workspace.id, branch)
+        })
+        .collect::<Vec<_>>();
+    app.replace_workspace_git_branches(branches);
 }
 
 fn restore_persisted_sessions(

@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 use tui_term::widget::{Cursor, PseudoTerminal};
@@ -14,7 +14,7 @@ use crate::{
     },
     config::{self, ColorSchemeConfig},
     model::{
-        ChatId, ChatStatus, TerminalId, TerminalLaunch, TerminalSession, TerminalStatus,
+        ChatId, ChatStatus, TerminalId, TerminalLaunch, TerminalSession, TerminalStatus, Workspace,
         WorkspaceId,
     },
     pty::PtyRuntime,
@@ -23,6 +23,9 @@ use crate::{
 const CHAT_AGENT_HEADER_LINES: u16 = 0;
 const TERMINAL_HEADER_LINES: u16 = 0;
 const CURSOR_COLOR: Color = Color::Rgb(255, 255, 255);
+const SIDEBAR_SELECTION_SYMBOL: &str = " ";
+const WORKSPACE_ICON: &str = "▣ ";
+const GIT_BRANCH_ICON: &str = "";
 
 #[allow(dead_code)]
 mod moon {
@@ -222,7 +225,7 @@ fn pane_inner(area: Rect) -> Rect {
 }
 
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
-    let items = sidebar_items(app, palette);
+    let items = sidebar_items(app, palette, sidebar_item_width(area));
     let selected = if items.is_empty() {
         None
     } else {
@@ -243,25 +246,23 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
                 .fg(palette.text)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol(" ");
+        .highlight_symbol(SIDEBAR_SELECTION_SYMBOL)
+        .highlight_spacing(HighlightSpacing::Always);
 
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn sidebar_items(app: &App, palette: Palette) -> Vec<ListItem<'static>> {
+fn sidebar_items(app: &App, palette: Palette, item_width: usize) -> Vec<ListItem<'static>> {
     app.project
         .workspaces
         .iter()
         .flat_map(|workspace| {
-            let workspace_line = ListItem::new(Line::from(vec![
-                Span::styled("▣ ", Style::default().fg(palette.foam)),
-                Span::styled(
-                    workspace.name.clone(),
-                    Style::default()
-                        .fg(palette.text)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]));
+            let workspace_line = ListItem::new(workspace_sidebar_line(
+                workspace,
+                app.workspace_git_branch(workspace.id),
+                palette,
+                item_width,
+            ));
 
             let chat_lines = workspace.chats.iter().map(move |chat| {
                 ListItem::new(Line::from(vec![
@@ -286,6 +287,114 @@ fn sidebar_items(app: &App, palette: Palette) -> Vec<ListItem<'static>> {
                 .into_iter()
         })
         .collect()
+}
+
+fn sidebar_item_width(area: Rect) -> usize {
+    usize::from(
+        area.width
+            .saturating_sub(text_width(SIDEBAR_SELECTION_SYMBOL) as u16),
+    )
+}
+
+fn workspace_sidebar_line(
+    workspace: &Workspace,
+    branch: Option<&str>,
+    palette: Palette,
+    item_width: usize,
+) -> Line<'static> {
+    if let Some(branch) = branch.filter(|branch| !branch.trim().is_empty()) {
+        let workspace_icon_width = text_width(WORKSPACE_ICON);
+        let branch_icon_width = text_width(GIT_BRANCH_ICON) + 1;
+        let branch_trailing_space_width = 1;
+        let minimum_name_width = 1;
+        let minimum_branch_name_width = 1;
+        let minimum_gap_width = 1;
+        let minimum_width = workspace_icon_width
+            + minimum_name_width
+            + minimum_gap_width
+            + branch_icon_width
+            + minimum_branch_name_width
+            + branch_trailing_space_width;
+
+        if item_width >= minimum_width {
+            let max_branch_name_width = item_width.saturating_sub(
+                workspace_icon_width
+                    + minimum_name_width
+                    + minimum_gap_width
+                    + branch_icon_width
+                    + branch_trailing_space_width,
+            );
+            let branch_name = truncate_text(branch, max_branch_name_width);
+            let branch_width =
+                branch_icon_width + text_width(&branch_name) + branch_trailing_space_width;
+            let max_name_width =
+                item_width.saturating_sub(workspace_icon_width + minimum_gap_width + branch_width);
+            let workspace_name = truncate_text(&workspace.name, max_name_width);
+            let gap_width = item_width
+                .saturating_sub(workspace_icon_width + text_width(&workspace_name) + branch_width);
+
+            return Line::from(vec![
+                Span::styled(WORKSPACE_ICON, Style::default().fg(palette.foam)),
+                Span::styled(
+                    workspace_name,
+                    Style::default()
+                        .fg(palette.text)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" ".repeat(gap_width)),
+                Span::styled(GIT_BRANCH_ICON, Style::default().fg(palette.iris)),
+                Span::raw(" "),
+                Span::styled(branch_name, Style::default().fg(palette.subtle)),
+                Span::raw(" "),
+            ]);
+        }
+    }
+
+    let workspace_icon_width = text_width(WORKSPACE_ICON);
+    let workspace_name = truncate_text(
+        &workspace.name,
+        item_width.saturating_sub(workspace_icon_width),
+    );
+    Line::from(vec![
+        Span::styled(WORKSPACE_ICON, Style::default().fg(palette.foam)),
+        Span::styled(
+            workspace_name,
+            Style::default()
+                .fg(palette.text)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn text_width(value: &str) -> usize {
+    Span::raw(value).width()
+}
+
+fn truncate_text(value: &str, max_width: usize) -> String {
+    if text_width(value) <= max_width {
+        return value.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+
+    let ellipsis_width = text_width("…");
+    let mut output = String::new();
+    let mut width = 0;
+    for ch in value.chars() {
+        let ch = ch.to_string();
+        let ch_width = text_width(&ch);
+        if width + ch_width + ellipsis_width > max_width {
+            break;
+        }
+        output.push_str(&ch);
+        width += ch_width;
+    }
+    output.push('…');
+    output
 }
 
 fn draw_main(frame: &mut Frame, app: &App, pty_runtime: &PtyRuntime, area: Rect, palette: Palette) {
@@ -1105,6 +1214,34 @@ mod tests {
 
         assert!(!text.contains("Ctrl-j/k navigate"));
         assert!(!text.contains("mouse wheel scroll"));
+    }
+
+    #[test]
+    fn sidebar_workspace_branch_is_right_aligned() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        app.project.workspaces.truncate(1);
+        app.project.workspaces[0].name = "mult".to_string();
+        app.project.workspaces[0].chats.clear();
+        app.project.workspaces[0].terminals.clear();
+        app.replace_workspace_git_branches([(workspace, Some("main".to_string()))]);
+
+        let backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    &PtyRuntime::new_offline(),
+                    &config::Config::default(),
+                )
+            })
+            .expect("draw app");
+
+        let sidebar_row = buffer_text(terminal.backend(), 0, 0, 34);
+        assert!(sidebar_row.contains("▣ mult"));
+        assert!(sidebar_row.ends_with(" main "));
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub struct App {
     pub prompt: Option<Prompt>,
     pub focus: FocusMode,
     pub chat_buffers: BTreeMap<ChatId, ChatBuffer>,
+    pub workspace_git_branches: BTreeMap<WorkspaceId, String>,
     pub active_search: Option<SearchState>,
     pub text_selection: Option<TextSelection>,
     pub should_quit: bool,
@@ -217,6 +218,7 @@ impl App {
             prompt: None,
             focus: FocusMode::Sidebar,
             chat_buffers,
+            workspace_git_branches: BTreeMap::new(),
             active_search: None,
             text_selection: None,
             should_quit: false,
@@ -241,6 +243,32 @@ impl App {
 
     pub fn is_prompt_active(&self) -> bool {
         self.prompt.is_some()
+    }
+
+    pub fn workspace_git_branch(&self, workspace: WorkspaceId) -> Option<&str> {
+        self.workspace_git_branches
+            .get(&workspace)
+            .map(String::as_str)
+    }
+
+    pub fn replace_workspace_git_branches(
+        &mut self,
+        branches: impl IntoIterator<Item = (WorkspaceId, Option<String>)>,
+    ) -> bool {
+        let next = branches
+            .into_iter()
+            .filter_map(|(workspace, branch)| {
+                let branch = clean_git_branch_name(branch?)?;
+                Some((workspace, branch))
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        if self.workspace_git_branches == next {
+            return false;
+        }
+
+        self.workspace_git_branches = next;
+        true
     }
 
     pub fn begin_command_palette(&mut self) {
@@ -1554,6 +1582,11 @@ fn workspace_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+fn clean_git_branch_name(branch: String) -> Option<String> {
+    let branch = branch.trim();
+    (!branch.is_empty()).then(|| branch.to_string())
+}
+
 fn normalize_agent_chat_titles(project: &mut ProjectState) -> bool {
     let mut changed = false;
     for chat in project
@@ -1638,6 +1671,18 @@ mod tests {
         assert_eq!(app.project.next_chat_id, 4);
         assert_eq!(app.project.next_terminal_id, 3);
         assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn workspace_git_branches_are_runtime_only() {
+        let mut app = App::default();
+        app.mark_clean();
+        let workspace = app.project.workspaces[0].id;
+
+        assert!(app.replace_workspace_git_branches([(workspace, Some(" main ".to_string()))]));
+
+        assert_eq!(app.workspace_git_branch(workspace), Some("main"));
+        assert!(!app.is_dirty());
     }
 
     #[test]
