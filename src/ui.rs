@@ -338,13 +338,13 @@ fn workspace_sidebar_line(
                 Span::styled(
                     workspace_name,
                     Style::default()
-                        .fg(palette.text)
+                        .fg(palette.foam)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" ".repeat(gap_width)),
                 Span::styled(GIT_BRANCH_ICON, Style::default().fg(palette.iris)),
                 Span::raw(" "),
-                Span::styled(branch_name, Style::default().fg(palette.subtle)),
+                Span::styled(branch_name, Style::default().fg(palette.iris)),
                 Span::raw(" "),
             ]);
         }
@@ -360,7 +360,7 @@ fn workspace_sidebar_line(
         Span::styled(
             workspace_name,
             Style::default()
-                .fg(palette.text)
+                .fg(palette.foam)
                 .add_modifier(Modifier::BOLD),
         ),
     ])
