@@ -29,6 +29,10 @@ Configuration is loaded from `$XDG_CONFIG_HOME/mult/config.json` or `~/.config/m
   "auto_start_pi_agent": true,
   "auto_start_terminals": true,
   "mouse_capture": true,
+  "projects": [
+    { "name": "mult", "path": "~/projects/mult" },
+    ["docs", "~/projects/docs"]
+  ],
   "colorscheme": {
     "_nc": "#1f1d30",
     "base": "#232136",
@@ -51,7 +55,7 @@ Configuration is loaded from `$XDG_CONFIG_HOME/mult/config.json` or `~/.config/m
 }
 ```
 
-Use `MULT_CONFIG_PATH=/path/to/config.json` to point at another config file. `auto_start_pi_agent` and `auto_start_terminals` default to `true`; set either to `false` if you want panes to wait for manual start. `mouse_capture` defaults to `true` so the left sidebar stays visible while mouse wheel scrolling and pane-local drag selection both work. Dragging in the selected chat/terminal pane highlights text and copies it through OSC 52 on release. Set `mouse_capture` to `false` to disable app mouse handling and fall back to your terminal emulator's native selection. The default colorscheme is Rosé Pine Moon; any color key can be overridden with a `#rrggbb` value.
+Use `MULT_CONFIG_PATH=/path/to/config.json` to point at another config file. `projects` is optional; when present, `Ctrl-F` opens a fuzzy project picker searched by project name and then imports the configured path. Entries may be objects (`{"name":"mult","path":"~/projects/mult"}`) or `["name","path"]` pairs. `auto_start_pi_agent` and `auto_start_terminals` default to `true`; set either to `false` if you want panes to wait for manual start. `mouse_capture` defaults to `true` so the left sidebar stays visible while mouse wheel scrolling and pane-local drag selection both work. Dragging in the selected chat/terminal pane highlights text and copies it through OSC 52 on release. Set `mouse_capture` to `false` to disable app mouse handling and fall back to your terminal emulator's native selection. The default colorscheme is Rosé Pine Moon; any color key can be overridden with a `#rrggbb` value.
 
 ## Current controls
 
@@ -63,13 +67,14 @@ mult is always in input mode: ordinary keys go to the selected terminal or agent
 - `Ctrl-Esc`: quit mult
 - `Ctrl-A`: add an agent chat to the selected workspace and start/focus its pi agent
 - `Ctrl-T`: add a shell terminal to the selected workspace
-- `Ctrl-F`: open/import a workspace by directory path
+- `Ctrl-F`: open/import a workspace; uses the configured fuzzy project list when `projects` is set, otherwise prompts for a directory path
 - Drag within the selected chat/terminal pane: select visible pane text and copy it on release
 - Mouse wheel over a chat/terminal output pane: scroll that pane without moving the outer terminal history
 
 When the open/import or command prompt is active:
 
-- Type a directory path or command
+- Type a configured project name, directory path, or command
+- Up/Ctrl-K and Down/Ctrl-J: select a configured project match
 - Enter: submit it
 - Esc or Ctrl-C: cancel
 

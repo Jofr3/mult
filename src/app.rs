@@ -5,6 +5,7 @@ use std::{
 
 use crate::{
     agent::{AgentEvent, AgentMessageRole, AgentTarget},
+    config::ConfiguredProject,
     model::{
         ChatId, ChatMessage, ChatMessageRole, ChatStatus, ProjectState, TerminalId, TerminalStatus,
         WorkspaceId, DEFAULT_AGENT_CHAT_TITLE, RUNTIME_TERMINAL_ID_FLAG,
@@ -44,6 +45,20 @@ pub enum FocusMode {
 pub struct OpenWorkspacePrompt {
     pub input: String,
     pub error: Option<String>,
+    pub selected: usize,
+    pub mode: OpenWorkspaceMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenWorkspaceMode {
+    Path,
+    ConfiguredProjects,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenWorkspaceMatch {
+    pub name: String,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,6 +272,27 @@ impl App {
             Some(Prompt::CommandPalette(prompt)) => self.command_palette_entries_for(&prompt.input),
             _ => Vec::new(),
         }
+    }
+
+    pub fn open_workspace_matches(
+        &self,
+        projects: &[ConfiguredProject],
+    ) -> Vec<OpenWorkspaceMatch> {
+        if let Some(Prompt::OpenWorkspace(prompt)) = &self.prompt {
+            if prompt.mode == OpenWorkspaceMode::ConfiguredProjects {
+                return open_workspace_matches_for(&prompt.input, projects);
+            }
+        }
+
+        Vec::new()
+    }
+
+    pub fn select_next_open_workspace_match(&mut self, projects: &[ConfiguredProject]) {
+        self.move_open_workspace_selection(1, projects);
+    }
+
+    pub fn select_previous_open_workspace_match(&mut self, projects: &[ConfiguredProject]) {
+        self.move_open_workspace_selection(-1, projects);
     }
 
     pub fn select_next_command_palette_entry(&mut self) {
@@ -520,6 +556,31 @@ impl App {
             help: "save state and exit",
         });
         entries
+    }
+
+    fn move_open_workspace_selection(&mut self, delta: isize, projects: &[ConfiguredProject]) {
+        let Some(Prompt::OpenWorkspace(prompt)) = &self.prompt else {
+            return;
+        };
+        if prompt.mode != OpenWorkspaceMode::ConfiguredProjects {
+            return;
+        }
+        let len = open_workspace_matches_for(&prompt.input, projects).len();
+        if len == 0 {
+            if let Some(Prompt::OpenWorkspace(prompt)) = &mut self.prompt {
+                prompt.selected = 0;
+            }
+            return;
+        }
+
+        if let Some(Prompt::OpenWorkspace(prompt)) = &mut self.prompt {
+            if delta.is_negative() {
+                let delta = delta.unsigned_abs() % len;
+                prompt.selected = prompt.selected.checked_sub(delta).unwrap_or(len - delta);
+            } else {
+                prompt.selected = (prompt.selected + delta as usize) % len;
+            }
+        }
     }
 
     fn move_command_palette_selection(&mut self, delta: isize) {
@@ -938,15 +999,26 @@ impl App {
         }
     }
 
-    pub fn begin_open_workspace(&mut self) {
-        let input = std::env::current_dir()
-            .ok()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default();
+    pub fn begin_open_workspace(&mut self, projects: &[ConfiguredProject]) {
+        let has_configured_projects = !projects.is_empty();
+        let input = if has_configured_projects {
+            String::new()
+        } else {
+            std::env::current_dir()
+                .ok()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default()
+        };
 
         self.prompt = Some(Prompt::OpenWorkspace(OpenWorkspacePrompt {
             input,
             error: None,
+            selected: 0,
+            mode: if has_configured_projects {
+                OpenWorkspaceMode::ConfiguredProjects
+            } else {
+                OpenWorkspaceMode::Path
+            },
         }));
     }
 
@@ -1014,6 +1086,7 @@ impl App {
             Some(Prompt::OpenWorkspace(prompt)) => {
                 prompt.input.push(c);
                 prompt.error = None;
+                prompt.selected = 0;
             }
             Some(Prompt::NewTerminalCommand(prompt)) => {
                 prompt.input.push(c);
@@ -1037,6 +1110,7 @@ impl App {
             Some(Prompt::OpenWorkspace(prompt)) => {
                 prompt.input.pop();
                 prompt.error = None;
+                prompt.selected = 0;
             }
             Some(Prompt::NewTerminalCommand(prompt)) => {
                 prompt.input.pop();
@@ -1055,17 +1129,38 @@ impl App {
         self.clamp_command_palette_selection();
     }
 
-    pub fn submit_open_workspace(&mut self) {
+    pub fn submit_open_workspace(&mut self, projects: &[ConfiguredProject]) {
         let Some(Prompt::OpenWorkspace(prompt)) = &self.prompt else {
             return;
         };
-        let raw_input = prompt.input.trim();
-        if raw_input.is_empty() {
+        let raw_input = prompt.input.trim().to_string();
+        let selected = prompt.selected;
+        let mode = prompt.mode;
+
+        if mode == OpenWorkspaceMode::ConfiguredProjects {
+            let matches = open_workspace_matches_for(&raw_input, projects);
+            if let Some(project) = matches.get(selected.min(matches.len().saturating_sub(1))) {
+                self.import_workspace_path(expand_path(&project.path), Some(project.name.clone()));
+                return;
+            }
+
+            if raw_input.is_empty() {
+                self.set_open_workspace_error("select a configured project");
+                return;
+            }
+            if !looks_like_path(&raw_input) {
+                self.set_open_workspace_error("no matching configured project");
+                return;
+            }
+        } else if raw_input.is_empty() {
             self.set_open_workspace_error("enter a directory path");
             return;
         }
 
-        let path = expand_tilde(raw_input);
+        self.import_workspace_path(expand_tilde(&raw_input), None);
+    }
+
+    fn import_workspace_path(&mut self, path: PathBuf, configured_name: Option<String>) {
         let Ok(cwd) = std::fs::canonicalize(&path) else {
             self.set_open_workspace_error("path does not exist");
             return;
@@ -1087,8 +1182,13 @@ impl App {
             return;
         }
 
-        let name = workspace_name(&cwd);
-        let workspace = self.project.add_workspace(name.clone(), Some(cwd));
+        let name = configured_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| workspace_name(&cwd));
+        let workspace = self.project.add_workspace(name, Some(cwd));
         self.project.add_chat(
             workspace,
             DEFAULT_AGENT_CHAT_TITLE.to_string(),
@@ -1236,6 +1336,89 @@ impl App {
     }
 }
 
+fn open_workspace_matches_for(
+    query: &str,
+    projects: &[ConfiguredProject],
+) -> Vec<OpenWorkspaceMatch> {
+    let query = query.trim();
+    let mut matches = projects
+        .iter()
+        .enumerate()
+        .filter_map(|(index, project)| {
+            fuzzy_project_score(&project.name, query).map(|score| {
+                (
+                    score,
+                    index,
+                    OpenWorkspaceMatch {
+                        name: project.name.clone(),
+                        path: project.path.clone(),
+                    },
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    matches.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+    matches.into_iter().map(|(_, _, project)| project).collect()
+}
+
+fn fuzzy_project_score(name: &str, query: &str) -> Option<i64> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Some(0);
+    }
+
+    let name_lower = name.to_lowercase();
+    query.split_whitespace().try_fold(0, |score, term| {
+        fuzzy_term_score(&name_lower, term).map(|term_score| score + term_score)
+    })
+}
+
+fn fuzzy_term_score(name: &str, term: &str) -> Option<i64> {
+    if term.is_empty() {
+        return Some(0);
+    }
+
+    let name_chars = name.chars().collect::<Vec<_>>();
+    let term_chars = term.chars().collect::<Vec<_>>();
+    let mut score = if name.contains(term) { 20 } else { 0 };
+    let mut position = 0;
+    let mut last_match: Option<usize> = None;
+
+    for ch in term_chars {
+        while position < name_chars.len() && name_chars[position] != ch {
+            position += 1;
+        }
+        if position == name_chars.len() {
+            return None;
+        }
+
+        score += 10;
+        if position == 0 {
+            score += 8;
+        } else if is_name_boundary(name_chars[position.saturating_sub(1)]) {
+            score += 6;
+        }
+        if let Some(previous) = last_match {
+            if position == previous + 1 {
+                score += 5;
+            } else {
+                score -= (position - previous - 1).min(8) as i64;
+            }
+        }
+
+        last_match = Some(position);
+        position += 1;
+    }
+
+    score -= name_chars.len().saturating_sub(term.len()).min(16) as i64;
+    Some(score)
+}
+
+fn is_name_boundary(ch: char) -> bool {
+    matches!(ch, '-' | '_' | ' ' | '/' | '.')
+}
+
 fn transcript_lines(messages: &[ChatMessage]) -> Vec<String> {
     messages
         .iter()
@@ -1347,6 +1530,20 @@ fn expand_tilde(input: &str) -> PathBuf {
     }
 
     PathBuf::from(input)
+}
+
+fn expand_path(path: &Path) -> PathBuf {
+    path.to_str()
+        .map(expand_tilde)
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+fn looks_like_path(input: &str) -> bool {
+    let input = input.trim();
+    Path::new(input).is_absolute()
+        || input.starts_with('~')
+        || input.starts_with('.')
+        || input.contains(std::path::MAIN_SEPARATOR)
 }
 
 fn workspace_name(path: &Path) -> String {
@@ -1721,7 +1918,7 @@ mod tests {
     #[test]
     fn prompt_input_can_be_edited() {
         let mut app = App::default();
-        app.begin_open_workspace();
+        app.begin_open_workspace(&[]);
         if let Some(Prompt::OpenWorkspace(prompt)) = &mut app.prompt {
             prompt.input.clear();
         }
@@ -1735,6 +1932,8 @@ mod tests {
             Some(Prompt::OpenWorkspace(OpenWorkspacePrompt {
                 input: "/".to_string(),
                 error: None,
+                selected: 0,
+                mode: OpenWorkspaceMode::Path,
             }))
         );
     }
@@ -1743,12 +1942,12 @@ mod tests {
     fn importing_workspace_adds_cwd_chat_and_terminal() {
         let path = unique_temp_dir();
         let mut app = App::default();
-        app.begin_open_workspace();
+        app.begin_open_workspace(&[]);
         if let Some(Prompt::OpenWorkspace(prompt)) = &mut app.prompt {
             prompt.input = path.display().to_string();
         }
 
-        app.submit_open_workspace();
+        app.submit_open_workspace(&[]);
 
         let imported = app.project.workspaces.last().unwrap();
         assert_eq!(imported.cwd.as_deref(), Some(path.as_path()));
@@ -1761,14 +1960,74 @@ mod tests {
     }
 
     #[test]
+    fn configured_workspace_prompt_fuzzy_filters_by_name_and_uses_configured_name() {
+        let selected_path = unique_temp_dir();
+        let other_path = unique_temp_dir();
+        let projects = vec![
+            ConfiguredProject {
+                name: "frontend".to_string(),
+                path: other_path,
+            },
+            ConfiguredProject {
+                name: "mult".to_string(),
+                path: selected_path.clone(),
+            },
+        ];
+        let mut app = App::default();
+
+        app.begin_open_workspace(&projects);
+        for ch in "mlt".chars() {
+            app.push_prompt_char(ch);
+        }
+
+        let matches = app.open_workspace_matches(&projects);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "mult");
+
+        app.submit_open_workspace(&projects);
+
+        let imported = app.project.workspaces.last().unwrap();
+        assert_eq!(imported.name, "mult");
+        assert_eq!(imported.cwd.as_deref(), Some(selected_path.as_path()));
+        assert_eq!(app.selected_item(), Some(NavItem::Workspace(imported.id)));
+        assert_eq!(app.prompt, None);
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn configured_workspace_prompt_arrow_selects_match() {
+        let first_path = unique_temp_dir();
+        let second_path = unique_temp_dir();
+        let projects = vec![
+            ConfiguredProject {
+                name: "first".to_string(),
+                path: first_path,
+            },
+            ConfiguredProject {
+                name: "second".to_string(),
+                path: second_path.clone(),
+            },
+        ];
+        let mut app = App::default();
+
+        app.begin_open_workspace(&projects);
+        app.select_next_open_workspace_match(&projects);
+        app.submit_open_workspace(&projects);
+
+        let imported = app.project.workspaces.last().unwrap();
+        assert_eq!(imported.name, "second");
+        assert_eq!(imported.cwd.as_deref(), Some(second_path.as_path()));
+    }
+
+    #[test]
     fn invalid_import_stays_in_prompt() {
         let mut app = App::default();
-        app.begin_open_workspace();
+        app.begin_open_workspace(&[]);
         if let Some(Prompt::OpenWorkspace(prompt)) = &mut app.prompt {
             prompt.input = "/this/path/should/not/exist".to_string();
         }
 
-        app.submit_open_workspace();
+        app.submit_open_workspace(&[]);
 
         let Some(Prompt::OpenWorkspace(prompt)) = &app.prompt else {
             panic!("expected prompt to remain open");

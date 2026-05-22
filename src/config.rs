@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 const CONFIG_PATH_ENV: &str = "MULT_CONFIG_PATH";
 const CONFIG_FILE_NAME: &str = "config.json";
@@ -19,7 +19,15 @@ pub struct Config {
     #[serde(default = "default_mouse_capture")]
     pub mouse_capture: bool,
     #[serde(default)]
+    pub projects: Vec<ConfiguredProject>,
+    #[serde(default)]
     pub colorscheme: ColorSchemeConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfiguredProject {
+    pub name: String,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,7 +77,28 @@ impl Default for Config {
             auto_start_pi_agent: default_auto_start_pi_agent(),
             auto_start_terminals: default_auto_start_terminals(),
             mouse_capture: default_mouse_capture(),
+            projects: Vec::new(),
             colorscheme: ColorSchemeConfig::default(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ConfiguredProject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum RawProject {
+            Object { name: String, path: PathBuf },
+            Pair(String, PathBuf),
+        }
+
+        match RawProject::deserialize(deserializer)? {
+            RawProject::Object { name, path } | RawProject::Pair(name, path) => {
+                Ok(Self { name, path })
+            }
         }
     }
 }
@@ -235,6 +264,7 @@ mod tests {
         assert!(config.auto_start_pi_agent);
         assert!(config.auto_start_terminals);
         assert!(config.mouse_capture);
+        assert!(config.projects.is_empty());
         assert_eq!(config.colorscheme.base, "#232136");
         assert_eq!(config.colorscheme.nc, "#1f1d30");
     }
@@ -261,7 +291,34 @@ mod tests {
         assert!(config.auto_start_pi_agent);
         assert!(config.auto_start_terminals);
         assert!(config.mouse_capture);
+        assert!(config.projects.is_empty());
         assert_eq!(config.colorscheme.text, "#e0def4");
+    }
+
+    #[test]
+    fn config_loads_projects_from_json_objects_and_pairs() {
+        let path = unique_temp_file();
+        fs::write(
+            &path,
+            r#"{"projects":[{"name":"mult","path":"~/projects/mult"},["docs","/tmp/docs"]]}"#,
+        )
+        .expect("write config");
+
+        let config = load_from_path(&path).expect("load config");
+
+        assert_eq!(
+            config.projects,
+            vec![
+                ConfiguredProject {
+                    name: "mult".to_string(),
+                    path: PathBuf::from("~/projects/mult"),
+                },
+                ConfiguredProject {
+                    name: "docs".to_string(),
+                    path: PathBuf::from("/tmp/docs"),
+                },
+            ]
+        );
     }
 
     #[test]

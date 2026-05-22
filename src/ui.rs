@@ -9,8 +9,8 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 
 use crate::{
     app::{
-        chat_agent_terminal_id, App, CommandPaletteEntry, FocusMode, NavItem, Prompt, SearchScope,
-        TextSelection,
+        chat_agent_terminal_id, App, CommandPaletteEntry, FocusMode, NavItem, OpenWorkspaceMatch,
+        OpenWorkspaceMode, Prompt, SearchScope, TextSelection,
     },
     config::{self, ColorSchemeConfig},
     model::{
@@ -132,7 +132,7 @@ pub fn draw(frame: &mut Frame, app: &App, pty_runtime: &PtyRuntime, config: &con
 
     draw_sidebar(frame, app, layout.sidebar, palette);
     draw_main(frame, app, pty_runtime, layout.main, palette);
-    draw_prompt_area(frame, app, layout.prompt, palette);
+    draw_prompt_area(frame, app, layout.prompt, palette, config);
 }
 
 pub fn selected_terminal_output_area(app: &App, frame_area: Rect) -> Option<(TerminalId, Rect)> {
@@ -187,6 +187,11 @@ impl PaneLayout {
 fn prompt_height(app: &App) -> u16 {
     match &app.prompt {
         Some(Prompt::CommandPalette(_)) => 7,
+        Some(Prompt::OpenWorkspace(prompt))
+            if prompt.mode == OpenWorkspaceMode::ConfiguredProjects =>
+        {
+            7
+        }
         Some(_) => 3,
         None => 0,
     }
@@ -731,12 +736,29 @@ fn search_result_lines(
     output
 }
 
-fn draw_prompt_area(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
+fn draw_prompt_area(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    palette: Palette,
+    config: &config::Config,
+) {
     let Some(prompt) = &app.prompt else {
         return;
     };
 
     match prompt {
+        Prompt::OpenWorkspace(prompt) if prompt.mode == OpenWorkspaceMode::ConfiguredProjects => {
+            draw_open_workspace_prompt(
+                frame,
+                area,
+                palette,
+                &prompt.input,
+                prompt.selected,
+                prompt.error.as_deref(),
+                app.open_workspace_matches(&config.projects),
+            )
+        }
         Prompt::OpenWorkspace(prompt) => draw_text_prompt(
             frame,
             area,
@@ -780,6 +802,76 @@ fn search_prompt_label(scope: SearchScope) -> &'static str {
         SearchScope::Terminal(_) => "Search terminal: ",
         SearchScope::Chat(_) => "Search chat: ",
     }
+}
+
+fn draw_open_workspace_prompt(
+    frame: &mut Frame,
+    area: Rect,
+    palette: Palette,
+    input: &str,
+    selected: usize,
+    error: Option<&str>,
+    entries: Vec<OpenWorkspaceMatch>,
+) {
+    let mut lines = vec![Line::from(vec![
+        Span::styled("Project: ", Style::default().fg(palette.muted)),
+        Span::raw(input.to_string()),
+        Span::styled("▌", Style::default().fg(CURSOR_COLOR)),
+    ])];
+
+    if let Some(error) = error {
+        lines.push(Line::from(Span::styled(
+            error.to_string(),
+            Style::default().fg(palette.love),
+        )));
+    }
+
+    if entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No matching configured projects".to_string(),
+            Style::default().fg(palette.love),
+        )));
+    } else {
+        let max_entries = usize::from(area.height.saturating_sub(lines.len() as u16)).max(1);
+        let start = selected.saturating_sub(max_entries.saturating_sub(1));
+        lines.extend(
+            entries
+                .into_iter()
+                .enumerate()
+                .skip(start)
+                .take(max_entries)
+                .map(|(index, entry)| open_workspace_match_line(entry, index == selected, palette)),
+        );
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(palette.text).bg(palette.base)),
+        area,
+    );
+}
+
+fn open_workspace_match_line(
+    entry: OpenWorkspaceMatch,
+    selected: bool,
+    palette: Palette,
+) -> Line<'static> {
+    let marker = if selected { "› " } else { "  " };
+    let style = if selected {
+        Style::default()
+            .fg(palette.text)
+            .bg(palette.highlight_med)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.text)
+    };
+    let path = entry.path.display().to_string();
+
+    Line::from(vec![
+        Span::styled(marker, style),
+        Span::styled(entry.name, style),
+        Span::styled(" ", Style::default().fg(palette.muted)),
+        Span::styled(path, Style::default().fg(palette.muted)),
+    ])
 }
 
 fn draw_command_palette_prompt(

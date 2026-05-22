@@ -217,7 +217,7 @@ fn handle_key(
     }
 
     match &app.prompt {
-        Some(Prompt::OpenWorkspace(_)) => handle_open_workspace_key(app, key),
+        Some(Prompt::OpenWorkspace(_)) => handle_open_workspace_key(app, config, key),
         Some(Prompt::NewTerminalCommand(_)) => handle_terminal_command_key(app, key),
         Some(Prompt::CommandPalette(_)) => {
             handle_command_palette_key(app, pty_runtime, config, key, frame_area);
@@ -540,7 +540,7 @@ fn handle_control_key(
         return true;
     }
     if is_unshifted_control_char(key, 'f') {
-        app.begin_open_workspace();
+        app.begin_open_workspace(&config.projects);
         return true;
     }
 
@@ -681,10 +681,18 @@ fn start_selected_pty_if_needed(
     }
 }
 
-fn handle_open_workspace_key(app: &mut App, key: KeyEvent) {
+fn handle_open_workspace_key(app: &mut App, config: &Config, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.cancel_prompt(),
-        KeyCode::Enter => app.submit_open_workspace(),
+        KeyCode::Enter => app.submit_open_workspace(&config.projects),
+        KeyCode::Up => app.select_previous_open_workspace_match(&config.projects),
+        KeyCode::Down => app.select_next_open_workspace_match(&config.projects),
+        _ if is_unshifted_control_char(key, 'k') => {
+            app.select_previous_open_workspace_match(&config.projects);
+        }
+        _ if is_unshifted_control_char(key, 'j') => {
+            app.select_next_open_workspace_match(&config.projects);
+        }
         KeyCode::Backspace => app.pop_prompt_char(),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cancel_prompt(),
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -723,6 +731,8 @@ fn handle_command_palette_key(
         }
         KeyCode::Up => app.select_previous_command_palette_entry(),
         KeyCode::Down => app.select_next_command_palette_entry(),
+        _ if is_unshifted_control_char(key, 'k') => app.select_previous_command_palette_entry(),
+        _ if is_unshifted_control_char(key, 'j') => app.select_next_command_palette_entry(),
         KeyCode::Backspace => app.pop_prompt_char(),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cancel_prompt(),
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -765,7 +775,7 @@ fn execute_command_action(
         CommandAction::AddCommandTerminal => {
             app.begin_new_terminal_command();
         }
-        CommandAction::OpenWorkspace => app.begin_open_workspace(),
+        CommandAction::OpenWorkspace => app.begin_open_workspace(&config.projects),
         CommandAction::DeleteSelected => delete_selected_now(app, pty_runtime),
         CommandAction::SearchSelectedPane => {
             app.begin_search();
@@ -1215,6 +1225,7 @@ mod tests {
                 auto_start_pi_agent: false,
                 auto_start_terminals: false,
                 mouse_capture: false,
+                projects: Vec::new(),
                 colorscheme: Default::default(),
             }),
             "pi -c"
@@ -1225,6 +1236,7 @@ mod tests {
                 auto_start_pi_agent: false,
                 auto_start_terminals: false,
                 mouse_capture: false,
+                projects: Vec::new(),
                 colorscheme: Default::default(),
             }),
             "pi"
@@ -1470,6 +1482,45 @@ mod tests {
             frame_area,
         );
         assert!(matches!(app.prompt, Some(Prompt::OpenWorkspace(_))));
+    }
+
+    #[test]
+    fn open_workspace_prompt_ctrl_j_and_ctrl_k_select_matches() {
+        let mut app = App::default();
+        let config = Config {
+            projects: vec![
+                mult::config::ConfiguredProject {
+                    name: "first".to_string(),
+                    path: "/tmp/first".into(),
+                },
+                mult::config::ConfiguredProject {
+                    name: "second".to_string(),
+                    path: "/tmp/second".into(),
+                },
+            ],
+            ..Config::default()
+        };
+
+        app.begin_open_workspace(&config.projects);
+        handle_open_workspace_key(
+            &mut app,
+            &config,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(
+            app.prompt,
+            Some(Prompt::OpenWorkspace(ref prompt)) if prompt.selected == 1
+        ));
+
+        handle_open_workspace_key(
+            &mut app,
+            &config,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(
+            app.prompt,
+            Some(Prompt::OpenWorkspace(ref prompt)) if prompt.selected == 0
+        ));
     }
 
     #[test]
