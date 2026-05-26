@@ -228,11 +228,7 @@ fn pane_inner(area: Rect) -> Rect {
 
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
     let items = sidebar_items(app, palette, sidebar_item_width(area));
-    let selected = if items.is_empty() {
-        None
-    } else {
-        Some(app.selected.min(items.len() - 1))
-    };
+    let selected = sidebar_selected_index(app, items.len());
     let mut state = ListState::default();
     state.select(selected);
 
@@ -255,40 +251,78 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
 }
 
 fn sidebar_items(app: &App, palette: Palette, item_width: usize) -> Vec<ListItem<'static>> {
-    app.project
-        .workspaces
-        .iter()
-        .flat_map(|workspace| {
-            let workspace_line = ListItem::new(workspace_sidebar_line(
-                workspace,
-                app.workspace_git_branch(workspace.id),
-                palette,
-                item_width,
-            ));
+    let mut items = Vec::new();
 
-            let chat_lines = workspace.chats.iter().map(move |chat| {
-                ListItem::new(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled("● ", chat_status_style(chat.status, palette)),
-                    Span::raw(chat.name.clone()),
-                ]))
-            });
+    for (workspace_index, workspace) in app.project.workspaces.iter().enumerate() {
+        if workspace_index > 0 {
+            items.push(ListItem::new(Line::from("")));
+        }
 
-            let terminal_lines = workspace.terminals.iter().map(move |terminal| {
-                ListItem::new(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled("$ ", terminal_status_style(terminal.status, palette)),
-                    Span::raw(terminal_name_label(terminal)),
-                ]))
-            });
+        items.push(ListItem::new(workspace_sidebar_line(
+            workspace,
+            app.workspace_git_branch(workspace.id),
+            palette,
+            item_width,
+        )));
 
-            std::iter::once(workspace_line)
-                .chain(chat_lines)
-                .chain(terminal_lines)
-                .collect::<Vec<_>>()
-                .into_iter()
-        })
-        .collect()
+        items.extend(workspace.chats.iter().map(|chat| {
+            ListItem::new(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("● ", chat_status_style(chat.status, palette)),
+                Span::raw(chat.name.clone()),
+            ]))
+        }));
+
+        items.extend(workspace.terminals.iter().map(|terminal| {
+            ListItem::new(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("$ ", terminal_status_style(terminal.status, palette)),
+                Span::raw(terminal_name_label(terminal)),
+            ]))
+        }));
+    }
+
+    items
+}
+
+fn sidebar_selected_index(app: &App, item_count: usize) -> Option<usize> {
+    if item_count == 0 {
+        return None;
+    }
+
+    let target_nav_index = app.selected.min(app.nav_len().saturating_sub(1));
+    let mut nav_index = 0;
+    let mut item_index = 0;
+
+    for (workspace_index, workspace) in app.project.workspaces.iter().enumerate() {
+        if workspace_index > 0 {
+            item_index += 1;
+        }
+
+        if nav_index == target_nav_index {
+            return Some(item_index.min(item_count - 1));
+        }
+        nav_index += 1;
+        item_index += 1;
+
+        for _ in &workspace.chats {
+            if nav_index == target_nav_index {
+                return Some(item_index.min(item_count - 1));
+            }
+            nav_index += 1;
+            item_index += 1;
+        }
+
+        for _ in &workspace.terminals {
+            if nav_index == target_nav_index {
+                return Some(item_index.min(item_count - 1));
+            }
+            nav_index += 1;
+            item_index += 1;
+        }
+    }
+
+    None
 }
 
 fn sidebar_item_width(area: Rect) -> usize {
@@ -1342,6 +1376,52 @@ mod tests {
 
         assert!(!text.contains("Ctrl-j/k navigate"));
         assert!(!text.contains("mouse wheel scroll"));
+    }
+
+    #[test]
+    fn sidebar_renders_blank_row_between_workspace_groups() {
+        let mut app = App::default();
+        app.project.workspaces[0].name = "first".to_string();
+        app.project.workspaces[0].chats.clear();
+        app.project.workspaces[0].terminals.clear();
+        app.project.workspaces[1].name = "second".to_string();
+        app.project.workspaces[1].chats.clear();
+        app.project.workspaces[1].terminals.clear();
+
+        let backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    &PtyRuntime::new_offline(),
+                    &config::Config::default(),
+                )
+            })
+            .expect("draw app");
+
+        assert!(buffer_text(terminal.backend(), 0, 0, 34).contains("▣ first"));
+        assert!(buffer_text(terminal.backend(), 0, 1, 34).trim().is_empty());
+        assert!(buffer_text(terminal.backend(), 0, 2, 34).contains("▣ second"));
+    }
+
+    #[test]
+    fn sidebar_selection_skips_workspace_spacers() {
+        let mut app = App::default();
+        let second_workspace = app.project.workspaces[1].id;
+        app.selected = app
+            .nav_items()
+            .iter()
+            .position(|item| *item == NavItem::Workspace(second_workspace))
+            .expect("second workspace exists");
+
+        let item_count = sidebar_items(&app, test_palette(), 33).len();
+
+        assert_eq!(
+            sidebar_selected_index(&app, item_count),
+            Some(app.selected + 1)
+        );
     }
 
     #[test]
