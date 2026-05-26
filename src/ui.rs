@@ -25,6 +25,7 @@ use crate::{
 const CHAT_AGENT_HEADER_LINES: u16 = 0;
 const TERMINAL_HEADER_LINES: u16 = 0;
 const CURSOR_COLOR: Color = Color::Rgb(255, 255, 255);
+const AGENT_FINISHED_COLOR: Color = Color::Rgb(62, 143, 84);
 const SIDEBAR_SELECTION_SYMBOL: &str = " ";
 const WORKSPACE_ICON: &str = "▣ ";
 const GIT_BRANCH_ICON: &str = "";
@@ -1261,7 +1262,7 @@ fn chat_status_style(status: ChatStatus, palette: Palette) -> Style {
         ChatStatus::Thinking => palette.pine,
         ChatStatus::Waiting => palette.gold,
         ChatStatus::Failed => palette.love,
-        ChatStatus::Done => palette.leaf,
+        ChatStatus::Done => AGENT_FINISHED_COLOR,
         ChatStatus::Idle => palette.muted,
     };
 
@@ -1328,7 +1329,7 @@ mod tests {
         );
         assert_eq!(
             chat_status_style(ChatStatus::Done, palette),
-            Style::default().fg(palette.leaf)
+            Style::default().fg(AGENT_FINISHED_COLOR)
         );
         assert_eq!(
             chat_status_style(ChatStatus::Idle, palette),
@@ -1394,7 +1395,7 @@ mod tests {
             .cell((3, 1))
             .expect("selected chat icon is in bounds");
         assert_eq!(icon_cell.symbol(), "●");
-        assert_eq!(icon_cell.fg, palette.leaf);
+        assert_eq!(icon_cell.fg, AGENT_FINISHED_COLOR);
         assert_eq!(icon_cell.bg, palette.highlight_med);
     }
 
