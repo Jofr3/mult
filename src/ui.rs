@@ -25,7 +25,7 @@ use crate::{
 const CHAT_AGENT_HEADER_LINES: u16 = 0;
 const TERMINAL_HEADER_LINES: u16 = 0;
 const CURSOR_COLOR: Color = Color::Rgb(255, 255, 255);
-const AGENT_FINISHED_COLOR: Color = Color::Rgb(62, 143, 84);
+const FINISHED_STATUS_COLOR: Color = Color::Rgb(62, 143, 84);
 const SIDEBAR_SELECTION_SYMBOL: &str = " ";
 const WORKSPACE_ICON: &str = "▣ ";
 const GIT_BRANCH_ICON: &str = "";
@@ -136,7 +136,7 @@ pub fn draw(frame: &mut Frame, app: &App, pty_runtime: &PtyRuntime, config: &con
     let layout = layout_areas(app, frame.area());
     let palette = Palette::from_colorscheme(&config.colorscheme);
 
-    draw_sidebar(frame, app, layout.sidebar, palette);
+    draw_sidebar(frame, app, pty_runtime, layout.sidebar, palette);
     draw_main(frame, app, pty_runtime, layout.main, palette);
     draw_prompt_area(frame, app, layout.prompt, palette, config);
 }
@@ -227,8 +227,14 @@ fn pane_inner(area: Rect) -> Rect {
     area
 }
 
-fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
-    let items = sidebar_items(app, palette, sidebar_item_width(area));
+fn draw_sidebar(
+    frame: &mut Frame,
+    app: &App,
+    pty_runtime: &PtyRuntime,
+    area: Rect,
+    palette: Palette,
+) {
+    let items = sidebar_items(app, pty_runtime, palette, sidebar_item_width(area));
     let selected = sidebar_selected_index(app, items.len());
     let mut state = ListState::default();
     state.select(selected);
@@ -250,7 +256,12 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn sidebar_items(app: &App, palette: Palette, item_width: usize) -> Vec<ListItem<'static>> {
+fn sidebar_items(
+    app: &App,
+    pty_runtime: &PtyRuntime,
+    palette: Palette,
+    item_width: usize,
+) -> Vec<ListItem<'static>> {
     let mut items = Vec::new();
 
     for (workspace_index, workspace) in app.project.workspaces.iter().enumerate() {
@@ -276,8 +287,12 @@ fn sidebar_items(app: &App, palette: Palette, item_width: usize) -> Vec<ListItem
         items.extend(workspace.terminals.iter().map(|terminal| {
             ListItem::new(Line::from(vec![
                 Span::raw("  "),
-                Span::styled("$ ", terminal_status_style(terminal.status, palette)),
-                Span::raw(terminal_name_label(terminal)),
+                Span::styled("$ ", terminal_icon_style(terminal, pty_runtime, palette)),
+                Span::raw(terminal_display_label(
+                    terminal,
+                    pty_runtime,
+                    item_width.saturating_sub(4),
+                )),
             ]))
         }));
     }
@@ -286,7 +301,7 @@ fn sidebar_items(app: &App, palette: Palette, item_width: usize) -> Vec<ListItem
 }
 
 fn sidebar_selected_index(app: &App, item_count: usize) -> Option<usize> {
-    if item_count == 0 {
+    if item_count == 0 || app.nav_len() == 0 {
         return None;
     }
 
@@ -298,11 +313,6 @@ fn sidebar_selected_index(app: &App, item_count: usize) -> Option<usize> {
         if workspace_index > 0 {
             item_index += 1;
         }
-
-        if nav_index == target_nav_index {
-            return Some(item_index.min(item_count - 1));
-        }
-        nav_index += 1;
         item_index += 1;
 
         for _ in &workspace.chats {
@@ -435,18 +445,10 @@ fn truncate_text(value: &str, max_width: usize) -> String {
 
 fn draw_main(frame: &mut Frame, app: &App, pty_runtime: &PtyRuntime, area: Rect, palette: Palette) {
     let selected_item = app.selected_item();
-    let pane_focus = selected_item.and_then(main_pane_focus);
+    let pane_focus = selected_item.map(main_pane_focus);
     let focused = pane_focus.is_some_and(|focus| focus_is_active(app, focus));
 
     match selected_item {
-        Some(NavItem::Workspace(workspace)) => render_lines_pane(
-            frame,
-            area,
-            workspace_details(app, workspace, palette),
-            focused,
-            palette,
-            true,
-        ),
         Some(NavItem::Chat { workspace, chat }) => {
             draw_chat_details(
                 frame,
@@ -470,14 +472,21 @@ fn draw_main(frame: &mut Frame, app: &App, pty_runtime: &PtyRuntime, area: Rect,
             area,
             PaneRenderStyle { focused, palette },
         ),
-        None => render_lines_pane(
-            frame,
-            area,
-            vec![Line::from("No workspaces yet.")],
-            focused,
-            palette,
-            true,
-        ),
+        None => {
+            let message = if app.project.workspaces.is_empty() {
+                "No workspaces yet. Press Ctrl-f to open one."
+            } else {
+                "No chats or terminals. Press Ctrl-a or Ctrl-t to add one."
+            };
+            render_lines_pane(
+                frame,
+                area,
+                vec![Line::from(message)],
+                focused,
+                palette,
+                true,
+            );
+        }
     }
 }
 
@@ -500,11 +509,10 @@ fn render_lines_pane(
     frame.render_widget(paragraph, area);
 }
 
-fn main_pane_focus(item: NavItem) -> Option<FocusMode> {
+fn main_pane_focus(item: NavItem) -> FocusMode {
     match item {
-        NavItem::Chat { .. } => Some(FocusMode::Chat),
-        NavItem::Terminal { .. } => Some(FocusMode::Terminal),
-        NavItem::Workspace(_) => None,
+        NavItem::Chat { .. } => FocusMode::Chat,
+        NavItem::Terminal { .. } => FocusMode::Terminal,
     }
 }
 
@@ -518,80 +526,6 @@ fn pane_style(focused: bool, palette: Palette) -> Style {
     } else {
         Style::default().fg(palette.text).bg(palette.nc)
     }
-}
-
-fn workspace_details(app: &App, workspace_id: WorkspaceId, palette: Palette) -> Vec<Line<'static>> {
-    let Some(workspace) = app.project.workspace(workspace_id) else {
-        return vec![Line::from("Missing workspace.")];
-    };
-
-    let cwd = workspace
-        .cwd
-        .as_ref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "<unset>".to_string());
-
-    let mut lines = vec![
-        Line::from(Span::styled(
-            workspace.name.clone(),
-            Style::default()
-                .fg(palette.foam)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![
-            Span::styled("cwd ", Style::default().fg(palette.muted)),
-            Span::raw(cwd),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(pad_cell("Chats", 42), Style::default().fg(palette.muted)),
-            Span::styled("Terminals", Style::default().fg(palette.muted)),
-        ]),
-    ];
-
-    let rows = workspace.chats.len().max(workspace.terminals.len());
-    if rows == 0 {
-        lines.push(Line::from(
-            "No chats or terminals. Press Ctrl-a or Ctrl-t to add one.",
-        ));
-        return lines;
-    }
-
-    for index in 0..rows {
-        let mut spans = Vec::new();
-        if let Some(chat) = workspace.chats.get(index) {
-            spans.push(Span::styled("● ", chat_status_style(chat.status, palette)));
-            spans.push(Span::raw(pad_cell(&chat.name, 40)));
-        } else {
-            spans.push(Span::raw(pad_cell("", 42)));
-        }
-
-        if let Some(terminal) = workspace.terminals.get(index) {
-            spans.push(Span::styled(
-                "$ ",
-                terminal_status_style(terminal.status, palette),
-            ));
-            spans.push(Span::raw(terminal_name_label(terminal)));
-        }
-
-        lines.push(Line::from(spans));
-    }
-
-    lines
-}
-
-fn pad_cell(value: &str, width: usize) -> String {
-    let value = if value.chars().count() > width {
-        let mut truncated = value
-            .chars()
-            .take(width.saturating_sub(1))
-            .collect::<String>();
-        truncated.push('…');
-        truncated
-    } else {
-        value.to_string()
-    };
-    format!("{value:<width$}")
 }
 
 fn draw_chat_details(
@@ -1239,21 +1173,30 @@ fn draw_text_prompt(
     frame.render_widget(prompt, area);
 }
 
-fn terminal_name_label(terminal: &TerminalSession) -> String {
+fn terminal_display_label(
+    terminal: &TerminalSession,
+    pty_runtime: &PtyRuntime,
+    max_width: usize,
+) -> String {
+    truncate_text(&terminal_command_label(terminal, pty_runtime), max_width)
+}
+
+fn terminal_command_label(terminal: &TerminalSession, pty_runtime: &PtyRuntime) -> String {
     match &terminal.launch {
-        TerminalLaunch::Command(command) if terminal.name.starts_with("cmd: ") => {
-            let command = command.trim();
-            if command.is_empty() {
-                terminal
-                    .name
-                    .strip_prefix("cmd: ")
-                    .unwrap_or(&terminal.name)
-                    .to_string()
-            } else {
-                command.to_string()
-            }
-        }
-        _ => terminal.name.clone(),
+        TerminalLaunch::Command(command) => command_label_or_default(command),
+        TerminalLaunch::Shell => pty_runtime
+            .terminal_last_command(terminal.id)
+            .map(command_label_or_default)
+            .unwrap_or_else(|| "terminal".to_string()),
+    }
+}
+
+fn command_label_or_default(command: &str) -> String {
+    let command = command.trim();
+    if command.is_empty() || command == "clear" {
+        "terminal".to_string()
+    } else {
+        command.to_string()
     }
 }
 
@@ -1262,17 +1205,30 @@ fn chat_status_style(status: ChatStatus, palette: Palette) -> Style {
         ChatStatus::Thinking => palette.pine,
         ChatStatus::Waiting => palette.gold,
         ChatStatus::Failed => palette.love,
-        ChatStatus::Done => AGENT_FINISHED_COLOR,
+        ChatStatus::Done => FINISHED_STATUS_COLOR,
         ChatStatus::Idle => palette.muted,
     };
 
     Style::default().fg(color)
 }
 
-fn terminal_status_style(status: TerminalStatus, palette: Palette) -> Style {
-    let color = match status {
-        TerminalStatus::Running => palette.pine,
-        TerminalStatus::Stopped => palette.muted,
+fn terminal_icon_style(
+    terminal: &TerminalSession,
+    pty_runtime: &PtyRuntime,
+    palette: Palette,
+) -> Style {
+    let color = if pty_runtime.is_running(terminal.id) {
+        palette.pine
+    } else if let Some(exit) = pty_runtime.terminal_exit_status(terminal.id) {
+        if exit.code == 0 && exit.signal.is_none() {
+            FINISHED_STATUS_COLOR
+        } else {
+            palette.love
+        }
+    } else if terminal.status == TerminalStatus::Running {
+        palette.pine
+    } else {
+        palette.muted
     };
 
     Style::default().fg(color)
@@ -1300,15 +1256,67 @@ mod tests {
     }
 
     #[test]
-    fn terminal_name_label_hides_legacy_command_prefix() {
-        let terminal = TerminalSession {
+    fn terminal_display_label_uses_command_or_default_and_truncates() {
+        let pty_runtime = PtyRuntime::new_offline();
+        let command_terminal = TerminalSession {
             id: TerminalId(99),
             name: "cmd: ping".to_string(),
             status: TerminalStatus::Running,
             launch: TerminalLaunch::Command("ping example.com".to_string()),
         };
+        let shell_terminal = TerminalSession {
+            id: TerminalId(100),
+            name: "shell".to_string(),
+            status: TerminalStatus::Stopped,
+            launch: TerminalLaunch::Shell,
+        };
 
-        assert_eq!(terminal_name_label(&terminal), "ping example.com");
+        assert_eq!(
+            terminal_display_label(&command_terminal, &pty_runtime, 80),
+            "ping example.com"
+        );
+        assert_eq!(
+            terminal_display_label(&shell_terminal, &pty_runtime, 80),
+            "terminal"
+        );
+        assert_eq!(
+            terminal_display_label(&command_terminal, &pty_runtime, 8),
+            "ping ex…"
+        );
+
+        let clear_terminal = TerminalSession {
+            id: TerminalId(101),
+            name: "clear".to_string(),
+            status: TerminalStatus::Stopped,
+            launch: TerminalLaunch::Command("clear".to_string()),
+        };
+        assert_eq!(
+            terminal_display_label(&clear_terminal, &pty_runtime, 80),
+            "terminal"
+        );
+    }
+
+    #[test]
+    fn terminal_icon_color_tracks_running_and_default_status() {
+        let palette = test_palette();
+        let pty_runtime = PtyRuntime::new_offline();
+        let mut terminal = TerminalSession {
+            id: TerminalId(99),
+            name: "shell".to_string(),
+            status: TerminalStatus::Stopped,
+            launch: TerminalLaunch::Shell,
+        };
+
+        assert_eq!(
+            terminal_icon_style(&terminal, &pty_runtime, palette),
+            Style::default().fg(palette.muted)
+        );
+
+        terminal.status = TerminalStatus::Running;
+        assert_eq!(
+            terminal_icon_style(&terminal, &pty_runtime, palette),
+            Style::default().fg(palette.pine)
+        );
     }
 
     #[test]
@@ -1329,7 +1337,7 @@ mod tests {
         );
         assert_eq!(
             chat_status_style(ChatStatus::Done, palette),
-            Style::default().fg(AGENT_FINISHED_COLOR)
+            Style::default().fg(FINISHED_STATUS_COLOR)
         );
         assert_eq!(
             chat_status_style(ChatStatus::Idle, palette),
@@ -1395,18 +1403,19 @@ mod tests {
             .cell((3, 1))
             .expect("selected chat icon is in bounds");
         assert_eq!(icon_cell.symbol(), "●");
-        assert_eq!(icon_cell.fg, AGENT_FINISHED_COLOR);
+        assert_eq!(icon_cell.fg, FINISHED_STATUS_COLOR);
         assert_eq!(icon_cell.bg, palette.highlight_med);
     }
 
     #[test]
     fn empty_workspace_hint_matches_current_ctrl_controls() {
         let mut app = App::default();
+        app.project.workspaces.truncate(1);
         app.project.workspaces[0].chats.clear();
         app.project.workspaces[0].terminals.clear();
-        let workspace = app.project.workspaces[0].id;
+        app.selected = 0;
 
-        let text = lines_text(workspace_details(&app, workspace, test_palette()));
+        let text = draw_text(&app, &PtyRuntime::new_offline(), 100, 30);
 
         assert!(text.contains("Press Ctrl-a or Ctrl-t"));
         assert!(!text.contains("Ctrl-c command"));
@@ -1496,21 +1505,26 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_selection_skips_workspace_spacers() {
+    fn sidebar_selection_skips_workspace_headers_and_spacers() {
         let mut app = App::default();
         let second_workspace = app.project.workspaces[1].id;
+        let second_chat = app.project.workspaces[1].chats[0].id;
         app.selected = app
             .nav_items()
             .iter()
-            .position(|item| *item == NavItem::Workspace(second_workspace))
-            .expect("second workspace exists");
+            .position(|item| {
+                *item
+                    == NavItem::Chat {
+                        workspace: second_workspace,
+                        chat: second_chat,
+                    }
+            })
+            .expect("second workspace chat exists");
 
-        let item_count = sidebar_items(&app, test_palette(), 33).len();
+        let pty_runtime = PtyRuntime::new_offline();
+        let item_count = sidebar_items(&app, &pty_runtime, test_palette(), 33).len();
 
-        assert_eq!(
-            sidebar_selected_index(&app, item_count),
-            Some(app.selected + 1)
-        );
+        assert_eq!(sidebar_selected_index(&app, item_count), Some(6));
     }
 
     #[test]
@@ -1737,19 +1751,6 @@ mod tests {
             .draw(|frame| draw(frame, app, pty_runtime, config))
             .expect("draw app");
         format!("{:?}", terminal.backend().buffer())
-    }
-
-    fn lines_text(lines: Vec<Line<'_>>) -> String {
-        lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 
     fn test_palette() -> Palette {

@@ -175,7 +175,6 @@ pub struct ChatBuffer {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavItem {
-    Workspace(WorkspaceId),
     Chat {
         workspace: WorkspaceId,
         chat: ChatId,
@@ -507,7 +506,6 @@ impl App {
         match self.selected_item()? {
             NavItem::Chat { .. } => Some(FocusMode::Chat),
             NavItem::Terminal { .. } => Some(FocusMode::Terminal),
-            NavItem::Workspace(_) => None,
         }
     }
 
@@ -569,7 +567,7 @@ impl App {
             entries.push(CommandPaletteEntry {
                 action: CommandAction::DeleteSelected,
                 label: "Delete selected item",
-                help: "delete the selected workspace, chat, or terminal",
+                help: "delete the selected chat/terminal or an empty workspace",
             });
         }
         if self.active_search.is_some() {
@@ -656,8 +654,6 @@ impl App {
         let mut items = Vec::with_capacity(self.nav_len());
 
         for workspace in &self.project.workspaces {
-            items.push(NavItem::Workspace(workspace.id));
-
             for chat in &workspace.chats {
                 items.push(NavItem::Chat {
                     workspace: workspace.id,
@@ -680,18 +676,13 @@ impl App {
         self.project
             .workspaces
             .iter()
-            .map(|workspace| 1 + workspace.chats.len() + workspace.terminals.len())
+            .map(|workspace| workspace.chats.len() + workspace.terminals.len())
             .sum()
     }
 
     pub fn nav_item_at(&self, target_index: usize) -> Option<NavItem> {
         let mut index = 0;
         for workspace in &self.project.workspaces {
-            if index == target_index {
-                return Some(NavItem::Workspace(workspace.id));
-            }
-            index += 1;
-
             for chat in &workspace.chats {
                 if index == target_index {
                     return Some(NavItem::Chat {
@@ -722,9 +713,9 @@ impl App {
 
     pub fn selected_workspace_id(&self) -> Option<WorkspaceId> {
         match self.selected_item() {
-            Some(NavItem::Workspace(workspace))
-            | Some(NavItem::Chat { workspace, .. })
-            | Some(NavItem::Terminal { workspace, .. }) => Some(workspace),
+            Some(NavItem::Chat { workspace, .. }) | Some(NavItem::Terminal { workspace, .. }) => {
+                Some(workspace)
+            }
             None => self
                 .project
                 .workspaces
@@ -754,7 +745,6 @@ impl App {
         match self.selected_item()? {
             NavItem::Chat { chat, .. } => Some(SearchScope::Chat(chat)),
             NavItem::Terminal { terminal, .. } => Some(SearchScope::Terminal(terminal)),
-            NavItem::Workspace(_) => None,
         }
     }
 
@@ -782,18 +772,14 @@ impl App {
         let mut runtime_terminals = Vec::new();
         match target {
             DeleteTarget::Workspace(workspace_id) => {
-                if let Some(workspace) = self.project.remove_workspace(workspace_id) {
-                    runtime_terminals
-                        .extend(workspace.terminals.iter().map(|terminal| terminal.id));
-                    runtime_terminals.extend(
-                        workspace
-                            .chats
-                            .iter()
-                            .map(|chat| chat_agent_terminal_id(chat.id)),
-                    );
-                    for chat in workspace.chats {
-                        self.chat_buffers.remove(&chat.id);
-                    }
+                let can_remove = self
+                    .project
+                    .workspace(workspace_id)
+                    .is_some_and(|workspace| {
+                        workspace.chats.is_empty() && workspace.terminals.is_empty()
+                    });
+                if can_remove && self.project.remove_workspace(workspace_id).is_some() {
+                    self.workspace_git_branches.remove(&workspace_id);
                     self.dirty = true;
                 }
             }
@@ -803,6 +789,7 @@ impl App {
                     runtime_terminals.push(terminal);
                     self.chat_buffers.remove(&chat);
                     self.dirty = true;
+                    self.remove_workspace_if_empty(workspace);
                 }
             }
             DeleteTarget::Terminal {
@@ -812,6 +799,7 @@ impl App {
                 if self.project.remove_terminal(workspace, terminal).is_some() {
                     runtime_terminals.push(terminal);
                     self.dirty = true;
+                    self.remove_workspace_if_empty(workspace);
                 }
             }
         }
@@ -822,16 +810,39 @@ impl App {
     }
 
     fn selected_delete_target(&self) -> Option<DeleteTarget> {
-        match self.selected_item()? {
-            NavItem::Workspace(workspace) => Some(DeleteTarget::Workspace(workspace)),
-            NavItem::Chat { workspace, chat } => Some(DeleteTarget::Chat { workspace, chat }),
-            NavItem::Terminal {
+        match self.selected_item() {
+            Some(NavItem::Chat { workspace, chat }) => Some(DeleteTarget::Chat { workspace, chat }),
+            Some(NavItem::Terminal {
                 workspace,
                 terminal,
-            } => Some(DeleteTarget::Terminal {
+            }) => Some(DeleteTarget::Terminal {
                 workspace,
                 terminal,
             }),
+            None => self.first_empty_workspace_id().map(DeleteTarget::Workspace),
+        }
+    }
+
+    fn first_empty_workspace_id(&self) -> Option<WorkspaceId> {
+        self.project
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.chats.is_empty() && workspace.terminals.is_empty())
+            .map(|workspace| workspace.id)
+    }
+
+    fn remove_workspace_if_empty(&mut self, workspace_id: WorkspaceId) {
+        let is_empty = self
+            .project
+            .workspace(workspace_id)
+            .is_some_and(|workspace| workspace.chats.is_empty() && workspace.terminals.is_empty());
+        if !is_empty {
+            return;
+        }
+
+        if self.project.remove_workspace(workspace_id).is_some() {
+            self.workspace_git_branches.remove(&workspace_id);
+            self.dirty = true;
         }
     }
 
@@ -857,7 +868,6 @@ impl App {
         match self.selected_item()? {
             NavItem::Chat { chat, .. } => Some(chat_agent_terminal_id(chat)),
             NavItem::Terminal { terminal, .. } => Some(terminal),
-            NavItem::Workspace(_) => None,
         }
     }
 
@@ -1206,8 +1216,9 @@ impl App {
             .iter()
             .find(|workspace| workspace.cwd.as_deref() == Some(cwd.as_path()))
         {
+            let workspace = existing_workspace.id;
             self.prompt = None;
-            self.select_item(NavItem::Workspace(existing_workspace.id));
+            self.select_first_item_in_workspace(workspace);
             return;
         }
 
@@ -1218,7 +1229,7 @@ impl App {
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| workspace_name(&cwd));
         let workspace = self.project.add_workspace(name, Some(cwd));
-        self.project.add_chat(
+        let chat = self.project.add_chat(
             workspace,
             DEFAULT_AGENT_CHAT_TITLE.to_string(),
             ChatStatus::Idle,
@@ -1227,7 +1238,11 @@ impl App {
             .add_terminal(workspace, "shell".to_string(), TerminalStatus::Stopped);
 
         self.prompt = None;
-        self.select_item(NavItem::Workspace(workspace));
+        if let Some(chat) = chat {
+            self.select_item(NavItem::Chat { workspace, chat });
+        } else {
+            self.select_first_item_in_workspace(workspace);
+        }
         self.dirty = true;
     }
 
@@ -1321,14 +1336,43 @@ impl App {
         self.normalize_focus();
     }
 
+    fn select_first_item_in_workspace(&mut self, workspace_id: WorkspaceId) -> bool {
+        let Some(workspace) = self.project.workspace(workspace_id) else {
+            self.clamp_selection();
+            self.normalize_focus();
+            return false;
+        };
+
+        let target = workspace
+            .chats
+            .first()
+            .map(|chat| NavItem::Chat {
+                workspace: workspace_id,
+                chat: chat.id,
+            })
+            .or_else(|| {
+                workspace
+                    .terminals
+                    .first()
+                    .map(|terminal| NavItem::Terminal {
+                        workspace: workspace_id,
+                        terminal: terminal.id,
+                    })
+            });
+
+        if let Some(target) = target {
+            self.select_item(target);
+            true
+        } else {
+            self.clamp_selection();
+            self.normalize_focus();
+            false
+        }
+    }
+
     fn nav_item_position(&self, target: NavItem) -> Option<usize> {
         let mut index = 0;
         for workspace in &self.project.workspaces {
-            if NavItem::Workspace(workspace.id) == target {
-                return Some(index);
-            }
-            index += 1;
-
             for chat in &workspace.chats {
                 if (NavItem::Chat {
                     workspace: workspace.id,
@@ -1856,23 +1900,51 @@ mod tests {
     }
 
     #[test]
-    fn delete_selected_workspace_removes_nested_runtime_ids() {
+    fn workspaces_are_not_selectable_nav_items() {
+        let app = App::default();
+        let first_workspace = app.project.workspaces[0].id;
+        let first_chat = app.project.workspaces[0].chats[0].id;
+
+        assert_eq!(app.nav_len(), 5);
+        assert_eq!(
+            app.nav_items().first().copied(),
+            Some(NavItem::Chat {
+                workspace: first_workspace,
+                chat: first_chat,
+            })
+        );
+        assert_eq!(app.selected_item(), app.nav_items().first().copied());
+    }
+
+    #[test]
+    fn deleting_last_workspace_item_closes_workspace() {
         let mut app = App::default();
+        app.project.workspaces.truncate(1);
+        app.project.workspaces[0].terminals.clear();
+        app.project.workspaces[0].chats.truncate(1);
         let workspace = app.project.workspaces[0].id;
-        let terminal = app.project.workspaces[0].terminals[0].id;
-        let chats = app.project.workspaces[0]
-            .chats
-            .iter()
-            .map(|chat| chat.id)
-            .collect::<Vec<_>>();
-        app.select_item(NavItem::Workspace(workspace));
+        let chat = app.project.workspaces[0].chats[0].id;
+        app.select_item(NavItem::Chat { workspace, chat });
 
         let runtime_terminals = app.delete_selected_immediately();
 
-        assert!(runtime_terminals.contains(&terminal));
-        for chat in chats {
-            assert!(runtime_terminals.contains(&chat_agent_terminal_id(chat)));
-        }
+        assert_eq!(runtime_terminals, vec![chat_agent_terminal_id(chat)]);
+        assert!(app.project.workspace(workspace).is_none());
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn empty_workspace_can_be_closed_without_selecting_workspace() {
+        let mut app = App::default();
+        app.project.workspaces.truncate(1);
+        app.project.workspaces[0].chats.clear();
+        app.project.workspaces[0].terminals.clear();
+        let workspace = app.project.workspaces[0].id;
+        app.clamp_selection();
+
+        let runtime_terminals = app.delete_selected_immediately();
+
+        assert!(runtime_terminals.is_empty());
         assert!(app.project.workspace(workspace).is_none());
         assert!(app.is_dirty());
     }
@@ -1892,8 +1964,10 @@ mod tests {
     }
 
     #[test]
-    fn non_terminal_selection_is_not_a_terminal_input_target() {
+    fn empty_selection_is_not_a_terminal_input_target() {
         let mut app = App::default();
+        app.project.workspaces.clear();
+        app.clamp_selection();
 
         assert!(!app.begin_terminal_input());
         assert_eq!(app.pty_input_target(), None);
@@ -2030,9 +2104,15 @@ mod tests {
         assert_eq!(imported.cwd.as_deref(), Some(path.as_path()));
         assert_eq!(imported.chats.len(), 1);
         assert_eq!(imported.terminals.len(), 1);
-        assert_eq!(app.selected_item(), Some(NavItem::Workspace(imported.id)));
+        assert_eq!(
+            app.selected_item(),
+            Some(NavItem::Chat {
+                workspace: imported.id,
+                chat: imported.chats[0].id,
+            })
+        );
         assert_eq!(app.prompt, None);
-        assert_eq!(app.focus, FocusMode::Sidebar);
+        assert_eq!(app.focus, FocusMode::Chat);
         assert!(app.is_dirty());
     }
 
@@ -2066,7 +2146,13 @@ mod tests {
         let imported = app.project.workspaces.last().unwrap();
         assert_eq!(imported.name, "mult");
         assert_eq!(imported.cwd.as_deref(), Some(selected_path.as_path()));
-        assert_eq!(app.selected_item(), Some(NavItem::Workspace(imported.id)));
+        assert_eq!(
+            app.selected_item(),
+            Some(NavItem::Chat {
+                workspace: imported.id,
+                chat: imported.chats[0].id,
+            })
+        );
         assert_eq!(app.prompt, None);
         assert!(app.is_dirty());
     }

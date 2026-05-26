@@ -11,7 +11,7 @@
 - PTYs are managed in-memory with `portable-pty`, visible-pane resizing, in-memory scrollback, shell terminals, and command/dev-server terminals.
 - Selected chat panes can run an embedded `pi` process through a PTY. Config is loaded from `$XDG_CONFIG_HOME/mult/config.json` or `~/.config/mult/config.json`.
 - The default UI palette is Rosé Pine Moon, with per-color `colorscheme` config overrides.
-- Workspace/chat/terminal deletion uses `Ctrl-Q` and stops related running PTYs.
+- Chat/terminal deletion uses `Ctrl-Q` and stops related running PTYs; workspace headers are labels and empty workspaces close after their last item is removed.
 - The UI is always in input mode: ordinary keys go to the selected terminal or pi-agent PTY, while workspace actions use Ctrl chords.
 - Selection drives the active pane highlight; the inactive pane uses a darker background.
 - `Ctrl-J`/`Ctrl-K` navigate the sidebar selection, `Ctrl-A`/`Ctrl-T` create agent/shell sessions, `Ctrl-F` imports workspaces, and `Ctrl-Esc` quits.
@@ -23,7 +23,7 @@
 - **Chat/session**: an agent conversation attached to a workspace. Shows status such as idle, thinking, waiting for input, failed, or done. Current operational path is an embedded pi PTY; the adapter trait remains groundwork for future backends.
 - **Terminal**: a PTY attached to a workspace. Used for dev servers, test runs, shells, logs, and commands not controlled by an agent.
 - **Sidebar**: tree of open workspaces, with nested chats and terminals plus live status indicators.
-- **Main pane**: selected chat transcript/pi PTY, terminal screen, or workspace overview.
+- **Main pane**: selected chat transcript/pi PTY or terminal screen.
 - **Future panes**: command palette, diff/patch preview, and background job monitor.
 
 ## Milestones
@@ -74,7 +74,7 @@ Completed in this milestone:
 
 - [x] Render a pi agent directly in selected chat panes via PTY.
 - [x] Load user config from `~/.config/mult/config.json`, including colorscheme overrides.
-- [x] Delete workspaces, agent chats, and terminals with `Ctrl-Q`.
+- [x] Delete agent chats and terminals with `Ctrl-Q`; close empty workspaces after their items are gone.
 - [x] Add active pane highlighting without changing PTY backend behavior.
 - [x] Use borderless panes with darker backgrounds for inactive panes.
 - [x] Use Ctrl-based workspace actions so ordinary keys can always go to PTY input.

@@ -70,6 +70,8 @@ pub struct PtyRuntime {
     parsers: HashMap<TerminalId, Parser>,
     responders: HashMap<TerminalId, TerminalResponseDetector>,
     terminals_with_output: HashSet<TerminalId>,
+    terminal_exit_statuses: HashMap<TerminalId, PtyExit>,
+    command_trackers: HashMap<TerminalId, TerminalCommandTracker>,
     pending_events: Vec<PtyEvent>,
 }
 
@@ -89,6 +91,21 @@ struct ServerConnection {
 #[derive(Debug, Default)]
 struct TerminalResponseDetector {
     state: TerminalResponseState,
+}
+
+#[derive(Debug, Default)]
+struct TerminalCommandTracker {
+    input: String,
+    last: Option<String>,
+    state: TerminalInputTrackState,
+}
+
+#[derive(Debug, Default)]
+enum TerminalInputTrackState {
+    #[default]
+    Ground,
+    Escape,
+    Csi,
 }
 
 #[derive(Debug, Default)]
@@ -147,6 +164,8 @@ impl PtyRuntime {
             parsers: HashMap::new(),
             responders: HashMap::new(),
             terminals_with_output: HashSet::new(),
+            terminal_exit_statuses: HashMap::new(),
+            command_trackers: HashMap::new(),
             pending_events,
         }
     }
@@ -200,6 +219,16 @@ impl PtyRuntime {
         self.parsers.get(&terminal)
     }
 
+    pub fn terminal_exit_status(&self, terminal: TerminalId) -> Option<&PtyExit> {
+        self.terminal_exit_statuses.get(&terminal)
+    }
+
+    pub fn terminal_last_command(&self, terminal: TerminalId) -> Option<&str> {
+        self.command_trackers
+            .get(&terminal)
+            .and_then(TerminalCommandTracker::last_command)
+    }
+
     pub fn ensure_parser(&mut self, terminal: TerminalId, size: PtyDimensions) {
         self.parsers.entry(terminal).or_insert_with(|| {
             Parser::new(
@@ -222,6 +251,7 @@ impl PtyRuntime {
         );
         self.responders.remove(&terminal);
         self.terminals_with_output.remove(&terminal);
+        self.terminal_exit_statuses.remove(&terminal);
     }
 
     pub fn remove_terminal(&mut self, terminal: TerminalId) {
@@ -231,6 +261,8 @@ impl PtyRuntime {
         self.parsers.remove(&terminal);
         self.responders.remove(&terminal);
         self.terminals_with_output.remove(&terminal);
+        self.terminal_exit_statuses.remove(&terminal);
+        self.command_trackers.remove(&terminal);
     }
 
     pub fn process_terminal_output(&mut self, terminal: TerminalId, bytes: &[u8]) {
@@ -262,8 +294,10 @@ impl PtyRuntime {
         };
 
         self.terminals_with_output.insert(terminal);
-        for response in responses {
-            let _ = self.send_input(terminal, &response);
+        if let Some(pane) = self.terminal_to_pane.get(&terminal).copied() {
+            for response in responses {
+                let _ = self.send_input_inner(terminal, pane, &response, false);
+            }
         }
     }
 
@@ -307,6 +341,7 @@ impl PtyRuntime {
 
         self.ensure_connected()?;
         self.reset_parser(spawn.terminal, spawn.size);
+        self.command_trackers.remove(&spawn.terminal);
         let session = session_for_terminal(spawn.terminal);
         let pane = pane_for_terminal(spawn.terminal);
         let launch = launch_spec(&spawn);
@@ -347,6 +382,7 @@ impl PtyRuntime {
         self.send(ClientMessage::Stop { pane })?;
         self.terminal_to_pane.remove(&terminal);
         self.pane_to_terminal.remove(&pane);
+        self.terminal_exit_statuses.remove(&terminal);
         Ok(true)
     }
 
@@ -354,16 +390,37 @@ impl PtyRuntime {
         let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
             return Ok(false);
         };
+        self.send_input_inner(terminal, pane, input, true)?;
+        Ok(true)
+    }
+
+    fn send_input_inner(
+        &mut self,
+        terminal: TerminalId,
+        pane: PaneId,
+        input: &[u8],
+        track_command: bool,
+    ) -> io::Result<()> {
         if !input.is_empty() {
+            let alternate_screen = self
+                .parsers
+                .get(&terminal)
+                .is_some_and(|parser| parser.screen().alternate_screen());
             if let Some(parser) = self.parsers.get_mut(&terminal) {
                 parser.set_scrollback(0);
+            }
+            if track_command && !alternate_screen {
+                self.command_trackers
+                    .entry(terminal)
+                    .or_default()
+                    .record_input(input);
             }
         }
         self.send(ClientMessage::Input {
             pane,
             bytes: input.to_vec(),
         })?;
-        Ok(true)
+        Ok(())
     }
 
     pub fn send_paste(&mut self, terminal: TerminalId, text: &str) -> io::Result<bool> {
@@ -489,13 +546,12 @@ impl PtyRuntime {
             ServerMessage::PaneExited { pane, exit } => {
                 if let Some(terminal) = self.pane_to_terminal.remove(&pane) {
                     self.terminal_to_pane.remove(&terminal);
-                    events.push(PtyEvent::Exited {
-                        terminal,
-                        status: PtyExit {
-                            code: exit.code,
-                            signal: exit.signal,
-                        },
-                    });
+                    let status = PtyExit {
+                        code: exit.code,
+                        signal: exit.signal,
+                    };
+                    self.terminal_exit_statuses.insert(terminal, status.clone());
+                    events.push(PtyEvent::Exited { terminal, status });
                 }
             }
             ServerMessage::Error { message } => {
@@ -645,6 +701,59 @@ fn terminal_paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     bytes.extend_from_slice(text.as_bytes());
     bytes.extend_from_slice(BRACKETED_PASTE_END);
     bytes
+}
+
+impl TerminalCommandTracker {
+    fn record_input(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            let state = std::mem::take(&mut self.state);
+            self.state = match state {
+                TerminalInputTrackState::Ground => match *byte {
+                    b'\r' | b'\n' => {
+                        self.commit_input();
+                        TerminalInputTrackState::Ground
+                    }
+                    0x03 | 0x15 => {
+                        self.input.clear();
+                        TerminalInputTrackState::Ground
+                    }
+                    0x08 | 0x7f => {
+                        self.input.pop();
+                        TerminalInputTrackState::Ground
+                    }
+                    0x1b => TerminalInputTrackState::Escape,
+                    0x20..=0x7e => {
+                        self.input.push(*byte as char);
+                        TerminalInputTrackState::Ground
+                    }
+                    _ => TerminalInputTrackState::Ground,
+                },
+                TerminalInputTrackState::Escape => match *byte {
+                    b'[' => TerminalInputTrackState::Csi,
+                    _ => TerminalInputTrackState::Ground,
+                },
+                TerminalInputTrackState::Csi => {
+                    if (0x40..=0x7e).contains(byte) {
+                        TerminalInputTrackState::Ground
+                    } else {
+                        TerminalInputTrackState::Csi
+                    }
+                }
+            };
+        }
+    }
+
+    fn last_command(&self) -> Option<&str> {
+        self.last.as_deref()
+    }
+
+    fn commit_input(&mut self) {
+        let command = self.input.trim();
+        if !command.is_empty() {
+            self.last = Some(command.to_string());
+        }
+        self.input.clear();
+    }
 }
 
 impl TerminalResponseDetector {
@@ -1033,6 +1142,8 @@ mod tests {
             parsers: HashMap::new(),
             responders: HashMap::new(),
             terminals_with_output: HashSet::new(),
+            terminal_exit_statuses: HashMap::new(),
+            command_trackers: HashMap::new(),
             pending_events: Vec::new(),
         };
         runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
@@ -1181,6 +1292,8 @@ mod tests {
             parsers: HashMap::new(),
             responders: HashMap::new(),
             terminals_with_output: HashSet::new(),
+            terminal_exit_statuses: HashMap::new(),
+            command_trackers: HashMap::new(),
             pending_events: Vec::new(),
         };
 
@@ -1223,6 +1336,55 @@ mod tests {
         );
         assert!(!runtime.is_running(terminal));
         assert!(!runtime.pane_to_terminal.contains_key(&pane));
+        assert_eq!(
+            runtime.terminal_exit_status(terminal),
+            Some(&PtyExit {
+                code: 3,
+                signal: None,
+            })
+        );
+    }
+
+    #[test]
+    fn terminal_last_command_tracks_submitted_input() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let terminal = TerminalId(9);
+        let pane = PaneId(9);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+
+        assert!(runtime
+            .send_input(terminal, b"cargo test")
+            .expect("send command"));
+        let _: ClientMessage = read_message(&mut server_stream).expect("read command input");
+        assert_eq!(runtime.terminal_last_command(terminal), None);
+
+        assert!(runtime.send_input(terminal, b"\r").expect("send enter"));
+        let _: ClientMessage = read_message(&mut server_stream).expect("read enter input");
+
+        assert_eq!(runtime.terminal_last_command(terminal), Some("cargo test"));
+    }
+
+    #[test]
+    fn terminal_last_command_ignores_fullscreen_app_input() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let terminal = TerminalId(9);
+        let pane = PaneId(9);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
+
+        assert!(runtime.send_input(terminal, b"nvim\r").expect("send nvim"));
+        let _: ClientMessage = read_message(&mut server_stream).expect("read nvim input");
+        assert_eq!(runtime.terminal_last_command(terminal), Some("nvim"));
+
+        runtime.process_terminal_output(terminal, b"\x1b[?1049h");
+        assert!(runtime
+            .send_input(terminal, b"asdasdq\r")
+            .expect("send editor input"));
+        let _: ClientMessage = read_message(&mut server_stream).expect("read editor input");
+
+        assert_eq!(runtime.terminal_last_command(terminal), Some("nvim"));
     }
 
     #[test]
@@ -1351,6 +1513,8 @@ mod tests {
             parsers: HashMap::new(),
             responders: HashMap::new(),
             terminals_with_output: HashSet::new(),
+            terminal_exit_statuses: HashMap::new(),
+            command_trackers: HashMap::new(),
             pending_events: Vec::new(),
         }
     }

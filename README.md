@@ -63,7 +63,7 @@ mult is always in input mode: ordinary keys go to the selected terminal or agent
 
 - `Ctrl-J`: navigate down
 - `Ctrl-K`: navigate up
-- `Ctrl-Q`: delete the selected workspace, agent chat, terminal, or command terminal immediately
+- `Ctrl-Q`: delete the selected agent chat, terminal, or command terminal immediately; closing the last item under a workspace closes the workspace too
 - `Ctrl-Esc`: quit mult
 - `Ctrl-A`: add an agent chat to the selected workspace and start/focus its pi agent
 - `Ctrl-T`: add a shell terminal to the selected workspace
@@ -78,7 +78,7 @@ When the open/import or command prompt is active:
 - Enter: submit it
 - Esc or Ctrl-C: cancel
 
-Deleting a workspace also deletes its agent chats and terminals; deleting a chat or terminal stops its running PTY if needed.
+Workspace headers are labels, not selectable panes. Deleting a chat or terminal stops its running PTY if needed, and deleting the last item under a workspace closes that workspace too.
 
 The selected chat/terminal pane receives keyboard input directly. If its PTY is not running, typing into it starts the PTY first. Mouse wheel scrolling works over the pane under the cursor. Running PTYs are sized from the visible pane instead of a fixed 80x24 size. Chat panes run `pi` by default; set `pi_agent_command` in the config file to override it.
 

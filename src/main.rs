@@ -711,7 +711,6 @@ fn start_selected_pty_if_needed(
                 None
             }
         }
-        NavItem::Workspace(_) => None,
     }
 }
 
