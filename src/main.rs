@@ -1,5 +1,7 @@
 use std::{
+    fs,
     io::{self, Write},
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -26,6 +28,7 @@ use mult::{
     storage, ui,
 };
 use ratatui::{layout::Rect, DefaultTerminal};
+use serde::Deserialize;
 
 fn main() -> io::Result<()> {
     let project = storage::load_or_default()?;
@@ -60,10 +63,19 @@ fn disable_terminal_features(mouse_capture: bool) -> io::Result<()> {
 }
 
 const AGENT_CMD_ENV: &str = "MULT_AGENT_CMD";
+const MULT_AGENT_STATUS_PATH_ENV: &str = "MULT_AGENT_STATUS_PATH";
+const MULT_AGENT_CHAT_ID_ENV: &str = "MULT_AGENT_CHAT_ID";
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const READY_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(0);
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const MOUSE_SCROLL_ROWS: usize = 3;
+
+#[derive(Debug, Deserialize)]
+struct MultAgentStatusRecord {
+    status: String,
+}
+
+const MULT_STATUS_EXTENSION_SOURCE: &str = include_str!("../extensions/mult-status.ts");
 
 enum RuntimeAgentBackend {
     Noop(NoopAgentBackend),
@@ -123,6 +135,7 @@ fn run(terminal: &mut DefaultTerminal, mut app: App, config: Config) -> io::Resu
         }
         drain_pty_events(&mut app, &mut pty_runtime);
         drain_agent_events(&mut app, &mut agent_backend);
+        drain_mult_agent_status_events(&mut app);
         save_if_dirty(&mut app)?;
         resize_visible_terminal(&mut app, &mut pty_runtime, &config, frame_area);
         resize_visible_chat_agent(&mut app, &mut pty_runtime, &config, frame_area);
@@ -931,19 +944,27 @@ fn start_or_focus_chat_agent(
         .find(|chat| chat.id == chat_id)
         .map(|chat| chat.name.clone())
         .unwrap_or_else(|| format!("chat {}", chat_id.0));
-    let command = pi_command(config);
+    let command = pi_command_with_mult_status_extension(config);
+    let status_path = mult_agent_status_path(chat_id);
+    let _ = fs::remove_file(&status_path);
+    let mut environment = workspace.environment.clone();
+    environment.insert(
+        MULT_AGENT_STATUS_PATH_ENV.to_string(),
+        status_path.display().to_string(),
+    );
+    environment.insert(MULT_AGENT_CHAT_ID_ENV.to_string(), chat_id.0.to_string());
     let mut spawn = PtySpawn::command_line(
         terminal_id,
         command.clone(),
         workspace.cwd.clone(),
-        workspace.environment.clone(),
+        environment,
     );
     spawn.size =
         selected_chat_agent_dimensions(app, config, frame_area, chat_id).unwrap_or_default();
 
     match pty_runtime.start(spawn) {
         Ok(()) => {
-            app.mark_chat_status_by_id(chat_id, ChatStatus::Thinking);
+            app.mark_chat_status_by_id(chat_id, ChatStatus::Idle);
             if focus_after_start {
                 app.begin_chat_agent_input();
             }
@@ -1014,6 +1035,39 @@ fn pi_command(config: &Config) -> String {
     } else {
         command.to_string()
     }
+}
+
+fn pi_command_with_mult_status_extension(config: &Config) -> String {
+    let command = pi_command(config);
+    let Some(extension) = write_mult_status_extension_file() else {
+        return command;
+    };
+
+    format!(
+        "{command} -e {}",
+        shell_quote(&extension.display().to_string())
+    )
+}
+
+fn write_mult_status_extension_file() -> Option<PathBuf> {
+    let path =
+        std::env::temp_dir().join(format!("mult-status-extension-{}.ts", std::process::id()));
+    fs::write(&path, MULT_STATUS_EXTENSION_SOURCE).ok()?;
+    Some(path)
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '+'))
+    {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn focus_selected_input(
@@ -1210,6 +1264,46 @@ fn drain_agent_events(app: &mut App, backend: &mut impl AgentBackend) {
     }
 }
 
+fn drain_mult_agent_status_events(app: &mut App) {
+    let chats = app
+        .project
+        .workspaces
+        .iter()
+        .flat_map(|workspace| workspace.chats.iter().map(|chat| chat.id))
+        .collect::<Vec<_>>();
+
+    for chat in chats {
+        if let Some(status) = read_mult_agent_status(&mult_agent_status_path(chat)) {
+            app.mark_chat_status_by_id(chat, status);
+        }
+    }
+}
+
+fn read_mult_agent_status(path: &Path) -> Option<ChatStatus> {
+    let contents = fs::read_to_string(path).ok()?;
+    let record = serde_json::from_str::<MultAgentStatusRecord>(&contents).ok()?;
+    mult_agent_status_to_chat_status(&record.status)
+}
+
+fn mult_agent_status_to_chat_status(status: &str) -> Option<ChatStatus> {
+    match status {
+        "idle" => Some(ChatStatus::Idle),
+        "running" => Some(ChatStatus::Thinking),
+        "waiting" => Some(ChatStatus::Waiting),
+        "error" => Some(ChatStatus::Failed),
+        "finished" => Some(ChatStatus::Done),
+        _ => None,
+    }
+}
+
+fn mult_agent_status_path(chat: model::ChatId) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "mult-agent-status-{}-{}.json",
+        std::process::id(),
+        chat.0
+    ))
+}
+
 fn save_if_dirty(app: &mut App) -> io::Result<()> {
     if app.is_dirty() {
         storage::save(&app.project)?;
@@ -1262,6 +1356,43 @@ mod tests {
             }),
             "pi"
         );
+    }
+
+    #[test]
+    fn pi_command_appends_mult_status_extension_when_available() {
+        let command = pi_command_with_mult_status_extension(&Config {
+            pi_agent_command: "pi --model test".to_string(),
+            auto_start_pi_agent: false,
+            auto_start_terminals: false,
+            mouse_capture: false,
+            projects: Vec::new(),
+            colorscheme: Default::default(),
+        });
+
+        assert!(command.starts_with("pi --model test"));
+        assert!(command.contains(" -e "));
+        assert!(command.contains("mult-status-extension-"));
+    }
+
+    #[test]
+    fn shell_quote_handles_paths_with_spaces() {
+        assert_eq!(shell_quote("/tmp/no-spaces.ts"), "/tmp/no-spaces.ts");
+        assert_eq!(shell_quote("/tmp/has space.ts"), "'/tmp/has space.ts'");
+        assert_eq!(shell_quote("/tmp/it's.ts"), "'/tmp/it'\\''s.ts'");
+    }
+
+    #[test]
+    fn mult_agent_status_file_updates_chat_status() {
+        let mut app = App::default();
+        let chat = app.project.workspaces[0].chats[0].id;
+        let path = mult_agent_status_path(chat);
+        let _ = fs::remove_file(&path);
+        fs::write(&path, r#"{"version":1,"status":"finished"}"#).expect("write status file");
+
+        drain_mult_agent_status_events(&mut app);
+
+        assert_eq!(app.project.workspaces[0].chats[0].status, ChatStatus::Done);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

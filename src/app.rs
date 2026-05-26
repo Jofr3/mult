@@ -205,6 +205,7 @@ impl App {
     pub fn new(mut project: ProjectState) -> Self {
         let ids_normalized = project.normalize_next_ids();
         let titles_normalized = normalize_agent_chat_titles(&mut project);
+        let chat_statuses_normalized = normalize_transient_chat_statuses(&mut project);
         let chat_buffers = project
             .workspaces
             .iter()
@@ -222,7 +223,7 @@ impl App {
             active_search: None,
             text_selection: None,
             should_quit: false,
-            dirty: ids_normalized || titles_normalized,
+            dirty: ids_normalized || titles_normalized || chat_statuses_normalized,
         };
         app.clamp_selection();
         app.sync_focus_to_selection();
@@ -1603,6 +1604,22 @@ fn normalize_agent_chat_titles(project: &mut ProjectState) -> bool {
     changed
 }
 
+fn normalize_transient_chat_statuses(project: &mut ProjectState) -> bool {
+    let mut changed = false;
+    for chat in project
+        .workspaces
+        .iter_mut()
+        .flat_map(|workspace| workspace.chats.iter_mut())
+    {
+        if matches!(chat.status, ChatStatus::Thinking | ChatStatus::Waiting) {
+            chat.status = ChatStatus::Idle;
+            changed = true;
+        }
+    }
+
+    changed
+}
+
 fn command_terminal_name(command: &str, next: usize) -> String {
     let command = command.trim();
     if command.is_empty() {
@@ -1653,6 +1670,21 @@ mod tests {
             app.project.workspaces[0].chats[0].name,
             DEFAULT_AGENT_CHAT_TITLE
         );
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn app_normalizes_transient_chat_statuses_on_load() {
+        let mut state = ProjectState::default();
+        state.workspaces[0].chats[0].status = ChatStatus::Thinking;
+        state.workspaces[0].chats[1].status = ChatStatus::Waiting;
+        state.workspaces[1].chats[0].status = ChatStatus::Done;
+
+        let app = App::new(state);
+
+        assert_eq!(app.project.workspaces[0].chats[0].status, ChatStatus::Idle);
+        assert_eq!(app.project.workspaces[0].chats[1].status, ChatStatus::Idle);
+        assert_eq!(app.project.workspaces[1].chats[0].status, ChatStatus::Done);
         assert!(app.is_dirty());
     }
 

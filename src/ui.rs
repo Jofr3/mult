@@ -241,7 +241,6 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
         .highlight_style(
             Style::default()
                 .bg(palette.highlight_med)
-                .fg(palette.text)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(SIDEBAR_SELECTION_SYMBOL)
@@ -1259,10 +1258,11 @@ fn terminal_name_label(terminal: &TerminalSession) -> String {
 
 fn chat_status_style(status: ChatStatus, palette: Palette) -> Style {
     let color = match status {
-        ChatStatus::Failed => palette.love,
-        ChatStatus::Waiting => palette.gold,
         ChatStatus::Thinking => palette.pine,
-        ChatStatus::Idle | ChatStatus::Done => palette.muted,
+        ChatStatus::Waiting => palette.gold,
+        ChatStatus::Failed => palette.love,
+        ChatStatus::Done => palette.leaf,
+        ChatStatus::Idle => palette.muted,
     };
 
     Style::default().fg(color)
@@ -1308,6 +1308,94 @@ mod tests {
         };
 
         assert_eq!(terminal_name_label(&terminal), "ping example.com");
+    }
+
+    #[test]
+    fn agent_icon_color_tracks_chat_status() {
+        let palette = test_palette();
+
+        assert_eq!(
+            chat_status_style(ChatStatus::Thinking, palette),
+            Style::default().fg(palette.pine)
+        );
+        assert_eq!(
+            chat_status_style(ChatStatus::Waiting, palette),
+            Style::default().fg(palette.gold)
+        );
+        assert_eq!(
+            chat_status_style(ChatStatus::Failed, palette),
+            Style::default().fg(palette.love)
+        );
+        assert_eq!(
+            chat_status_style(ChatStatus::Done, palette),
+            Style::default().fg(palette.leaf)
+        );
+        assert_eq!(
+            chat_status_style(ChatStatus::Idle, palette),
+            Style::default().fg(palette.muted)
+        );
+    }
+
+    #[test]
+    fn default_sidebar_agent_icon_is_gray() {
+        let app = App::default();
+        let backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    &PtyRuntime::new_offline(),
+                    &config::Config::default(),
+                )
+            })
+            .expect("draw app");
+
+        let palette = test_palette();
+        let icon_cell = terminal
+            .backend()
+            .buffer()
+            .cell((3, 1))
+            .expect("chat icon is in bounds");
+        assert_eq!(icon_cell.symbol(), "●");
+        assert_eq!(icon_cell.fg, palette.muted);
+    }
+
+    #[test]
+    fn selected_sidebar_agent_icon_keeps_status_color() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        let chat = app.project.workspaces[0].chats[0].id;
+        app.project.workspaces[0].chats[0].status = ChatStatus::Done;
+        app.selected = app
+            .nav_items()
+            .iter()
+            .position(|item| *item == NavItem::Chat { workspace, chat })
+            .expect("chat exists");
+
+        let backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    &PtyRuntime::new_offline(),
+                    &config::Config::default(),
+                )
+            })
+            .expect("draw app");
+
+        let palette = test_palette();
+        let icon_cell = terminal
+            .backend()
+            .buffer()
+            .cell((3, 1))
+            .expect("selected chat icon is in bounds");
+        assert_eq!(icon_cell.symbol(), "●");
+        assert_eq!(icon_cell.fg, palette.leaf);
+        assert_eq!(icon_cell.bg, palette.highlight_med);
     }
 
     #[test]

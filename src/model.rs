@@ -105,11 +105,7 @@ impl Default for ProjectState {
         };
 
         let mult = state.add_workspace("mult".to_string(), std::env::current_dir().ok());
-        state.add_chat(
-            mult,
-            DEFAULT_AGENT_CHAT_TITLE.to_string(),
-            ChatStatus::Thinking,
-        );
+        state.add_chat(mult, DEFAULT_AGENT_CHAT_TITLE.to_string(), ChatStatus::Idle);
         state.add_chat(mult, DEFAULT_AGENT_CHAT_TITLE.to_string(), ChatStatus::Idle);
         state.add_terminal(mult, "dev server".to_string(), TerminalStatus::Stopped);
 
@@ -117,7 +113,7 @@ impl Default for ProjectState {
         state.add_chat(
             website,
             DEFAULT_AGENT_CHAT_TITLE.to_string(),
-            ChatStatus::Waiting,
+            ChatStatus::Idle,
         );
         state.add_terminal(website, "shell".to_string(), TerminalStatus::Stopped);
 
