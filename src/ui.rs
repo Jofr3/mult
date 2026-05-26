@@ -277,17 +277,22 @@ fn sidebar_items(
         )));
 
         items.extend(workspace.chats.iter().map(|chat| {
+            let focused = chat_sidebar_item_is_focused(app, workspace.id, chat.id);
             ListItem::new(Line::from(vec![
                 Span::raw("  "),
-                Span::styled("● ", chat_status_style(chat.status, palette)),
+                Span::styled("● ", chat_status_style(chat.status, focused, palette)),
                 Span::raw(chat.name.clone()),
             ]))
         }));
 
         items.extend(workspace.terminals.iter().map(|terminal| {
+            let focused = terminal_sidebar_item_is_focused(app, workspace.id, terminal.id);
             ListItem::new(Line::from(vec![
                 Span::raw("  "),
-                Span::styled("$ ", terminal_icon_style(terminal, pty_runtime, palette)),
+                Span::styled(
+                    "$ ",
+                    terminal_icon_style(terminal, pty_runtime, focused, palette),
+                ),
                 Span::raw(terminal_display_label(
                     terminal,
                     pty_runtime,
@@ -298,6 +303,24 @@ fn sidebar_items(
     }
 
     items
+}
+
+fn chat_sidebar_item_is_focused(app: &App, workspace: WorkspaceId, chat: ChatId) -> bool {
+    focus_is_active(app, FocusMode::Chat)
+        && app.selected_item() == Some(NavItem::Chat { workspace, chat })
+}
+
+fn terminal_sidebar_item_is_focused(
+    app: &App,
+    workspace: WorkspaceId,
+    terminal: TerminalId,
+) -> bool {
+    focus_is_active(app, FocusMode::Terminal)
+        && app.selected_item()
+            == Some(NavItem::Terminal {
+                workspace,
+                terminal,
+            })
 }
 
 fn sidebar_selected_index(app: &App, item_count: usize) -> Option<usize> {
@@ -1200,13 +1223,12 @@ fn command_label_or_default(command: &str) -> String {
     }
 }
 
-fn chat_status_style(status: ChatStatus, palette: Palette) -> Style {
+fn chat_status_style(status: ChatStatus, focused: bool, palette: Palette) -> Style {
     let color = match status {
-        ChatStatus::Thinking => palette.pine,
-        ChatStatus::Waiting => palette.gold,
+        ChatStatus::Thinking | ChatStatus::Waiting => palette.pine,
         ChatStatus::Failed => palette.love,
-        ChatStatus::Done => FINISHED_STATUS_COLOR,
-        ChatStatus::Idle => palette.muted,
+        ChatStatus::Done if !focused => FINISHED_STATUS_COLOR,
+        ChatStatus::Done | ChatStatus::Idle => palette.muted,
     };
 
     Style::default().fg(color)
@@ -1215,23 +1237,30 @@ fn chat_status_style(status: ChatStatus, palette: Palette) -> Style {
 fn terminal_icon_style(
     terminal: &TerminalSession,
     pty_runtime: &PtyRuntime,
+    focused: bool,
     palette: Palette,
 ) -> Style {
-    let color = if pty_runtime.is_running(terminal.id) {
+    let color = if terminal_has_active_command(terminal, pty_runtime) {
         palette.pine
     } else if let Some(exit) = pty_runtime.terminal_exit_status(terminal.id) {
         if exit.code == 0 && exit.signal.is_none() {
-            FINISHED_STATUS_COLOR
+            if focused {
+                palette.muted
+            } else {
+                FINISHED_STATUS_COLOR
+            }
         } else {
             palette.love
         }
-    } else if terminal.status == TerminalStatus::Running {
-        palette.pine
     } else {
         palette.muted
     };
 
     Style::default().fg(color)
+}
+
+fn terminal_has_active_command(terminal: &TerminalSession, pty_runtime: &PtyRuntime) -> bool {
+    matches!(terminal.launch, TerminalLaunch::Command(_)) && pty_runtime.is_running(terminal.id)
 }
 
 #[cfg(test)]
@@ -1297,10 +1326,10 @@ mod tests {
     }
 
     #[test]
-    fn terminal_icon_color_tracks_running_and_default_status() {
+    fn terminal_icon_color_tracks_active_commands_and_completion_focus() {
         let palette = test_palette();
         let pty_runtime = PtyRuntime::new_offline();
-        let mut terminal = TerminalSession {
+        let mut shell_terminal = TerminalSession {
             id: TerminalId(99),
             name: "shell".to_string(),
             status: TerminalStatus::Stopped,
@@ -1308,14 +1337,44 @@ mod tests {
         };
 
         assert_eq!(
-            terminal_icon_style(&terminal, &pty_runtime, palette),
+            terminal_icon_style(&shell_terminal, &pty_runtime, false, palette),
             Style::default().fg(palette.muted)
         );
 
-        terminal.status = TerminalStatus::Running;
+        shell_terminal.status = TerminalStatus::Running;
         assert_eq!(
-            terminal_icon_style(&terminal, &pty_runtime, palette),
+            terminal_icon_style(&shell_terminal, &pty_runtime, false, palette),
+            Style::default().fg(palette.muted)
+        );
+
+        let command_terminal = TerminalSession {
+            id: TerminalId(100),
+            name: "test".to_string(),
+            status: TerminalStatus::Running,
+            launch: TerminalLaunch::Command("cargo test".to_string()),
+        };
+        let mut running_runtime = PtyRuntime::new_offline();
+        running_runtime.mark_running_for_test(command_terminal.id);
+        assert_eq!(
+            terminal_icon_style(&command_terminal, &running_runtime, false, palette),
             Style::default().fg(palette.pine)
+        );
+
+        let mut done_runtime = PtyRuntime::new_offline();
+        done_runtime.record_exit_status_for_test(
+            command_terminal.id,
+            crate::pty::PtyExit {
+                code: 0,
+                signal: None,
+            },
+        );
+        assert_eq!(
+            terminal_icon_style(&command_terminal, &done_runtime, false, palette),
+            Style::default().fg(FINISHED_STATUS_COLOR)
+        );
+        assert_eq!(
+            terminal_icon_style(&command_terminal, &done_runtime, true, palette),
+            Style::default().fg(palette.muted)
         );
     }
 
@@ -1324,23 +1383,27 @@ mod tests {
         let palette = test_palette();
 
         assert_eq!(
-            chat_status_style(ChatStatus::Thinking, palette),
+            chat_status_style(ChatStatus::Thinking, false, palette),
             Style::default().fg(palette.pine)
         );
         assert_eq!(
-            chat_status_style(ChatStatus::Waiting, palette),
-            Style::default().fg(palette.gold)
+            chat_status_style(ChatStatus::Waiting, false, palette),
+            Style::default().fg(palette.pine)
         );
         assert_eq!(
-            chat_status_style(ChatStatus::Failed, palette),
+            chat_status_style(ChatStatus::Failed, false, palette),
             Style::default().fg(palette.love)
         );
         assert_eq!(
-            chat_status_style(ChatStatus::Done, palette),
+            chat_status_style(ChatStatus::Done, false, palette),
             Style::default().fg(FINISHED_STATUS_COLOR)
         );
         assert_eq!(
-            chat_status_style(ChatStatus::Idle, palette),
+            chat_status_style(ChatStatus::Done, true, palette),
+            Style::default().fg(palette.muted)
+        );
+        assert_eq!(
+            chat_status_style(ChatStatus::Idle, false, palette),
             Style::default().fg(palette.muted)
         );
     }
@@ -1372,7 +1435,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_sidebar_agent_icon_keeps_status_color() {
+    fn selected_done_sidebar_agent_icon_is_gray() {
         let mut app = App::default();
         let workspace = app.project.workspaces[0].id;
         let chat = app.project.workspaces[0].chats[0].id;
@@ -1403,7 +1466,7 @@ mod tests {
             .cell((3, 1))
             .expect("selected chat icon is in bounds");
         assert_eq!(icon_cell.symbol(), "●");
-        assert_eq!(icon_cell.fg, FINISHED_STATUS_COLOR);
+        assert_eq!(icon_cell.fg, palette.muted);
         assert_eq!(icon_cell.bg, palette.highlight_med);
     }
 

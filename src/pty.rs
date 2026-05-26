@@ -229,6 +229,18 @@ impl PtyRuntime {
             .and_then(TerminalCommandTracker::last_command)
     }
 
+    #[cfg(test)]
+    pub fn mark_running_for_test(&mut self, terminal: TerminalId) {
+        let pane = pane_for_terminal(terminal);
+        self.terminal_to_pane.insert(terminal, pane);
+        self.pane_to_terminal.insert(pane, terminal);
+    }
+
+    #[cfg(test)]
+    pub fn record_exit_status_for_test(&mut self, terminal: TerminalId, status: PtyExit) {
+        self.terminal_exit_statuses.insert(terminal, status);
+    }
+
     pub fn ensure_parser(&mut self, terminal: TerminalId, size: PtyDimensions) {
         self.parsers.entry(terminal).or_insert_with(|| {
             Parser::new(
