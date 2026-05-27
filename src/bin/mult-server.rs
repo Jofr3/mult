@@ -3,7 +3,7 @@ use std::{
     env, fs, io,
     io::{Read, Write},
     os::unix::net::{UnixListener, UnixStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{mpsc, Arc, Mutex},
     thread,
     time::Duration,
@@ -11,8 +11,8 @@ use std::{
 
 use mult_protocol::{
     bounded_screen_dimensions, default_socket_path, read_message, write_message, ClientMessage,
-    ExitInfo, LaunchSpec, PaneId, PaneInfo, ServerMessage, SessionId, SessionInfo,
-    MAX_MESSAGE_BYTES, PROTOCOL_VERSION,
+    ExitInfo, ForegroundProcessInfo, LaunchSpec, PaneId, PaneInfo, ServerMessage, SessionId,
+    SessionInfo, MAX_MESSAGE_BYTES, PROTOCOL_VERSION,
 };
 use portable_pty::{native_pty_system, Child, CommandBuilder, ExitStatus, MasterPty, PtySize};
 
@@ -49,6 +49,8 @@ struct PaneState {
     raw_history: Vec<u8>,
     master: SharedMasterPty,
     writer: SharedPtyWriter,
+    child_pid: Option<u32>,
+    foreground_process: ForegroundProcessInfo,
     child: Option<Box<dyn Child + Send + Sync>>,
     clients: Vec<ClientHandle>,
 }
@@ -253,6 +255,7 @@ fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SpawnedPane
     }
 
     let child = pair.slave.spawn_command(command).map_err(error_to_io)?;
+    let child_pid = child.process_id();
     let reader = pair.master.try_clone_reader().map_err(error_to_io)?;
     let writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(error_to_io)?));
     let master = Arc::new(Mutex::new(pair.master));
@@ -268,6 +271,12 @@ fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SpawnedPane
         raw_history: Vec::new(),
         master,
         writer,
+        child_pid,
+        foreground_process: ForegroundProcessInfo {
+            root_pid: child_pid,
+            foreground_pid: None,
+            command: None,
+        },
         child: Some(child),
         clients: Vec::new(),
     }));
@@ -375,7 +384,7 @@ fn handle_client_messages(
                     continue;
                 };
 
-                let (pane_info, pane_id, history) = {
+                let (pane_info, pane_id, history, foreground_process) = {
                     let mut pane = pane.lock().map_err(lock_error)?;
                     if pane.clients.iter().any(|existing| existing.id != client.id) {
                         let _ = client.sender.send(ServerMessage::Error {
@@ -387,12 +396,22 @@ fn handle_client_messages(
                     if !pane.clients.iter().any(|existing| existing.id == client.id) {
                         pane.clients.push(client.clone());
                     }
-                    (pane.pane_info(), pane.pane, pane.raw_history.clone())
+                    let foreground_process = pane.refresh_foreground_process();
+                    (
+                        pane.pane_info(),
+                        pane.pane,
+                        pane.raw_history.clone(),
+                        foreground_process,
+                    )
                 };
 
                 let _ = client.sender.send(ServerMessage::Attached {
                     session,
                     panes: vec![pane_info],
+                });
+                let _ = client.sender.send(ServerMessage::ForegroundProcess {
+                    pane: pane_id,
+                    process: foreground_process,
                 });
                 send_pty_scrollback(&client, pane_id, &history);
             }
@@ -401,6 +420,9 @@ fn handle_client_messages(
                 if let Some(pane) = pane {
                     let writer = { Arc::clone(&pane.lock().map_err(lock_error)?.writer) };
                     write_pty_input(&writer, &bytes)?;
+                    if input_may_change_foreground(&bytes) {
+                        schedule_foreground_process_poll(pane);
+                    }
                 }
             }
             ClientMessage::Paste { pane, text } => {
@@ -408,6 +430,9 @@ fn handle_client_messages(
                 if let Some(pane) = pane {
                     let writer = { Arc::clone(&pane.lock().map_err(lock_error)?.writer) };
                     write_pty_input(&writer, text.as_bytes())?;
+                    if input_may_change_foreground(text.as_bytes()) {
+                        schedule_foreground_process_poll(pane);
+                    }
                 }
             }
             ClientMessage::Scroll { .. }
@@ -522,6 +547,7 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, pane: SharedPane, server: Shar
                         Err(_) => break,
                     };
                     broadcast_pty_output(pane_id, bytes, clients);
+                    broadcast_foreground_process_if_changed(&pane);
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
@@ -596,6 +622,46 @@ fn send_pty_scrollback(client: &ClientHandle, pane: PaneId, bytes: &[u8]) {
     }
 }
 
+fn broadcast_foreground_process_if_changed(pane: &SharedPane) {
+    let Some((pane_id, process, clients)) = foreground_process_update(pane) else {
+        return;
+    };
+
+    for client in clients {
+        let _ = client.sender.send(ServerMessage::ForegroundProcess {
+            pane: pane_id,
+            process: process.clone(),
+        });
+    }
+}
+
+fn foreground_process_update(
+    pane: &SharedPane,
+) -> Option<(PaneId, ForegroundProcessInfo, Vec<ClientHandle>)> {
+    let mut pane = pane.lock().ok()?;
+    let process = pane.refresh_foreground_process_if_changed()?;
+    Some((pane.pane, process, pane.clients.clone()))
+}
+
+fn schedule_foreground_process_poll(pane: SharedPane) {
+    thread::spawn(move || {
+        for delay in [
+            Duration::from_millis(25),
+            Duration::from_millis(100),
+            Duration::from_millis(500),
+        ] {
+            thread::sleep(delay);
+            broadcast_foreground_process_if_changed(&pane);
+        }
+    });
+}
+
+fn input_may_change_foreground(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .any(|byte| matches!(*byte, b'\r' | b'\n' | 0x03 | 0x1a))
+}
+
 fn broadcast_exit(pane: PaneId, exit: ExitInfo, clients: Vec<ClientHandle>) {
     for client in clients {
         let _ = client.sender.send(ServerMessage::PaneExited {
@@ -630,6 +696,37 @@ impl PaneState {
             title: self.title.clone(),
             rows: self.rows,
             cols: self.cols,
+        }
+    }
+
+    fn refresh_foreground_process(&mut self) -> ForegroundProcessInfo {
+        let process = self.current_foreground_process();
+        self.foreground_process = process.clone();
+        process
+    }
+
+    fn refresh_foreground_process_if_changed(&mut self) -> Option<ForegroundProcessInfo> {
+        let process = self.current_foreground_process();
+        if process == self.foreground_process {
+            None
+        } else {
+            self.foreground_process = process.clone();
+            Some(process)
+        }
+    }
+
+    fn current_foreground_process(&self) -> ForegroundProcessInfo {
+        let foreground_pid = self
+            .master
+            .lock()
+            .ok()
+            .and_then(|master| master.process_group_leader())
+            .and_then(|pid| u32::try_from(pid).ok());
+        let command = foreground_pid.and_then(command_line_for_pid);
+        ForegroundProcessInfo {
+            root_pid: self.child_pid,
+            foreground_pid,
+            command,
         }
     }
 
@@ -670,6 +767,47 @@ impl PaneState {
 
 fn bounded_pty_dimensions(rows: u16, cols: u16) -> (u16, u16) {
     bounded_screen_dimensions(rows.max(1), cols.max(1))
+}
+
+fn command_line_for_pid(pid: u32) -> Option<String> {
+    let bytes = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    command_line_from_cmdline_bytes(&bytes)
+}
+
+fn command_line_from_cmdline_bytes(bytes: &[u8]) -> Option<String> {
+    let mut args = bytes
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg).to_string())
+        .collect::<Vec<_>>();
+    if args.is_empty() {
+        return None;
+    }
+
+    if let Some(program) = Path::new(&args[0])
+        .file_name()
+        .and_then(|name| name.to_str())
+    {
+        args[0] = program.to_string();
+    }
+
+    Some(
+        args.into_iter()
+            .map(shell_display_arg)
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+fn shell_display_arg(arg: String) -> String {
+    if arg
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '='))
+    {
+        arg
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
 }
 
 fn write_pty_input(writer: &SharedPtyWriter, bytes: &[u8]) -> io::Result<()> {
@@ -836,6 +974,15 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[test]
+    fn command_line_from_cmdline_bytes_formats_process_args() {
+        assert_eq!(
+            command_line_from_cmdline_bytes(b"/usr/bin/cargo\0test\0--\0space value\0"),
+            Some("cargo test -- 'space value'".to_string())
+        );
+        assert_eq!(command_line_from_cmdline_bytes(b""), None);
+    }
+
     fn test_pane_state() -> PaneState {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -856,6 +1003,12 @@ mod tests {
             raw_history: Vec::new(),
             master: Arc::new(Mutex::new(pair.master)),
             writer: Arc::new(Mutex::new(Box::new(io::sink()))),
+            child_pid: None,
+            foreground_process: ForegroundProcessInfo {
+                root_pid: None,
+                foreground_pid: None,
+                command: None,
+            },
             child: None,
             clients: Vec::new(),
         }

@@ -7,7 +7,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const DEFAULT_SOCKET_NAME: &str = "mult.sock";
 pub const SOCKET_PATH_ENV: &str = "MULT_SOCKET_PATH";
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -78,6 +78,13 @@ pub struct PaneInfo {
     pub title: String,
     pub rows: u16,
     pub cols: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForegroundProcessInfo {
+    pub root_pid: Option<u32>,
+    pub foreground_pid: Option<u32>,
+    pub command: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +159,10 @@ pub enum ServerMessage {
     PtyOutput {
         pane: PaneId,
         bytes: Vec<u8>,
+    },
+    ForegroundProcess {
+        pane: PaneId,
+        process: ForegroundProcessInfo,
     },
     PaneExited {
         pane: PaneId,

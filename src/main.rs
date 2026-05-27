@@ -1383,6 +1383,7 @@ mod tests {
     #[test]
     fn mult_agent_status_file_updates_chat_status() {
         let mut app = App::default();
+        app.project.workspaces[0].chats[0].id = model::ChatId(9_001);
         let chat = app.project.workspaces[0].chats[0].id;
         let path = mult_agent_status_path(chat);
         let _ = fs::remove_file(&path);

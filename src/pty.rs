@@ -13,8 +13,8 @@ use std::{
 };
 
 use mult_protocol::{
-    default_socket_path, read_message, write_message, ClientMessage, LaunchSpec, PaneId,
-    ServerMessage, SessionId, PROTOCOL_VERSION, SOCKET_PATH_ENV,
+    default_socket_path, read_message, write_message, ClientMessage, ForegroundProcessInfo,
+    LaunchSpec, PaneId, ServerMessage, SessionId, PROTOCOL_VERSION, SOCKET_PATH_ENV,
 };
 use vt100::Parser;
 
@@ -71,6 +71,7 @@ pub struct PtyRuntime {
     responders: HashMap<TerminalId, TerminalResponseDetector>,
     terminals_with_output: HashSet<TerminalId>,
     terminal_exit_statuses: HashMap<TerminalId, PtyExit>,
+    foreground_processes: HashMap<TerminalId, ForegroundProcessInfo>,
     command_trackers: HashMap<TerminalId, TerminalCommandTracker>,
     pending_events: Vec<PtyEvent>,
 }
@@ -165,6 +166,7 @@ impl PtyRuntime {
             responders: HashMap::new(),
             terminals_with_output: HashSet::new(),
             terminal_exit_statuses: HashMap::new(),
+            foreground_processes: HashMap::new(),
             command_trackers: HashMap::new(),
             pending_events,
         }
@@ -274,6 +276,7 @@ impl PtyRuntime {
         self.responders.remove(&terminal);
         self.terminals_with_output.remove(&terminal);
         self.terminal_exit_statuses.remove(&terminal);
+        self.foreground_processes.remove(&terminal);
         self.command_trackers.remove(&terminal);
     }
 
@@ -353,6 +356,7 @@ impl PtyRuntime {
 
         self.ensure_connected()?;
         self.reset_parser(spawn.terminal, spawn.size);
+        self.foreground_processes.remove(&spawn.terminal);
         self.command_trackers.remove(&spawn.terminal);
         let session = session_for_terminal(spawn.terminal);
         let pane = pane_for_terminal(spawn.terminal);
@@ -421,7 +425,7 @@ impl PtyRuntime {
             if let Some(parser) = self.parsers.get_mut(&terminal) {
                 parser.set_scrollback(0);
             }
-            if track_command && !alternate_screen {
+            if track_command && !alternate_screen && self.terminal_accepts_shell_input(terminal) {
                 self.command_trackers
                     .entry(terminal)
                     .or_default()
@@ -433,6 +437,17 @@ impl PtyRuntime {
             bytes: input.to_vec(),
         })?;
         Ok(())
+    }
+
+    fn terminal_accepts_shell_input(&self, terminal: TerminalId) -> bool {
+        let Some(process) = self.foreground_processes.get(&terminal) else {
+            return true;
+        };
+
+        match (process.root_pid, process.foreground_pid) {
+            (Some(root_pid), Some(foreground_pid)) => root_pid == foreground_pid,
+            _ => true,
+        }
     }
 
     pub fn send_paste(&mut self, terminal: TerminalId, text: &str) -> io::Result<bool> {
@@ -543,6 +558,11 @@ impl PtyRuntime {
             ServerMessage::Hello { .. }
             | ServerMessage::Sessions(_)
             | ServerMessage::Attached { .. } => {}
+            ServerMessage::ForegroundProcess { pane, process } => {
+                if let Some(terminal) = self.terminal_for_pane(pane) {
+                    self.record_foreground_process(terminal, process);
+                }
+            }
             ServerMessage::PtyScrollback { pane, bytes } => {
                 if let Some(terminal) = self.terminal_for_pane(pane) {
                     self.feed_terminal_output(terminal, &bytes, false);
@@ -583,6 +603,22 @@ impl PtyRuntime {
             .get(&pane)
             .copied()
             .or(Some(TerminalId(pane.0)))
+    }
+
+    fn record_foreground_process(&mut self, terminal: TerminalId, process: ForegroundProcessInfo) {
+        let foreground_is_child = matches!(
+            (process.root_pid, process.foreground_pid),
+            (Some(root_pid), Some(foreground_pid)) if root_pid != foreground_pid
+        );
+        if foreground_is_child {
+            if let Some(command) = process.command.as_deref() {
+                self.command_trackers
+                    .entry(terminal)
+                    .or_default()
+                    .record_process_command(command);
+            }
+        }
+        self.foreground_processes.insert(terminal, process);
     }
 
     fn ensure_connected(&mut self) -> io::Result<()> {
@@ -757,6 +793,14 @@ impl TerminalCommandTracker {
 
     fn last_command(&self) -> Option<&str> {
         self.last.as_deref()
+    }
+
+    fn record_process_command(&mut self, command: &str) {
+        let command = command.trim();
+        if !command.is_empty() {
+            self.last = Some(command.to_string());
+        }
+        self.input.clear();
     }
 
     fn commit_input(&mut self) {
@@ -1155,6 +1199,7 @@ mod tests {
             responders: HashMap::new(),
             terminals_with_output: HashSet::new(),
             terminal_exit_statuses: HashMap::new(),
+            foreground_processes: HashMap::new(),
             command_trackers: HashMap::new(),
             pending_events: Vec::new(),
         };
@@ -1305,6 +1350,7 @@ mod tests {
             responders: HashMap::new(),
             terminals_with_output: HashSet::new(),
             terminal_exit_statuses: HashMap::new(),
+            foreground_processes: HashMap::new(),
             command_trackers: HashMap::new(),
             pending_events: Vec::new(),
         };
@@ -1397,6 +1443,51 @@ mod tests {
         let _: ClientMessage = read_message(&mut server_stream).expect("read editor input");
 
         assert_eq!(runtime.terminal_last_command(terminal), Some("nvim"));
+    }
+
+    #[test]
+    fn terminal_last_command_uses_foreground_process_not_child_input() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (sender, receiver) = mpsc::channel();
+        let terminal = TerminalId(9);
+        let pane = PaneId(9);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+
+        sender
+            .send(ServerMessage::ForegroundProcess {
+                pane,
+                process: ForegroundProcessInfo {
+                    root_pid: Some(10),
+                    foreground_pid: Some(20),
+                    command: Some("python".to_string()),
+                },
+            })
+            .expect("send foreground process");
+        assert!(runtime.drain_events().is_empty());
+        assert_eq!(runtime.terminal_last_command(terminal), Some("python"));
+
+        assert!(runtime
+            .send_input(terminal, b"print('typed text')\r")
+            .expect("send child input"));
+        let _: ClientMessage = read_message(&mut server_stream).expect("read child input");
+        assert_eq!(runtime.terminal_last_command(terminal), Some("python"));
+
+        sender
+            .send(ServerMessage::ForegroundProcess {
+                pane,
+                process: ForegroundProcessInfo {
+                    root_pid: Some(10),
+                    foreground_pid: Some(10),
+                    command: Some("bash".to_string()),
+                },
+            })
+            .expect("send shell foreground process");
+        assert!(runtime.drain_events().is_empty());
+        assert!(runtime
+            .send_input(terminal, b"cargo test\r")
+            .expect("send shell input"));
+        let _: ClientMessage = read_message(&mut server_stream).expect("read shell input");
+        assert_eq!(runtime.terminal_last_command(terminal), Some("cargo test"));
     }
 
     #[test]
@@ -1526,6 +1617,7 @@ mod tests {
             responders: HashMap::new(),
             terminals_with_output: HashSet::new(),
             terminal_exit_statuses: HashMap::new(),
+            foreground_processes: HashMap::new(),
             command_trackers: HashMap::new(),
             pending_events: Vec::new(),
         }
