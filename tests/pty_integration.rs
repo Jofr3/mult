@@ -90,6 +90,35 @@ fn reconnect_replays_raw_scrollback_into_fresh_parser() {
 }
 
 #[test]
+fn server_ignores_sighup_and_keeps_sessions_running() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let Some(mut server) = start_isolated_server() else {
+        return;
+    };
+    let mut runtime = PtyRuntime::connect_to_socket(server.socket_path.clone())
+        .expect("connect to isolated mult-server");
+    let terminal = TerminalId(7004);
+
+    start_short_lived_command(
+        &mut runtime,
+        terminal,
+        "printf before; sleep 1; printf after; sleep 3",
+    );
+    wait_for_output(&mut runtime, terminal, "before")
+        .expect("command should produce output before hangup");
+
+    let rc = unsafe { libc::kill(server.child.id() as i32, libc::SIGHUP) };
+    assert_eq!(rc, 0, "send SIGHUP to mult-server");
+    assert_server_still_running(&mut server);
+    wait_for_output(&mut runtime, terminal, "after")
+        .expect("server should keep PTY command running after SIGHUP");
+
+    assert!(runtime.stop(terminal).expect("stop terminal after SIGHUP"));
+}
+
+#[test]
 fn rapid_stop_restart_and_chat_runtime_ids_keep_client_registry_consistent() {
     if integration_tests_are_skipped() {
         return;
@@ -199,6 +228,18 @@ fn wait_for_terminal_exit(
     }
 
     None
+}
+
+fn assert_server_still_running(server: &mut ServerGuard) {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        match server.child.try_wait() {
+            Ok(Some(status)) => panic!("mult-server exited after SIGHUP: {status}"),
+            Ok(None) => {}
+            Err(error) => panic!("failed to poll mult-server child after SIGHUP: {error}"),
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn integration_tests_are_skipped() -> bool {

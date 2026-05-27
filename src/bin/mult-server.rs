@@ -75,6 +75,7 @@ struct SpawnedPane {
 }
 
 fn main() -> io::Result<()> {
+    ignore_hangup_signal()?;
     let socket_path = default_socket_path();
     bind_socket_path(&socket_path)?;
     let server = Arc::new(Mutex::new(ServerState::default()));
@@ -177,6 +178,16 @@ impl ServerState {
             }
         }
     }
+}
+
+fn ignore_hangup_signal() -> io::Result<()> {
+    // The server owns long-lived PTYs. Ignore terminal hangups so a foreground
+    // development server, or an autospawned server that has not exec'd yet, does
+    // not terminate all panes when the launching terminal is closed.
+    if unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) } == libc::SIG_ERR {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn bind_socket_path(path: &PathBuf) -> io::Result<()> {

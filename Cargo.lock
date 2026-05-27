@@ -325,6 +325,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "fnug-vt100",
+ "libc",
  "mult-protocol",
  "portable-pty",
  "ratatui",

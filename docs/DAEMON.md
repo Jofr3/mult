@@ -62,7 +62,7 @@ just server
 cargo run --bin mult-server
 ```
 
-The `mult` client also attempts a lightweight tmux-style autospawn when the socket is missing or stale. It looks for a `mult-server` executable next to the running `mult` executable, starts it with stdio detached, waits briefly for the socket, then connects.
+The `mult` client also attempts a lightweight tmux-style autospawn when the socket is missing or stale. It looks for a `mult-server` executable next to the running `mult` executable, starts it detached from the launching terminal with stdio closed, waits briefly for the socket, then connects. Autospawned servers keep owning PTYs after the client terminal is closed, so reopening `mult` can reattach to the same panes.
 
 Disable client autospawn with:
 
@@ -70,4 +70,4 @@ Disable client autospawn with:
 MULT_SERVER_AUTOSPAWN=0 mult
 ```
 
-Autospawn is a convenience for interactive use. Prefer the systemd user service for a robust long-lived daemon across logouts/restarts.
+Autospawn is a convenience for interactive use and survives closing the terminal that launched the `mult` client. Prefer the systemd user service for a robust long-lived daemon across full logouts/restarts.

@@ -12,6 +12,7 @@ default-members = [".", "crates/protocol"]
 [dependencies]
 anyhow = "1.0"
 crossterm = "0.28"
+libc = "0.2"
 mult-protocol = { path = "crates/protocol" }
 portable-pty = "0.9"
 ratatui = "0.29"

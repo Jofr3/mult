@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env, fs, io,
-    os::unix::net::UnixStream,
+    os::unix::{net::UnixStream, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -1011,13 +1011,31 @@ fn spawn_server(socket_path: &Path) -> io::Result<()> {
         )
     })?;
 
-    Command::new(server)
+    let mut command = Command::new(server);
+    command
         .env(SOCKET_PATH_ENV, socket_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map(|_| ())
+        .stderr(Stdio::null());
+    detach_autospawned_server(&mut command);
+    command.spawn().map(|_| ())
+}
+
+fn detach_autospawned_server(command: &mut Command) {
+    // Autospawned servers should behave like a small user daemon: if the
+    // terminal running the `mult` client is closed, the server must not receive
+    // that terminal's hangup and tear down the PTYs it owns.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::signal(libc::SIGHUP, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 fn wait_for_server(path: &Path) -> io::Result<UnixStream> {
