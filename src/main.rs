@@ -841,7 +841,7 @@ fn start_selected_terminal(
 fn start_terminal(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
-    config: &Config,
+    _config: &Config,
     frame_area: Rect,
     workspace_id: model::WorkspaceId,
     terminal_id: model::TerminalId,
@@ -876,8 +876,7 @@ fn start_terminal(
             workspace.environment.clone(),
         ),
     };
-    spawn.size =
-        selected_terminal_dimensions(app, config, frame_area, terminal_id).unwrap_or_default();
+    spawn.size = terminal_dimensions(app, frame_area);
 
     match pty_runtime.start(spawn) {
         Ok(()) => {
@@ -958,8 +957,7 @@ fn start_or_focus_chat_agent(
         workspace.cwd.clone(),
         environment,
     );
-    spawn.size =
-        selected_chat_agent_dimensions(app, config, frame_area, chat_id).unwrap_or_default();
+    spawn.size = chat_agent_dimensions(app, frame_area);
 
     match pty_runtime.start(spawn) {
         Ok(()) => {
@@ -1128,26 +1126,12 @@ fn resize_visible_chat_agent(
     let _ = pty_runtime.resize(terminal_id, size);
 }
 
-fn selected_terminal_dimensions(
-    app: &App,
-    _config: &Config,
-    frame_area: Rect,
-    terminal_id: model::TerminalId,
-) -> Option<PtyDimensions> {
-    ui::selected_terminal_output_area(app, frame_area)
-        .filter(|(selected_terminal, _)| *selected_terminal == terminal_id)
-        .map(|(_, area)| pty_dimensions_from_area(area))
+fn terminal_dimensions(app: &App, frame_area: Rect) -> PtyDimensions {
+    pty_dimensions_from_area(ui::terminal_output_area_for(app, frame_area))
 }
 
-fn selected_chat_agent_dimensions(
-    app: &App,
-    _config: &Config,
-    frame_area: Rect,
-    chat_id: model::ChatId,
-) -> Option<PtyDimensions> {
-    ui::selected_chat_agent_output_area(app, frame_area)
-        .filter(|(selected_chat, _)| *selected_chat == chat_id)
-        .map(|(_, area)| pty_dimensions_from_area(area))
+fn chat_agent_dimensions(app: &App, frame_area: Rect) -> PtyDimensions {
+    pty_dimensions_from_area(ui::chat_agent_output_area_for(app, frame_area))
 }
 
 fn pty_dimensions_from_area(area: Rect) -> PtyDimensions {
@@ -1329,6 +1313,17 @@ mod tests {
     #[test]
     fn blank_process_agent_command_is_ignored() {
         assert_eq!(parse_process_agent_command("   "), None);
+    }
+
+    #[test]
+    fn restored_terminal_dimensions_use_visible_main_width_even_when_not_selected() {
+        let app = App::default();
+        let frame_area = Rect::new(0, 0, 120, 40);
+
+        assert_eq!(
+            terminal_dimensions(&app, frame_area),
+            PtyDimensions { rows: 40, cols: 86 }
+        );
     }
 
     #[test]

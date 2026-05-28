@@ -146,8 +146,7 @@ pub fn selected_terminal_output_area(app: &App, frame_area: Rect) -> Option<(Ter
         return None;
     };
 
-    let layout = layout_areas(app, frame_area);
-    Some((terminal, terminal_output_area(layout.main)))
+    Some((terminal, terminal_output_area_for(app, frame_area)))
 }
 
 pub fn selected_chat_agent_output_area(app: &App, frame_area: Rect) -> Option<(ChatId, Rect)> {
@@ -155,8 +154,17 @@ pub fn selected_chat_agent_output_area(app: &App, frame_area: Rect) -> Option<(C
         return None;
     };
 
+    Some((chat, chat_agent_output_area_for(app, frame_area)))
+}
+
+pub fn terminal_output_area_for(app: &App, frame_area: Rect) -> Rect {
     let layout = layout_areas(app, frame_area);
-    Some((chat, chat_agent_output_area(layout.main)))
+    terminal_output_area(layout.main)
+}
+
+pub fn chat_agent_output_area_for(app: &App, frame_area: Rect) -> Rect {
+    let layout = layout_areas(app, frame_area);
+    chat_agent_output_area(layout.main)
 }
 
 fn layout_areas(app: &App, frame_area: Rect) -> LayoutAreas {
@@ -1831,6 +1839,18 @@ mod tests {
 
         let (_, area) = selected_terminal_output_area(&app, Rect::new(0, 0, 120, 40))
             .expect("terminal selection has output area");
+
+        assert_eq!(area.x, 34);
+        assert_eq!(area.y, 0);
+        assert_eq!(area.width, 86);
+        assert_eq!(area.height, 40);
+    }
+
+    #[test]
+    fn terminal_output_area_for_tracks_visible_main_pane_without_terminal_selection() {
+        let app = App::default();
+
+        let area = terminal_output_area_for(&app, Rect::new(0, 0, 120, 40));
 
         assert_eq!(area.x, 34);
         assert_eq!(area.y, 0);
