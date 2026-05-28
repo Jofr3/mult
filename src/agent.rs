@@ -3,11 +3,13 @@ use std::{
     io::{self, Read, Write},
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Receiver, SyncSender},
     thread,
 };
 
 use crate::model::{ChatId, ChatStatus, WorkspaceId};
+
+const AGENT_EVENT_QUEUE_CAPACITY: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AgentTarget {
@@ -75,7 +77,7 @@ pub struct ProcessAgentCommand {
 pub struct ProcessAgentBackend {
     command: ProcessAgentCommand,
     running: BTreeMap<AgentTarget, RunningAgentProcess>,
-    sender: Sender<AgentEvent>,
+    sender: SyncSender<AgentEvent>,
     receiver: Receiver<AgentEvent>,
 }
 
@@ -122,7 +124,7 @@ impl ProcessAgentCommand {
 
 impl ProcessAgentBackend {
     pub fn new(command: ProcessAgentCommand) -> Self {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(AGENT_EVENT_QUEUE_CAPACITY);
         Self {
             command,
             running: BTreeMap::new(),
@@ -289,7 +291,7 @@ fn spawn_pipe_reader(
     target: AgentTarget,
     role: AgentMessageRole,
     mut reader: impl Read + Send + 'static,
-    sender: Sender<AgentEvent>,
+    sender: SyncSender<AgentEvent>,
 ) {
     thread::spawn(move || {
         let mut buffer = [0; 8192];

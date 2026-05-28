@@ -1,8 +1,14 @@
 use std::{
-    collections::BTreeMap,
-    env, fs, io,
+    collections::{BTreeMap, BTreeSet},
+    env,
+    fs::{self, DirBuilder},
+    io,
     io::{Read, Write},
-    os::unix::net::{UnixListener, UnixStream},
+    os::unix::{
+        fs::DirBuilderExt,
+        io::AsRawFd,
+        net::{UnixListener, UnixStream},
+    },
     path::{Path, PathBuf},
     sync::{mpsc, Arc, Mutex},
     thread,
@@ -21,11 +27,12 @@ type SharedServer = Arc<Mutex<ServerState>>;
 type SharedPane = Arc<Mutex<PaneState>>;
 type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 type SharedMasterPty = Arc<Mutex<Box<dyn MasterPty + Send>>>;
-type ClientSender = mpsc::Sender<ServerMessage>;
+type ClientSender = mpsc::SyncSender<ServerMessage>;
 
 const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 const RAW_HISTORY_MAX_BYTES: usize = MAX_MESSAGE_BYTES * 2;
 const RAW_HISTORY_CHUNK_BYTES: usize = 64 * 1024;
+const CLIENT_QUEUE_CAPACITY: usize = 1_024;
 
 #[derive(Clone)]
 struct ClientHandle {
@@ -35,6 +42,7 @@ struct ClientHandle {
 
 struct ServerState {
     sessions: BTreeMap<SessionId, SharedPane>,
+    reserved_sessions: BTreeSet<SessionId>,
     next_session_id: u64,
     next_client_id: ClientId,
 }
@@ -79,7 +87,7 @@ fn main() -> io::Result<()> {
     let socket_path = default_socket_path();
     bind_socket_path(&socket_path)?;
     let server = Arc::new(Mutex::new(ServerState::default()));
-    let listener = UnixListener::bind(&socket_path)?;
+    let listener = bind_unix_listener(&socket_path)?;
     restrict_socket_permissions(&socket_path)?;
     eprintln!("mult-server listening on {}", socket_path.display());
 
@@ -104,6 +112,7 @@ impl Default for ServerState {
     fn default() -> Self {
         Self {
             sessions: BTreeMap::new(),
+            reserved_sessions: BTreeSet::new(),
             next_session_id: 1,
             next_client_id: 1,
         }
@@ -118,12 +127,31 @@ impl ServerState {
     }
 
     fn allocate_session_id(&mut self) -> SessionId {
-        while self.sessions.contains_key(&SessionId(self.next_session_id)) {
+        while self.sessions.contains_key(&SessionId(self.next_session_id))
+            || self
+                .reserved_sessions
+                .contains(&SessionId(self.next_session_id))
+        {
             self.next_session_id += 1;
         }
         let id = SessionId(self.next_session_id);
         self.next_session_id += 1;
         id
+    }
+
+    fn reserve_session_id(&mut self, requested_id: Option<SessionId>) -> io::Result<SessionId> {
+        let session = requested_id.unwrap_or_else(|| self.allocate_session_id());
+        if self.sessions.contains_key(&session) || !self.reserved_sessions.insert(session) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("session {} already exists or is being created", session.0),
+            ));
+        }
+        Ok(session)
+    }
+
+    fn release_session_reservation(&mut self, session: SessionId) {
+        self.reserved_sessions.remove(&session);
     }
 
     fn session_infos(&self) -> Vec<SessionInfo> {
@@ -202,9 +230,39 @@ fn bind_socket_path(path: &PathBuf) -> io::Result<()> {
     }
 
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        create_private_dir_all(parent)?;
     }
     Ok(())
+}
+
+fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    let mut builder = DirBuilder::new();
+    builder.recursive(true).mode(0o700).create(path)
+}
+
+fn bind_unix_listener(path: &Path) -> io::Result<UnixListener> {
+    let _umask = UmaskGuard::new(0o077);
+    UnixListener::bind(path)
+}
+
+struct UmaskGuard {
+    previous: libc::mode_t,
+}
+
+impl UmaskGuard {
+    fn new(mask: libc::mode_t) -> Self {
+        Self {
+            previous: unsafe { libc::umask(mask) },
+        }
+    }
+}
+
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::umask(self.previous);
+        }
+    }
 }
 
 fn remove_stale_socket_file(path: &PathBuf, connect_error: io::Error) -> io::Result<()> {
@@ -239,6 +297,59 @@ fn restrict_socket_permissions(path: &PathBuf) -> io::Result<()> {
     let mut permissions = fs::metadata(path)?.permissions();
     permissions.set_mode(0o600);
     fs::set_permissions(path, permissions)
+}
+
+fn verify_peer_owner(stream: &UnixStream, peer_label: &str) -> io::Result<()> {
+    let Some(peer_uid) = peer_uid(stream)? else {
+        return Ok(());
+    };
+    let current_uid = current_euid();
+    if uid_matches_peer(peer_uid, current_uid) {
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("rejecting {peer_label} uid {peer_uid}; expected current uid {current_uid}"),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &UnixStream) -> io::Result<Option<u32>> {
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if length < std::mem::size_of::<libc::ucred>() as libc::socklen_t {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short SO_PEERCRED response",
+        ));
+    }
+    Ok(Some(unsafe { credentials.assume_init().uid }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_uid(_stream: &UnixStream) -> io::Result<Option<u32>> {
+    Ok(None)
+}
+
+fn current_euid() -> u32 {
+    unsafe { libc::geteuid() as u32 }
+}
+
+fn uid_matches_peer(peer_uid: u32, current_uid: u32) -> bool {
+    peer_uid == current_uid
 }
 
 fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SpawnedPane> {
@@ -296,7 +407,8 @@ fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SpawnedPane
 }
 
 fn handle_client(stream: UnixStream, server: SharedServer) -> io::Result<()> {
-    let (sender, receiver) = mpsc::channel();
+    verify_peer_owner(&stream, "client")?;
+    let (sender, receiver) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
     let client_id = server.lock().map_err(lock_error)?.allocate_client_id();
     let client = ClientHandle {
         id: client_id,
@@ -512,28 +624,48 @@ fn send_hello_response(client: &ClientHandle, protocol_version: u16) -> bool {
 }
 
 fn create_session(server: &SharedServer, spec: SessionCreateSpec) -> io::Result<SharedPane> {
+    create_session_with_spawner(server, spec, spawn_pane)
+}
+
+fn create_session_with_spawner(
+    server: &SharedServer,
+    spec: SessionCreateSpec,
+    spawn: impl FnOnce(SessionId, PaneSpawnSpec) -> io::Result<SpawnedPane>,
+) -> io::Result<SharedPane> {
     let session = {
         let mut server = server.lock().map_err(lock_error)?;
-        spec.requested_id
-            .unwrap_or_else(|| server.allocate_session_id())
+        if let Some(requested_id) = spec.requested_id {
+            if let Some(existing) = server.sessions.get(&requested_id).cloned() {
+                return Ok(existing);
+            }
+        }
+        server.reserve_session_id(spec.requested_id)?
     };
 
-    if let Some(existing) = server
-        .lock()
-        .map_err(lock_error)?
-        .sessions
-        .get(&session)
-        .cloned()
-    {
-        return Ok(existing);
-    }
+    let spawned = match spawn(session, spec.pane) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            if let Ok(mut server) = server.lock() {
+                server.release_session_reservation(session);
+            }
+            return Err(error);
+        }
+    };
 
-    let spawned = spawn_pane(session, spec.pane)?;
-    server
-        .lock()
-        .map_err(lock_error)?
-        .sessions
-        .insert(session, Arc::clone(&spawned.pane));
+    {
+        let mut server = server.lock().map_err(lock_error)?;
+        server.release_session_reservation(session);
+        if server.sessions.contains_key(&session) {
+            if let Ok(mut pane) = spawned.pane.lock() {
+                let _ = pane.stop();
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("session {} was created concurrently", session.0),
+            ));
+        }
+        server.sessions.insert(session, Arc::clone(&spawned.pane));
+    }
     spawn_reader(
         spawned.reader,
         Arc::clone(&spawned.pane),
@@ -894,6 +1026,34 @@ mod tests {
     }
 
     #[test]
+    fn peer_owner_check_accepts_same_user_socket_pair() {
+        let (client, _server) = UnixStream::pair().expect("create socket pair");
+
+        verify_peer_owner(&client, "test client").expect("same uid peer is accepted");
+        assert!(uid_matches_peer(current_euid(), current_euid()));
+        assert!(!uid_matches_peer(
+            current_euid().saturating_add(1),
+            current_euid()
+        ));
+    }
+
+    #[test]
+    fn bind_socket_path_creates_missing_parent_with_user_only_mode() {
+        let dir = unique_socket_dir();
+        let path = dir.join("mult.sock");
+
+        bind_socket_path(&path).expect("prepare socket path");
+
+        let mode = fs::metadata(&dir)
+            .expect("socket parent metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        fs::remove_dir_all(&dir).expect("remove socket dir");
+    }
+
+    #[test]
     fn server_rejects_incompatible_client_protocol_version() {
         let (mut client_stream, server_stream) = UnixStream::pair().expect("create socket pair");
         client_stream
@@ -957,6 +1117,60 @@ mod tests {
         pane.append_raw_history(&vec![b'a'; RAW_HISTORY_MAX_BYTES + 10]);
 
         assert_eq!(pane.raw_history.len(), RAW_HISTORY_MAX_BYTES);
+    }
+
+    #[test]
+    fn session_allocation_skips_reserved_ids() {
+        let mut server = ServerState::default();
+        server
+            .reserve_session_id(Some(SessionId(1)))
+            .expect("reserve first session");
+
+        assert_eq!(server.allocate_session_id(), SessionId(2));
+    }
+
+    #[test]
+    fn duplicate_requested_session_reservation_is_rejected() {
+        let mut server = ServerState::default();
+        server
+            .reserve_session_id(Some(SessionId(7)))
+            .expect("reserve requested session");
+
+        let error = server
+            .reserve_session_id(Some(SessionId(7)))
+            .expect_err("duplicate reservation should fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn reservation_is_released_when_spawn_fails() {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let error = match create_session_with_spawner(
+            &server,
+            SessionCreateSpec {
+                requested_id: Some(SessionId(11)),
+                pane: PaneSpawnSpec {
+                    name: "broken".to_string(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                    launch: LaunchSpec::Shell,
+                    rows: 24,
+                    cols: 80,
+                },
+            },
+            |_session, _spec| Err(io::Error::other("injected spawn failure")),
+        ) {
+            Ok(_) => panic!("injected spawn failure should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(server
+            .lock()
+            .expect("server lock")
+            .reserved_sessions
+            .is_empty());
     }
 
     #[test]
@@ -1031,5 +1245,13 @@ mod tests {
             .expect("system clock should be after Unix epoch")
             .as_nanos();
         env::temp_dir().join(format!("mult-server-test-{unique}.sock"))
+    }
+
+    fn unique_socket_dir() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        env::temp_dir().join(format!("mult-server-test-{unique}"))
     }
 }

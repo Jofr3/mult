@@ -2,12 +2,12 @@ use std::{
     env,
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::model::ProjectState;
+use crate::model::{ProjectState, STATE_VERSION};
 
 const STATE_PATH_ENV: &str = "MULT_STATE_PATH";
 
@@ -29,13 +29,38 @@ pub fn state_path() -> PathBuf {
 
 fn load_from_path(path: &Path) -> io::Result<ProjectState> {
     match fs::read(path) {
-        Ok(bytes) => match serde_json::from_slice(&bytes) {
+        Ok(bytes) => match decode_project_state(&bytes) {
             Ok(state) => Ok(state),
-            Err(error) => backup_invalid_state_and_reset(path, error),
+            Err(StateDecodeError::InvalidJson(error)) => backup_invalid_state_and_reset(path, error),
+            Err(StateDecodeError::UnsupportedVersion(version)) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "state file version {version} is newer than supported version {STATE_VERSION}; not modifying {}",
+                    path.display()
+                ),
+            )),
         },
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ProjectState::default()),
         Err(error) => Err(error),
     }
+}
+
+fn decode_project_state(bytes: &[u8]) -> Result<ProjectState, StateDecodeError> {
+    let mut state: ProjectState =
+        serde_json::from_slice(bytes).map_err(StateDecodeError::InvalidJson)?;
+    if state.version > STATE_VERSION {
+        return Err(StateDecodeError::UnsupportedVersion(state.version));
+    }
+    if state.version < STATE_VERSION {
+        state.version = STATE_VERSION;
+    }
+    Ok(state)
+}
+
+#[derive(Debug)]
+enum StateDecodeError {
+    InvalidJson(serde_json::Error),
+    UnsupportedVersion(u32),
 }
 
 fn save_to_path(state: &ProjectState, path: &Path) -> io::Result<()> {
@@ -96,8 +121,8 @@ fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
 }
 
 fn create_temp_state_file(path: &Path) -> io::Result<(PathBuf, File)> {
-    for attempt in 0..16 {
-        let temp_path = temp_save_path(path, attempt);
+    for _ in 0..64 {
+        let temp_path = random_temp_save_path(path)?;
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -119,6 +144,25 @@ fn create_temp_state_file(path: &Path) -> io::Result<(PathBuf, File)> {
     ))
 }
 
+fn random_temp_save_path(path: &Path) -> io::Result<PathBuf> {
+    let mut file_name = path
+        .file_name()
+        .map(OsString::from)
+        .unwrap_or_else(|| OsString::from("state.json"));
+    file_name.push(format!(
+        ".tmp-{}-{:016x}",
+        std::process::id(),
+        random_u64()?
+    ));
+    Ok(path.with_file_name(file_name))
+}
+
+fn random_u64() -> io::Result<u64> {
+    let mut bytes = [0_u8; 8];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(u64::from_ne_bytes(bytes))
+}
+
 fn restrict_state_file_permissions(file: &File) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -137,7 +181,7 @@ fn ensure_parent_dir(path: &Path) -> io::Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        fs::create_dir_all(parent)?;
+        create_private_dir_all(parent)?;
     }
     Ok(())
 }
@@ -152,7 +196,23 @@ fn sync_parent_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn temp_save_path(path: &Path, attempt: usize) -> PathBuf {
+fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
+#[cfg(test)]
+fn legacy_temp_save_path(path: &Path, attempt: usize) -> PathBuf {
     let mut file_name = path
         .file_name()
         .map(OsString::from)
@@ -222,7 +282,7 @@ mod tests {
         let bytes = fs::read(&path).expect("read saved state");
         let decoded: ProjectState = serde_json::from_slice(&bytes).expect("decode state");
         assert_eq!(decoded.workspaces[0].name, "saved");
-        assert!(!temp_save_path(&path, 0).exists());
+        assert_no_state_temp_files(&path);
     }
 
     #[test]
@@ -255,7 +315,7 @@ mod tests {
     #[test]
     fn save_does_not_clobber_preexisting_temp_file() {
         let path = unique_temp_file();
-        let preexisting_temp = temp_save_path(&path, 0);
+        let preexisting_temp = legacy_temp_save_path(&path, 0);
         fs::write(&preexisting_temp, "do not clobber").expect("write preexisting temp file");
 
         save_to_path(&ProjectState::default(), &path).expect("save state");
@@ -265,6 +325,27 @@ mod tests {
             "do not clobber"
         );
         fs::remove_file(&preexisting_temp).expect("remove preexisting temp file");
+    }
+
+    #[test]
+    fn future_state_versions_are_rejected_without_backup_or_reset() {
+        let path = unique_temp_file();
+        fs::write(
+            &path,
+            format!(
+                r#"{{"version":{},"next_workspace_id":1,"next_chat_id":1,"next_terminal_id":1,"workspaces":[]}}"#,
+                STATE_VERSION + 1
+            ),
+        )
+        .expect("write future state");
+
+        let error = load_from_path(&path).expect_err("future state should be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(path.exists());
+        assert!(fs::read_to_string(&path)
+            .expect("future state remains")
+            .contains(&format!("\"version\":{}", STATE_VERSION + 1)));
     }
 
     #[cfg(unix)]
@@ -282,17 +363,53 @@ mod tests {
         assert_eq!(mode, 0o600);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn save_creates_missing_parent_dir_with_user_only_permissions() {
+        let parent = unique_temp_dir();
+        let path = parent.join("nested").join("state.json");
+
+        save_to_path(&ProjectState::default(), &path).expect("save state");
+
+        let mode = fs::metadata(path.parent().expect("state has parent"))
+            .expect("parent metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        fs::remove_dir_all(parent).expect("remove temp state dir");
+    }
+
     #[test]
     fn parent_dir_creation_allows_bare_file_names() {
         ensure_parent_dir(Path::new("state.json"))
             .expect("bare file name has no directory to create");
     }
 
+    fn assert_no_state_temp_files(path: &Path) {
+        let parent = path.parent().expect("temp path has parent");
+        let prefix = format!(
+            "{}.tmp-{}-",
+            path.file_name().unwrap().to_string_lossy(),
+            std::process::id()
+        );
+        let matches = fs::read_dir(parent)
+            .expect("read state parent")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .collect::<Vec<_>>();
+        assert!(matches.is_empty(), "left state temp files: {matches:?}");
+    }
+
     fn unique_temp_file() -> PathBuf {
+        unique_temp_dir().with_extension("json")
+    }
+
+    fn unique_temp_dir() -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after Unix epoch")
             .as_nanos();
-        env::temp_dir().join(format!("mult-storage-test-{unique}.json"))
+        env::temp_dir().join(format!("mult-storage-test-{unique}"))
     }
 }

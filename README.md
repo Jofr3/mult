@@ -1,27 +1,113 @@
 # mult
 
-`mult` is an early Ratatui prototype for an AI agent multiplexer: multiple workspaces, nested agent chats, and per-workspace terminals in one TUI.
+`mult` is a terminal UI for multiplexing project workspaces, `pi` agent chats, and per-workspace PTY terminals.
+
+The current implementation is a Ratatui/Crossterm client plus a small `mult-server` process that owns long-lived PTYs. The client renders workspaces, chats, terminals, prompt overlays, status indicators, git branches, and terminal output while the server keeps terminal sessions alive across client reconnects.
+
+## Current capabilities
+
+- Multiple workspaces, each with a working directory, agent chats, and terminals.
+- Persistent JSON project state for workspace/chat/terminal metadata and chat transcripts.
+- Runtime PTY sessions managed by `mult-server` over a Unix socket.
+- Shell terminals and command terminals.
+- Auto-start for the selected terminal or selected `pi` chat.
+- Per-chat `pi` processes using a bundled status extension.
+- Terminal scrollback, paste handling, mouse wheel scrolling, mouse text selection, and OSC52 clipboard copy.
+- Configurable project shortcuts and colorscheme.
 
 ## Quick start
 
+With Nix:
+
 ```sh
 nix develop
-just server   # keep this running in one terminal during development
-just run      # start/discard TUI clients in another terminal
+cargo build --workspace
+just run
+# before opening a PR or handing changes off:
+just ci
 ```
 
-Or without `just`:
+Without Nix:
 
 ```sh
-cargo run --bin mult-server
+cargo build --workspace
 cargo run
 ```
 
-Installed `mult` clients autospawn `mult-server` if the socket is missing. The autospawned server is detached from the client terminal, so running panes can survive closing and reopening the `mult` client. For persistence across full logouts/restarts, the recommended long-lived setup is a systemd user service; see `docs/DAEMON.md`.
+The client tries to autospawn `mult-server` when the `mult-server` binary is next to the `mult` binary. If that is not true in your workflow, start the server manually in another terminal:
 
-State is auto-saved to `$XDG_DATA_HOME/mult/state.json` or `~/.local/share/mult/state.json`. Override with `MULT_STATE_PATH=/path/to/state.json`. Saved state files are written with owner-only permissions. Chat transcripts, terminal definitions, and running/restorable chat-terminal status are persisted with workspace state; terminal scrollback remains in-memory. If state JSON is corrupt, mult moves it aside to a `*.corrupt-*` backup and starts from default state.
+```sh
+just server
+# or
+cargo run --bin mult-server
+```
 
-Configuration is loaded from `$XDG_CONFIG_HOME/mult/config.json` or `~/.config/mult/config.json`:
+## Useful commands
+
+```sh
+just run        # run the TUI client
+just server     # run the persistent PTY server
+just check      # cargo check --workspace --all-targets --all-features
+just test       # cargo test --workspace --all-targets --all-features
+just fmt        # format Rust, and flake.nix when nixpkgs-fmt exists
+just fmt-check  # check Rust formatting without modifying files
+just lint       # clippy with warnings denied
+just audit      # cargo audit -D warnings (requires cargo-audit)
+just ci         # strict local CI: fmt-check, lint, test, audit
+just watch      # cargo-watch check/test loop
+just nix-build  # nix build
+just nix-check  # nix flake check
+```
+
+## Validation / CI
+
+`just ci` is the local gate and intentionally fails if `cargo-audit` is missing. `nix develop` provides `just` and `cargo-audit`. GitHub Actions runs the same `just ci` gate on Linux and also runs `nix flake check` in a separate job.
+
+The audit gate currently avoids known RustSec advisories by using `postcard` for local IPC framing and current `ratatui`/`tui-term` releases.
+
+## Controls
+
+Global controls when no prompt is open:
+
+| Key | Action |
+| --- | --- |
+| `Ctrl+j` or `Ctrl+Enter` | Select next sidebar item |
+| `Ctrl+k` | Select previous sidebar item |
+| `Ctrl+a` | Add a new agent chat to the selected workspace |
+| `Ctrl+t` | Add a new shell terminal to the selected workspace |
+| `Ctrl+f` | Open/import a workspace |
+| `Ctrl+p` | Open the command palette |
+| `Ctrl+s` | Search the selected chat/terminal pane |
+| `Ctrl+q` | Delete the selected chat/terminal, or an empty workspace |
+| `Ctrl+Esc` | Quit |
+
+Typing in a selected chat or terminal starts/focuses its PTY and forwards input to it.
+
+Prompt controls:
+
+| Key | Action |
+| --- | --- |
+| `Enter` | Submit |
+| `Esc` or `Ctrl+c` | Cancel |
+| `Backspace` | Delete one character |
+| `Up`/`Down` or `Ctrl+k`/`Ctrl+j` | Move through prompt results where supported |
+
+Mouse support:
+
+- Scroll wheel scrolls the selected output pane.
+- Drag over terminal/chat-agent output to select visible text and copy it through OSC52.
+
+The command palette includes discoverable actions for focus changes, starting input, adding/deleting sessions, opening workspaces, search, clearing search, and quitting.
+
+## Configuration
+
+Config path:
+
+- `$MULT_CONFIG_PATH`, if set
+- otherwise `$XDG_CONFIG_HOME/mult/config.json`
+- otherwise `~/.config/mult/config.json`
+
+Example:
 
 ```json
 {
@@ -31,55 +117,67 @@ Configuration is loaded from `$XDG_CONFIG_HOME/mult/config.json` or `~/.config/m
   "mouse_capture": true,
   "projects": [
     { "name": "mult", "path": "~/projects/mult" },
-    ["docs", "~/projects/docs"]
+    ["scratch", "/tmp/scratch"]
   ],
   "colorscheme": {
-    "_nc": "#1f1d30",
     "base": "#232136",
-    "surface": "#2a273f",
-    "overlay": "#393552",
-    "muted": "#6e6a86",
-    "subtle": "#908caa",
     "text": "#e0def4",
-    "love": "#eb6f92",
-    "gold": "#f6c177",
-    "rose": "#ea9a97",
-    "pine": "#3e8fb0",
-    "foam": "#9ccfd8",
-    "iris": "#c4a7e7",
-    "leaf": "#95b1ac",
-    "highlight_low": "#2a283e",
-    "highlight_med": "#44415a",
-    "highlight_high": "#56526e"
+    "iris": "#c4a7e7"
   }
 }
 ```
 
-Use `MULT_CONFIG_PATH=/path/to/config.json` to point at another config file. `projects` is optional; when present, `Ctrl-F` opens a fuzzy project picker searched by project name and then imports the configured path. Entries may be objects (`{"name":"mult","path":"~/projects/mult"}`) or `["name","path"]` pairs. `auto_start_pi_agent` and `auto_start_terminals` default to `true`; set either to `false` if you want panes to wait for manual start. `mouse_capture` defaults to `true` so the left sidebar stays visible while mouse wheel scrolling and pane-local drag selection both work. Dragging in the selected chat/terminal pane highlights text and copies it through OSC 52 on release. Set `mouse_capture` to `false` to disable app mouse handling and fall back to your terminal emulator's native selection. The default colorscheme is Rosé Pine Moon; any color key can be overridden with a `#rrggbb` value.
+Environment variables:
 
-## Current controls
+| Variable | Purpose |
+| --- | --- |
+| `MULT_CONFIG_PATH` | Override config file path |
+| `MULT_STATE_PATH` | Override state file path |
+| `MULT_SOCKET_PATH` | Override `mult-server` Unix socket path |
+| `MULT_SERVER_AUTOSPAWN=0` | Disable server autospawn |
+| `MULT_AGENT_CMD` | Configure the experimental process-agent backend. Simple shell-style quotes and backslash escapes are supported; shell expansion is not performed. |
 
-mult is always in input mode: ordinary keys go to the selected terminal or agent PTY. Workspace actions use Ctrl chords:
+## State
 
-- `Ctrl-J`: navigate down
-- `Ctrl-K`: navigate up
-- `Ctrl-Q`: delete the selected agent chat, terminal, or command terminal immediately; closing the last item under a workspace closes the workspace too
-- `Ctrl-Esc`: quit mult
-- `Ctrl-A`: add an agent chat to the selected workspace and start/focus its pi agent
-- `Ctrl-T`: add a shell terminal to the selected workspace
-- `Ctrl-F`: open/import a workspace; uses the configured fuzzy project list when `projects` is set, otherwise prompts for a directory path
-- Drag within the selected chat/terminal pane: select visible pane text and copy it on release
-- Mouse wheel over a chat/terminal output pane: scroll that pane without moving the outer terminal history
+State path:
 
-When the open/import or command prompt is active:
+- `$MULT_STATE_PATH`, if set
+- otherwise `$XDG_DATA_HOME/mult/state.json`
+- otherwise `~/.local/share/mult/state.json`
 
-- Type a configured project name, directory path, or command
-- Up/Ctrl-K and Down/Ctrl-J: select a configured project match
-- Enter: submit it
-- Esc or Ctrl-C: cancel
+The state file is written atomically through an owner-only temporary file and final state files are set to `0600`. Newly-created state directories use owner-only permissions. Invalid JSON is moved aside with a `.corrupt-*` suffix before resetting to defaults; state files with a newer schema version are rejected without rewriting them.
 
-Workspace headers are labels, not selectable panes. Deleting a chat or terminal stops its running PTY if needed, and deleting the last item under a workspace closes that workspace too.
+Durable state contains the workspace tree, chat messages, terminal metadata, terminal launch commands, and statuses. PTY processes, raw terminal buffers, and scrollback are runtime/server-owned and are not stored in the JSON state file.
 
-The selected chat/terminal pane receives keyboard input directly. If its PTY is not running, typing into it starts the PTY first. Mouse wheel scrolling works over the pane under the cursor. Running PTYs are sized from the visible pane instead of a fixed 80x24 size. Chat panes run `pi` by default; set `pi_agent_command` in the config file to override it.
+## Project layout
 
-See `docs/PLAN.md` for the roadmap and `AGENTS.md` for contributor/agent guidance.
+```text
+src/main.rs              TUI event loop and runtime wiring
+src/app.rs               app state, navigation, prompts, search, mutations
+src/model.rs             durable project model and IDs
+src/ui.rs                pure Ratatui rendering
+src/pty.rs               client-side PTY runtime and server protocol adapter
+src/bin/mult-server.rs   PTY server process
+src/config.rs            config loading/defaults
+src/storage.rs           state loading/saving
+src/agent.rs             experimental process-agent backend
+crates/protocol          shared client/server protocol types
+extensions/mult-status.ts bundled pi status extension
+```
+
+## Runtime server and IPC
+
+`mult-server` owns long-lived PTYs and communicates with clients over a Unix socket. See [docs/DAEMON.md](docs/DAEMON.md) for operational details, socket path selection, autospawn behavior, and security notes.
+
+By default the socket lives at `$XDG_RUNTIME_DIR/mult.sock`; without `XDG_RUNTIME_DIR`, the fallback is a private `/tmp/mult-<uid>/mult.sock` directory. Server-created socket parents are mode `0700`, sockets are mode `0600`, and Linux builds verify Unix-socket peer credentials when clients connect.
+
+## Platform notes
+
+`mult` currently uses Unix sockets and Unix PTY/process APIs, so the practical target is Linux/macOS-like systems.
+
+## License
+
+Licensed under either of:
+
+- [MIT](LICENSE-MIT)
+- [Apache-2.0](LICENSE-APACHE)

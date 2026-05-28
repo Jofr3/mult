@@ -1,73 +1,39 @@
-# mult server lifecycle
+# `mult-server` daemon
 
-`mult` uses a tmux-style split: `mult-server` owns PTYs and terminal grids, while `mult` clients attach over a per-user Unix socket.
+`mult-server` is the long-lived process that owns PTYs. The `mult` TUI client connects to it over a Unix socket so terminal sessions can survive client restarts.
 
-Socket path:
+## Socket path
 
-- `MULT_SOCKET_PATH=/path/to/mult.sock` when explicitly set
-- `$XDG_RUNTIME_DIR/mult.sock`
-- fallback: `/tmp/mult-$UID.sock`, or `/tmp/mult-$USER.sock` if `UID` is unset; unsafe path characters in the env value are replaced with `_`
+Path selection comes from `mult-protocol::default_socket_path()`:
 
-The server removes a stale socket file when it starts, but refuses to remove an existing non-socket path. If a live server already owns the socket, a second server exits. The socket file is chmodded to `0600` after bind. Clients validate the socket protocol version on connect; after upgrading `mult`, restart `mult-server` if the client reports an incompatible protocol version. Client autospawn propagates the selected socket path to `mult-server`.
+1. `$MULT_SOCKET_PATH`, when set.
+2. `$XDG_RUNTIME_DIR/mult.sock`, when `XDG_RUNTIME_DIR` is set.
+3. `/tmp/mult-<uid>/mult.sock`, where the fallback directory is private to the user.
 
-## Recommended: systemd user service on NixOS
+The server creates missing socket parent directories with mode `0700`, binds with a restrictive umask, and sets the socket file to `0600` after binding. Linux builds also verify that connected peers have the same effective UID.
 
-Enable linger so the user service can keep running after logout:
+## Autospawn
 
-```nix
-{
-  users.users.jofre.linger = true;
-}
-```
+The client attempts to autospawn `mult-server` when:
 
-Add a user service. If this repo is exposed as a flake input named `mult`, one suitable NixOS module snippet is:
+- the socket is missing, or the socket path is a stale Unix socket that refuses connections;
+- `MULT_SERVER_AUTOSPAWN` is not `0`, `false`, `False`, or `FALSE`; and
+- a `mult-server` executable exists next to the running `mult` executable.
 
-```nix
-{ inputs, pkgs, ... }:
-{
-  systemd.user.services.mult-server = {
-    description = "mult persistent terminal server";
-    wantedBy = [ "default.target" ];
+Set `MULT_SERVER_AUTOSPAWN=0` to require starting the server manually.
 
-    serviceConfig = {
-      ExecStart = "${inputs.mult.packages.${pkgs.system}.default}/bin/mult-server";
-      Restart = "on-failure";
-      RestartSec = "1s";
-    };
-  };
-}
-```
+## Protocol and compatibility
 
-Apply the config, then start it:
+The client and server exchange a protocol hello and require matching `PROTOCOL_VERSION`. A protocol mismatch usually means an old server is still running after an upgrade; stop it and start the new `mult-server` binary.
 
-```sh
-systemctl --user daemon-reload
-systemctl --user enable --now mult-server.service
-```
+IPC messages are length-prefixed and encoded with `postcard`. Oversized frames are rejected before allocation.
 
-Useful checks:
+## PTY lifecycle
 
-```sh
-systemctl --user status mult-server.service
-journalctl --user -u mult-server.service -f
-```
+Session IDs are reserved under the server lock before spawning PTYs, so duplicate requested IDs cannot race with creation. If spawning fails, the reservation is released. The client waits for attach confirmation and rolls back local attachment state if attach is rejected.
 
-## Development/autospawn path
+## Operational notes
 
-For local development you can run the server manually:
-
-```sh
-just server
-# or
-cargo run --bin mult-server
-```
-
-The `mult` client also attempts a lightweight tmux-style autospawn when the socket is missing or stale. It looks for a `mult-server` executable next to the running `mult` executable, starts it detached from the launching terminal with stdio closed, waits briefly for the socket, then connects. Autospawned servers keep owning PTYs after the client terminal is closed, so reopening `mult` can reattach to the same panes.
-
-Disable client autospawn with:
-
-```sh
-MULT_SERVER_AUTOSPAWN=0 mult
-```
-
-Autospawn is a convenience for interactive use and survives closing the terminal that launched the `mult` client. Prefer the systemd user service for a robust long-lived daemon across full logouts/restarts.
+- Start manually with `just server` or `cargo run --bin mult-server`.
+- The server ignores SIGHUP so PTYs are not torn down when the launching terminal closes.
+- Socket collisions with non-socket files are refused rather than removed.

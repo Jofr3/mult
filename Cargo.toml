@@ -11,14 +11,14 @@ default-members = [".", "crates/protocol"]
 
 [dependencies]
 anyhow = "1.0"
-crossterm = "0.28"
+crossterm = "0.29"
 libc = "0.2"
 mult-protocol = { path = "crates/protocol" }
 portable-pty = "0.9"
-ratatui = "0.29"
+ratatui = "0.30"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tui-term = { version = "0.2", default-features = false }
+tui-term = { version = "0.3.4", default-features = false }
 # Fork of vt100 0.15 with deep visible scrollback support; keep tui-term's
 # vt100 feature disabled and render through the local adapter in src/ui.rs.
 vt100 = { package = "fnug-vt100", version = "0.15.2" }

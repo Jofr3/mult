@@ -8,7 +8,7 @@ use crate::{
     config::ConfiguredProject,
     model::{
         ChatId, ChatMessage, ChatMessageRole, ChatStatus, ProjectState, TerminalId, TerminalStatus,
-        WorkspaceId, DEFAULT_AGENT_CHAT_TITLE, RUNTIME_TERMINAL_ID_FLAG,
+        WorkspaceId, DEFAULT_AGENT_CHAT_TITLE, RUNTIME_TERMINAL_ID_FLAG, STATE_VERSION,
     },
 };
 
@@ -89,7 +89,7 @@ pub struct SearchState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectionCell {
-    pub row: u16,
+    pub row: i32,
     pub col: u16,
 }
 
@@ -202,6 +202,8 @@ pub fn chat_id_from_agent_terminal_id(terminal: TerminalId) -> Option<ChatId> {
 
 impl App {
     pub fn new(mut project: ProjectState) -> Self {
+        let version_normalized = project.version != STATE_VERSION;
+        project.version = STATE_VERSION;
         let ids_normalized = project.normalize_next_ids();
         let titles_normalized = normalize_agent_chat_titles(&mut project);
         let chat_statuses_normalized = normalize_transient_chat_statuses(&mut project);
@@ -222,7 +224,10 @@ impl App {
             active_search: None,
             text_selection: None,
             should_quit: false,
-            dirty: ids_normalized || titles_normalized || chat_statuses_normalized,
+            dirty: version_normalized
+                || ids_normalized
+                || titles_normalized
+                || chat_statuses_normalized,
         };
         app.clamp_selection();
         app.sync_focus_to_selection();
@@ -419,6 +424,27 @@ impl App {
 
     pub fn clear_text_selection(&mut self) {
         self.text_selection = None;
+    }
+
+    pub fn shift_text_selection_rows(&mut self, terminal: TerminalId, delta: i32) -> bool {
+        if delta == 0 {
+            return false;
+        }
+        let Some(selection) = &mut self.text_selection else {
+            return false;
+        };
+        if selection.terminal != terminal {
+            return false;
+        }
+
+        let anchor_row = selection.anchor.row.saturating_add(delta);
+        let focus_row = selection.focus.row.saturating_add(delta);
+        if selection.anchor.row == anchor_row && selection.focus.row == focus_row {
+            return false;
+        }
+        selection.anchor.row = anchor_row;
+        selection.focus.row = focus_row;
+        true
     }
 
     pub fn text_selection_for(&self, terminal: TerminalId) -> Option<&TextSelection> {
@@ -1759,6 +1785,24 @@ mod tests {
 
         assert_eq!(app.workspace_git_branch(workspace), Some("main"));
         assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn text_selection_rows_shift_with_viewport_scroll() {
+        let mut app = App::default();
+        let terminal = TerminalId(9);
+        app.begin_text_selection(terminal, SelectionCell { row: 1, col: 0 });
+        app.update_text_selection(terminal, SelectionCell { row: 1, col: 2 });
+
+        assert!(app.shift_text_selection_rows(terminal, 3));
+        let selection = app.text_selection_for(terminal).expect("selection remains");
+        assert_eq!(selection.anchor.row, 4);
+        assert_eq!(selection.focus.row, 4);
+
+        assert!(app.shift_text_selection_rows(terminal, -5));
+        let selection = app.text_selection_for(terminal).expect("selection remains");
+        assert_eq!(selection.anchor.row, -1);
+        assert_eq!(selection.focus.row, -1);
     }
 
     #[test]

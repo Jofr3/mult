@@ -1,6 +1,6 @@
 use std::{
-    fs,
-    io::{self, Write},
+    fs::{self, OpenOptions},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -65,7 +65,7 @@ fn disable_terminal_features(mouse_capture: bool) -> io::Result<()> {
 const AGENT_CMD_ENV: &str = "MULT_AGENT_CMD";
 const MULT_AGENT_STATUS_PATH_ENV: &str = "MULT_AGENT_STATUS_PATH";
 const MULT_AGENT_CHAT_ID_ENV: &str = "MULT_AGENT_CHAT_ID";
-const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const READY_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(0);
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const MOUSE_SCROLL_ROWS: usize = 3;
@@ -110,13 +110,91 @@ impl AgentBackend for RuntimeAgentBackend {
 }
 
 fn parse_process_agent_command(raw: &str) -> Option<ProcessAgentCommand> {
-    let mut parts = raw.split_whitespace().map(ToOwned::to_owned);
+    let mut parts = split_process_agent_command(raw).ok()?.into_iter();
     let program = parts.next()?;
     if program.is_empty() {
         return None;
     }
 
     Some(ProcessAgentCommand::with_args(program, parts))
+}
+
+fn split_process_agent_command(raw: &str) -> Result<Vec<String>, &'static str> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote = Quote::None;
+    let mut escaping = false;
+    let mut in_token = false;
+
+    for ch in raw.chars() {
+        if escaping {
+            current.push(ch);
+            escaping = false;
+            in_token = true;
+            continue;
+        }
+
+        match quote {
+            Quote::None => match ch {
+                '\\' => {
+                    escaping = true;
+                    in_token = true;
+                }
+                '\'' => {
+                    quote = Quote::Single;
+                    in_token = true;
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    in_token = true;
+                }
+                ch if ch.is_whitespace() => {
+                    if in_token {
+                        args.push(std::mem::take(&mut current));
+                        in_token = false;
+                    }
+                }
+                _ => {
+                    current.push(ch);
+                    in_token = true;
+                }
+            },
+            Quote::Single => {
+                if ch == '\'' {
+                    quote = Quote::None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            Quote::Double => match ch {
+                '"' => quote = Quote::None,
+                '\\' => {
+                    escaping = true;
+                    in_token = true;
+                }
+                _ => current.push(ch),
+            },
+        }
+    }
+
+    if escaping {
+        current.push('\\');
+    }
+    if quote != Quote::None {
+        return Err("unterminated quote");
+    }
+    if in_token {
+        args.push(current);
+    }
+
+    Ok(args)
 }
 
 fn run(terminal: &mut DefaultTerminal, mut app: App, config: Config) -> io::Result<()> {
@@ -408,9 +486,10 @@ fn mouse_cell_in_area(area: Rect, column: u16, row: u16) -> Option<SelectionCell
         return None;
     }
     Some(SelectionCell {
-        row: row
-            .saturating_sub(area.y)
-            .min(area.height.saturating_sub(1)),
+        row: i32::from(
+            row.saturating_sub(area.y)
+                .min(area.height.saturating_sub(1)),
+        ),
         col: column
             .saturating_sub(area.x)
             .min(area.width.saturating_sub(1)),
@@ -426,10 +505,25 @@ fn selected_text(pty_runtime: &PtyRuntime, selection: TextSelection) -> Option<S
     }
 
     let range = selection.normalized_range();
-    let start_row = range.start.row.min(rows.saturating_sub(1));
-    let end_row = range.end.row.min(rows.saturating_sub(1));
-    let start_col = range.start.col.min(cols.saturating_sub(1));
-    let end_col = range.end.col.min(cols.saturating_sub(1));
+    let visible_last_row = i32::from(rows.saturating_sub(1));
+    if range.end.row < 0 || range.start.row > visible_last_row {
+        return None;
+    }
+
+    let start_row = range.start.row.max(0);
+    let end_row = range.end.row.min(visible_last_row);
+    let start_col = if start_row == range.start.row {
+        range.start.col.min(cols.saturating_sub(1))
+    } else {
+        0
+    };
+    let end_col = if end_row == range.end.row {
+        range.end.col.min(cols.saturating_sub(1))
+    } else {
+        cols.saturating_sub(1)
+    };
+    let start_row = u16::try_from(start_row).unwrap_or(0);
+    let end_row = u16::try_from(end_row).unwrap_or(rows.saturating_sub(1));
     let end_col_exclusive = end_col.saturating_add(1).min(cols);
     if start_row == end_row && start_col >= end_col_exclusive {
         return None;
@@ -565,6 +659,13 @@ fn handle_control_key(
         delete_selected_now(app, pty_runtime);
         return true;
     }
+    if is_unshifted_control_char(key, 'p') {
+        app.begin_command_palette();
+        return true;
+    }
+    if is_unshifted_control_char(key, 's') && app.begin_search() {
+        return true;
+    }
     if is_unshifted_control_char(key, 'a') {
         add_agent_to_selected_workspace(app, pty_runtime, config, frame_area);
         return true;
@@ -609,21 +710,49 @@ fn is_control_key(key: KeyEvent) -> bool {
 }
 
 fn scroll_terminal_output_up(
-    _app: &mut App,
+    app: &mut App,
     pty_runtime: &mut PtyRuntime,
     terminal: TerminalId,
     rows: usize,
 ) -> bool {
-    pty_runtime.scroll_up(terminal, rows).unwrap_or(false)
+    let before = terminal_scrollback(pty_runtime, terminal);
+    let changed = pty_runtime.scroll_up(terminal, rows).unwrap_or(false);
+    sync_text_selection_with_scrollback(app, pty_runtime, terminal, before, changed);
+    changed
 }
 
 fn scroll_terminal_output_down(
-    _app: &mut App,
+    app: &mut App,
     pty_runtime: &mut PtyRuntime,
     terminal: TerminalId,
     rows: usize,
 ) -> bool {
-    pty_runtime.scroll_down(terminal, rows).unwrap_or(false)
+    let before = terminal_scrollback(pty_runtime, terminal);
+    let changed = pty_runtime.scroll_down(terminal, rows).unwrap_or(false);
+    sync_text_selection_with_scrollback(app, pty_runtime, terminal, before, changed);
+    changed
+}
+
+fn terminal_scrollback(pty_runtime: &PtyRuntime, terminal: TerminalId) -> usize {
+    pty_runtime
+        .parser(terminal)
+        .map(|parser| parser.screen().scrollback())
+        .unwrap_or_default()
+}
+
+fn sync_text_selection_with_scrollback(
+    app: &mut App,
+    pty_runtime: &PtyRuntime,
+    terminal: TerminalId,
+    before: usize,
+    changed: bool,
+) {
+    if !changed {
+        return;
+    }
+    let after = terminal_scrollback(pty_runtime, terminal);
+    let delta = (after as i64 - before as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    app.shift_text_selection_rows(terminal, delta);
 }
 
 fn add_agent_to_selected_workspace(
@@ -1047,10 +1176,33 @@ fn pi_command_with_mult_status_extension(config: &Config) -> String {
 }
 
 fn write_mult_status_extension_file() -> Option<PathBuf> {
-    let path =
-        std::env::temp_dir().join(format!("mult-status-extension-{}.ts", std::process::id()));
-    fs::write(&path, MULT_STATUS_EXTENSION_SOURCE).ok()?;
-    Some(path)
+    let dir = ensure_mult_runtime_dir().ok()?;
+    for _ in 0..16 {
+        let path = dir.join(format!(
+            "mult-status-extension-{}-{:016x}.ts",
+            std::process::id(),
+            random_u64().ok()?
+        ));
+        match write_private_file(&path, MULT_STATUS_EXTENSION_SOURCE.as_bytes()) {
+            Ok(()) => return Some(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1280,11 +1432,50 @@ fn mult_agent_status_to_chat_status(status: &str) -> Option<ChatStatus> {
 }
 
 fn mult_agent_status_path(chat: model::ChatId) -> PathBuf {
-    std::env::temp_dir().join(format!(
+    let dir = ensure_mult_runtime_dir().unwrap_or_else(|_| mult_runtime_dir());
+    dir.join(format!(
         "mult-agent-status-{}-{}.json",
         std::process::id(),
         chat.0
     ))
+}
+
+fn ensure_mult_runtime_dir() -> io::Result<PathBuf> {
+    let dir = mult_runtime_dir();
+    create_private_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn mult_runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("mult-{}", current_euid())))
+        .join("mult")
+}
+
+fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
+fn current_euid() -> u32 {
+    unsafe { libc::geteuid() as u32 }
+}
+
+fn random_u64() -> io::Result<u64> {
+    let mut bytes = [0_u8; 8];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(u64::from_ne_bytes(bytes))
 }
 
 fn save_if_dirty(app: &mut App) -> io::Result<()> {
@@ -1311,8 +1502,23 @@ mod tests {
     }
 
     #[test]
-    fn blank_process_agent_command_is_ignored() {
+    fn process_agent_command_supports_basic_shell_quoting() {
+        let command = parse_process_agent_command(
+            "agent-cli --prompt 'hello world' \"two words\" escaped\\ space",
+        )
+        .expect("command parses");
+
+        assert_eq!(command.program, "agent-cli");
+        assert_eq!(
+            command.args,
+            vec!["--prompt", "hello world", "two words", "escaped space"]
+        );
+    }
+
+    #[test]
+    fn blank_or_unterminated_process_agent_command_is_ignored() {
         assert_eq!(parse_process_agent_command("   "), None);
+        assert_eq!(parse_process_agent_command("agent 'unterminated"), None);
     }
 
     #[test]
@@ -1419,6 +1625,44 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_p_opens_palette_and_ctrl_s_opens_search_for_selected_pane() {
+        let mut app = App::default();
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let config = Config::default();
+        let frame_area = Rect::new(0, 0, 120, 40);
+
+        handle_unprompted_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            frame_area,
+        );
+        assert!(matches!(app.prompt, Some(Prompt::CommandPalette(_))));
+        app.cancel_prompt();
+
+        let workspace = app.project.workspaces[0].id;
+        let terminal = app.project.workspaces[0].terminals[0].id;
+        let target = NavItem::Terminal {
+            workspace,
+            terminal,
+        };
+        app.selected = app
+            .nav_items()
+            .iter()
+            .position(|item| *item == target)
+            .expect("terminal nav item exists");
+        handle_unprompted_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            frame_area,
+        );
+        assert!(matches!(app.prompt, Some(Prompt::Search(_))));
+    }
+
+    #[test]
     fn plain_keys_are_not_workspace_commands() {
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
@@ -1505,6 +1749,72 @@ mod tests {
             pty_runtime.terminal_lines(terminal_id),
             vec!["four".to_string(), "five".to_string()]
         );
+    }
+
+    #[test]
+    fn mouse_wheel_scroll_moves_text_selection_with_scrollback() {
+        let mut app = App::default();
+        let (selected, terminal_id) = app
+            .nav_items()
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| match item {
+                mult::app::NavItem::Terminal { terminal, .. } => Some((index, *terminal)),
+                _ => None,
+            })
+            .expect("seed state has a terminal");
+        app.selected = selected;
+        app.begin_text_selection(terminal_id, SelectionCell { row: 0, col: 0 });
+        app.update_text_selection(terminal_id, SelectionCell { row: 0, col: 2 });
+
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime
+            .resize(terminal_id, PtyDimensions { rows: 2, cols: 8 })
+            .expect("resize parser");
+        pty_runtime.process_terminal_output(terminal_id, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        let config = Config {
+            mouse_capture: true,
+            ..Config::default()
+        };
+        let frame_area = Rect::new(0, 0, 120, 40);
+        let (_, output_area) = ui::selected_terminal_output_area(&app, frame_area)
+            .expect("terminal selection has output area");
+
+        handle_event(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: output_area.x,
+                row: output_area.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            frame_area,
+        );
+        let selection = app
+            .text_selection_for(terminal_id)
+            .expect("selection follows scroll up");
+        assert_eq!(selection.anchor.row, 3);
+        assert_eq!(selection.focus.row, 3);
+
+        handle_event(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: output_area.x,
+                row: output_area.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            frame_area,
+        );
+        let selection = app
+            .text_selection_for(terminal_id)
+            .expect("selection follows scroll down");
+        assert_eq!(selection.anchor.row, 0);
+        assert_eq!(selection.focus.row, 0);
     }
 
     #[test]

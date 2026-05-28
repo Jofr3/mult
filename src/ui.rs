@@ -764,7 +764,7 @@ fn render_terminal_parser(
         .cursor(cursor);
     frame.render_widget(pseudo_term, area);
     if let Some(selection) = selection {
-        render_text_selection(frame, area, selection, palette);
+        render_text_selection(frame, area, parser.screen().size().0, selection, palette);
     }
 }
 
@@ -896,23 +896,30 @@ fn vt100_color_to_ratatui(color: vt100::Color) -> Color {
 fn render_text_selection(
     frame: &mut Frame,
     area: Rect,
+    terminal_rows: u16,
     selection: &TextSelection,
     palette: Palette,
 ) {
-    if area.is_empty() {
+    if area.is_empty() || terminal_rows == 0 {
         return;
     }
 
+    let visible_rows = area.height.min(terminal_rows);
+    let visible_last_row = i32::from(visible_rows.saturating_sub(1));
     let range = selection.normalized_range();
-    let start_row = range.start.row.min(area.height.saturating_sub(1));
-    let end_row = range.end.row.min(area.height.saturating_sub(1));
+    if range.end.row < 0 || range.start.row > visible_last_row {
+        return;
+    }
+
+    let start_row = range.start.row.max(0);
+    let end_row = range.end.row.min(visible_last_row);
     let start_col = range.start.col.min(area.width.saturating_sub(1));
     let end_col = range.end.col.min(area.width.saturating_sub(1));
     let style = Style::default().fg(palette.nc).bg(palette.foam);
 
     for row in start_row..=end_row {
-        let row_start_col = if row == start_row { start_col } else { 0 };
-        let row_end_col = if row == end_row {
+        let row_start_col = if row == range.start.row { start_col } else { 0 };
+        let row_end_col = if row == range.end.row {
             end_col
         } else {
             area.width.saturating_sub(1)
@@ -920,6 +927,7 @@ fn render_text_selection(
         if row_start_col > row_end_col {
             continue;
         }
+        let row = u16::try_from(row).unwrap_or(0);
         frame.buffer_mut().set_style(
             Rect::new(
                 area.x.saturating_add(row_start_col),
@@ -1744,6 +1752,53 @@ mod tests {
         assert_eq!(selected_cell.symbol(), "x");
         assert_eq!(selected_cell.fg, palette.nc);
         assert_eq!(selected_cell.bg, palette.foam);
+    }
+
+    #[test]
+    fn offscreen_terminal_text_selection_is_not_pinned_to_pane_edge() {
+        let mut app = App::default();
+        let nav_items = app.nav_items();
+        let (selected, terminal_id) = nav_items
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| match item {
+                NavItem::Terminal { terminal, .. } => Some((index, *terminal)),
+                _ => None,
+            })
+            .expect("seed state has a terminal");
+        app.selected = selected;
+        app.begin_text_selection(terminal_id, SelectionCell { row: -1, col: 0 });
+        app.update_text_selection(terminal_id, SelectionCell { row: -1, col: 1 });
+
+        let frame_area = Rect::new(0, 0, 50, 6);
+        let (_, output_area) = selected_terminal_output_area(&app, frame_area)
+            .expect("terminal selection has output area");
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime
+            .resize(
+                terminal_id,
+                crate::pty::PtyDimensions {
+                    rows: output_area.height,
+                    cols: output_area.width,
+                },
+            )
+            .expect("resize parser");
+        pty_runtime.process_terminal_output(terminal_id, b"xy");
+
+        let backend = TestBackend::new(frame_area.width, frame_area.height);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app, &pty_runtime, &config::Config::default()))
+            .expect("draw app");
+
+        let palette = test_palette();
+        let cell = terminal
+            .backend()
+            .buffer()
+            .cell((output_area.x, output_area.y))
+            .expect("cell is in bounds");
+        assert_eq!(cell.symbol(), "x");
+        assert_ne!(cell.bg, palette.foam);
     }
 
     #[test]

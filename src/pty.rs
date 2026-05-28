@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env, fs, io,
-    os::unix::{net::UnixStream, process::CommandExt},
+    os::unix::{io::AsRawFd, net::UnixStream, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -77,6 +77,8 @@ pub struct PtyRuntime {
 }
 
 const SERVER_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
+const ATTACH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const SERVER_EVENT_QUEUE_CAPACITY: usize = 4_096;
 const TERMINAL_SCROLLBACK_LINES: usize = 5_000;
 const TERMINAL_MAX_CSI_SEQUENCE_BYTES: usize = 128;
 const PRIMARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[?1;2c";
@@ -381,7 +383,8 @@ impl PtyRuntime {
                     rows: spawn.size.rows,
                     cols: spawn.size.cols,
                 })
-            });
+            })
+            .and_then(|()| self.wait_for_attach_ack(session, ATTACH_ACK_TIMEOUT));
 
         if result.is_err() {
             self.terminal_to_pane.remove(&spawn.terminal);
@@ -526,6 +529,61 @@ impl PtyRuntime {
         events
     }
 
+    fn wait_for_attach_ack(&mut self, session: SessionId, timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("timed out after {timeout:?} waiting for attach confirmation"),
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let message = {
+                let Some(connection) = self.connection.as_ref() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "not connected to mult-server",
+                    ));
+                };
+                connection.receiver.recv_timeout(remaining)
+            };
+
+            match message {
+                Ok(ServerMessage::Attached {
+                    session: attached, ..
+                }) if attached == session => return Ok(()),
+                Ok(ServerMessage::Error { message }) => {
+                    let kind = if message.contains("already attached") {
+                        io::ErrorKind::AlreadyExists
+                    } else {
+                        io::ErrorKind::Other
+                    };
+                    return Err(io::Error::new(kind, message));
+                }
+                Ok(message) => {
+                    let mut events = Vec::new();
+                    self.handle_server_message(message, &mut events);
+                    self.pending_events.extend(events);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("timed out after {timeout:?} waiting for attach confirmation"),
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.connection = None;
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "mult-server disconnected before attach confirmation",
+                    ));
+                }
+            }
+        }
+    }
+
     fn resize_parser(&mut self, terminal: TerminalId, size: PtyDimensions) {
         let parser = self
             .parsers
@@ -630,6 +688,7 @@ impl PtyRuntime {
 
     fn connect(&mut self) -> io::Result<()> {
         let mut stream = connect_or_spawn_server(&self.socket_path)?;
+        validate_peer_owner(&stream, "mult-server")?;
         stream.set_nonblocking(false)?;
         let mut writer_stream = stream.try_clone()?;
         write_message(
@@ -641,7 +700,7 @@ impl PtyRuntime {
         validate_server_hello_with_timeout(&mut stream, SERVER_HELLO_TIMEOUT)?;
 
         let writer = Arc::new(Mutex::new(writer_stream));
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(SERVER_EVENT_QUEUE_CAPACITY);
         thread::spawn(move || {
             let mut reader = stream;
             loop {
@@ -956,6 +1015,59 @@ fn validate_server_hello(reader: &mut impl io::Read) -> io::Result<()> {
     }
 }
 
+fn validate_peer_owner(stream: &UnixStream, peer_label: &str) -> io::Result<()> {
+    let Some(peer_uid) = peer_uid(stream)? else {
+        return Ok(());
+    };
+    let current_uid = current_euid();
+    if uid_matches_peer(peer_uid, current_uid) {
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("rejecting {peer_label} uid {peer_uid}; expected current uid {current_uid}"),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &UnixStream) -> io::Result<Option<u32>> {
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if length < std::mem::size_of::<libc::ucred>() as libc::socklen_t {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short SO_PEERCRED response",
+        ));
+    }
+    Ok(Some(unsafe { credentials.assume_init().uid }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_uid(_stream: &UnixStream) -> io::Result<Option<u32>> {
+    Ok(None)
+}
+
+fn current_euid() -> u32 {
+    unsafe { libc::geteuid() as u32 }
+}
+
+fn uid_matches_peer(peer_uid: u32, current_uid: u32) -> bool {
+    peer_uid == current_uid
+}
+
 fn connect_or_spawn_server(path: &Path) -> io::Result<UnixStream> {
     match UnixStream::connect(path) {
         Ok(stream) => Ok(stream),
@@ -1262,6 +1374,75 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(error.to_string().contains("waiting for mult-server hello"));
+    }
+
+    #[test]
+    fn peer_owner_check_accepts_same_user_socket_pair() {
+        let (client, _server) = UnixStream::pair().expect("create socket pair");
+
+        validate_peer_owner(&client, "test peer").expect("same uid peer is accepted");
+        assert!(uid_matches_peer(current_euid(), current_euid()));
+        assert!(!uid_matches_peer(
+            current_euid().saturating_add(1),
+            current_euid()
+        ));
+    }
+
+    #[test]
+    fn start_rolls_back_local_attachment_when_attach_is_rejected() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let terminal = TerminalId(7);
+        let pane = PaneId(7);
+        let mut runtime = PtyRuntime {
+            socket_path: unique_socket_path(),
+            connection: Some(ServerConnection {
+                writer: Arc::new(Mutex::new(client_stream)),
+                receiver,
+            }),
+            terminal_to_pane: HashMap::new(),
+            pane_to_terminal: HashMap::new(),
+            parsers: HashMap::new(),
+            responders: HashMap::new(),
+            terminals_with_output: HashSet::new(),
+            terminal_exit_statuses: HashMap::new(),
+            foreground_processes: HashMap::new(),
+            command_trackers: HashMap::new(),
+            pending_events: Vec::new(),
+        };
+        let server = thread::spawn(move || {
+            let create: ClientMessage = read_message(&mut server_stream).expect("read create");
+            assert!(matches!(
+                create,
+                ClientMessage::CreateSession {
+                    requested_id: Some(SessionId(7)),
+                    ..
+                }
+            ));
+            let attach: ClientMessage = read_message(&mut server_stream).expect("read attach");
+            assert_eq!(
+                attach,
+                ClientMessage::Attach {
+                    session: SessionId(7),
+                    rows: 24,
+                    cols: 80,
+                }
+            );
+            sender
+                .send(ServerMessage::Error {
+                    message: "session 7 is already attached".to_string(),
+                })
+                .expect("send attach rejection");
+        });
+
+        let error = runtime
+            .start(PtySpawn::shell(terminal, None, BTreeMap::new()))
+            .expect_err("attach rejection should fail start");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(!runtime.is_running(terminal));
+        assert!(!runtime.pane_to_terminal.contains_key(&pane));
+        server.join().expect("server thread should finish");
     }
 
     #[test]

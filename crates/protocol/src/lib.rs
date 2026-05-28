@@ -7,7 +7,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 pub const DEFAULT_SOCKET_NAME: &str = "mult.sock";
 pub const SOCKET_PATH_ENV: &str = "MULT_SOCKET_PATH";
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -27,10 +27,9 @@ pub fn default_socket_path() -> PathBuf {
     let user = env::var("UID")
         .or_else(|_| env::var("USER"))
         .unwrap_or_else(|_| "unknown".to_string());
-    PathBuf::from("/tmp").join(format!(
-        "mult-{}.sock",
-        sanitize_socket_path_component(&user)
-    ))
+    PathBuf::from("/tmp")
+        .join(format!("mult-{}", sanitize_socket_path_component(&user)))
+        .join(DEFAULT_SOCKET_NAME)
 }
 
 fn sanitize_socket_path_component(input: &str) -> String {
@@ -183,19 +182,25 @@ pub fn read_message<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> io:
 
     let mut payload = vec![0; len];
     reader.read_exact(&mut payload)?;
-    bincode::deserialize(&payload).map_err(invalid_data)
+    let (message, trailing) = postcard::take_from_bytes(&payload).map_err(invalid_data)?;
+    if !trailing.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "message contains trailing bytes",
+        ));
+    }
+    Ok(message)
 }
 
 pub fn write_message<T: Serialize>(writer: &mut impl Write, message: &T) -> io::Result<()> {
-    let serialized_len = bincode::serialized_size(message).map_err(invalid_data)?;
-    if serialized_len > MAX_MESSAGE_BYTES as u64 {
+    let payload = postcard::to_allocvec(message).map_err(invalid_data)?;
+    if payload.len() > MAX_MESSAGE_BYTES {
         return Err(message_too_large(
             io::ErrorKind::InvalidInput,
-            serialized_len,
+            payload.len() as u64,
         ));
     }
 
-    let payload = bincode::serialize(message).map_err(invalid_data)?;
     let len = u32::try_from(payload.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "message too large"))?;
     writer.write_all(&len.to_be_bytes())?;
@@ -221,8 +226,8 @@ fn message_too_large(kind: io::ErrorKind, len: u64) -> io::Error {
     )
 }
 
-fn invalid_data(error: bincode::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
+fn invalid_data(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
 #[cfg(test)]
@@ -281,6 +286,25 @@ mod tests {
             .expect_err("oversized message should be rejected");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_message_rejects_trailing_bytes_inside_frame() {
+        let message = ClientMessage::Attach {
+            session: SessionId(1),
+            rows: 24,
+            cols: 80,
+        };
+        let mut payload = postcard::to_allocvec(&message).expect("serialize payload");
+        payload.push(0xff);
+        let mut bytes = (payload.len() as u32).to_be_bytes().to_vec();
+        bytes.extend(payload);
+
+        let error = read_message::<ClientMessage>(&mut bytes.as_slice())
+            .expect_err("trailing bytes should be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("trailing bytes"));
     }
 
     #[test]
