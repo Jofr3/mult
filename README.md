@@ -96,6 +96,7 @@ Mouse support:
 
 - Scroll wheel scrolls the selected output pane.
 - Drag over terminal/chat-agent output to select visible text and copy it through OSC52.
+- `Ctrl+Shift+C` copies the active `mult` text selection when the terminal forwards that key to `mult`.
 
 The command palette includes discoverable actions for focus changes, starting input, adding/deleting sessions, opening workspaces, search, clearing search, and quitting.
 

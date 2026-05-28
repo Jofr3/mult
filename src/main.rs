@@ -8,8 +8,9 @@ use std::{
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-        MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
 };
@@ -47,18 +48,38 @@ fn main() -> io::Result<()> {
 }
 
 fn enable_terminal_features(mouse_capture: bool) -> io::Result<()> {
+    // Preserve Shift on modified keys in terminals that support the kitty keyboard
+    // protocol, so Ctrl+Shift+C does not arrive looking identical to Ctrl+C.
     if mouse_capture {
-        execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)
+        execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            EnableMouseCapture,
+            EnableBracketedPaste,
+        )
     } else {
-        execute!(io::stdout(), EnableBracketedPaste)
+        execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            EnableBracketedPaste,
+        )
     }
 }
 
 fn disable_terminal_features(mouse_capture: bool) -> io::Result<()> {
     if mouse_capture {
-        execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture)
+        execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            PopKeyboardEnhancementFlags,
+        )
     } else {
-        execute!(io::stdout(), DisableBracketedPaste)
+        execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            PopKeyboardEnhancementFlags,
+        )
     }
 }
 
@@ -454,10 +475,25 @@ fn finish_text_selection_at_mouse(
         app.clear_text_selection();
         return false;
     }
-    if let Some(text) = selected_text(pty_runtime, selection) {
-        let _ = copy_text_to_clipboard(&text);
-    }
+    let _ = copy_text_selection_to_clipboard(pty_runtime, selection);
     true
+}
+
+fn copy_current_text_selection(app: &App, pty_runtime: &PtyRuntime) -> bool {
+    let Some(selection) = app.text_selection else {
+        return false;
+    };
+    copy_text_selection_to_clipboard(pty_runtime, selection)
+}
+
+fn copy_text_selection_to_clipboard(pty_runtime: &PtyRuntime, selection: TextSelection) -> bool {
+    if selection.anchor == selection.focus {
+        return false;
+    }
+    let Some(text) = selected_text(pty_runtime, selection) else {
+        return false;
+    };
+    copy_text_to_clipboard(&text).is_ok()
 }
 
 fn active_selection_cell_at_mouse(
@@ -647,6 +683,11 @@ fn handle_control_key(
     key: KeyEvent,
     frame_area: Rect,
 ) -> bool {
+    if is_shifted_control_char(key, 'c') {
+        let _ = copy_current_text_selection(app, pty_runtime);
+        return true;
+    }
+
     if is_control_down_key(key) {
         app.select_next();
         return true;
@@ -703,6 +744,16 @@ fn is_unshifted_control_char(key: KeyEvent, target: char) -> bool {
     is_control_key(key)
         && !key.modifiers.contains(KeyModifiers::SHIFT)
         && ch == target.to_ascii_lowercase()
+}
+
+fn is_shifted_control_char(key: KeyEvent, target: char) -> bool {
+    let KeyCode::Char(ch) = key.code else {
+        return false;
+    };
+
+    is_control_key(key)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && ch.eq_ignore_ascii_case(&target)
 }
 
 fn is_control_key(key: KeyEvent) -> bool {
@@ -856,7 +907,7 @@ fn handle_open_workspace_key(app: &mut App, config: &Config, key: KeyEvent) {
             app.select_next_open_workspace_match(&config.projects);
         }
         KeyCode::Backspace => app.pop_prompt_char(),
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cancel_prompt(),
+        _ if is_unshifted_control_char(key, 'c') => app.cancel_prompt(),
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.push_prompt_char(c);
         }
@@ -869,7 +920,7 @@ fn handle_terminal_command_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => app.cancel_prompt(),
         KeyCode::Enter => app.submit_new_terminal_command(),
         KeyCode::Backspace => app.pop_prompt_char(),
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cancel_prompt(),
+        _ if is_unshifted_control_char(key, 'c') => app.cancel_prompt(),
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.push_prompt_char(c);
         }
@@ -896,7 +947,7 @@ fn handle_command_palette_key(
         _ if is_unshifted_control_char(key, 'k') => app.select_previous_command_palette_entry(),
         _ if is_unshifted_control_char(key, 'j') => app.select_next_command_palette_entry(),
         KeyCode::Backspace => app.pop_prompt_char(),
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cancel_prompt(),
+        _ if is_unshifted_control_char(key, 'c') => app.cancel_prompt(),
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.push_prompt_char(c);
         }
@@ -909,7 +960,7 @@ fn handle_search_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => app.cancel_prompt(),
         KeyCode::Enter => app.submit_search(),
         KeyCode::Backspace => app.pop_prompt_char(),
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.cancel_prompt(),
+        _ if is_unshifted_control_char(key, 'c') => app.cancel_prompt(),
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.push_prompt_char(c);
         }
@@ -1358,6 +1409,9 @@ fn base_key_to_pty_bytes(key: KeyEvent) -> Option<Vec<u8>> {
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Delete => b"\x1b[3~".to_vec(),
         KeyCode::Insert => b"\x1b[2~".to_vec(),
+        // Never collapse Ctrl+Shift+C into ETX/Ctrl+C when enhanced keyboard
+        // reporting lets us tell those keypresses apart.
+        KeyCode::Char(_) if is_shifted_control_char(key, 'c') => return None,
         KeyCode::F(1) => b"\x1bOP".to_vec(),
         KeyCode::F(2) => b"\x1bOQ".to_vec(),
         KeyCode::F(3) => b"\x1bOR".to_vec(),
@@ -1922,6 +1976,32 @@ mod tests {
 
         assert_eq!(app.prompt, None);
         assert_eq!(app.project.workspaces[0].terminals.len(), initial_terminals);
+    }
+
+    #[test]
+    fn ctrl_shift_c_is_copy_shortcut_not_pty_interrupt() {
+        let mut app = App::default();
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let config = Config::default();
+        let frame_area = Rect::new(0, 0, 120, 40);
+        let key = KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+
+        assert!(handle_control_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            key,
+            frame_area,
+        ));
+        assert!(key_to_pty_bytes(key).is_empty());
+        assert!(key_to_pty_bytes(KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .is_empty());
     }
 
     #[test]
