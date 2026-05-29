@@ -28,49 +28,33 @@ const SIDEBAR_SELECTION_SYMBOL: &str = " ";
 const WORKSPACE_ICON: &str = "▣ ";
 const GIT_BRANCH_ICON: &str = "";
 
-#[allow(dead_code)]
 mod moon {
     use ratatui::style::Color;
 
     pub const NC: Color = Color::Rgb(31, 29, 48);
     pub const BASE: Color = Color::Rgb(35, 33, 54);
-    pub const SURFACE: Color = Color::Rgb(42, 39, 63);
-    pub const OVERLAY: Color = Color::Rgb(57, 53, 82);
     pub const MUTED: Color = Color::Rgb(110, 106, 134);
-    pub const SUBTLE: Color = Color::Rgb(144, 140, 170);
     pub const TEXT: Color = Color::Rgb(224, 222, 244);
     pub const LOVE: Color = Color::Rgb(235, 111, 146);
     pub const GOLD: Color = Color::Rgb(246, 193, 119);
-    pub const ROSE: Color = Color::Rgb(234, 154, 151);
     pub const PINE: Color = Color::Rgb(62, 143, 176);
     pub const FOAM: Color = Color::Rgb(156, 207, 216);
     pub const IRIS: Color = Color::Rgb(196, 167, 231);
-    pub const LEAF: Color = Color::Rgb(149, 177, 172);
-    pub const HIGHLIGHT_LOW: Color = Color::Rgb(42, 40, 62);
     pub const HIGHLIGHT_MED: Color = Color::Rgb(68, 65, 90);
-    pub const HIGHLIGHT_HIGH: Color = Color::Rgb(86, 82, 110);
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct Palette {
     nc: Color,
     base: Color,
-    surface: Color,
-    overlay: Color,
     muted: Color,
-    subtle: Color,
     text: Color,
     love: Color,
     gold: Color,
-    rose: Color,
     pine: Color,
     foam: Color,
     iris: Color,
-    leaf: Color,
-    highlight_low: Color,
     highlight_med: Color,
-    highlight_high: Color,
     cursor: Color,
     success: Color,
 }
@@ -80,22 +64,14 @@ impl Palette {
         Self {
             nc: parse_color(&colorscheme.nc).unwrap_or(moon::NC),
             base: parse_color(&colorscheme.base).unwrap_or(moon::BASE),
-            surface: parse_color(&colorscheme.surface).unwrap_or(moon::SURFACE),
-            overlay: parse_color(&colorscheme.overlay).unwrap_or(moon::OVERLAY),
             muted: parse_color(&colorscheme.muted).unwrap_or(moon::MUTED),
-            subtle: parse_color(&colorscheme.subtle).unwrap_or(moon::SUBTLE),
             text: parse_color(&colorscheme.text).unwrap_or(moon::TEXT),
             love: parse_color(&colorscheme.love).unwrap_or(moon::LOVE),
             gold: parse_color(&colorscheme.gold).unwrap_or(moon::GOLD),
-            rose: parse_color(&colorscheme.rose).unwrap_or(moon::ROSE),
             pine: parse_color(&colorscheme.pine).unwrap_or(moon::PINE),
             foam: parse_color(&colorscheme.foam).unwrap_or(moon::FOAM),
             iris: parse_color(&colorscheme.iris).unwrap_or(moon::IRIS),
-            leaf: parse_color(&colorscheme.leaf).unwrap_or(moon::LEAF),
-            highlight_low: parse_color(&colorscheme.highlight_low).unwrap_or(moon::HIGHLIGHT_LOW),
             highlight_med: parse_color(&colorscheme.highlight_med).unwrap_or(moon::HIGHLIGHT_MED),
-            highlight_high: parse_color(&colorscheme.highlight_high)
-                .unwrap_or(moon::HIGHLIGHT_HIGH),
             cursor: parse_color(&colorscheme.cursor).unwrap_or(Color::Rgb(255, 255, 255)),
             success: parse_color(&colorscheme.success).unwrap_or(Color::Rgb(62, 143, 84)),
         }
