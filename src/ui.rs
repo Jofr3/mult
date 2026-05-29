@@ -90,6 +90,44 @@ fn parse_color(input: &str) -> Option<Color> {
     Some(Color::Rgb(red, green, blue))
 }
 
+/// Relative luminance per WCAG 2.x (sRGB). Non-RGB colors are treated as dark.
+fn relative_luminance(color: Color) -> f64 {
+    let Color::Rgb(red, green, blue) = color else {
+        return 0.0;
+    };
+    fn linearize(channel: u8) -> f64 {
+        let channel = f64::from(channel) / 255.0;
+        if channel <= 0.039_28 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * linearize(red) + 0.7152 * linearize(green) + 0.0722 * linearize(blue)
+}
+
+/// WCAG contrast ratio between two colors (1.0 = identical, up to 21.0).
+fn contrast_ratio(a: Color, b: Color) -> f64 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (high, low) = if la >= lb { (la, lb) } else { (lb, la) };
+    (high + 0.05) / (low + 0.05)
+}
+
+/// Foreground for text drawn on `background`: keep `preferred` while it stays
+/// legible there, otherwise fall back to black or white. This preserves the
+/// default (dark) theme's exact look while staying readable on light or
+/// inverted user palettes, where a fixed dark foreground would wash out.
+fn readable_fg(preferred: Color, background: Color) -> Color {
+    const MIN_CONTRAST: f64 = 4.5; // WCAG AA for normal-size text
+    if contrast_ratio(preferred, background) >= MIN_CONTRAST {
+        preferred
+    } else if relative_luminance(background) > 0.179 {
+        Color::Rgb(0, 0, 0)
+    } else {
+        Color::Rgb(255, 255, 255)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PaneLayout {
     sidebar_width: u16,
@@ -731,7 +769,9 @@ fn render_terminal_parser(
     selection: Option<&TextSelection>,
 ) {
     let cursor_style = Style::default().fg(palette.cursor).bg(palette.base);
-    let cursor_overlay_style = Style::default().fg(palette.nc).bg(palette.cursor);
+    let cursor_overlay_style = Style::default()
+        .fg(readable_fg(palette.nc, palette.cursor))
+        .bg(palette.cursor);
     let cursor = Cursor::default()
         .symbol("█")
         .style(cursor_style)
@@ -743,7 +783,17 @@ fn render_terminal_parser(
         .cursor(cursor);
     frame.render_widget(pseudo_term, area);
     if let Some(selection) = selection {
-        render_text_selection(frame, area, parser.screen().size().0, selection, palette);
+        let screen = parser.screen();
+        let (rows, cols) = screen.size();
+        let row_content_widths: Vec<u16> = (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .rev()
+                    .find(|&col| screen.cell(row, col).is_some_and(vt100::Cell::has_contents))
+                    .map_or(0, |col| col.saturating_add(1))
+            })
+            .collect();
+        render_text_selection(frame, area, &row_content_widths, selection, palette);
     }
 }
 
@@ -875,10 +925,11 @@ fn vt100_color_to_ratatui(color: vt100::Color) -> Color {
 fn render_text_selection(
     frame: &mut Frame,
     area: Rect,
-    terminal_rows: u16,
+    row_content_widths: &[u16],
     selection: &TextSelection,
     palette: Palette,
 ) {
+    let terminal_rows = u16::try_from(row_content_widths.len()).unwrap_or(u16::MAX);
     if area.is_empty() || terminal_rows == 0 {
         return;
     }
@@ -894,15 +945,31 @@ fn render_text_selection(
     let end_row = range.end.row.min(visible_last_row);
     let start_col = range.start.col.min(area.width.saturating_sub(1));
     let end_col = range.end.col.min(area.width.saturating_sub(1));
-    let style = Style::default().fg(palette.nc).bg(palette.foam);
+    let style = Style::default()
+        .fg(readable_fg(palette.nc, palette.foam))
+        .bg(palette.foam);
 
     for row in start_row..=end_row {
+        // Clip the highlight to the row's glyph extent so trailing blank cells
+        // of short lines are not painted as selected — matching the text that
+        // `contents_between` actually copies. A fully blank row highlights
+        // nothing.
+        let content_width = usize::try_from(row)
+            .ok()
+            .and_then(|index| row_content_widths.get(index))
+            .copied()
+            .unwrap_or(0);
+        if content_width == 0 {
+            continue;
+        }
+        let content_last_col = content_width.saturating_sub(1);
         let row_start_col = if row == range.start.row { start_col } else { 0 };
         let row_end_col = if row == range.end.row {
             end_col
         } else {
             area.width.saturating_sub(1)
-        };
+        }
+        .min(content_last_col);
         if row_start_col > row_end_col {
             continue;
         }
@@ -1766,6 +1833,64 @@ mod tests {
     }
 
     #[test]
+    fn multiline_selection_does_not_highlight_trailing_blanks_of_short_rows() {
+        let mut app = App::default();
+        let nav_items = app.nav_items();
+        let (selected, terminal_id) = nav_items
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| match item {
+                NavItem::Terminal { terminal, .. } => Some((index, PtyKey::Terminal(*terminal))),
+                _ => None,
+            })
+            .expect("seed state has a terminal");
+        app.select_nav_index(selected);
+        // Select three rows top-to-bottom; the middle row is shorter than the
+        // ones bracketing it.
+        app.begin_text_selection(terminal_id, SelectionCell { row: 0, col: 0 });
+        app.update_text_selection(terminal_id, SelectionCell { row: 2, col: 4 });
+
+        let frame_area = Rect::new(0, 0, 50, 12);
+        let (_, output_area) = selected_terminal_output_area(&app, frame_area)
+            .expect("terminal selection has output area");
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime
+            .resize(
+                terminal_id,
+                crate::pty::PtyDimensions {
+                    rows: output_area.height,
+                    cols: output_area.width,
+                },
+            )
+            .expect("resize parser");
+        pty_runtime.process_terminal_output(terminal_id, b"xxxxx\r\nab\r\nyyyyy");
+
+        let backend = TestBackend::new(frame_area.width, frame_area.height);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app, &pty_runtime, &config::Config::default()))
+            .expect("draw app");
+
+        let palette = test_palette();
+        let buffer = terminal.backend().buffer();
+        let bg_at = |col: u16, row: u16| {
+            buffer
+                .cell((output_area.x + col, output_area.y + row))
+                .expect("cell is in bounds")
+                .bg
+        };
+
+        // Middle row "ab": both glyphs are highlighted...
+        assert_eq!(bg_at(0, 1), palette.foam);
+        assert_eq!(bg_at(1, 1), palette.foam);
+        // ...but the blank cells past its content are not, even though the
+        // rows above and below extend across that column.
+        assert_ne!(bg_at(3, 1), palette.foam);
+        assert_eq!(bg_at(3, 0), palette.foam);
+        assert_eq!(bg_at(3, 2), palette.foam);
+    }
+
+    #[test]
     fn offscreen_terminal_text_selection_is_not_pinned_to_pane_edge() {
         let mut app = App::default();
         let nav_items = app.nav_items();
@@ -1892,6 +2017,20 @@ mod tests {
 
     fn test_palette() -> Palette {
         Palette::from_colorscheme(&config::Config::default().colorscheme)
+    }
+
+    #[test]
+    fn readable_fg_keeps_legible_preferred_but_swaps_when_washed_out() {
+        let dark = Color::Rgb(31, 29, 48); // moon `nc`
+        let light = Color::Rgb(156, 207, 216); // moon `foam`
+
+        // Dark-on-light (the default selection/cursor) is legible, so the
+        // preferred foreground is kept verbatim — the default theme is unchanged.
+        assert_eq!(readable_fg(dark, light), dark);
+        // A light foreground on a light background would wash out: flip to black.
+        assert_eq!(readable_fg(light, light), Color::Rgb(0, 0, 0));
+        // A dark foreground on a dark background flips to white.
+        assert_eq!(readable_fg(dark, dark), Color::Rgb(255, 255, 255));
     }
 
     #[test]
