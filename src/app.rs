@@ -1129,7 +1129,9 @@ impl App {
         self.sync_focus_to_selection();
     }
 
-    pub fn mark_chat_status_by_id(&mut self, chat: ChatId, status: ChatStatus) {
+    /// Returns whether the chat's status actually changed (useful for deciding
+    /// if a redraw is needed).
+    pub fn mark_chat_status_by_id(&mut self, chat: ChatId, status: ChatStatus) -> bool {
         for chat_session in self
             .project
             .workspaces
@@ -1140,10 +1142,12 @@ impl App {
                 if chat_session.status != status {
                     chat_session.status = status;
                     self.dirty = true;
+                    return true;
                 }
-                return;
+                return false;
             }
         }
+        false
     }
 
     pub fn push_prompt_char(&mut self, c: char) {

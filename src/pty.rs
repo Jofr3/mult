@@ -296,16 +296,17 @@ impl PtyRuntime {
                 .parsers
                 .entry(terminal)
                 .or_insert_with(|| Parser::new(24, 80, TERMINAL_SCROLLBACK_LINES));
-            let responder = self.responders.entry(terminal).or_default();
-            let mut responses = Vec::new();
-            for byte in bytes {
-                parser.process(std::slice::from_ref(byte));
-                if respond {
-                    if let Some(response) = responder.advance(*byte, parser.screen()) {
-                        responses.push(response);
-                    }
-                }
-            }
+            let responses = if respond {
+                let responder = self.responders.entry(terminal).or_default();
+                feed_parser_with_responder(parser, responder, bytes)
+            } else {
+                // No terminal queries to answer on this path (scrollback replay,
+                // local echo, system lines), so feed the whole slice in one call
+                // rather than one parser dispatch per byte — a replay can be
+                // megabytes.
+                parser.process(bytes);
+                Vec::new()
+            };
             clamp_parser_scrollback(parser);
             responses
         };
@@ -872,6 +873,10 @@ impl TerminalCommandTracker {
 }
 
 impl TerminalResponseDetector {
+    fn is_ground(&self) -> bool {
+        matches!(self.state, TerminalResponseState::Ground)
+    }
+
     fn advance(&mut self, byte: u8, screen: &vt100::Screen) -> Option<Vec<u8>> {
         let state = std::mem::take(&mut self.state);
         let (next, response) = match state {
@@ -919,6 +924,41 @@ impl TerminalResponseDetector {
         self.state = next;
         response
     }
+}
+
+/// Feed `bytes` to `parser` while letting `responder` answer terminal queries.
+/// While the responder is idle (Ground) no query can begin until an escape, so
+/// the run of bytes up to the next ESC is fed in a single `process` call; only
+/// escape sequences are stepped one byte at a time, which is what the responder
+/// needs to report state such as the cursor position at the exact query point.
+/// This is behaviourally identical to feeding every byte individually.
+fn feed_parser_with_responder(
+    parser: &mut Parser,
+    responder: &mut TerminalResponseDetector,
+    bytes: &[u8],
+) -> Vec<Vec<u8>> {
+    let mut responses = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if responder.is_ground() {
+            let run_end = bytes[index..]
+                .iter()
+                .position(|&byte| byte == 0x1b)
+                .map_or(bytes.len(), |offset| index + offset);
+            if run_end > index {
+                parser.process(&bytes[index..run_end]);
+                index = run_end;
+                continue;
+            }
+        }
+        let byte = bytes[index];
+        parser.process(std::slice::from_ref(&byte));
+        if let Some(response) = responder.advance(byte, parser.screen()) {
+            responses.push(response);
+        }
+        index += 1;
+    }
+    responses
 }
 
 fn csi_terminal_response(
@@ -1720,6 +1760,38 @@ mod tests {
             ClientMessage::Input {
                 pane,
                 bytes: PRIMARY_DEVICE_ATTRIBUTES_RESPONSE.to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn live_output_reports_cursor_after_a_batched_run() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (sender, receiver) = mpsc::channel();
+        let terminal = TerminalId(9);
+        let pane = PaneId(9);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
+
+        // "abc" advances the cursor to column 3 and is fed as a batched run; the
+        // trailing DSR cursor-position query must still report the cursor at the
+        // query point (row 1, col 4 in 1-based terms), proving the batched feed
+        // matches byte-by-byte behaviour.
+        sender
+            .send(ServerMessage::PtyOutput {
+                pane,
+                bytes: b"abc\x1b[6n".to_vec(),
+            })
+            .expect("send output with embedded cursor query");
+
+        let _ = runtime.drain_events();
+        let message: ClientMessage = read_message(&mut server_stream).expect("read DSR response");
+
+        assert_eq!(
+            message,
+            ClientMessage::Input {
+                pane,
+                bytes: b"\x1b[1;4R".to_vec(),
             }
         );
     }
