@@ -74,7 +74,7 @@ fn backup_invalid_state_and_reset(
     path: &Path,
     decode_error: serde_json::Error,
 ) -> io::Result<ProjectState> {
-    let backup = corrupt_backup_path(path);
+    let backup = corrupt_backup_path(path)?;
     fs::rename(path, &backup).map_err(|rename_error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -88,18 +88,16 @@ fn backup_invalid_state_and_reset(
     Ok(ProjectState::default())
 }
 
-fn corrupt_backup_path(path: &Path) -> PathBuf {
+fn corrupt_backup_path(path: &Path) -> io::Result<PathBuf> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    for attempt in 0..16 {
-        let candidate = path.with_extension(format!("json.corrupt-{timestamp}-{attempt}"));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    path.with_extension(format!("json.corrupt-{timestamp}"))
+    // A random suffix keeps the name unique and unpredictable without an
+    // exists()-then-rename probe (a TOCTOU pattern); the rename onto it is
+    // atomic, mirroring how create_temp_state_file already picks its path.
+    let random = random_u64()?;
+    Ok(path.with_extension(format!("json.corrupt-{timestamp}-{random:016x}")))
 }
 
 fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {

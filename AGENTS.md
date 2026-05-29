@@ -35,3 +35,4 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 - Do not add dependencies unless they clearly reduce risk or replace an unsafe/unmaintained dependency.
 - State files and runtime IPC are security-sensitive; keep paths private and avoid predictable public `/tmp` files.
 - `MULT_AGENT_CMD` is parsed by `mult`, not a shell: basic quotes and backslash escapes are supported, but shell expansion is intentionally not.
+- `pi_agent_command` (the default chat-agent backend) and `TerminalLaunch::Command` are the opposite: they are run through the login shell (`$SHELL -lc <command>`), so they *are* shell-evaluated — pipelines, `$VAR` expansion, and globbing all apply. This is the user's own config, not a privilege boundary, but the two agent-launch paths deliberately have different semantics, so keep them distinct.

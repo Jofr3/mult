@@ -128,6 +128,8 @@ Example:
 }
 ```
 
+`pi_agent_command` is launched through your login shell (`$SHELL -lc …`), so shell features — pipelines, `$VAR` expansion, globbing — work inside it. This is intentionally different from `MULT_AGENT_CMD` (below), which `mult` splits into arguments itself with no shell involved.
+
 Environment variables:
 
 | Variable | Purpose |

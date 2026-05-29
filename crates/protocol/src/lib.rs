@@ -1,8 +1,8 @@
 use std::{
     collections::BTreeMap,
-    env,
+    env, fs,
     io::{self, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
@@ -24,14 +24,34 @@ pub fn default_socket_path() -> PathBuf {
         return PathBuf::from(runtime_dir).join(DEFAULT_SOCKET_NAME);
     }
 
-    let user = env::var("UID")
-        .or_else(|_| env::var("USER"))
-        .unwrap_or_else(|_| "unknown".to_string());
+    // No XDG_RUNTIME_DIR: fall back to a per-user directory under /tmp. Key it
+    // on the real effective UID, never on $USER/$UID — those are spoofable and
+    // can collide, letting another local user predict or pre-create ("squat")
+    // the path. `ensure_private_dir` verifies ownership before the socket binds.
     PathBuf::from("/tmp")
-        .join(format!("mult-{}", sanitize_socket_path_component(&user)))
+        .join(format!("mult-{}", socket_user_component()))
         .join(DEFAULT_SOCKET_NAME)
 }
 
+/// Stable, unspoofable per-user component for the `/tmp` socket fallback.
+fn socket_user_component() -> String {
+    #[cfg(unix)]
+    {
+        // SAFETY: `geteuid` is always successful and has no failure mode.
+        unsafe { libc::geteuid() }.to_string()
+    }
+
+    #[cfg(not(unix))]
+    {
+        sanitize_socket_path_component(
+            &env::var("USERNAME")
+                .or_else(|_| env::var("USER"))
+                .unwrap_or_else(|_| "unknown".to_string()),
+        )
+    }
+}
+
+#[cfg(not(unix))]
 fn sanitize_socket_path_component(input: &str) -> String {
     let sanitized = input
         .chars()
@@ -49,6 +69,76 @@ fn sanitize_socket_path_component(input: &str) -> String {
     } else {
         sanitized
     }
+}
+
+/// Create `dir` (and any missing parents) as a private directory, then verify
+/// it cannot have been pre-created by another local user.
+///
+/// The directory is made with mode `0700`. Because the `/tmp` fallback lives
+/// under a world-writable, sticky parent, a plain `mkdir -p` that tolerates an
+/// existing path would happily adopt a directory an attacker created first. So
+/// after creating, every component we own is checked — via `lstat`, so symlinks
+/// are never followed — to be a real directory owned by us with no group/other
+/// write bit. The walk stops at a shared system root (a sticky, world-writable
+/// directory such as `/tmp`) or a root-owned ancestor; a component owned by some
+/// other non-root user is rejected as a squatter.
+#[cfg(unix)]
+pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+
+    // SAFETY: `geteuid` is always successful and has no failure mode.
+    let euid = unsafe { libc::geteuid() } as u32;
+    let mut cursor = Some(dir);
+    while let Some(path) = cursor {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_dir() {
+            return Err(private_dir_error(path, "is not a directory"));
+        }
+
+        let mode = metadata.mode();
+        // A sticky, world-writable directory (e.g. /tmp, /dev/shm) is a shared
+        // system root; the private subtree below it is what must be ours.
+        if mode & 0o1000 != 0 && mode & 0o002 != 0 {
+            break;
+        }
+
+        let owner = metadata.uid();
+        if owner == euid {
+            if mode & 0o022 != 0 {
+                return Err(private_dir_error(path, "is writable by group or others"));
+            }
+        } else if owner != 0 {
+            return Err(private_dir_error(
+                path,
+                "is owned by another user (refusing a pre-created path)",
+            ));
+        }
+
+        cursor = path.parent();
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)
+}
+
+#[cfg(unix)]
+fn private_dir_error(path: &Path, problem: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "refusing to use runtime directory {}: it {problem}",
+            path.display()
+        ),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -261,11 +351,88 @@ mod tests {
         assert_eq!(decoded, message);
     }
 
+    #[cfg(not(unix))]
     #[test]
     fn socket_path_component_sanitization_removes_path_separators() {
         assert_eq!(sanitize_socket_path_component("user-1000"), "user-1000");
         assert_eq!(sanitize_socket_path_component("../bad/user"), "___bad_user");
         assert_eq!(sanitize_socket_path_component(""), "unknown");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_user_component_is_the_numeric_effective_uid() {
+        // The /tmp fallback must be keyed off geteuid(), not spoofable env, and
+        // must contain no path separators or other surprises.
+        let component = socket_user_component();
+        assert!(!component.is_empty());
+        assert!(component.chars().all(|ch| ch.is_ascii_digit()));
+        assert_eq!(component, unsafe { libc::geteuid() }.to_string());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_creates_and_accepts_a_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_test_dir("create").join("nested");
+        ensure_private_dir(&dir).expect("create private dir");
+        assert!(dir.is_dir());
+        let mode = fs::metadata(&dir).expect("metadata").permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // Idempotent: a second call on the directory we own succeeds.
+        ensure_private_dir(&dir).expect("re-accept private dir");
+
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_rejects_group_or_other_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_test_dir("loose");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).expect("chmod");
+
+        let error = ensure_private_dir(&dir).expect_err("world-writable dir must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_rejects_a_symlinked_directory() {
+        let base = unique_test_dir("symlink");
+        let target = base.join("real");
+        fs::create_dir(&target).expect("create target");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        let error = ensure_private_dir(&link).expect_err("symlinked dir must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    fn unique_test_dir(label: &str) -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = env::temp_dir().join(format!(
+            "mult-protocol-test-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .expect("create unique test dir");
+        dir
     }
 
     #[test]

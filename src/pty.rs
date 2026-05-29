@@ -1371,6 +1371,11 @@ fn session_name(spawn: &PtySpawn, launch: &LaunchSpec) -> String {
 }
 
 fn shell_command_args(command: String) -> Vec<String> {
+    // The command string is handed to the login shell for evaluation (`-lc`),
+    // so it is fully shell-interpreted: pipelines, `$VAR` expansion, and globbing
+    // all apply. This is by design for `pi_agent_command` and
+    // `TerminalLaunch::Command`, and is the deliberate difference from
+    // `MULT_AGENT_CMD`, which `mult` splits into argv with no shell. See AGENTS.md.
     #[cfg(windows)]
     {
         vec!["-NoExit".to_string(), "-Command".to_string(), command]

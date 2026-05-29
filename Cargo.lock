@@ -734,6 +734,7 @@ dependencies = [
 name = "mult-protocol"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "postcard",
  "serde",
 ]
