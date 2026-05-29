@@ -227,22 +227,36 @@ fn run(terminal: &mut DefaultTerminal, mut app: App, config: Config) -> io::Resu
     refresh_workspace_git_branches(&mut app);
     let mut last_git_branch_refresh = Instant::now();
 
+    // The screen is static unless something changes, so only rebuild a frame
+    // when needed instead of every ~16ms tick. The tick still runs so PTY/agent
+    // output (delivered over channels, not via event::poll) is drained promptly;
+    // it is just the expensive draw that is gated. `needs_redraw` is set by any
+    // input event, drained PTY/agent/status change, git-branch refresh, or an
+    // auto-start/resize that altered state.
+    let mut needs_redraw = true;
     while !app.should_quit {
         if last_git_branch_refresh.elapsed() >= GIT_BRANCH_REFRESH_INTERVAL {
             refresh_workspace_git_branches(&mut app);
             last_git_branch_refresh = Instant::now();
+            needs_redraw = true;
         }
-        drain_pty_events(&mut app, &mut pty_runtime);
-        drain_agent_events(&mut app, &mut agent_backend);
-        drain_mult_agent_status_events(&mut app);
+        needs_redraw |= drain_pty_events(&mut app, &mut pty_runtime);
+        needs_redraw |= drain_agent_events(&mut app, &mut agent_backend);
+        needs_redraw |= drain_mult_agent_status_events(&mut app);
         save_if_dirty(&mut app)?;
-        resize_visible_terminal(&mut app, &mut pty_runtime, &config, frame_area);
-        resize_visible_chat_agent(&mut app, &mut pty_runtime, &config, frame_area);
-        auto_start_selected_terminal(&mut app, &mut pty_runtime, &config, frame_area);
-        auto_start_selected_chat_agent(&mut app, &mut pty_runtime, &config, frame_area);
-        frame_area = terminal
-            .draw(|frame| ui::draw(frame, &app, &pty_runtime, &config))?
-            .area;
+        needs_redraw |= resize_visible_terminal(&mut app, &mut pty_runtime, &config, frame_area);
+        needs_redraw |= resize_visible_chat_agent(&mut app, &mut pty_runtime, &config, frame_area);
+        needs_redraw |=
+            auto_start_selected_terminal(&mut app, &mut pty_runtime, &config, frame_area);
+        needs_redraw |=
+            auto_start_selected_chat_agent(&mut app, &mut pty_runtime, &config, frame_area);
+
+        if needs_redraw {
+            frame_area = terminal
+                .draw(|frame| ui::draw(frame, &app, &pty_runtime, &config))?
+                .area;
+            needs_redraw = false;
+        }
 
         if event::poll(EVENT_POLL_INTERVAL)? {
             handle_event(
@@ -252,6 +266,7 @@ fn run(terminal: &mut DefaultTerminal, mut app: App, config: Config) -> io::Resu
                 event::read()?,
                 frame_area,
             );
+            needs_redraw = true;
             while !app.should_quit && event::poll(READY_EVENT_POLL_INTERVAL)? {
                 handle_event(
                     &mut app,
@@ -1161,19 +1176,20 @@ fn auto_start_selected_terminal(
     pty_runtime: &mut PtyRuntime,
     config: &Config,
     frame_area: Rect,
-) {
+) -> bool {
     if !config.auto_start_terminals || app.is_prompt_active() {
-        return;
+        return false;
     }
 
     let Some((_, terminal_id)) = app.selected_terminal_id() else {
-        return;
+        return false;
     };
     if pty_runtime.is_running(terminal_id) || !pty_runtime.terminal_output_is_blank(terminal_id) {
-        return;
+        return false;
     }
 
     start_selected_terminal(app, pty_runtime, config, frame_area);
+    true
 }
 
 fn auto_start_selected_chat_agent(
@@ -1181,17 +1197,17 @@ fn auto_start_selected_chat_agent(
     pty_runtime: &mut PtyRuntime,
     config: &Config,
     frame_area: Rect,
-) {
+) -> bool {
     if !config.auto_start_pi_agent || app.is_prompt_active() {
-        return;
+        return false;
     }
 
     let Some((workspace_id, chat_id)) = app.selected_chat_id() else {
-        return;
+        return false;
     };
     let terminal_id = chat_agent_terminal_id(chat_id);
     if pty_runtime.is_running(terminal_id) || !pty_runtime.terminal_output_is_blank(terminal_id) {
-        return;
+        return false;
     }
 
     start_or_focus_chat_agent(
@@ -1203,6 +1219,7 @@ fn auto_start_selected_chat_agent(
         chat_id,
         false,
     );
+    true
 }
 
 fn pi_command(config: &Config) -> String {
@@ -1307,12 +1324,14 @@ fn resize_visible_terminal(
     pty_runtime: &mut PtyRuntime,
     _config: &Config,
     frame_area: Rect,
-) {
+) -> bool {
     let Some((terminal_id, area)) = ui::selected_terminal_output_area(app, frame_area) else {
-        return;
+        return false;
     };
     let size = pty_dimensions_from_area(area);
+    let changed = pty_dimensions_changed(pty_runtime, terminal_id, size);
     let _ = pty_runtime.resize(terminal_id, size);
+    changed
 }
 
 fn resize_visible_chat_agent(
@@ -1320,13 +1339,29 @@ fn resize_visible_chat_agent(
     pty_runtime: &mut PtyRuntime,
     _config: &Config,
     frame_area: Rect,
-) {
+) -> bool {
     let Some((chat_id, area)) = ui::selected_chat_agent_output_area(app, frame_area) else {
-        return;
+        return false;
     };
     let terminal_id = chat_agent_terminal_id(chat_id);
     let size = pty_dimensions_from_area(area);
+    let changed = pty_dimensions_changed(pty_runtime, terminal_id, size);
     let _ = pty_runtime.resize(terminal_id, size);
+    changed
+}
+
+/// Whether resizing `terminal` to `size` would actually change its parser
+/// dimensions (and therefore the rendered output). A terminal with no parser
+/// yet is treated as changed so the freshly sized screen gets drawn.
+fn pty_dimensions_changed(
+    pty_runtime: &PtyRuntime,
+    terminal: TerminalId,
+    size: PtyDimensions,
+) -> bool {
+    match pty_runtime.parser(terminal) {
+        Some(parser) => parser.screen().size() != (size.rows, size.cols),
+        None => true,
+    }
 }
 
 fn terminal_dimensions(app: &App, frame_area: Rect) -> PtyDimensions {
@@ -1344,8 +1379,10 @@ fn pty_dimensions_from_area(area: Rect) -> PtyDimensions {
     }
 }
 
-fn drain_pty_events(app: &mut App, pty_runtime: &mut PtyRuntime) {
+fn drain_pty_events(app: &mut App, pty_runtime: &mut PtyRuntime) -> bool {
+    let mut changed = false;
     for event in pty_runtime.drain_events() {
+        changed = true;
         match event {
             PtyEvent::Scrollback { .. } | PtyEvent::Output { .. } => {}
             PtyEvent::Exited { terminal, status } => {
@@ -1375,6 +1412,7 @@ fn drain_pty_events(app: &mut App, pty_runtime: &mut PtyRuntime) {
             }
         }
     }
+    changed
 }
 
 fn key_to_pty_bytes(key: KeyEvent) -> Vec<u8> {
@@ -1447,13 +1485,16 @@ fn control_byte(c: char) -> Option<u8> {
     }
 }
 
-fn drain_agent_events(app: &mut App, backend: &mut impl AgentBackend) {
+fn drain_agent_events(app: &mut App, backend: &mut impl AgentBackend) -> bool {
+    let mut changed = false;
     for event in backend.drain_events() {
+        changed = true;
         app.apply_agent_event(event);
     }
+    changed
 }
 
-fn drain_mult_agent_status_events(app: &mut App) {
+fn drain_mult_agent_status_events(app: &mut App) -> bool {
     let chats = app
         .project
         .workspaces
@@ -1461,11 +1502,13 @@ fn drain_mult_agent_status_events(app: &mut App) {
         .flat_map(|workspace| workspace.chats.iter().map(|chat| chat.id))
         .collect::<Vec<_>>();
 
+    let mut changed = false;
     for chat in chats {
         if let Some(status) = read_mult_agent_status(&mult_agent_status_path(chat)) {
-            app.mark_chat_status_by_id(chat, status);
+            changed |= app.mark_chat_status_by_id(chat, status);
         }
     }
+    changed
 }
 
 fn read_mult_agent_status(path: &Path) -> Option<ChatStatus> {
