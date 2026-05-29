@@ -527,24 +527,25 @@ fn handle_client_messages(
                     server.sessions.get(&session).cloned()
                 };
                 let Some(pane) = pane else {
-                    let _ = client.sender.try_send(ServerMessage::Error {
-                        message: format!("unknown session {}", session.0),
+                    // The session is gone (e.g., the daemon was restarted or
+                    // autospawned fresh while this client was away). Report the
+                    // pane as exited so a reconnecting client stops treating it as
+                    // live and can recover, instead of silently freezing on a
+                    // session that no longer exists.
+                    let _ = client.sender.try_send(ServerMessage::PaneExited {
+                        pane: PaneId(session.0),
+                        exit: ExitInfo {
+                            code: 1,
+                            signal: Some("server session unavailable".to_string()),
+                        },
                     });
                     continue;
                 };
 
                 let (pane_info, pane_id, history, foreground_process) = {
                     let mut pane = pane.lock().map_err(lock_error)?;
-                    if pane.clients.iter().any(|existing| existing.id != client.id) {
-                        let _ = client.sender.try_send(ServerMessage::Error {
-                            message: format!("session {} is already attached", session.0),
-                        });
-                        continue;
-                    }
                     pane.resize(rows, cols)?;
-                    if !pane.clients.iter().any(|existing| existing.id == client.id) {
-                        pane.clients.push(client.clone());
-                    }
+                    pane.attach_client(client.clone());
                     let foreground_process = pane.refresh_foreground_process();
                     (
                         pane.pane_info(),
@@ -981,6 +982,17 @@ impl PaneState {
         self.child.take()
     }
 
+    /// Attach `client`, taking over from any other client (single-attach with
+    /// takeover). This lets a reconnecting client re-attach even when its
+    /// previous, now-dead connection is still listed here and has not been
+    /// reaped yet, instead of being rejected as already attached.
+    fn attach_client(&mut self, client: ClientHandle) {
+        self.clients.retain(|existing| existing.id == client.id);
+        if !self.clients.iter().any(|existing| existing.id == client.id) {
+            self.clients.push(client);
+        }
+    }
+
     fn append_raw_history(&mut self, bytes: &[u8]) {
         self.raw_history.extend_from_slice(bytes);
         let overflow = self.raw_history.len().saturating_sub(RAW_HISTORY_MAX_BYTES);
@@ -1348,6 +1360,37 @@ mod tests {
             receiver.recv(),
             Ok(ServerMessage::PtyOutput { pane, bytes }) if pane == PaneId(3) && bytes == b"data"
         ));
+    }
+
+    #[test]
+    fn attaching_a_new_client_takes_over_from_the_previous_one() {
+        let mut pane = test_pane_state();
+
+        pane.attach_client(test_client(1));
+        assert_eq!(pane.clients.len(), 1);
+        assert_eq!(pane.clients[0].id, 1);
+
+        // A second client takes over: the previous one is evicted.
+        pane.attach_client(test_client(2));
+        assert_eq!(pane.clients.len(), 1);
+        assert_eq!(pane.clients[0].id, 2);
+
+        // Re-attaching the same id is idempotent (no duplicate entry).
+        pane.attach_client(test_client(2));
+        assert_eq!(pane.clients.len(), 1);
+        assert_eq!(pane.clients[0].id, 2);
+    }
+
+    fn test_client(id: ClientId) -> ClientHandle {
+        // The receiver and peer socket are dropped immediately; this test only
+        // inspects pane.clients membership and never sends to the client.
+        let (sender, _) = mpsc::sync_channel(1);
+        let (stream, _) = UnixStream::pair().expect("create socket pair");
+        ClientHandle {
+            id,
+            sender,
+            stream: Arc::new(stream),
+        }
     }
 
     fn test_pane_state() -> PaneState {

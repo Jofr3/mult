@@ -74,6 +74,10 @@ pub struct PtyRuntime {
     foreground_processes: HashMap<TerminalId, ForegroundProcessInfo>,
     command_trackers: HashMap<TerminalId, TerminalCommandTracker>,
     pending_events: Vec<PtyEvent>,
+    // The terminal currently being created by `start`, if any. It is excluded
+    // from reconnect re-attach because its session does not exist on the server
+    // until `start`'s own CreateSession completes.
+    starting: Option<TerminalId>,
 }
 
 const SERVER_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -171,6 +175,7 @@ impl PtyRuntime {
             foreground_processes: HashMap::new(),
             command_trackers: HashMap::new(),
             pending_events,
+            starting: None,
         }
     }
 }
@@ -356,6 +361,16 @@ impl PtyRuntime {
             ));
         }
 
+        // Mark this terminal as starting so a reconnect triggered mid-start does
+        // not re-attach it before its CreateSession exists on the server. Cleared
+        // on every exit path.
+        self.starting = Some(spawn.terminal);
+        let result = self.start_attached(spawn);
+        self.starting = None;
+        result
+    }
+
+    fn start_attached(&mut self, spawn: PtySpawn) -> io::Result<()> {
         self.ensure_connected()?;
         self.reset_parser(spawn.terminal, spawn.size);
         self.foreground_processes.remove(&spawn.terminal);
@@ -521,9 +536,12 @@ impl PtyRuntime {
         }
 
         if disconnected {
+            // Keep terminal_to_pane / pane_to_terminal / parsers: the daemon's
+            // sessions outlive a dropped connection, so we preserve our intent to
+            // stay attached and re-attach on the next connect (see
+            // `ensure_connected`). The parser keeps showing the last output until
+            // the re-attached scrollback rebuilds it.
             self.connection = None;
-            self.terminal_to_pane.clear();
-            self.pane_to_terminal.clear();
         }
 
         events
@@ -683,7 +701,44 @@ impl PtyRuntime {
         if self.connection.is_some() {
             return Ok(());
         }
-        self.connect()
+        self.connect()?;
+        self.reattach_terminals();
+        Ok(())
+    }
+
+    /// Re-attach every terminal we still believe is running after establishing a
+    /// fresh connection. The daemon's sessions outlive a dropped connection, so
+    /// this restores live output without re-spawning anything. The server
+    /// replays full scrollback on attach, so each parser is reset first to
+    /// rebuild cleanly from the authoritative history rather than appending to
+    /// stale content. A session the server no longer has answers with
+    /// `PaneExited`, which surfaces as a normal exit and clears the terminal.
+    fn reattach_terminals(&mut self) {
+        let terminals: Vec<TerminalId> = self
+            .terminal_to_pane
+            .keys()
+            .copied()
+            .filter(|terminal| Some(*terminal) != self.starting)
+            .collect();
+        for terminal in terminals {
+            let size = self.parser_dimensions(terminal);
+            self.reset_parser(terminal, size);
+            let _ = self.write(&ClientMessage::Attach {
+                session: session_for_terminal(terminal),
+                rows: size.rows,
+                cols: size.cols,
+            });
+        }
+    }
+
+    fn parser_dimensions(&self, terminal: TerminalId) -> PtyDimensions {
+        self.parsers
+            .get(&terminal)
+            .map(|parser| {
+                let (rows, cols) = parser.screen().size();
+                PtyDimensions { rows, cols }
+            })
+            .unwrap_or_default()
     }
 
     fn connect(&mut self) -> io::Result<()> {
@@ -1332,6 +1387,7 @@ mod tests {
             foreground_processes: HashMap::new(),
             command_trackers: HashMap::new(),
             pending_events: Vec::new(),
+            starting: None,
         };
         runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
         runtime.process_terminal_output(terminal, b"\x1b[?2004h");
@@ -1409,6 +1465,7 @@ mod tests {
             foreground_processes: HashMap::new(),
             command_trackers: HashMap::new(),
             pending_events: Vec::new(),
+            starting: None,
         };
         let server = thread::spawn(move || {
             let create: ClientMessage = read_message(&mut server_stream).expect("read create");
@@ -1552,6 +1609,7 @@ mod tests {
             foreground_processes: HashMap::new(),
             command_trackers: HashMap::new(),
             pending_events: Vec::new(),
+            starting: None,
         };
 
         let error = runtime.stop(terminal).expect_err("stop should fail");
@@ -1753,7 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_receiver_clears_registries_for_reconnect_but_keeps_parser() {
+    fn disconnected_receiver_preserves_registries_and_parser_for_reattach() {
         let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
         let (sender, receiver) = mpsc::channel();
         let terminal = TerminalId(10);
@@ -1764,10 +1822,54 @@ mod tests {
 
         assert!(runtime.drain_events().is_empty());
 
+        // The connection is dropped, but the daemon's session outlives it, so we
+        // keep our attachment intent (and the parser) and re-attach on the next
+        // connect rather than tearing the terminal down.
         assert!(runtime.connection.is_none());
-        assert!(!runtime.is_running(terminal));
-        assert!(runtime.pane_to_terminal.is_empty());
+        assert!(runtime.is_running(terminal));
+        assert_eq!(runtime.pane_to_terminal.get(&pane), Some(&terminal));
         assert!(runtime.parser(terminal).is_some());
+    }
+
+    #[test]
+    fn reattach_terminals_reattaches_known_sessions_with_parser_dimensions() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let terminal = TerminalId(5);
+        let pane = pane_for_terminal(terminal);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 6, cols: 20 });
+
+        runtime.reattach_terminals();
+
+        let message: ClientMessage = read_message(&mut server_stream).expect("read reattach");
+        assert_eq!(
+            message,
+            ClientMessage::Attach {
+                session: session_for_terminal(terminal),
+                rows: 6,
+                cols: 20,
+            }
+        );
+    }
+
+    #[test]
+    fn reattach_skips_the_terminal_currently_starting() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let terminal = TerminalId(5);
+        let pane = pane_for_terminal(terminal);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 6, cols: 20 });
+        runtime.starting = Some(terminal);
+
+        runtime.reattach_terminals();
+
+        // The terminal being started must not be re-attached, so nothing is sent.
+        server_stream
+            .set_nonblocking(true)
+            .expect("set nonblocking");
+        assert!(read_message::<ClientMessage>(&mut server_stream).is_err());
     }
 
     #[test]
@@ -1819,6 +1921,7 @@ mod tests {
             foreground_processes: HashMap::new(),
             command_trackers: HashMap::new(),
             pending_events: Vec::new(),
+            starting: None,
         }
     }
 

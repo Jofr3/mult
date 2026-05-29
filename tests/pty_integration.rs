@@ -90,6 +90,84 @@ fn reconnect_replays_raw_scrollback_into_fresh_parser() {
 }
 
 #[test]
+fn second_client_takes_over_session_from_a_still_attached_client() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let Some(server) = start_isolated_server() else {
+        return;
+    };
+    let terminal = TerminalId(7005);
+
+    // Client A attaches to a long-running session and observes its output.
+    let mut client_a =
+        PtyRuntime::connect_to_socket(server.socket_path.clone()).expect("connect client A");
+    start_short_lived_command(
+        &mut client_a,
+        terminal,
+        "printf takeover; while true; do sleep 1; done",
+    );
+    wait_for_output(&mut client_a, terminal, "takeover").expect("client A should see output");
+
+    // Client B attaches to the same session while A is *still attached*. Without
+    // takeover the server rejects this as "already attached"; with it, B takes
+    // over and receives the replayed scrollback. `start` reuses the existing
+    // server session (CreateSession is idempotent for a known id).
+    let mut client_b =
+        PtyRuntime::connect_to_socket(server.socket_path.clone()).expect("connect client B");
+    let mut spawn = PtySpawn::command_line(
+        terminal,
+        "ignored-existing-session".to_string(),
+        None,
+        BTreeMap::new(),
+    );
+    spawn.size = PtyDimensions { rows: 6, cols: 40 };
+    client_b
+        .start(spawn)
+        .expect("client B should take over the existing session");
+    wait_for_output(&mut client_b, terminal, "takeover")
+        .expect("takeover should replay buffered output to client B");
+
+    assert!(client_b.stop(terminal).expect("stop after takeover"));
+}
+
+#[test]
+fn reattach_after_server_restart_reports_vanished_session_as_exited() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let Some(server) = start_isolated_server() else {
+        return;
+    };
+    let socket_path = server.socket_path.clone();
+    let terminal = TerminalId(7006);
+
+    let mut runtime =
+        PtyRuntime::connect_to_socket(socket_path.clone()).expect("connect to first server");
+    start_short_lived_command(
+        &mut runtime,
+        terminal,
+        "printf alive; while true; do sleep 1; done",
+    );
+    wait_for_output(&mut runtime, terminal, "alive").expect("see output from first server");
+    assert!(runtime.is_running(terminal));
+
+    // Restart the daemon on the same socket path: the previous session is gone.
+    drop(server);
+    let Some(_server2) = start_isolated_server_at(socket_path) else {
+        return;
+    };
+
+    // Nudging the runtime makes it reconnect to the fresh server and re-attach;
+    // because the session no longer exists, the server answers with PaneExited
+    // and the client cleanly retires the terminal instead of freezing on it.
+    let status = wait_for_terminal_exit_after_reconnect(&mut runtime, terminal)
+        .expect("client should learn the session vanished after a server restart");
+    assert_ne!(status.code, 0, "a vanished session is not a clean exit");
+    assert!(!runtime.is_running(terminal));
+}
+
+#[test]
 fn server_ignores_sighup_and_keeps_sessions_running() {
     if integration_tests_are_skipped() {
         return;
@@ -230,6 +308,33 @@ fn wait_for_terminal_exit(
     None
 }
 
+fn wait_for_terminal_exit_after_reconnect(
+    runtime: &mut PtyRuntime,
+    terminal: TerminalId,
+) -> Option<PtyExit> {
+    let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    let size = PtyDimensions { rows: 6, cols: 40 };
+    while Instant::now() < deadline {
+        // Any send forces a transparent reconnect to the restarted server and a
+        // re-attach of the still-tracked terminal; errors here are expected
+        // mid-reconnect and ignored.
+        let _ = runtime.resize(terminal, size);
+        for event in runtime.drain_events() {
+            if let PtyEvent::Exited {
+                terminal: event_terminal,
+                status,
+            } = event
+            {
+                if event_terminal == terminal {
+                    return Some(status);
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
 fn assert_server_still_running(server: &mut ServerGuard) {
     let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {
@@ -252,11 +357,14 @@ fn integration_tests_are_skipped() -> bool {
 }
 
 fn start_isolated_server() -> Option<ServerGuard> {
+    start_isolated_server_at(unique_socket_path())
+}
+
+fn start_isolated_server_at(socket_path: PathBuf) -> Option<ServerGuard> {
     let Some(server_bin) = option_env!("CARGO_BIN_EXE_mult-server") else {
         eprintln!("skipping PTY integration tests: CARGO_BIN_EXE_mult-server is unavailable");
         return None;
     };
-    let socket_path = unique_socket_path();
     let mut child = match Command::new(server_bin)
         .env(SOCKET_PATH_ENV, &socket_path)
         .env("SHELL", integration_test_shell())
