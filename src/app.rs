@@ -676,61 +676,37 @@ impl App {
         self.selected_output_terminal_id()
     }
 
-    pub fn nav_items(&self) -> Vec<NavItem> {
-        let mut items = Vec::with_capacity(self.nav_len());
-
-        for workspace in &self.project.workspaces {
-            for chat in &workspace.chats {
-                items.push(NavItem::Chat {
-                    workspace: workspace.id,
-                    chat: chat.id,
-                });
-            }
-
-            for terminal in &workspace.terminals {
-                items.push(NavItem::Terminal {
+    /// The single source of truth for sidebar navigation order: each workspace's
+    /// chats followed by its terminals, across all workspaces. Every other nav
+    /// query (`nav_items`/`nav_len`/`nav_item_at`/`nav_item_position`) is defined
+    /// in terms of this iterator so the traversal order is defined once.
+    fn nav_iter(&self) -> impl Iterator<Item = NavItem> + '_ {
+        self.project.workspaces.iter().flat_map(|workspace| {
+            let chats = workspace.chats.iter().map(move |chat| NavItem::Chat {
+                workspace: workspace.id,
+                chat: chat.id,
+            });
+            let terminals = workspace
+                .terminals
+                .iter()
+                .map(move |terminal| NavItem::Terminal {
                     workspace: workspace.id,
                     terminal: terminal.id,
                 });
-            }
-        }
+            chats.chain(terminals)
+        })
+    }
 
-        items
+    pub fn nav_items(&self) -> Vec<NavItem> {
+        self.nav_iter().collect()
     }
 
     pub fn nav_len(&self) -> usize {
-        self.project
-            .workspaces
-            .iter()
-            .map(|workspace| workspace.chats.len() + workspace.terminals.len())
-            .sum()
+        self.nav_iter().count()
     }
 
     pub fn nav_item_at(&self, target_index: usize) -> Option<NavItem> {
-        let mut index = 0;
-        for workspace in &self.project.workspaces {
-            for chat in &workspace.chats {
-                if index == target_index {
-                    return Some(NavItem::Chat {
-                        workspace: workspace.id,
-                        chat: chat.id,
-                    });
-                }
-                index += 1;
-            }
-
-            for terminal in &workspace.terminals {
-                if index == target_index {
-                    return Some(NavItem::Terminal {
-                        workspace: workspace.id,
-                        terminal: terminal.id,
-                    });
-                }
-                index += 1;
-            }
-        }
-
-        None
+        self.nav_iter().nth(target_index)
     }
 
     pub fn selected_item(&self) -> Option<NavItem> {
@@ -1401,32 +1377,7 @@ impl App {
     }
 
     fn nav_item_position(&self, target: NavItem) -> Option<usize> {
-        let mut index = 0;
-        for workspace in &self.project.workspaces {
-            for chat in &workspace.chats {
-                if (NavItem::Chat {
-                    workspace: workspace.id,
-                    chat: chat.id,
-                }) == target
-                {
-                    return Some(index);
-                }
-                index += 1;
-            }
-
-            for terminal in &workspace.terminals {
-                if (NavItem::Terminal {
-                    workspace: workspace.id,
-                    terminal: terminal.id,
-                }) == target
-                {
-                    return Some(index);
-                }
-                index += 1;
-            }
-        }
-
-        None
+        self.nav_iter().position(|item| item == target)
     }
 
     fn clamp_selection(&mut self) {
