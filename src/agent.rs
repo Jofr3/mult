@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     io::{self, Read, Write},
     path::PathBuf,
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::mpsc::{self, Receiver, SyncSender},
     thread,
 };
@@ -170,13 +170,7 @@ impl AgentBackend for ProcessAgentBackend {
         let mut child = command.spawn()?;
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(prompt.prompt.as_bytes())?;
-            if !prompt.prompt.ends_with('\n') {
-                stdin.write_all(b"\n")?;
-            }
-        }
+        let stdin = child.stdin.take();
 
         self.running
             .insert(prompt.target, RunningAgentProcess { child });
@@ -189,6 +183,10 @@ impl AgentBackend for ProcessAgentBackend {
             command: self.command.label(),
         });
 
+        // Spawn the output readers before sending the prompt so the child can
+        // never block writing stdout while we block writing stdin. The prompt is
+        // written from its own thread as well, so a prompt larger than the OS
+        // pipe buffer cannot stall the UI even if the child is slow to drain it.
         if let Some(stdout) = stdout {
             spawn_pipe_reader(
                 prompt.target,
@@ -204,6 +202,9 @@ impl AgentBackend for ProcessAgentBackend {
                 stderr,
                 self.sender.clone(),
             );
+        }
+        if let Some(stdin) = stdin {
+            spawn_prompt_writer(prompt.target, prompt.prompt, stdin, self.sender.clone());
         }
 
         Ok(())
@@ -315,6 +316,37 @@ fn spawn_pipe_reader(
                     });
                     break;
                 }
+            }
+        }
+    });
+}
+
+fn spawn_prompt_writer(
+    target: AgentTarget,
+    prompt: String,
+    mut stdin: ChildStdin,
+    sender: SyncSender<AgentEvent>,
+) {
+    thread::spawn(move || {
+        let result = stdin
+            .write_all(prompt.as_bytes())
+            .and_then(|()| {
+                if prompt.ends_with('\n') {
+                    Ok(())
+                } else {
+                    stdin.write_all(b"\n")
+                }
+            })
+            .and_then(|()| stdin.flush());
+        // Dropping `stdin` here closes the pipe so the child sees EOF on its
+        // input. A broken pipe just means the child exited or stopped reading,
+        // which the process-exit path already reports; surface anything else.
+        if let Err(error) = result {
+            if error.kind() != io::ErrorKind::BrokenPipe {
+                let _ = sender.send(AgentEvent::Error {
+                    target,
+                    message: format!("failed to send prompt to agent process: {error}"),
+                });
             }
         }
     });

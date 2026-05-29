@@ -4,13 +4,17 @@ use std::{
     fs::{self, DirBuilder},
     io,
     io::{Read, Write},
+    net::Shutdown,
     os::unix::{
         fs::DirBuilderExt,
         io::AsRawFd,
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
     time::Duration,
 };
@@ -38,6 +42,27 @@ const CLIENT_QUEUE_CAPACITY: usize = 1_024;
 struct ClientHandle {
     id: ClientId,
     sender: ClientSender,
+    // A clone of the client socket kept solely so the server can proactively
+    // tear the connection down (`shutdown`) when the client falls too far
+    // behind or its writer dies. Shutting down any clone of the socket unblocks
+    // the reader/writer threads that hold the other clones.
+    stream: Arc<UnixStream>,
+}
+
+impl ClientHandle {
+    /// Hand a message to the client's writer queue without ever blocking the
+    /// caller. Returns `false` when the client should be dropped because its
+    /// queue is full (it cannot keep up) or its receiver is gone.
+    fn try_deliver(&self, message: ServerMessage) -> bool {
+        match self.sender.try_send(message) {
+            Ok(()) => true,
+            Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    fn disconnect(&self) {
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
 }
 
 struct ServerState {
@@ -61,6 +86,10 @@ struct PaneState {
     foreground_process: ForegroundProcessInfo,
     child: Option<Box<dyn Child + Send + Sync>>,
     clients: Vec<ClientHandle>,
+    // Set while a foreground-process poll is already scheduled for this pane so
+    // a burst of input coalesces into a single in-flight poller thread instead
+    // of spawning one thread per keystroke.
+    foreground_poll_scheduled: Arc<AtomicBool>,
 }
 
 struct SessionCreateSpec {
@@ -171,21 +200,6 @@ impl ServerState {
                 matches.then(|| Arc::clone(candidate))
             })
         })
-    }
-
-    fn remove_pane_by_id(&mut self, pane: PaneId) -> Option<SharedPane> {
-        if let Some(removed) = self.sessions.remove(&SessionId(pane.0)) {
-            return Some(removed);
-        }
-
-        let session = self.sessions.iter().find_map(|(session, candidate)| {
-            let matches = candidate
-                .lock()
-                .ok()
-                .is_some_and(|candidate| candidate.pane == pane);
-            matches.then_some(*session)
-        })?;
-        self.sessions.remove(&session)
     }
 
     fn remove_session_if_same(&mut self, session: SessionId, pane: &SharedPane) -> bool {
@@ -401,6 +415,7 @@ fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SpawnedPane
         },
         child: Some(child),
         clients: Vec::new(),
+        foreground_poll_scheduled: Arc::new(AtomicBool::new(false)),
     }));
 
     Ok(SpawnedPane { pane, reader })
@@ -410,18 +425,29 @@ fn handle_client(stream: UnixStream, server: SharedServer) -> io::Result<()> {
     verify_peer_owner(&stream, "client")?;
     let (sender, receiver) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
     let client_id = server.lock().map_err(lock_error)?.allocate_client_id();
+    let shutdown_handle = Arc::new(stream.try_clone()?);
     let client = ClientHandle {
         id: client_id,
         sender: sender.clone(),
+        stream: Arc::clone(&shutdown_handle),
     };
 
     let mut writer_stream = stream.try_clone()?;
+    let writer_server = Arc::clone(&server);
+    // Detached: it exits on its own when its write fails or the channel closes.
     let _writer = thread::spawn(move || {
         for message in receiver {
             if write_message(&mut writer_stream, &message).is_err() {
                 break;
             }
         }
+        // The writer is gone (socket error or the channel was dropped). Stop the
+        // server from broadcasting into a dead connection and unblock the reader
+        // half so this client is fully reaped instead of lingering in panes.
+        if let Ok(mut server) = writer_server.lock() {
+            server.remove_client(client_id);
+        }
+        let _ = shutdown_handle.shutdown(Shutdown::Both);
     });
 
     let result = handle_client_messages(stream, &server, client);
@@ -444,7 +470,7 @@ fn handle_client_messages(
     stream.set_read_timeout(None)?;
 
     let ClientMessage::Hello { protocol_version } = message else {
-        let _ = client.sender.send(ServerMessage::Error {
+        let _ = client.sender.try_send(ServerMessage::Error {
             message: "expected protocol hello before other client messages".to_string(),
         });
         return Ok(());
@@ -463,7 +489,7 @@ fn handle_client_messages(
             }
             ClientMessage::ListSessions => {
                 let sessions = server.lock().map_err(lock_error)?.session_infos();
-                let _ = client.sender.send(ServerMessage::Sessions(sessions));
+                let _ = client.sender.try_send(ServerMessage::Sessions(sessions));
             }
             ClientMessage::CreateSession {
                 requested_id,
@@ -489,7 +515,7 @@ fn handle_client_messages(
                     },
                 )?;
                 let info = pane.lock().map_err(lock_error)?.session_info();
-                let _ = client.sender.send(ServerMessage::Sessions(vec![info]));
+                let _ = client.sender.try_send(ServerMessage::Sessions(vec![info]));
             }
             ClientMessage::Attach {
                 session,
@@ -501,24 +527,25 @@ fn handle_client_messages(
                     server.sessions.get(&session).cloned()
                 };
                 let Some(pane) = pane else {
-                    let _ = client.sender.send(ServerMessage::Error {
-                        message: format!("unknown session {}", session.0),
+                    // The session is gone (e.g., the daemon was restarted or
+                    // autospawned fresh while this client was away). Report the
+                    // pane as exited so a reconnecting client stops treating it as
+                    // live and can recover, instead of silently freezing on a
+                    // session that no longer exists.
+                    let _ = client.sender.try_send(ServerMessage::PaneExited {
+                        pane: PaneId(session.0),
+                        exit: ExitInfo {
+                            code: 1,
+                            signal: Some("server session unavailable".to_string()),
+                        },
                     });
                     continue;
                 };
 
                 let (pane_info, pane_id, history, foreground_process) = {
                     let mut pane = pane.lock().map_err(lock_error)?;
-                    if pane.clients.iter().any(|existing| existing.id != client.id) {
-                        let _ = client.sender.send(ServerMessage::Error {
-                            message: format!("session {} is already attached", session.0),
-                        });
-                        continue;
-                    }
                     pane.resize(rows, cols)?;
-                    if !pane.clients.iter().any(|existing| existing.id == client.id) {
-                        pane.clients.push(client.clone());
-                    }
+                    pane.attach_client(client.clone());
                     let foreground_process = pane.refresh_foreground_process();
                     (
                         pane.pane_info(),
@@ -528,11 +555,11 @@ fn handle_client_messages(
                     )
                 };
 
-                let _ = client.sender.send(ServerMessage::Attached {
+                let _ = client.sender.try_send(ServerMessage::Attached {
                     session,
                     panes: vec![pane_info],
                 });
-                let _ = client.sender.send(ServerMessage::ForegroundProcess {
+                let _ = client.sender.try_send(ServerMessage::ForegroundProcess {
                     pane: pane_id,
                     process: foreground_process,
                 });
@@ -574,13 +601,23 @@ fn handle_client_messages(
                     continue;
                 };
 
-                let stop_result = target.lock().map_err(lock_error)?.stop();
-                match stop_result {
+                // Take the child out under a brief lock, then kill+reap with the
+                // pane lock released so the blocking wait never stalls the reader
+                // thread. Remove the session by identity so a recycled id created
+                // in the meantime is never torn down by mistake.
+                let (session, child) = {
+                    let mut target = target.lock().map_err(lock_error)?;
+                    (target.session, target.take_child())
+                };
+                match kill_and_reap(child) {
                     Ok(()) => {
-                        server.lock().map_err(lock_error)?.remove_pane_by_id(pane);
+                        server
+                            .lock()
+                            .map_err(lock_error)?
+                            .remove_session_if_same(session, &target);
                     }
                     Err(error) => {
-                        let _ = client.sender.send(ServerMessage::Error {
+                        let _ = client.sender.try_send(ServerMessage::Error {
                             message: format!("failed to stop pane: {error}"),
                         });
                     }
@@ -609,7 +646,7 @@ fn is_client_disconnect(error: &io::Error) -> bool {
 
 fn send_hello_response(client: &ClientHandle, protocol_version: u16) -> bool {
     if protocol_version != PROTOCOL_VERSION {
-        let _ = client.sender.send(ServerMessage::Error {
+        let _ = client.sender.try_send(ServerMessage::Error {
             message: format!(
                 "client protocol version {protocol_version} is incompatible with server version {PROTOCOL_VERSION}; restart mult clients"
             ),
@@ -617,7 +654,7 @@ fn send_hello_response(client: &ClientHandle, protocol_version: u16) -> bool {
         return false;
     }
 
-    let _ = client.sender.send(ServerMessage::Hello {
+    let _ = client.sender.try_send(ServerMessage::Hello {
         protocol_version: PROTOCOL_VERSION,
     });
     true
@@ -656,9 +693,13 @@ fn create_session_with_spawner(
         let mut server = server.lock().map_err(lock_error)?;
         server.release_session_reservation(session);
         if server.sessions.contains_key(&session) {
-            if let Ok(mut pane) = spawned.pane.lock() {
-                let _ = pane.stop();
-            }
+            let child = spawned
+                .pane
+                .lock()
+                .ok()
+                .and_then(|mut pane| pane.take_child());
+            drop(server);
+            let _ = kill_and_reap(child);
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("session {} was created concurrently", session.0),
@@ -689,7 +730,8 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, pane: SharedPane, server: Shar
                         }
                         Err(_) => break,
                     };
-                    broadcast_pty_output(pane_id, bytes, clients);
+                    let dropped = broadcast_pty_output(pane_id, bytes, &clients);
+                    remove_pane_clients(&pane, &dropped);
                     broadcast_foreground_process_if_changed(&pane);
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -706,7 +748,7 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, pane: SharedPane, server: Shar
         if let Ok(mut server) = server.lock() {
             server.remove_session_if_same(session, &pane);
         }
-        broadcast_exit(pane_id, exit, clients);
+        let _ = broadcast_exit(pane_id, exit, &clients);
     });
 }
 
@@ -750,18 +792,23 @@ fn exit_info(status: ExitStatus) -> ExitInfo {
 
 fn send_pty_scrollback(client: &ClientHandle, pane: PaneId, bytes: &[u8]) {
     if bytes.is_empty() {
-        let _ = client.sender.send(ServerMessage::PtyScrollback {
+        if !client.try_deliver(ServerMessage::PtyScrollback {
             pane,
             bytes: Vec::new(),
-        });
+        }) {
+            client.disconnect();
+        }
         return;
     }
 
     for chunk in bytes.chunks(RAW_HISTORY_CHUNK_BYTES) {
-        let _ = client.sender.send(ServerMessage::PtyScrollback {
+        if !client.try_deliver(ServerMessage::PtyScrollback {
             pane,
             bytes: chunk.to_vec(),
-        });
+        }) {
+            client.disconnect();
+            break;
+        }
     }
 }
 
@@ -770,12 +817,13 @@ fn broadcast_foreground_process_if_changed(pane: &SharedPane) {
         return;
     };
 
-    for client in clients {
-        let _ = client.sender.send(ServerMessage::ForegroundProcess {
+    let dropped = deliver_to_clients(&clients, |client| {
+        client.try_deliver(ServerMessage::ForegroundProcess {
             pane: pane_id,
             process: process.clone(),
-        });
-    }
+        })
+    });
+    remove_pane_clients(pane, &dropped);
 }
 
 fn foreground_process_update(
@@ -787,6 +835,18 @@ fn foreground_process_update(
 }
 
 fn schedule_foreground_process_poll(pane: SharedPane) {
+    let scheduled = match pane.lock() {
+        Ok(pane) => Arc::clone(&pane.foreground_poll_scheduled),
+        Err(_) => return,
+    };
+    // Coalesce bursts of input into a single in-flight poller. When a poll is
+    // already scheduled it will observe the latest state at its staged
+    // intervals, so a paste of many newlines no longer spawns one thread per
+    // byte (and one stuck /proc read can no longer multiply across threads).
+    if scheduled.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
     thread::spawn(move || {
         for delay in [
             Duration::from_millis(25),
@@ -796,6 +856,7 @@ fn schedule_foreground_process_poll(pane: SharedPane) {
             thread::sleep(delay);
             broadcast_foreground_process_if_changed(&pane);
         }
+        scheduled.store(false, Ordering::Release);
     });
 }
 
@@ -805,22 +866,50 @@ fn input_may_change_foreground(bytes: &[u8]) -> bool {
         .any(|byte| matches!(*byte, b'\r' | b'\n' | 0x03 | 0x1a))
 }
 
-fn broadcast_exit(pane: PaneId, exit: ExitInfo, clients: Vec<ClientHandle>) {
+/// Deliver a per-client message without ever blocking the caller, returning the
+/// ids of clients that must be dropped because they could not keep up or are
+/// gone. Each dropped client is disconnected so its reader/writer threads exit
+/// and the connection is reclaimed; the caller is responsible for removing the
+/// returned ids from the pane's client list.
+fn deliver_to_clients(
+    clients: &[ClientHandle],
+    mut deliver: impl FnMut(&ClientHandle) -> bool,
+) -> Vec<ClientId> {
+    let mut dropped = Vec::new();
     for client in clients {
-        let _ = client.sender.send(ServerMessage::PaneExited {
-            pane,
-            exit: exit.clone(),
-        });
+        if !deliver(client) {
+            client.disconnect();
+            dropped.push(client.id);
+        }
+    }
+    dropped
+}
+
+fn remove_pane_clients(pane: &SharedPane, dropped: &[ClientId]) {
+    if dropped.is_empty() {
+        return;
+    }
+    if let Ok(mut pane) = pane.lock() {
+        pane.clients.retain(|client| !dropped.contains(&client.id));
     }
 }
 
-fn broadcast_pty_output(pane: PaneId, bytes: Vec<u8>, clients: Vec<ClientHandle>) {
-    for client in clients {
-        let _ = client.sender.send(ServerMessage::PtyOutput {
+fn broadcast_exit(pane: PaneId, exit: ExitInfo, clients: &[ClientHandle]) -> Vec<ClientId> {
+    deliver_to_clients(clients, |client| {
+        client.try_deliver(ServerMessage::PaneExited {
+            pane,
+            exit: exit.clone(),
+        })
+    })
+}
+
+fn broadcast_pty_output(pane: PaneId, bytes: Vec<u8>, clients: &[ClientHandle]) -> Vec<ClientId> {
+    deliver_to_clients(clients, |client| {
+        client.try_deliver(ServerMessage::PtyOutput {
             pane,
             bytes: bytes.clone(),
-        });
-    }
+        })
+    })
 }
 
 impl PaneState {
@@ -889,14 +978,19 @@ impl PaneState {
             .map_err(error_to_io)
     }
 
-    fn stop(&mut self) -> io::Result<()> {
-        if let Some(child) = self.child.as_mut() {
-            child.kill()?;
+    fn take_child(&mut self) -> Option<Box<dyn Child + Send + Sync>> {
+        self.child.take()
+    }
+
+    /// Attach `client`, taking over from any other client (single-attach with
+    /// takeover). This lets a reconnecting client re-attach even when its
+    /// previous, now-dead connection is still listed here and has not been
+    /// reaped yet, instead of being rejected as already attached.
+    fn attach_client(&mut self, client: ClientHandle) {
+        self.clients.retain(|existing| existing.id == client.id);
+        if !self.clients.iter().any(|existing| existing.id == client.id) {
+            self.clients.push(client);
         }
-        if let Some(mut child) = self.child.take() {
-            let _ = child.wait();
-        }
-        Ok(())
     }
 
     fn append_raw_history(&mut self, bytes: &[u8]) {
@@ -906,6 +1000,18 @@ impl PaneState {
             self.raw_history.drain(..overflow);
         }
     }
+}
+
+/// Kill and reap a PTY child. `wait` can block, so this must run with the
+/// `PaneState` mutex released — the per-pane reader thread needs that lock to
+/// keep draining output and would otherwise stall behind us.
+fn kill_and_reap(child: Option<Box<dyn Child + Send + Sync>>) -> io::Result<()> {
+    let Some(mut child) = child else {
+        return Ok(());
+    };
+    child.kill()?;
+    let _ = child.wait();
+    Ok(())
 }
 
 fn bounded_pty_dimensions(rows: u16, cols: u16) -> (u16, u16) {
@@ -1208,6 +1314,85 @@ mod tests {
         assert_eq!(command_line_from_cmdline_bytes(b""), None);
     }
 
+    #[test]
+    fn broadcast_drops_full_client_without_blocking_the_reader() {
+        // Keep the receiver alive so the channel reports Full (a slow client),
+        // not Disconnected (a gone client).
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let (stream, _peer) = UnixStream::pair().expect("create socket pair");
+        let client = ClientHandle {
+            id: 1,
+            sender,
+            stream: Arc::new(stream),
+        };
+        // Fill the one-slot queue; a blocking send would now wedge the reader.
+        client
+            .sender
+            .try_send(ServerMessage::PtyOutput {
+                pane: PaneId(1),
+                bytes: Vec::new(),
+            })
+            .expect("prime the client queue");
+
+        // Returns promptly (the test would hang on a blocking send) and reports
+        // the slow client for eviction.
+        let dropped =
+            broadcast_pty_output(PaneId(1), b"more".to_vec(), std::slice::from_ref(&client));
+
+        assert_eq!(dropped, vec![1]);
+    }
+
+    #[test]
+    fn broadcast_keeps_client_that_drains_its_queue() {
+        let (sender, receiver) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
+        let (stream, _peer) = UnixStream::pair().expect("create socket pair");
+        let client = ClientHandle {
+            id: 7,
+            sender,
+            stream: Arc::new(stream),
+        };
+
+        let dropped =
+            broadcast_pty_output(PaneId(3), b"data".to_vec(), std::slice::from_ref(&client));
+
+        assert!(dropped.is_empty());
+        assert!(matches!(
+            receiver.recv(),
+            Ok(ServerMessage::PtyOutput { pane, bytes }) if pane == PaneId(3) && bytes == b"data"
+        ));
+    }
+
+    #[test]
+    fn attaching_a_new_client_takes_over_from_the_previous_one() {
+        let mut pane = test_pane_state();
+
+        pane.attach_client(test_client(1));
+        assert_eq!(pane.clients.len(), 1);
+        assert_eq!(pane.clients[0].id, 1);
+
+        // A second client takes over: the previous one is evicted.
+        pane.attach_client(test_client(2));
+        assert_eq!(pane.clients.len(), 1);
+        assert_eq!(pane.clients[0].id, 2);
+
+        // Re-attaching the same id is idempotent (no duplicate entry).
+        pane.attach_client(test_client(2));
+        assert_eq!(pane.clients.len(), 1);
+        assert_eq!(pane.clients[0].id, 2);
+    }
+
+    fn test_client(id: ClientId) -> ClientHandle {
+        // The receiver and peer socket are dropped immediately; this test only
+        // inspects pane.clients membership and never sends to the client.
+        let (sender, _) = mpsc::sync_channel(1);
+        let (stream, _) = UnixStream::pair().expect("create socket pair");
+        ClientHandle {
+            id,
+            sender,
+            stream: Arc::new(stream),
+        }
+    }
+
     fn test_pane_state() -> PaneState {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -1236,6 +1421,7 @@ mod tests {
             },
             child: None,
             clients: Vec::new(),
+            foreground_poll_scheduled: Arc::new(AtomicBool::new(false)),
         }
     }
 
