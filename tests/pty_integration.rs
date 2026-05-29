@@ -168,6 +168,41 @@ fn reattach_after_server_restart_reports_vanished_session_as_exited() {
 }
 
 #[test]
+fn terminal_is_retired_when_the_daemon_is_gone_and_not_autospawned() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let Some(mut server) = start_isolated_server() else {
+        return;
+    };
+    let terminal = TerminalId(7007);
+
+    let mut runtime =
+        PtyRuntime::connect_to_socket(server.socket_path.clone()).expect("connect to server");
+    start_short_lived_command(
+        &mut runtime,
+        terminal,
+        "printf live; while true; do sleep 1; done",
+    );
+    wait_for_output(&mut runtime, terminal, "live").expect("see output before the daemon dies");
+    assert!(runtime.is_running(terminal));
+
+    // Kill the daemon and do NOT restart it. Integration tests never autospawn
+    // (the test binary is not named `mult`, so server_executable() is None), so
+    // this reproduces the "daemon gone, autospawn unavailable" case.
+    let _ = server.child.kill();
+    let _ = server.child.wait();
+
+    let status = wait_for_terminal_exit_after_reconnect(&mut runtime, terminal)
+        .expect("client should retire the terminal once the daemon is unreachable");
+    assert_eq!(
+        status.signal.as_deref(),
+        Some("mult-server connection lost")
+    );
+    assert!(!runtime.is_running(terminal));
+}
+
+#[test]
 fn server_ignores_sighup_and_keeps_sessions_running() {
     if integration_tests_are_skipped() {
         return;
