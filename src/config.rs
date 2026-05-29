@@ -68,6 +68,10 @@ pub struct ColorSchemeConfig {
     pub highlight_high: String,
     #[serde(default = "default_moon_none")]
     pub none: String,
+    #[serde(default = "default_cursor")]
+    pub cursor: String,
+    #[serde(default = "default_success")]
+    pub success: String,
 }
 
 impl Default for Config {
@@ -124,6 +128,8 @@ impl Default for ColorSchemeConfig {
             highlight_med: default_moon_highlight_med(),
             highlight_high: default_moon_highlight_high(),
             none: default_moon_none(),
+            cursor: default_cursor(),
+            success: default_success(),
         }
     }
 }
@@ -241,6 +247,14 @@ fn default_moon_highlight_high() -> String {
 
 fn default_moon_none() -> String {
     "NONE".to_string()
+}
+
+fn default_cursor() -> String {
+    "#ffffff".to_string()
+}
+
+fn default_success() -> String {
+    "#3e8f54".to_string()
 }
 
 fn invalid_data(error: serde_json::Error) -> io::Error {

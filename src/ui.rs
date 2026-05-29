@@ -24,8 +24,6 @@ use crate::{
 
 const CHAT_AGENT_HEADER_LINES: u16 = 0;
 const TERMINAL_HEADER_LINES: u16 = 0;
-const CURSOR_COLOR: Color = Color::Rgb(255, 255, 255);
-const FINISHED_STATUS_COLOR: Color = Color::Rgb(62, 143, 84);
 const SIDEBAR_SELECTION_SYMBOL: &str = " ";
 const WORKSPACE_ICON: &str = "▣ ";
 const GIT_BRANCH_ICON: &str = "";
@@ -73,6 +71,8 @@ struct Palette {
     highlight_low: Color,
     highlight_med: Color,
     highlight_high: Color,
+    cursor: Color,
+    success: Color,
 }
 
 impl Palette {
@@ -96,6 +96,8 @@ impl Palette {
             highlight_med: parse_color(&colorscheme.highlight_med).unwrap_or(moon::HIGHLIGHT_MED),
             highlight_high: parse_color(&colorscheme.highlight_high)
                 .unwrap_or(moon::HIGHLIGHT_HIGH),
+            cursor: parse_color(&colorscheme.cursor).unwrap_or(Color::Rgb(255, 255, 255)),
+            success: parse_color(&colorscheme.success).unwrap_or(Color::Rgb(62, 143, 84)),
         }
     }
 }
@@ -752,8 +754,8 @@ fn render_terminal_parser(
     palette: Palette,
     selection: Option<&TextSelection>,
 ) {
-    let cursor_style = Style::default().fg(CURSOR_COLOR).bg(palette.base);
-    let cursor_overlay_style = Style::default().fg(palette.nc).bg(CURSOR_COLOR);
+    let cursor_style = Style::default().fg(palette.cursor).bg(palette.base);
+    let cursor_overlay_style = Style::default().fg(palette.nc).bg(palette.cursor);
     let cursor = Cursor::default()
         .symbol("█")
         .style(cursor_style)
@@ -1061,7 +1063,7 @@ fn draw_open_workspace_prompt(
     let mut lines = vec![Line::from(vec![
         Span::styled("Project: ", Style::default().fg(palette.muted)),
         Span::raw(input.to_string()),
-        Span::styled("▌", Style::default().fg(CURSOR_COLOR)),
+        Span::styled("▌", Style::default().fg(palette.cursor)),
     ])];
 
     if let Some(error) = error {
@@ -1131,7 +1133,7 @@ fn draw_command_palette_prompt(
         Line::from(vec![
             Span::styled("Command: ", Style::default().fg(palette.muted)),
             Span::raw(input.to_string()),
-            Span::styled("▌", Style::default().fg(CURSOR_COLOR)),
+            Span::styled("▌", Style::default().fg(palette.cursor)),
         ]),
         Line::from(Span::styled(
             "type to filter • ↑/↓ select • enter runs • esc cancels".to_string(),
@@ -1205,7 +1207,7 @@ fn draw_text_prompt(
         Line::from(vec![
             Span::styled(label, Style::default().fg(palette.muted)),
             Span::raw(input.to_string()),
-            Span::styled("▌", Style::default().fg(CURSOR_COLOR)),
+            Span::styled("▌", Style::default().fg(palette.cursor)),
         ]),
         Line::from(Span::styled(message.to_string(), message_style)),
     ])
@@ -1244,7 +1246,7 @@ fn chat_status_style(status: ChatStatus, focused: bool, palette: Palette) -> Sty
     let color = match status {
         ChatStatus::Thinking | ChatStatus::Waiting => palette.pine,
         ChatStatus::Failed => palette.love,
-        ChatStatus::Done if !focused => FINISHED_STATUS_COLOR,
+        ChatStatus::Done if !focused => palette.success,
         ChatStatus::Done | ChatStatus::Idle => palette.muted,
     };
 
@@ -1264,7 +1266,7 @@ fn terminal_icon_style(
             if focused {
                 palette.muted
             } else {
-                FINISHED_STATUS_COLOR
+                palette.success
             }
         } else {
             palette.love
@@ -1388,7 +1390,7 @@ mod tests {
         );
         assert_eq!(
             terminal_icon_style(&command_terminal, &done_runtime, false, palette),
-            Style::default().fg(FINISHED_STATUS_COLOR)
+            Style::default().fg(palette.success)
         );
         assert_eq!(
             terminal_icon_style(&command_terminal, &done_runtime, true, palette),
@@ -1414,7 +1416,7 @@ mod tests {
         );
         assert_eq!(
             chat_status_style(ChatStatus::Done, false, palette),
-            Style::default().fg(FINISHED_STATUS_COLOR)
+            Style::default().fg(palette.success)
         );
         assert_eq!(
             chat_status_style(ChatStatus::Done, true, palette),
@@ -1681,7 +1683,7 @@ mod tests {
             .cell((output_area.x + 1, output_area.y))
             .expect("cursor cell is in bounds");
         assert_eq!(cursor_cell.symbol(), "█");
-        assert_eq!(cursor_cell.fg, CURSOR_COLOR);
+        assert_eq!(cursor_cell.fg, palette.cursor);
         assert_eq!(cursor_cell.bg, palette.base);
         assert_ne!(cursor_cell.fg, palette.nc);
     }
@@ -1861,6 +1863,31 @@ mod tests {
 
     fn test_palette() -> Palette {
         Palette::from_colorscheme(&config::Config::default().colorscheme)
+    }
+
+    #[test]
+    fn custom_cursor_and_success_colors_are_themable() {
+        let mut colorscheme = config::Config::default().colorscheme;
+        colorscheme.cursor = "#010203".to_string();
+        colorscheme.success = "#0a0b0c".to_string();
+
+        let palette = Palette::from_colorscheme(&colorscheme);
+
+        assert_eq!(palette.cursor, Color::Rgb(1, 2, 3));
+        assert_eq!(palette.success, Color::Rgb(10, 11, 12));
+    }
+
+    #[test]
+    fn extreme_terminal_sizes_render_without_panicking() {
+        let app = App::default();
+        let pty_runtime = PtyRuntime::new_offline();
+
+        // Tiny / lopsided frames must not underflow the layout or cursor math.
+        // The sidebar is wider than these frames, so the main pane is starved;
+        // rendering should still succeed rather than panic.
+        for (width, height) in [(1, 1), (2, 3), (20, 5), (1, 40), (40, 1)] {
+            let _ = draw_text(&app, &pty_runtime, width, height);
+        }
     }
 
     #[test]
