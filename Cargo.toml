@@ -2,12 +2,22 @@
 name = "mult"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 description = "A terminal UI prototype for multiplexing AI agent workspaces, chats, and terminals."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/Jofr3/mult"
 
 [workspace]
 members = ["crates/protocol"]
 default-members = [".", "crates/protocol"]
+
+[profile.release]
+# Smaller, faster shipped binaries. `panic = "unwind"` (the default) is kept on
+# purpose: the client and daemon run cleanup/lock logic while unwinding, so
+# `panic = "abort"` is intentionally NOT set here.
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
 
 [dependencies]
 anyhow = "1.0"

@@ -176,6 +176,10 @@ By default the socket lives at `$XDG_RUNTIME_DIR/mult.sock`; without `XDG_RUNTIM
 
 `mult` currently uses Unix sockets and Unix PTY/process APIs, so the practical target is Linux/macOS-like systems.
 
+## Contributing
+
+Contributions are welcome — start with [CONTRIBUTING.md](CONTRIBUTING.md) and the detailed [AGENTS.md](AGENTS.md) guide. For security issues, see [SECURITY.md](SECURITY.md). Planned follow-up work is tracked in [docs/REMAINING_WORK.md](docs/REMAINING_WORK.md).
+
 ## License
 
 Licensed under either of:

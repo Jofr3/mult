@@ -1,0 +1,6 @@
+# Pin the Rust toolchain so CI, rustup-based contributors, and the documented
+# `just ci` gate all build with the same compiler. (The Nix dev shell provides
+# its own pinned Rust from the flake; bump both together when upgrading.)
+[toolchain]
+channel = "1.94"
+components = ["rustfmt", "clippy"]

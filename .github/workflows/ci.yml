@@ -7,20 +7,52 @@ on:
 
 jobs:
   cargo:
-    name: Cargo validation
+    name: Cargo validation (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-audit
+      - name: Run local CI gate
+        run: just ci
+
+  deny:
+    name: cargo-deny
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Install just and cargo-audit
-        run: |
-          cargo install just --locked
-          cargo install cargo-audit --locked
-      - name: Run local CI gate
-        run: just ci
+          toolchain: "1.94"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
+
+  extension:
+    name: Status extension typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: extensions/package-lock.json
+      - run: npm ci
+        working-directory: extensions
+      - run: npm run typecheck
+        working-directory: extensions
 
   nix:
     name: Nix flake check

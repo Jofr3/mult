@@ -1,0 +1,35 @@
+# cargo-deny configuration. Run `cargo deny check` locally; CI runs it too.
+# Supersedes the standalone `cargo audit` for supply-chain checks (advisories,
+# licenses, banned/duplicate crates, and crate sources).
+
+[advisories]
+# Vulnerabilities and unmaintained crates are reported by default. Add RustSec
+# advisory IDs here (with a comment) to consciously accept a specific risk.
+ignore = []
+
+[licenses]
+# The dependency tree is permissive; every crate must satisfy one of these.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSL-1.0",
+    "Unicode-3.0",
+    # Present in the full dependency graph but not always resolved on every
+    # platform; kept so the check stays green on Linux and macOS alike.
+    "Unicode-DFS-2016",
+    "WTFPL",
+    "Zlib",
+]
+
+[bans]
+# Surface accidental duplicate versions of a crate without failing the build.
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The default crates.io registry. fnug-vt100 is a published crates.io crate, so
+# no extra source allowance is needed for the vt100 fork.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
