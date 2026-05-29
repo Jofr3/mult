@@ -71,6 +71,16 @@ pub struct ChatId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TerminalId(pub u64);
 
+/// Identifies a PTY owned by the runtime: either a durable workspace terminal or
+/// the agent process backing a chat. A runtime-only key (never persisted) that
+/// replaces the old trick of stuffing a `ChatId` into a `TerminalId`'s high bit,
+/// so the two cases are now distinct by type instead of a reused integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PtyKey {
+    Terminal(TerminalId),
+    ChatAgent(ChatId),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChatStatus {
     Idle,
