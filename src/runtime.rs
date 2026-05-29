@@ -1455,8 +1455,32 @@ fn drain_mult_agent_status_events(app: &mut App) -> bool {
     changed
 }
 
+/// Upper bound on the agent status file. It is a tiny JSON object; anything
+/// larger is a bug or a hostile same-UID writer, and this read happens on the
+/// render thread once per frame per chat, so it must never read unboundedly.
+const MAX_STATUS_FILE_BYTES: u64 = 64 * 1024;
+
 fn read_mult_agent_status(path: &Path) -> Option<ChatStatus> {
-    let contents = fs::read_to_string(path).ok()?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NOFOLLOW: never follow a symlink swapped in for the status file.
+        // O_NONBLOCK: opening a FIFO or device must not stall the render thread.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+
+    let file = options.open(path).ok()?;
+    // Read regular files only; a swapped-in FIFO/socket/device is ignored.
+    if !file.metadata().ok()?.file_type().is_file() {
+        return None;
+    }
+
+    let mut contents = String::new();
+    file.take(MAX_STATUS_FILE_BYTES)
+        .read_to_string(&mut contents)
+        .ok()?;
     let record = serde_json::from_str::<MultAgentStatusRecord>(&contents).ok()?;
     mult_agent_status_to_chat_status(&record.status)
 }
@@ -1545,6 +1569,56 @@ mod tests {
     fn blank_or_unterminated_process_agent_command_is_ignored() {
         assert_eq!(parse_process_agent_command("   "), None);
         assert_eq!(parse_process_agent_command("agent 'unterminated"), None);
+    }
+
+    #[test]
+    fn read_mult_agent_status_parses_a_small_status_file() {
+        let path = unique_status_path("small");
+        fs::write(&path, r#"{"status":"running"}"#).expect("write status");
+
+        assert_eq!(read_mult_agent_status(&path), Some(ChatStatus::Thinking));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_mult_agent_status_caps_the_read_and_rejects_oversized_files() {
+        let path = unique_status_path("huge");
+        // Valid JSON as a whole, but far larger than the cap. Read in full it
+        // would parse; truncated at the cap it cannot, so a bounded read rejects
+        // it — proving the read never grows with the file.
+        let padding = " ".repeat(MAX_STATUS_FILE_BYTES as usize + 1024);
+        fs::write(&path, format!(r#"{{"status":"idle",{padding}"x":1}}"#)).expect("write status");
+
+        assert_eq!(read_mult_agent_status(&path), None);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_mult_agent_status_does_not_follow_symlinks() {
+        let target = unique_status_path("symlink-target");
+        fs::write(&target, r#"{"status":"idle"}"#).expect("write status");
+        let link = unique_status_path("symlink-link");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        // O_NOFOLLOW means the symlink is not traversed, so nothing is read.
+        assert_eq!(read_mult_agent_status(&link), None);
+
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_file(&target);
+    }
+
+    fn unique_status_path(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "mult-status-test-{label}-{}-{nanos}.json",
+            std::process::id()
+        ))
     }
 
     #[test]
