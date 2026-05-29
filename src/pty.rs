@@ -18,11 +18,11 @@ use mult_protocol::{
 };
 use vt100::Parser;
 
-use crate::model::TerminalId;
+use crate::model::{ChatId, PtyKey, TerminalId, RUNTIME_TERMINAL_ID_FLAG};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtySpawn {
-    pub terminal: TerminalId,
+    pub terminal: PtyKey,
     pub program: String,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
@@ -38,22 +38,10 @@ pub struct PtyDimensions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PtyEvent {
-    Scrollback {
-        terminal: TerminalId,
-        bytes: Vec<u8>,
-    },
-    Output {
-        terminal: TerminalId,
-        bytes: Vec<u8>,
-    },
-    Exited {
-        terminal: TerminalId,
-        status: PtyExit,
-    },
-    Error {
-        terminal: TerminalId,
-        message: String,
-    },
+    Scrollback { terminal: PtyKey, bytes: Vec<u8> },
+    Output { terminal: PtyKey, bytes: Vec<u8> },
+    Exited { terminal: PtyKey, status: PtyExit },
+    Error { terminal: PtyKey, message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,19 +53,19 @@ pub struct PtyExit {
 pub struct PtyRuntime {
     socket_path: PathBuf,
     connection: Option<ServerConnection>,
-    terminal_to_pane: HashMap<TerminalId, PaneId>,
-    pane_to_terminal: HashMap<PaneId, TerminalId>,
-    parsers: HashMap<TerminalId, Parser>,
-    responders: HashMap<TerminalId, TerminalResponseDetector>,
-    terminals_with_output: HashSet<TerminalId>,
-    terminal_exit_statuses: HashMap<TerminalId, PtyExit>,
-    foreground_processes: HashMap<TerminalId, ForegroundProcessInfo>,
-    command_trackers: HashMap<TerminalId, TerminalCommandTracker>,
+    terminal_to_pane: HashMap<PtyKey, PaneId>,
+    pane_to_terminal: HashMap<PaneId, PtyKey>,
+    parsers: HashMap<PtyKey, Parser>,
+    responders: HashMap<PtyKey, TerminalResponseDetector>,
+    terminals_with_output: HashSet<PtyKey>,
+    terminal_exit_statuses: HashMap<PtyKey, PtyExit>,
+    foreground_processes: HashMap<PtyKey, ForegroundProcessInfo>,
+    command_trackers: HashMap<PtyKey, TerminalCommandTracker>,
     pending_events: Vec<PtyEvent>,
     // The terminal currently being created by `start`, if any. It is excluded
     // from reconnect re-attach because its session does not exist on the server
     // until `start`'s own CreateSession completes.
-    starting: Option<TerminalId>,
+    starting: Option<PtyKey>,
 }
 
 const SERVER_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -149,7 +137,7 @@ impl PtyRuntime {
             Err(error) => Self::disconnected(
                 socket_path,
                 vec![PtyEvent::Error {
-                    terminal: TerminalId(0),
+                    terminal: PtyKey::Terminal(TerminalId(0)),
                     message: format!("failed to connect to mult-server: {error}"),
                 }],
             ),
@@ -181,11 +169,7 @@ impl PtyRuntime {
 }
 
 impl PtySpawn {
-    pub fn shell(
-        terminal: TerminalId,
-        cwd: Option<PathBuf>,
-        env: BTreeMap<String, String>,
-    ) -> Self {
+    pub fn shell(terminal: PtyKey, cwd: Option<PathBuf>, env: BTreeMap<String, String>) -> Self {
         Self {
             terminal,
             program: default_shell(),
@@ -197,7 +181,7 @@ impl PtySpawn {
     }
 
     pub fn command_line(
-        terminal: TerminalId,
+        terminal: PtyKey,
         command: String,
         cwd: Option<PathBuf>,
         env: BTreeMap<String, String>,
@@ -220,37 +204,37 @@ impl Default for PtyDimensions {
 }
 
 impl PtyRuntime {
-    pub fn is_running(&self, terminal: TerminalId) -> bool {
+    pub fn is_running(&self, terminal: PtyKey) -> bool {
         self.terminal_to_pane.contains_key(&terminal)
     }
 
-    pub fn parser(&self, terminal: TerminalId) -> Option<&Parser> {
+    pub fn parser(&self, terminal: PtyKey) -> Option<&Parser> {
         self.parsers.get(&terminal)
     }
 
-    pub fn terminal_exit_status(&self, terminal: TerminalId) -> Option<&PtyExit> {
+    pub fn terminal_exit_status(&self, terminal: PtyKey) -> Option<&PtyExit> {
         self.terminal_exit_statuses.get(&terminal)
     }
 
-    pub fn terminal_last_command(&self, terminal: TerminalId) -> Option<&str> {
+    pub fn terminal_last_command(&self, terminal: PtyKey) -> Option<&str> {
         self.command_trackers
             .get(&terminal)
             .and_then(TerminalCommandTracker::last_command)
     }
 
     #[cfg(test)]
-    pub fn mark_running_for_test(&mut self, terminal: TerminalId) {
-        let pane = pane_for_terminal(terminal);
+    pub fn mark_running_for_test(&mut self, terminal: PtyKey) {
+        let pane = pane_for_key(terminal);
         self.terminal_to_pane.insert(terminal, pane);
         self.pane_to_terminal.insert(pane, terminal);
     }
 
     #[cfg(test)]
-    pub fn record_exit_status_for_test(&mut self, terminal: TerminalId, status: PtyExit) {
+    pub fn record_exit_status_for_test(&mut self, terminal: PtyKey, status: PtyExit) {
         self.terminal_exit_statuses.insert(terminal, status);
     }
 
-    pub fn ensure_parser(&mut self, terminal: TerminalId, size: PtyDimensions) {
+    pub fn ensure_parser(&mut self, terminal: PtyKey, size: PtyDimensions) {
         self.parsers.entry(terminal).or_insert_with(|| {
             Parser::new(
                 size.rows.max(1),
@@ -261,7 +245,7 @@ impl PtyRuntime {
         self.resize_parser(terminal, size);
     }
 
-    pub fn reset_parser(&mut self, terminal: TerminalId, size: PtyDimensions) {
+    pub fn reset_parser(&mut self, terminal: PtyKey, size: PtyDimensions) {
         self.parsers.insert(
             terminal,
             Parser::new(
@@ -275,7 +259,7 @@ impl PtyRuntime {
         self.terminal_exit_statuses.remove(&terminal);
     }
 
-    pub fn remove_terminal(&mut self, terminal: TerminalId) {
+    pub fn remove_terminal(&mut self, terminal: PtyKey) {
         if let Some(pane) = self.terminal_to_pane.remove(&terminal) {
             self.pane_to_terminal.remove(&pane);
         }
@@ -287,11 +271,11 @@ impl PtyRuntime {
         self.command_trackers.remove(&terminal);
     }
 
-    pub fn process_terminal_output(&mut self, terminal: TerminalId, bytes: &[u8]) {
+    pub fn process_terminal_output(&mut self, terminal: PtyKey, bytes: &[u8]) {
         self.feed_terminal_output(terminal, bytes, false);
     }
 
-    fn feed_terminal_output(&mut self, terminal: TerminalId, bytes: &[u8], respond: bool) {
+    fn feed_terminal_output(&mut self, terminal: PtyKey, bytes: &[u8], respond: bool) {
         if bytes.is_empty() {
             return;
         }
@@ -324,23 +308,23 @@ impl PtyRuntime {
         }
     }
 
-    pub fn append_terminal_system_line(&mut self, terminal: TerminalId, message: impl AsRef<str>) {
+    pub fn append_terminal_system_line(&mut self, terminal: PtyKey, message: impl AsRef<str>) {
         let line = format!("[mult] {}\r\n", message.as_ref());
         self.process_terminal_output(terminal, line.as_bytes());
     }
 
-    pub fn terminal_lines(&self, terminal: TerminalId) -> Vec<String> {
+    pub fn terminal_lines(&self, terminal: PtyKey) -> Vec<String> {
         let Some(parser) = self.parsers.get(&terminal) else {
             return Vec::new();
         };
         terminal_screen_rows(parser)
     }
 
-    pub fn terminal_all_lines(&self, terminal: TerminalId) -> Vec<String> {
+    pub fn terminal_all_lines(&self, terminal: PtyKey) -> Vec<String> {
         self.terminal_lines(terminal)
     }
 
-    pub fn terminal_output_is_blank(&self, terminal: TerminalId) -> bool {
+    pub fn terminal_output_is_blank(&self, terminal: PtyKey) -> bool {
         if self.terminals_with_output.contains(&terminal) {
             return false;
         }
@@ -376,8 +360,8 @@ impl PtyRuntime {
         self.reset_parser(spawn.terminal, spawn.size);
         self.foreground_processes.remove(&spawn.terminal);
         self.command_trackers.remove(&spawn.terminal);
-        let session = session_for_terminal(spawn.terminal);
-        let pane = pane_for_terminal(spawn.terminal);
+        let session = session_for_key(spawn.terminal);
+        let pane = pane_for_key(spawn.terminal);
         let launch = launch_spec(&spawn);
         let name = session_name(&spawn, &launch);
         self.terminal_to_pane.insert(spawn.terminal, pane);
@@ -409,7 +393,7 @@ impl PtyRuntime {
         result
     }
 
-    pub fn stop(&mut self, terminal: TerminalId) -> io::Result<bool> {
+    pub fn stop(&mut self, terminal: PtyKey) -> io::Result<bool> {
         let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
             return Ok(false);
         };
@@ -421,7 +405,7 @@ impl PtyRuntime {
         Ok(true)
     }
 
-    pub fn send_input(&mut self, terminal: TerminalId, input: &[u8]) -> io::Result<bool> {
+    pub fn send_input(&mut self, terminal: PtyKey, input: &[u8]) -> io::Result<bool> {
         let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
             return Ok(false);
         };
@@ -431,7 +415,7 @@ impl PtyRuntime {
 
     fn send_input_inner(
         &mut self,
-        terminal: TerminalId,
+        terminal: PtyKey,
         pane: PaneId,
         input: &[u8],
         track_command: bool,
@@ -458,7 +442,7 @@ impl PtyRuntime {
         Ok(())
     }
 
-    fn terminal_accepts_shell_input(&self, terminal: TerminalId) -> bool {
+    fn terminal_accepts_shell_input(&self, terminal: PtyKey) -> bool {
         let Some(process) = self.foreground_processes.get(&terminal) else {
             return true;
         };
@@ -469,7 +453,7 @@ impl PtyRuntime {
         }
     }
 
-    pub fn send_paste(&mut self, terminal: TerminalId, text: &str) -> io::Result<bool> {
+    pub fn send_paste(&mut self, terminal: PtyKey, text: &str) -> io::Result<bool> {
         let use_bracketed = self
             .parsers
             .get(&terminal)
@@ -478,15 +462,15 @@ impl PtyRuntime {
         self.send_input(terminal, &bytes)
     }
 
-    pub fn scroll_up(&mut self, terminal: TerminalId, rows: usize) -> io::Result<bool> {
+    pub fn scroll_up(&mut self, terminal: PtyKey, rows: usize) -> io::Result<bool> {
         Ok(self.scroll_parser(terminal, rows as i32))
     }
 
-    pub fn scroll_down(&mut self, terminal: TerminalId, rows: usize) -> io::Result<bool> {
+    pub fn scroll_down(&mut self, terminal: PtyKey, rows: usize) -> io::Result<bool> {
         Ok(self.scroll_parser(terminal, -(rows.min(i32::MAX as usize) as i32)))
     }
 
-    pub fn scroll_to_top(&mut self, terminal: TerminalId) -> io::Result<bool> {
+    pub fn scroll_to_top(&mut self, terminal: PtyKey) -> io::Result<bool> {
         let Some(parser) = self.parsers.get_mut(&terminal) else {
             return Ok(false);
         };
@@ -496,7 +480,7 @@ impl PtyRuntime {
         Ok(parser.screen().scrollback() != old)
     }
 
-    pub fn scroll_to_bottom(&mut self, terminal: TerminalId) -> io::Result<bool> {
+    pub fn scroll_to_bottom(&mut self, terminal: PtyKey) -> io::Result<bool> {
         let Some(parser) = self.parsers.get_mut(&terminal) else {
             return Ok(false);
         };
@@ -505,7 +489,7 @@ impl PtyRuntime {
         Ok(old != 0)
     }
 
-    pub fn resize(&mut self, terminal: TerminalId, size: PtyDimensions) -> io::Result<()> {
+    pub fn resize(&mut self, terminal: PtyKey, size: PtyDimensions) -> io::Result<()> {
         self.resize_parser(terminal, size);
         let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
             return Ok(());
@@ -609,7 +593,7 @@ impl PtyRuntime {
         }
     }
 
-    fn resize_parser(&mut self, terminal: TerminalId, size: PtyDimensions) {
+    fn resize_parser(&mut self, terminal: PtyKey, size: PtyDimensions) {
         let parser = self
             .parsers
             .entry(terminal)
@@ -618,7 +602,7 @@ impl PtyRuntime {
         clamp_parser_scrollback(parser);
     }
 
-    fn scroll_parser(&mut self, terminal: TerminalId, rows: i32) -> bool {
+    fn scroll_parser(&mut self, terminal: PtyKey, rows: i32) -> bool {
         if rows == 0 {
             return false;
         }
@@ -642,18 +626,18 @@ impl PtyRuntime {
             | ServerMessage::Sessions(_)
             | ServerMessage::Attached { .. } => {}
             ServerMessage::ForegroundProcess { pane, process } => {
-                if let Some(terminal) = self.terminal_for_pane(pane) {
+                if let Some(terminal) = self.key_for_pane(pane) {
                     self.record_foreground_process(terminal, process);
                 }
             }
             ServerMessage::PtyScrollback { pane, bytes } => {
-                if let Some(terminal) = self.terminal_for_pane(pane) {
+                if let Some(terminal) = self.key_for_pane(pane) {
                     self.feed_terminal_output(terminal, &bytes, false);
                     events.push(PtyEvent::Scrollback { terminal, bytes });
                 }
             }
             ServerMessage::PtyOutput { pane, bytes } => {
-                if let Some(terminal) = self.terminal_for_pane(pane) {
+                if let Some(terminal) = self.key_for_pane(pane) {
                     self.feed_terminal_output(terminal, &bytes, true);
                     events.push(PtyEvent::Output { terminal, bytes });
                 }
@@ -675,20 +659,20 @@ impl PtyRuntime {
                     .values()
                     .next()
                     .copied()
-                    .unwrap_or(TerminalId(0));
+                    .unwrap_or(PtyKey::Terminal(TerminalId(0)));
                 events.push(PtyEvent::Error { terminal, message });
             }
         }
     }
 
-    fn terminal_for_pane(&self, pane: PaneId) -> Option<TerminalId> {
+    fn key_for_pane(&self, pane: PaneId) -> Option<PtyKey> {
         self.pane_to_terminal
             .get(&pane)
             .copied()
-            .or(Some(TerminalId(pane.0)))
+            .or_else(|| Some(key_for_pane_id(pane)))
     }
 
-    fn record_foreground_process(&mut self, terminal: TerminalId, process: ForegroundProcessInfo) {
+    fn record_foreground_process(&mut self, terminal: PtyKey, process: ForegroundProcessInfo) {
         let foreground_is_child = matches!(
             (process.root_pid, process.foreground_pid),
             (Some(root_pid), Some(foreground_pid)) if root_pid != foreground_pid
@@ -737,7 +721,7 @@ impl PtyRuntime {
     /// exit, drop the attachment mappings (so `is_running` becomes false and the
     /// app can restart them), and emit an exit event for each.
     fn connection_lost(&mut self) {
-        let terminals: Vec<TerminalId> = self.terminal_to_pane.keys().copied().collect();
+        let terminals: Vec<PtyKey> = self.terminal_to_pane.keys().copied().collect();
         for terminal in terminals {
             if let Some(pane) = self.terminal_to_pane.remove(&terminal) {
                 self.pane_to_terminal.remove(&pane);
@@ -760,7 +744,7 @@ impl PtyRuntime {
     /// stale content. A session the server no longer has answers with
     /// `PaneExited`, which surfaces as a normal exit and clears the terminal.
     fn reattach_terminals(&mut self) {
-        let terminals: Vec<TerminalId> = self
+        let terminals: Vec<PtyKey> = self
             .terminal_to_pane
             .keys()
             .copied()
@@ -770,14 +754,14 @@ impl PtyRuntime {
             let size = self.parser_dimensions(terminal);
             self.reset_parser(terminal, size);
             let _ = self.write(&ClientMessage::Attach {
-                session: session_for_terminal(terminal),
+                session: session_for_key(terminal),
                 rows: size.rows,
                 cols: size.cols,
             });
         }
     }
 
-    fn parser_dimensions(&self, terminal: TerminalId) -> PtyDimensions {
+    fn parser_dimensions(&self, terminal: PtyKey) -> PtyDimensions {
         self.parsers
             .get(&terminal)
             .map(|parser| {
@@ -1341,12 +1325,33 @@ fn is_disconnected_error(error: &io::Error) -> bool {
     )
 }
 
-fn session_for_terminal(terminal: TerminalId) -> SessionId {
-    SessionId(terminal.0)
+fn session_for_key(key: PtyKey) -> SessionId {
+    SessionId(wire_id(key))
 }
 
-fn pane_for_terminal(terminal: TerminalId) -> PaneId {
-    PaneId(terminal.0)
+fn pane_for_key(key: PtyKey) -> PaneId {
+    PaneId(wire_id(key))
+}
+
+/// The on-the-wire session/pane id for a PTY key. Durable terminals keep their
+/// raw id; chat-agent PTYs set the high bit. This is the only place the old
+/// high-bit encoding lives now, and it is kept identical so the daemon (which
+/// is keyed purely by these ids) is unaffected by the `PtyKey` change.
+fn wire_id(key: PtyKey) -> u64 {
+    match key {
+        PtyKey::Terminal(terminal) => terminal.0,
+        PtyKey::ChatAgent(chat) => chat.0 | RUNTIME_TERMINAL_ID_FLAG,
+    }
+}
+
+/// Inverse of `wire_id`: recover the `PtyKey` for a pane id received from the
+/// server (used for output on panes the client has not explicitly registered).
+fn key_for_pane_id(pane: PaneId) -> PtyKey {
+    if pane.0 & RUNTIME_TERMINAL_ID_FLAG != 0 {
+        PtyKey::ChatAgent(ChatId(pane.0 & !RUNTIME_TERMINAL_ID_FLAG))
+    } else {
+        PtyKey::Terminal(TerminalId(pane.0))
+    }
 }
 
 fn launch_spec(spawn: &PtySpawn) -> LaunchSpec {
@@ -1360,7 +1365,7 @@ fn launch_spec(spawn: &PtySpawn) -> LaunchSpec {
 
 fn session_name(spawn: &PtySpawn, launch: &LaunchSpec) -> String {
     match launch {
-        LaunchSpec::Shell => format!("shell {}", spawn.terminal.0),
+        LaunchSpec::Shell => format!("shell {}", wire_id(spawn.terminal)),
         LaunchSpec::Command(command) => command.clone(),
     }
 }
@@ -1400,9 +1405,9 @@ mod tests {
 
     #[test]
     fn pty_spawn_uses_default_size() {
-        let spawn = PtySpawn::shell(TerminalId(7), None, BTreeMap::new());
+        let spawn = PtySpawn::shell(PtyKey::Terminal(TerminalId(7)), None, BTreeMap::new());
 
-        assert_eq!(spawn.terminal, TerminalId(7));
+        assert_eq!(spawn.terminal, PtyKey::Terminal(TerminalId(7)));
         assert_eq!(spawn.args, Vec::<String>::new());
         assert_eq!(spawn.size, PtyDimensions { rows: 24, cols: 80 });
         assert!(!spawn.program.is_empty());
@@ -1411,13 +1416,13 @@ mod tests {
     #[test]
     fn pty_spawn_command_line_runs_through_shell() {
         let spawn = PtySpawn::command_line(
-            TerminalId(7),
+            PtyKey::Terminal(TerminalId(7)),
             "cargo test".to_string(),
             None,
             BTreeMap::new(),
         );
 
-        assert_eq!(spawn.terminal, TerminalId(7));
+        assert_eq!(spawn.terminal, PtyKey::Terminal(TerminalId(7)));
         assert_eq!(spawn.args.last().map(String::as_str), Some("cargo test"));
         assert!(!spawn.program.is_empty());
     }
@@ -1435,7 +1440,7 @@ mod tests {
     #[test]
     fn parser_processes_output_and_preserves_scrollback_cap() {
         let mut runtime = PtyRuntime::new_offline();
-        let terminal = TerminalId(9);
+        let terminal = PtyKey::Terminal(TerminalId(9));
         runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
         runtime.process_terminal_output(terminal, b"one\r\ntwo\r\nthree");
 
@@ -1450,7 +1455,7 @@ mod tests {
     #[test]
     fn parser_resize_updates_screen_size() {
         let mut runtime = PtyRuntime::new_offline();
-        let terminal = TerminalId(9);
+        let terminal = PtyKey::Terminal(TerminalId(9));
 
         runtime
             .resize(terminal, PtyDimensions { rows: 5, cols: 12 })
@@ -1463,7 +1468,7 @@ mod tests {
     fn send_paste_wraps_when_parser_reports_bracketed_paste() {
         let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
         let (_sender, receiver) = mpsc::channel();
-        let terminal = TerminalId(7);
+        let terminal = PtyKey::Terminal(TerminalId(7));
         let pane = PaneId(7);
         let mut runtime = PtyRuntime {
             socket_path: unique_socket_path(),
@@ -1541,7 +1546,7 @@ mod tests {
     fn start_rolls_back_local_attachment_when_attach_is_rejected() {
         let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
         let (sender, receiver) = mpsc::sync_channel(8);
-        let terminal = TerminalId(7);
+        let terminal = PtyKey::Terminal(TerminalId(7));
         let pane = PaneId(7);
         let mut runtime = PtyRuntime {
             socket_path: unique_socket_path(),
@@ -1599,7 +1604,7 @@ mod tests {
     fn pty_stop_sends_stop_message_and_clears_local_attachment() {
         let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
         let (_sender, receiver) = mpsc::channel();
-        let terminal = TerminalId(7);
+        let terminal = PtyKey::Terminal(TerminalId(7));
         let pane = PaneId(7);
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
 
@@ -1615,7 +1620,7 @@ mod tests {
     fn input_returns_scrolled_parser_to_bottom() {
         let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
         let (_sender, receiver) = mpsc::channel();
-        let terminal = TerminalId(7);
+        let terminal = PtyKey::Terminal(TerminalId(7));
         let pane = PaneId(7);
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
         runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
@@ -1639,7 +1644,7 @@ mod tests {
     #[test]
     fn parser_scrolls_beyond_visible_screen_height() {
         let mut runtime = PtyRuntime::new_offline();
-        let terminal = TerminalId(7);
+        let terminal = PtyKey::Terminal(TerminalId(7));
         runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
         runtime.process_terminal_output(terminal, b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix");
 
@@ -1656,7 +1661,7 @@ mod tests {
     fn pty_scroll_is_local_and_paste_sends_input_message() {
         let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
         let (_sender, receiver) = mpsc::channel();
-        let terminal = TerminalId(7);
+        let terminal = PtyKey::Terminal(TerminalId(7));
         let pane = PaneId(7);
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
         runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
@@ -1664,7 +1669,9 @@ mod tests {
 
         assert!(runtime.scroll_up(terminal, 1).expect("scroll up"));
         assert!(runtime.scroll_down(terminal, 1).expect("scroll down"));
-        assert!(!runtime.scroll_to_top(TerminalId(99)).expect("missing"));
+        assert!(!runtime
+            .scroll_to_top(PtyKey::Terminal(TerminalId(99)))
+            .expect("missing"));
         assert!(runtime.send_paste(terminal, "one\ntwo").expect("paste"));
 
         let message: ClientMessage = read_message(&mut server_stream).expect("read client message");
@@ -1681,7 +1688,7 @@ mod tests {
     fn pty_stop_keeps_local_attachment_when_send_fails() {
         let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
         let (_sender, receiver) = mpsc::channel();
-        let terminal = TerminalId(7);
+        let terminal = PtyKey::Terminal(TerminalId(7));
         let pane = PaneId(7);
         let writer = Arc::new(Mutex::new(client_stream));
         let poison_writer = writer.clone();
@@ -1716,7 +1723,7 @@ mod tests {
     fn pane_exit_event_clears_local_attachment() {
         let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
         let (sender, receiver) = mpsc::channel();
-        let terminal = TerminalId(9);
+        let terminal = PtyKey::Terminal(TerminalId(9));
         let pane = PaneId(9);
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
 
@@ -1757,7 +1764,7 @@ mod tests {
     fn terminal_last_command_tracks_submitted_input() {
         let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
         let (_sender, receiver) = mpsc::channel();
-        let terminal = TerminalId(9);
+        let terminal = PtyKey::Terminal(TerminalId(9));
         let pane = PaneId(9);
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
 
@@ -1777,7 +1784,7 @@ mod tests {
     fn terminal_last_command_ignores_fullscreen_app_input() {
         let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
         let (_sender, receiver) = mpsc::channel();
-        let terminal = TerminalId(9);
+        let terminal = PtyKey::Terminal(TerminalId(9));
         let pane = PaneId(9);
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
         runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
@@ -1799,7 +1806,7 @@ mod tests {
     fn terminal_last_command_uses_foreground_process_not_child_input() {
         let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
         let (sender, receiver) = mpsc::channel();
-        let terminal = TerminalId(9);
+        let terminal = PtyKey::Terminal(TerminalId(9));
         let pane = PaneId(9);
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
 
@@ -1844,7 +1851,7 @@ mod tests {
     fn live_output_answers_primary_device_attributes_query() {
         let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
         let (sender, receiver) = mpsc::channel();
-        let terminal = TerminalId(9);
+        let terminal = PtyKey::Terminal(TerminalId(9));
         let pane = PaneId(9);
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
         runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
@@ -1879,7 +1886,7 @@ mod tests {
     fn live_output_reports_cursor_after_a_batched_run() {
         let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
         let (sender, receiver) = mpsc::channel();
-        let terminal = TerminalId(9);
+        let terminal = PtyKey::Terminal(TerminalId(9));
         let pane = PaneId(9);
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
         runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
@@ -1911,7 +1918,7 @@ mod tests {
     fn output_event_feeds_matching_parser() {
         let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
         let (sender, receiver) = mpsc::channel();
-        let terminal = TerminalId(9);
+        let terminal = PtyKey::Terminal(TerminalId(9));
         let pane = PaneId(9);
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
         runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
@@ -1939,7 +1946,7 @@ mod tests {
     fn lost_connection_retires_terminals_when_reconnect_fails() {
         let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
         let (sender, receiver) = mpsc::channel();
-        let terminal = TerminalId(10);
+        let terminal = PtyKey::Terminal(TerminalId(10));
         let pane = PaneId(10);
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
         runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
@@ -1967,8 +1974,8 @@ mod tests {
     fn reattach_terminals_reattaches_known_sessions_with_parser_dimensions() {
         let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
         let (_sender, receiver) = mpsc::channel();
-        let terminal = TerminalId(5);
-        let pane = pane_for_terminal(terminal);
+        let terminal = PtyKey::Terminal(TerminalId(5));
+        let pane = pane_for_key(terminal);
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
         runtime.ensure_parser(terminal, PtyDimensions { rows: 6, cols: 20 });
 
@@ -1978,7 +1985,7 @@ mod tests {
         assert_eq!(
             message,
             ClientMessage::Attach {
-                session: session_for_terminal(terminal),
+                session: session_for_key(terminal),
                 rows: 6,
                 cols: 20,
             }
@@ -1989,8 +1996,8 @@ mod tests {
     fn reattach_skips_the_terminal_currently_starting() {
         let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
         let (_sender, receiver) = mpsc::channel();
-        let terminal = TerminalId(5);
-        let pane = pane_for_terminal(terminal);
+        let terminal = PtyKey::Terminal(TerminalId(5));
+        let pane = pane_for_key(terminal);
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
         runtime.ensure_parser(terminal, PtyDimensions { rows: 6, cols: 20 });
         runtime.starting = Some(terminal);
@@ -2035,7 +2042,7 @@ mod tests {
     fn test_runtime(
         client_stream: UnixStream,
         receiver: Receiver<ServerMessage>,
-        terminal: TerminalId,
+        terminal: PtyKey,
         pane: PaneId,
     ) -> PtyRuntime {
         PtyRuntime {

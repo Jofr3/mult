@@ -7,8 +7,8 @@ use crate::{
     agent::{AgentEvent, AgentMessageRole, AgentTarget},
     config::ConfiguredProject,
     model::{
-        ChatId, ChatMessage, ChatMessageRole, ChatStatus, ProjectState, TerminalId, TerminalStatus,
-        WorkspaceId, DEFAULT_AGENT_CHAT_TITLE, RUNTIME_TERMINAL_ID_FLAG, STATE_VERSION,
+        ChatId, ChatMessage, ChatMessageRole, ChatStatus, ProjectState, PtyKey, TerminalId,
+        TerminalStatus, WorkspaceId, DEFAULT_AGENT_CHAT_TITLE, STATE_VERSION,
     },
 };
 
@@ -99,7 +99,7 @@ pub struct SelectionCell {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextSelection {
-    pub terminal: TerminalId,
+    pub terminal: PtyKey,
     pub anchor: SelectionCell,
     pub focus: SelectionCell,
     pub dragging: bool,
@@ -193,15 +193,6 @@ impl Default for App {
     fn default() -> Self {
         Self::new(ProjectState::default())
     }
-}
-
-pub fn chat_agent_terminal_id(chat: ChatId) -> TerminalId {
-    TerminalId(chat.0 | RUNTIME_TERMINAL_ID_FLAG)
-}
-
-pub fn chat_id_from_agent_terminal_id(terminal: TerminalId) -> Option<ChatId> {
-    ((terminal.0 & RUNTIME_TERMINAL_ID_FLAG) != 0)
-        .then_some(ChatId(terminal.0 & !RUNTIME_TERMINAL_ID_FLAG))
 }
 
 impl App {
@@ -390,7 +381,7 @@ impl App {
         self.active_search = None;
     }
 
-    pub fn begin_text_selection(&mut self, terminal: TerminalId, cell: SelectionCell) {
+    pub fn begin_text_selection(&mut self, terminal: PtyKey, cell: SelectionCell) {
         self.text_selection = Some(TextSelection {
             terminal,
             anchor: cell,
@@ -399,7 +390,7 @@ impl App {
         });
     }
 
-    pub fn update_text_selection(&mut self, terminal: TerminalId, cell: SelectionCell) -> bool {
+    pub fn update_text_selection(&mut self, terminal: PtyKey, cell: SelectionCell) -> bool {
         let Some(selection) = &mut self.text_selection else {
             return false;
         };
@@ -412,7 +403,7 @@ impl App {
 
     pub fn end_text_selection(
         &mut self,
-        terminal: TerminalId,
+        terminal: PtyKey,
         cell: SelectionCell,
     ) -> Option<TextSelection> {
         if !self.update_text_selection(terminal, cell) {
@@ -430,7 +421,7 @@ impl App {
         self.text_selection = None;
     }
 
-    pub fn shift_text_selection_rows(&mut self, terminal: TerminalId, delta: i32) -> bool {
+    pub fn shift_text_selection_rows(&mut self, terminal: PtyKey, delta: i32) -> bool {
         if delta == 0 {
             return false;
         }
@@ -451,7 +442,7 @@ impl App {
         true
     }
 
-    pub fn text_selection_for(&self, terminal: TerminalId) -> Option<&TextSelection> {
+    pub fn text_selection_for(&self, terminal: PtyKey) -> Option<&TextSelection> {
         self.text_selection
             .as_ref()
             .filter(|selection| selection.terminal == terminal)
@@ -676,7 +667,7 @@ impl App {
         self.selected_terminal_id().map(|(_, terminal)| terminal)
     }
 
-    pub fn pty_input_target(&self) -> Option<TerminalId> {
+    pub fn pty_input_target(&self) -> Option<PtyKey> {
         self.selected_output_terminal_id()
     }
 
@@ -783,7 +774,7 @@ impl App {
         self.selected_search_scope().is_some()
     }
 
-    pub fn delete_selected_immediately(&mut self) -> Vec<TerminalId> {
+    pub fn delete_selected_immediately(&mut self) -> Vec<PtyKey> {
         let Some(target) = self.selected_delete_target() else {
             return Vec::new();
         };
@@ -791,7 +782,7 @@ impl App {
         self.delete_target(target)
     }
 
-    fn delete_target(&mut self, target: DeleteTarget) -> Vec<TerminalId> {
+    fn delete_target(&mut self, target: DeleteTarget) -> Vec<PtyKey> {
         // Remember where the selection sat so that, if the selected item is the
         // one being removed, the selection lands on whatever shifts into its slot.
         let previous_index = self.selected_index();
@@ -811,8 +802,7 @@ impl App {
             }
             DeleteTarget::Chat { workspace, chat } => {
                 if self.project.remove_chat(workspace, chat).is_some() {
-                    let terminal = chat_agent_terminal_id(chat);
-                    runtime_terminals.push(terminal);
+                    runtime_terminals.push(PtyKey::ChatAgent(chat));
                     self.chat_buffers.remove(&chat);
                     self.dirty = true;
                     self.remove_workspace_if_empty(workspace);
@@ -823,7 +813,7 @@ impl App {
                 terminal,
             } => {
                 if self.project.remove_terminal(workspace, terminal).is_some() {
-                    runtime_terminals.push(terminal);
+                    runtime_terminals.push(PtyKey::Terminal(terminal));
                     self.dirty = true;
                     self.remove_workspace_if_empty(workspace);
                 }
@@ -890,10 +880,10 @@ impl App {
         }
     }
 
-    pub fn selected_output_terminal_id(&self) -> Option<TerminalId> {
+    pub fn selected_output_terminal_id(&self) -> Option<PtyKey> {
         match self.selected_item()? {
-            NavItem::Chat { chat, .. } => Some(chat_agent_terminal_id(chat)),
-            NavItem::Terminal { terminal, .. } => Some(terminal),
+            NavItem::Chat { chat, .. } => Some(PtyKey::ChatAgent(chat)),
+            NavItem::Terminal { terminal, .. } => Some(PtyKey::Terminal(terminal)),
         }
     }
 
@@ -1784,7 +1774,7 @@ mod tests {
     #[test]
     fn text_selection_rows_shift_with_viewport_scroll() {
         let mut app = App::default();
-        let terminal = TerminalId(9);
+        let terminal = PtyKey::Terminal(TerminalId(9));
         app.begin_text_selection(terminal, SelectionCell { row: 1, col: 0 });
         app.update_text_selection(terminal, SelectionCell { row: 1, col: 2 });
 
@@ -1916,7 +1906,7 @@ mod tests {
         });
         let runtime_terminals = app.delete_selected_immediately();
 
-        assert_eq!(runtime_terminals, vec![terminal]);
+        assert_eq!(runtime_terminals, vec![PtyKey::Terminal(terminal)]);
         assert!(app.project.terminal(workspace, terminal).is_none());
         assert!(app.is_dirty());
     }
@@ -1928,7 +1918,7 @@ mod tests {
         let chat = app.project.workspaces[0].chats[0].id;
         app.select_item(NavItem::Chat { workspace, chat });
         app.chat_buffers.insert(chat, ChatBuffer::default());
-        let pi_terminal = chat_agent_terminal_id(chat);
+        let pi_terminal = PtyKey::ChatAgent(chat);
         let runtime_terminals = app.delete_selected_immediately();
 
         assert_eq!(runtime_terminals, vec![pi_terminal]);
@@ -2001,7 +1991,7 @@ mod tests {
 
         let runtime_terminals = app.delete_selected_immediately();
 
-        assert_eq!(runtime_terminals, vec![chat_agent_terminal_id(chat)]);
+        assert_eq!(runtime_terminals, vec![PtyKey::ChatAgent(chat)]);
         assert!(app.project.workspace(workspace).is_none());
         assert!(app.is_dirty());
     }

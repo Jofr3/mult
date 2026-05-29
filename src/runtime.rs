@@ -17,13 +17,10 @@ use mult::{
     agent::{
         self, AgentBackend, AgentEvent, NoopAgentBackend, ProcessAgentBackend, ProcessAgentCommand,
     },
-    app::{
-        chat_agent_terminal_id, chat_id_from_agent_terminal_id, App, CommandAction, NavItem,
-        Prompt, SelectionCell, TextSelection,
-    },
+    app::{App, CommandAction, NavItem, Prompt, SelectionCell, TextSelection},
     config::Config,
     git,
-    model::{self, ChatStatus, TerminalId, TerminalLaunch, TerminalStatus},
+    model::{self, ChatStatus, PtyKey, TerminalLaunch, TerminalStatus},
     pty::{PtyDimensions, PtyEvent, PtyRuntime, PtySpawn},
     storage, ui,
 };
@@ -462,7 +459,7 @@ fn active_selection_cell_at_mouse(
     app: &App,
     frame_area: Rect,
     mouse: MouseEvent,
-) -> Option<(TerminalId, SelectionCell)> {
+) -> Option<(PtyKey, SelectionCell)> {
     let selection = app.text_selection?;
     let (terminal, area) = selected_output_area(app, frame_area)?;
     if terminal != selection.terminal {
@@ -471,12 +468,12 @@ fn active_selection_cell_at_mouse(
     mouse_cell_in_area(area, mouse.column, mouse.row).map(|cell| (terminal, cell))
 }
 
-fn selected_output_area(app: &App, frame_area: Rect) -> Option<(TerminalId, Rect)> {
+fn selected_output_area(app: &App, frame_area: Rect) -> Option<(PtyKey, Rect)> {
     if let Some((terminal, area)) = ui::selected_terminal_output_area(app, frame_area) {
-        return Some((terminal, area));
+        return Some((PtyKey::Terminal(terminal), area));
     }
     ui::selected_chat_agent_output_area(app, frame_area)
-        .map(|(chat, area)| (chat_agent_terminal_id(chat), area))
+        .map(|(chat, area)| (PtyKey::ChatAgent(chat), area))
 }
 
 fn mouse_cell_in_area(area: Rect, column: u16, row: u16) -> Option<SelectionCell> {
@@ -601,16 +598,16 @@ fn output_terminal_at(
     frame_area: Rect,
     column: u16,
     row: u16,
-) -> Option<TerminalId> {
+) -> Option<PtyKey> {
     if let Some((terminal, area)) = ui::selected_terminal_output_area(app, frame_area) {
         if rect_contains(area, column, row) {
-            return Some(terminal);
+            return Some(PtyKey::Terminal(terminal));
         }
     }
 
     if let Some((chat, area)) = ui::selected_chat_agent_output_area(app, frame_area) {
         if rect_contains(area, column, row) {
-            return Some(chat_agent_terminal_id(chat));
+            return Some(PtyKey::ChatAgent(chat));
         }
     }
 
@@ -725,7 +722,7 @@ fn is_control_key(key: KeyEvent) -> bool {
 fn scroll_terminal_output_up(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
-    terminal: TerminalId,
+    terminal: PtyKey,
     rows: usize,
 ) -> bool {
     let before = terminal_scrollback(pty_runtime, terminal);
@@ -737,7 +734,7 @@ fn scroll_terminal_output_up(
 fn scroll_terminal_output_down(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
-    terminal: TerminalId,
+    terminal: PtyKey,
     rows: usize,
 ) -> bool {
     let before = terminal_scrollback(pty_runtime, terminal);
@@ -746,7 +743,7 @@ fn scroll_terminal_output_down(
     changed
 }
 
-fn terminal_scrollback(pty_runtime: &PtyRuntime, terminal: TerminalId) -> usize {
+fn terminal_scrollback(pty_runtime: &PtyRuntime, terminal: PtyKey) -> usize {
     pty_runtime
         .parser(terminal)
         .map(|parser| parser.screen().scrollback())
@@ -756,7 +753,7 @@ fn terminal_scrollback(pty_runtime: &PtyRuntime, terminal: TerminalId) -> usize 
 fn sync_text_selection_with_scrollback(
     app: &mut App,
     pty_runtime: &PtyRuntime,
-    terminal: TerminalId,
+    terminal: PtyKey,
     before: usize,
     changed: bool,
 ) {
@@ -820,10 +817,10 @@ fn start_selected_pty_if_needed(
     pty_runtime: &mut PtyRuntime,
     config: &Config,
     frame_area: Rect,
-) -> Option<TerminalId> {
+) -> Option<PtyKey> {
     match app.selected_item()? {
         NavItem::Chat { workspace, chat } => {
-            let terminal = chat_agent_terminal_id(chat);
+            let terminal = PtyKey::ChatAgent(chat);
             if pty_runtime.is_running(terminal) {
                 app.begin_chat_agent_input();
             } else {
@@ -843,12 +840,13 @@ fn start_selected_pty_if_needed(
             workspace,
             terminal,
         } => {
-            if !pty_runtime.is_running(terminal) {
+            let key = PtyKey::Terminal(terminal);
+            if !pty_runtime.is_running(key) {
                 start_terminal(app, pty_runtime, config, frame_area, workspace, terminal);
             }
-            if pty_runtime.is_running(terminal) {
+            if pty_runtime.is_running(key) {
                 app.begin_terminal_input();
-                Some(terminal)
+                Some(key)
             } else {
                 None
             }
@@ -988,8 +986,9 @@ fn start_terminal(
     workspace_id: model::WorkspaceId,
     terminal_id: model::TerminalId,
 ) -> bool {
-    if pty_runtime.is_running(terminal_id) {
-        pty_runtime.append_terminal_system_line(terminal_id, "PTY already running");
+    let key = PtyKey::Terminal(terminal_id);
+    if pty_runtime.is_running(key) {
+        pty_runtime.append_terminal_system_line(key, "PTY already running");
         return true;
     }
 
@@ -1006,13 +1005,11 @@ fn start_terminal(
 
     let terminal_name = terminal.name.clone();
     let mut spawn = match &terminal.launch {
-        TerminalLaunch::Shell => PtySpawn::shell(
-            terminal_id,
-            workspace.cwd.clone(),
-            workspace.environment.clone(),
-        ),
+        TerminalLaunch::Shell => {
+            PtySpawn::shell(key, workspace.cwd.clone(), workspace.environment.clone())
+        }
         TerminalLaunch::Command(command) => PtySpawn::command_line(
-            terminal_id,
+            key,
             command.clone(),
             workspace.cwd.clone(),
             workspace.environment.clone(),
@@ -1027,7 +1024,7 @@ fn start_terminal(
         }
         Err(error) => {
             pty_runtime.append_terminal_system_line(
-                terminal_id,
+                key,
                 format!("failed to start terminal `{terminal_name}`: {error}"),
             );
             app.mark_terminal_stopped(terminal_id);
@@ -1066,7 +1063,7 @@ fn start_or_focus_chat_agent(
     chat_id: model::ChatId,
     focus_after_start: bool,
 ) {
-    let terminal_id = chat_agent_terminal_id(chat_id);
+    let terminal_id = PtyKey::ChatAgent(chat_id);
 
     if pty_runtime.is_running(terminal_id) {
         if focus_after_start {
@@ -1131,7 +1128,8 @@ fn auto_start_selected_terminal(
     let Some((_, terminal_id)) = app.selected_terminal_id() else {
         return false;
     };
-    if pty_runtime.is_running(terminal_id) || !pty_runtime.terminal_output_is_blank(terminal_id) {
+    let key = PtyKey::Terminal(terminal_id);
+    if pty_runtime.is_running(key) || !pty_runtime.terminal_output_is_blank(key) {
         return false;
     }
 
@@ -1152,7 +1150,7 @@ fn auto_start_selected_chat_agent(
     let Some((workspace_id, chat_id)) = app.selected_chat_id() else {
         return false;
     };
-    let terminal_id = chat_agent_terminal_id(chat_id);
+    let terminal_id = PtyKey::ChatAgent(chat_id);
     if pty_runtime.is_running(terminal_id) || !pty_runtime.terminal_output_is_blank(terminal_id) {
         return false;
     }
@@ -1256,12 +1254,13 @@ fn start_or_focus_selected_terminal(
     let Some((_, terminal_id)) = app.selected_terminal_id() else {
         return;
     };
+    let key = PtyKey::Terminal(terminal_id);
 
-    if !pty_runtime.is_running(terminal_id) {
+    if !pty_runtime.is_running(key) {
         start_selected_terminal(app, pty_runtime, config, frame_area);
     }
 
-    if pty_runtime.is_running(terminal_id) {
+    if pty_runtime.is_running(key) {
         app.begin_terminal_input();
     }
 }
@@ -1276,8 +1275,9 @@ fn resize_visible_terminal(
         return false;
     };
     let size = pty_dimensions_from_area(area);
-    let changed = pty_dimensions_changed(pty_runtime, terminal_id, size);
-    let _ = pty_runtime.resize(terminal_id, size);
+    let key = PtyKey::Terminal(terminal_id);
+    let changed = pty_dimensions_changed(pty_runtime, key, size);
+    let _ = pty_runtime.resize(key, size);
     changed
 }
 
@@ -1290,7 +1290,7 @@ fn resize_visible_chat_agent(
     let Some((chat_id, area)) = ui::selected_chat_agent_output_area(app, frame_area) else {
         return false;
     };
-    let terminal_id = chat_agent_terminal_id(chat_id);
+    let terminal_id = PtyKey::ChatAgent(chat_id);
     let size = pty_dimensions_from_area(area);
     let changed = pty_dimensions_changed(pty_runtime, terminal_id, size);
     let _ = pty_runtime.resize(terminal_id, size);
@@ -1300,11 +1300,7 @@ fn resize_visible_chat_agent(
 /// Whether resizing `terminal` to `size` would actually change its parser
 /// dimensions (and therefore the rendered output). A terminal with no parser
 /// yet is treated as changed so the freshly sized screen gets drawn.
-fn pty_dimensions_changed(
-    pty_runtime: &PtyRuntime,
-    terminal: TerminalId,
-    size: PtyDimensions,
-) -> bool {
+fn pty_dimensions_changed(pty_runtime: &PtyRuntime, terminal: PtyKey, size: PtyDimensions) -> bool {
     match pty_runtime.parser(terminal) {
         Some(parser) => parser.screen().size() != (size.rows, size.cols),
         None => true,
@@ -1332,8 +1328,8 @@ fn drain_pty_events(app: &mut App, pty_runtime: &mut PtyRuntime) -> bool {
         changed = true;
         match event {
             PtyEvent::Scrollback { .. } | PtyEvent::Output { .. } => {}
-            PtyEvent::Exited { terminal, status } => {
-                if let Some(chat_id) = chat_id_from_agent_terminal_id(terminal) {
+            PtyEvent::Exited { terminal, status } => match terminal {
+                PtyKey::ChatAgent(chat_id) => {
                     let chat_status = if status.code == 0 {
                         ChatStatus::Done
                     } else {
@@ -1345,15 +1341,16 @@ fn drain_pty_events(app: &mut App, pty_runtime: &mut PtyRuntime) -> bool {
                     }
                     let exit_message = format!("pi agent exited: {}", status.label());
                     pty_runtime.append_terminal_system_line(terminal, exit_message.as_str());
-                } else {
-                    app.mark_terminal_stopped(terminal);
-                    if app.terminal_input_target() == Some(terminal) {
+                }
+                PtyKey::Terminal(terminal_id) => {
+                    app.mark_terminal_stopped(terminal_id);
+                    if app.terminal_input_target() == Some(terminal_id) {
                         app.end_terminal_input();
                     }
                     let exit_message = format!("PTY exited: {}", status.label());
                     pty_runtime.append_terminal_system_line(terminal, exit_message.as_str());
                 }
-            }
+            },
             PtyEvent::Error { terminal, message } => {
                 pty_runtime.append_terminal_system_line(terminal, message.as_str());
             }
@@ -1738,7 +1735,9 @@ mod tests {
             .iter()
             .enumerate()
             .find_map(|(index, item)| match item {
-                mult::app::NavItem::Terminal { terminal, .. } => Some((index, *terminal)),
+                mult::app::NavItem::Terminal { terminal, .. } => {
+                    Some((index, PtyKey::Terminal(*terminal)))
+                }
                 _ => None,
             })
             .expect("seed state has a terminal");
@@ -1799,7 +1798,9 @@ mod tests {
             .iter()
             .enumerate()
             .find_map(|(index, item)| match item {
-                mult::app::NavItem::Terminal { terminal, .. } => Some((index, *terminal)),
+                mult::app::NavItem::Terminal { terminal, .. } => {
+                    Some((index, PtyKey::Terminal(*terminal)))
+                }
                 _ => None,
             })
             .expect("seed state has a terminal");
@@ -1859,7 +1860,7 @@ mod tests {
 
     #[test]
     fn terminal_text_selection_extracts_visible_pane_text() {
-        let terminal = TerminalId(77);
+        let terminal = PtyKey::Terminal(model::TerminalId(77));
         let mut pty_runtime = PtyRuntime::new_offline();
         pty_runtime
             .resize(terminal, PtyDimensions { rows: 2, cols: 8 })

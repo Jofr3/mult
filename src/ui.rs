@@ -11,13 +11,13 @@ use tui_term::widget::{
 
 use crate::{
     app::{
-        chat_agent_terminal_id, App, CommandPaletteEntry, FocusMode, NavItem, OpenWorkspaceMatch,
-        OpenWorkspaceMode, Prompt, SearchScope, TextSelection,
+        App, CommandPaletteEntry, FocusMode, NavItem, OpenWorkspaceMatch, OpenWorkspaceMode,
+        Prompt, SearchScope, TextSelection,
     },
     config::{self, ColorSchemeConfig},
     model::{
-        ChatId, ChatStatus, TerminalId, TerminalLaunch, TerminalSession, TerminalStatus, Workspace,
-        WorkspaceId,
+        ChatId, ChatStatus, PtyKey, TerminalId, TerminalLaunch, TerminalSession, TerminalStatus,
+        Workspace, WorkspaceId,
     },
     pty::PtyRuntime,
 };
@@ -608,7 +608,7 @@ fn draw_chat_details(
         return;
     }
 
-    let terminal_id = chat_agent_terminal_id(chat_id);
+    let terminal_id = PtyKey::ChatAgent(chat_id);
     if !pty_runtime.terminal_output_is_blank(terminal_id) {
         if let Some(parser) = pty_runtime.parser(terminal_id) {
             render_terminal_parser(
@@ -691,9 +691,10 @@ fn draw_terminal_details(
         return;
     };
 
-    if let Some(lines) =
-        app.terminal_search_matches(terminal_id, pty_runtime.terminal_all_lines(terminal_id))
-    {
+    if let Some(lines) = app.terminal_search_matches(
+        terminal_id,
+        pty_runtime.terminal_all_lines(PtyKey::Terminal(terminal_id)),
+    ) {
         let query = app
             .active_search
             .as_ref()
@@ -711,7 +712,7 @@ fn draw_terminal_details(
         return;
     }
 
-    if pty_runtime.terminal_output_is_blank(terminal_id) {
+    if pty_runtime.terminal_output_is_blank(PtyKey::Terminal(terminal_id)) {
         let mut lines = vec![match terminal.status {
             TerminalStatus::Running => {
                 Line::from("Terminal is running; waiting for output. Type to send PTY input.")
@@ -731,14 +732,14 @@ fn draw_terminal_details(
         return;
     }
 
-    if let Some(parser) = pty_runtime.parser(terminal_id) {
+    if let Some(parser) = pty_runtime.parser(PtyKey::Terminal(terminal_id)) {
         render_terminal_parser(
             frame,
             area,
             parser,
             focused,
             palette,
-            app.text_selection_for(terminal_id),
+            app.text_selection_for(PtyKey::Terminal(terminal_id)),
         );
     }
 }
@@ -1224,7 +1225,7 @@ fn terminal_command_label(terminal: &TerminalSession, pty_runtime: &PtyRuntime) 
     match &terminal.launch {
         TerminalLaunch::Command(command) => command_label_or_default(command),
         TerminalLaunch::Shell => pty_runtime
-            .terminal_last_command(terminal.id)
+            .terminal_last_command(PtyKey::Terminal(terminal.id))
             .map(command_label_or_default)
             .unwrap_or_else(|| "terminal".to_string()),
     }
@@ -1258,7 +1259,7 @@ fn terminal_icon_style(
 ) -> Style {
     let color = if terminal_has_active_command(terminal, pty_runtime) {
         palette.pine
-    } else if let Some(exit) = pty_runtime.terminal_exit_status(terminal.id) {
+    } else if let Some(exit) = pty_runtime.terminal_exit_status(PtyKey::Terminal(terminal.id)) {
         if exit.code == 0 && exit.signal.is_none() {
             if focused {
                 palette.muted
@@ -1276,7 +1277,8 @@ fn terminal_icon_style(
 }
 
 fn terminal_has_active_command(terminal: &TerminalSession, pty_runtime: &PtyRuntime) -> bool {
-    matches!(terminal.launch, TerminalLaunch::Command(_)) && pty_runtime.is_running(terminal.id)
+    matches!(terminal.launch, TerminalLaunch::Command(_))
+        && pty_runtime.is_running(PtyKey::Terminal(terminal.id))
 }
 
 #[cfg(test)]
@@ -1370,7 +1372,7 @@ mod tests {
             launch: TerminalLaunch::Command("cargo test".to_string()),
         };
         let mut running_runtime = PtyRuntime::new_offline();
-        running_runtime.mark_running_for_test(command_terminal.id);
+        running_runtime.mark_running_for_test(PtyKey::Terminal(command_terminal.id));
         assert_eq!(
             terminal_icon_style(&command_terminal, &running_runtime, false, palette),
             Style::default().fg(palette.pine)
@@ -1378,7 +1380,7 @@ mod tests {
 
         let mut done_runtime = PtyRuntime::new_offline();
         done_runtime.record_exit_status_for_test(
-            command_terminal.id,
+            PtyKey::Terminal(command_terminal.id),
             crate::pty::PtyExit {
                 code: 0,
                 signal: None,
@@ -1620,7 +1622,7 @@ mod tests {
             .iter()
             .enumerate()
             .find_map(|(index, item)| match item {
-                NavItem::Terminal { terminal, .. } => Some((index, *terminal)),
+                NavItem::Terminal { terminal, .. } => Some((index, PtyKey::Terminal(*terminal))),
                 _ => None,
             })
             .expect("seed state has a terminal");
@@ -1645,7 +1647,7 @@ mod tests {
             .iter()
             .enumerate()
             .find_map(|(index, item)| match item {
-                NavItem::Terminal { terminal, .. } => Some((index, *terminal)),
+                NavItem::Terminal { terminal, .. } => Some((index, PtyKey::Terminal(*terminal))),
                 _ => None,
             })
             .expect("seed state has a terminal");
@@ -1692,7 +1694,7 @@ mod tests {
             .iter()
             .enumerate()
             .find_map(|(index, item)| match item {
-                NavItem::Terminal { terminal, .. } => Some((index, *terminal)),
+                NavItem::Terminal { terminal, .. } => Some((index, PtyKey::Terminal(*terminal))),
                 _ => None,
             })
             .expect("seed state has a terminal");
@@ -1740,7 +1742,7 @@ mod tests {
             .iter()
             .enumerate()
             .find_map(|(index, item)| match item {
-                NavItem::Terminal { terminal, .. } => Some((index, *terminal)),
+                NavItem::Terminal { terminal, .. } => Some((index, PtyKey::Terminal(*terminal))),
                 _ => None,
             })
             .expect("seed state has a terminal");
@@ -1787,7 +1789,7 @@ mod tests {
             .iter()
             .enumerate()
             .find_map(|(index, item)| match item {
-                NavItem::Terminal { terminal, .. } => Some((index, *terminal)),
+                NavItem::Terminal { terminal, .. } => Some((index, PtyKey::Terminal(*terminal))),
                 _ => None,
             })
             .expect("seed state has a terminal");

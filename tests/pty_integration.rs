@@ -11,8 +11,7 @@ use std::{
 };
 
 use mult::{
-    app::chat_agent_terminal_id,
-    model::{ChatId, TerminalId},
+    model::{ChatId, PtyKey, TerminalId},
     pty::{PtyDimensions, PtyEvent, PtyExit, PtyRuntime, PtySpawn},
 };
 use mult_protocol::SOCKET_PATH_ENV;
@@ -42,7 +41,7 @@ fn client_receives_scrollback_output_and_real_exit_from_server_pty() {
     };
     let mut runtime = PtyRuntime::connect_to_socket(server.socket_path.clone())
         .expect("connect to isolated mult-server");
-    let terminal = TerminalId(7001);
+    let terminal = PtyKey::Terminal(TerminalId(7001));
 
     start_short_lived_command(&mut runtime, terminal, "printf 'hello from pty\\n'; exit 7");
     let observed = wait_for_terminal_exit(&mut runtime, terminal)
@@ -71,7 +70,7 @@ fn reconnect_replays_raw_scrollback_into_fresh_parser() {
     let Some(server) = start_isolated_server() else {
         return;
     };
-    let terminal = TerminalId(7003);
+    let terminal = PtyKey::Terminal(TerminalId(7003));
 
     {
         let mut runtime = PtyRuntime::connect_to_socket(server.socket_path.clone())
@@ -97,7 +96,7 @@ fn second_client_takes_over_session_from_a_still_attached_client() {
     let Some(server) = start_isolated_server() else {
         return;
     };
-    let terminal = TerminalId(7005);
+    let terminal = PtyKey::Terminal(TerminalId(7005));
 
     // Client A attaches to a long-running session and observes its output.
     let mut client_a =
@@ -140,7 +139,7 @@ fn reattach_after_server_restart_reports_vanished_session_as_exited() {
         return;
     };
     let socket_path = server.socket_path.clone();
-    let terminal = TerminalId(7006);
+    let terminal = PtyKey::Terminal(TerminalId(7006));
 
     let mut runtime =
         PtyRuntime::connect_to_socket(socket_path.clone()).expect("connect to first server");
@@ -175,7 +174,7 @@ fn terminal_is_retired_when_the_daemon_is_gone_and_not_autospawned() {
     let Some(mut server) = start_isolated_server() else {
         return;
     };
-    let terminal = TerminalId(7007);
+    let terminal = PtyKey::Terminal(TerminalId(7007));
 
     let mut runtime =
         PtyRuntime::connect_to_socket(server.socket_path.clone()).expect("connect to server");
@@ -212,7 +211,7 @@ fn server_ignores_sighup_and_keeps_sessions_running() {
     };
     let mut runtime = PtyRuntime::connect_to_socket(server.socket_path.clone())
         .expect("connect to isolated mult-server");
-    let terminal = TerminalId(7004);
+    let terminal = PtyKey::Terminal(TerminalId(7004));
 
     start_short_lived_command(
         &mut runtime,
@@ -241,7 +240,7 @@ fn rapid_stop_restart_and_chat_runtime_ids_keep_client_registry_consistent() {
     };
     let mut runtime = PtyRuntime::connect_to_socket(server.socket_path.clone())
         .expect("connect to isolated mult-server");
-    let terminal = TerminalId(7002);
+    let terminal = PtyKey::Terminal(TerminalId(7002));
 
     start_short_lived_command(&mut runtime, terminal, "while true; do sleep 1; done");
     assert!(runtime.is_running(terminal));
@@ -255,7 +254,7 @@ fn rapid_stop_restart_and_chat_runtime_ids_keep_client_registry_consistent() {
     assert!(restarted.output.contains("restarted"));
     assert!(!runtime.is_running(terminal));
 
-    let chat_terminal = chat_agent_terminal_id(ChatId(77));
+    let chat_terminal = PtyKey::ChatAgent(ChatId(77));
     start_short_lived_command(&mut runtime, chat_terminal, "printf chat-agent; exit 0");
     let chat = wait_for_terminal_exit(&mut runtime, chat_terminal)
         .expect("chat-agent runtime terminal should exit naturally");
@@ -271,13 +270,13 @@ struct ObservedTerminal {
     output: String,
 }
 
-fn start_short_lived_command(runtime: &mut PtyRuntime, terminal: TerminalId, command: &str) {
+fn start_short_lived_command(runtime: &mut PtyRuntime, terminal: PtyKey, command: &str) {
     let mut spawn = PtySpawn::command_line(terminal, command.to_string(), None, BTreeMap::new());
     spawn.size = PtyDimensions { rows: 6, cols: 40 };
     runtime.start(spawn).expect("start PTY command");
 }
 
-fn wait_for_output(runtime: &mut PtyRuntime, terminal: TerminalId, needle: &str) -> Option<()> {
+fn wait_for_output(runtime: &mut PtyRuntime, terminal: PtyKey, needle: &str) -> Option<()> {
     let deadline = Instant::now() + INTEGRATION_TIMEOUT;
     while Instant::now() < deadline {
         for event in runtime.drain_events() {
@@ -297,10 +296,7 @@ fn wait_for_output(runtime: &mut PtyRuntime, terminal: TerminalId, needle: &str)
     None
 }
 
-fn wait_for_terminal_exit(
-    runtime: &mut PtyRuntime,
-    terminal: TerminalId,
-) -> Option<ObservedTerminal> {
+fn wait_for_terminal_exit(runtime: &mut PtyRuntime, terminal: PtyKey) -> Option<ObservedTerminal> {
     let deadline = Instant::now() + INTEGRATION_TIMEOUT;
     let mut saw_scrollback = false;
     let mut saw_output = false;
@@ -345,7 +341,7 @@ fn wait_for_terminal_exit(
 
 fn wait_for_terminal_exit_after_reconnect(
     runtime: &mut PtyRuntime,
-    terminal: TerminalId,
+    terminal: PtyKey,
 ) -> Option<PtyExit> {
     let deadline = Instant::now() + INTEGRATION_TIMEOUT;
     let size = PtyDimensions { rows: 6, cols: 40 };
