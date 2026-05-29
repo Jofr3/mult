@@ -29,6 +29,21 @@ and the project aims to adhere to
 
 - Completed the truncated `LICENSE-APACHE` (added the standard appendix).
 
+### Security
+
+- The `/tmp` socket fallback (used when `XDG_RUNTIME_DIR` is unset) is keyed on
+  `geteuid()` instead of the spoofable `$USER`/`$UID`, and the socket and runtime
+  directories are ownership-verified — rejecting pre-created ("squatted"),
+  symlinked, or group/other-writable paths — before use.
+- The agent status file, read once per frame per chat, is now opened with
+  `O_NOFOLLOW`/`O_NONBLOCK`, checked to be a regular file, and read with a 64 KiB
+  cap, so a hostile or buggy same-UID writer cannot stall or OOM the UI thread.
+- The corrupt-state backup uses an unpredictable, atomically-renamed name instead
+  of an `exists()`-then-rename probe.
+- Documented that `pi_agent_command` (and `TerminalLaunch::Command`) are run
+  through the login shell (`$SHELL -lc`) and are therefore shell-evaluated,
+  unlike the argv-split `MULT_AGENT_CMD`.
+
 ## [0.1.0]
 
 Initial prototype: a Ratatui/Crossterm client plus a persistent `mult-server`
