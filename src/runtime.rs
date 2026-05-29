@@ -1654,7 +1654,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
             frame_area,
         );
-        assert_eq!(app.selected, 1);
+        assert_eq!(app.selected_index(), Some(1));
         assert_eq!(app.selected_item(), Some(app.nav_items()[1]));
 
         handle_unprompted_key(
@@ -1664,7 +1664,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
             frame_area,
         );
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected_index(), Some(0));
         assert_eq!(app.selected_item(), Some(app.nav_items()[0]));
     }
 
@@ -1691,11 +1691,7 @@ mod tests {
             workspace,
             terminal,
         };
-        app.selected = app
-            .nav_items()
-            .iter()
-            .position(|item| *item == target)
-            .expect("terminal nav item exists");
+        app.select_item(target);
         handle_unprompted_key(
             &mut app,
             &mut pty_runtime,
@@ -1746,7 +1742,7 @@ mod tests {
                 _ => None,
             })
             .expect("seed state has a terminal");
-        app.selected = selected;
+        app.select_nav_index(selected);
         let mut pty_runtime = PtyRuntime::new_offline();
         pty_runtime
             .resize(terminal_id, PtyDimensions { rows: 2, cols: 8 })
@@ -1807,7 +1803,7 @@ mod tests {
                 _ => None,
             })
             .expect("seed state has a terminal");
-        app.selected = selected;
+        app.select_nav_index(selected);
         app.begin_text_selection(terminal_id, SelectionCell { row: 0, col: 0 });
         app.update_text_selection(terminal_id, SelectionCell { row: 0, col: 2 });
 

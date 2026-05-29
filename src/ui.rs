@@ -336,7 +336,7 @@ fn sidebar_selected_index(app: &App, item_count: usize) -> Option<usize> {
         return None;
     }
 
-    let target_nav_index = app.selected.min(app.nav_len().saturating_sub(1));
+    let target_nav_index = app.selected_index().unwrap_or(0);
     let mut nav_index = 0;
     let mut item_index = 0;
 
@@ -1290,7 +1290,7 @@ mod tests {
     fn draw_handles_empty_workspace_list() {
         let mut app = App::default();
         app.project.workspaces.clear();
-        app.selected = 0;
+        app.select_nav_index(0);
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         let pty_runtime = PtyRuntime::new_offline();
@@ -1456,11 +1456,7 @@ mod tests {
         let workspace = app.project.workspaces[0].id;
         let chat = app.project.workspaces[0].chats[0].id;
         app.project.workspaces[0].chats[0].status = ChatStatus::Done;
-        app.selected = app
-            .nav_items()
-            .iter()
-            .position(|item| *item == NavItem::Chat { workspace, chat })
-            .expect("chat exists");
+        app.select_item(NavItem::Chat { workspace, chat });
 
         let backend = TestBackend::new(80, 6);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
@@ -1492,7 +1488,7 @@ mod tests {
         app.project.workspaces.truncate(1);
         app.project.workspaces[0].chats.clear();
         app.project.workspaces[0].terminals.clear();
-        app.selected = 0;
+        app.select_nav_index(0);
 
         let text = draw_text(&app, &PtyRuntime::new_offline(), 100, 30);
 
@@ -1508,11 +1504,7 @@ mod tests {
         let chat = app.project.workspaces[0].chats[0].id;
         app.project.workspaces[0].chats[0].status = ChatStatus::Waiting;
 
-        app.selected = app
-            .nav_items()
-            .iter()
-            .position(|item| *item == NavItem::Chat { workspace, chat })
-            .expect("chat exists");
+        app.select_item(NavItem::Chat { workspace, chat });
         let text = draw_text(&app, &PtyRuntime::new_offline(), 100, 30);
 
         assert!(text.contains("Type to send input to the selected agent PTY."));
@@ -1526,17 +1518,10 @@ mod tests {
         let terminal = app.project.workspaces[0].terminals[0].id;
 
         let mut app = app;
-        app.selected = app
-            .nav_items()
-            .iter()
-            .position(|item| {
-                *item
-                    == NavItem::Terminal {
-                        workspace,
-                        terminal,
-                    }
-            })
-            .expect("terminal exists");
+        app.select_item(NavItem::Terminal {
+            workspace,
+            terminal,
+        });
         let text = draw_text(&app, &PtyRuntime::new_offline(), 100, 30);
 
         assert!(text.contains("Type to start it and send input."));
@@ -1588,17 +1573,10 @@ mod tests {
         let mut app = App::default();
         let second_workspace = app.project.workspaces[1].id;
         let second_chat = app.project.workspaces[1].chats[0].id;
-        app.selected = app
-            .nav_items()
-            .iter()
-            .position(|item| {
-                *item
-                    == NavItem::Chat {
-                        workspace: second_workspace,
-                        chat: second_chat,
-                    }
-            })
-            .expect("second workspace chat exists");
+        app.select_item(NavItem::Chat {
+            workspace: second_workspace,
+            chat: second_chat,
+        });
 
         let pty_runtime = PtyRuntime::new_offline();
         let item_count = sidebar_items(&app, &pty_runtime, test_palette(), 33).len();
@@ -1646,7 +1624,7 @@ mod tests {
                 _ => None,
             })
             .expect("seed state has a terminal");
-        app.selected = selected;
+        app.select_nav_index(selected);
         let mut pty_runtime = PtyRuntime::new_offline();
         pty_runtime
             .resize(terminal_id, crate::pty::PtyDimensions { rows: 2, cols: 8 })
@@ -1671,7 +1649,7 @@ mod tests {
                 _ => None,
             })
             .expect("seed state has a terminal");
-        app.selected = selected;
+        app.select_nav_index(selected);
 
         let frame_area = Rect::new(0, 0, 50, 6);
         let (_, output_area) = selected_terminal_output_area(&app, frame_area)
@@ -1718,7 +1696,7 @@ mod tests {
                 _ => None,
             })
             .expect("seed state has a terminal");
-        app.selected = selected;
+        app.select_nav_index(selected);
         app.begin_text_selection(terminal_id, SelectionCell { row: 0, col: 0 });
         app.update_text_selection(terminal_id, SelectionCell { row: 0, col: 1 });
 
@@ -1766,7 +1744,7 @@ mod tests {
                 _ => None,
             })
             .expect("seed state has a terminal");
-        app.selected = selected;
+        app.select_nav_index(selected);
         app.begin_text_selection(terminal_id, SelectionCell { row: -1, col: 0 });
         app.update_text_selection(terminal_id, SelectionCell { row: -1, col: 1 });
 
@@ -1813,7 +1791,7 @@ mod tests {
                 _ => None,
             })
             .expect("seed state has a terminal");
-        app.selected = selected;
+        app.select_nav_index(selected);
 
         let frame_area = Rect::new(0, 0, 50, 6);
         let (_, output_area) = selected_terminal_output_area(&app, frame_area)
@@ -1886,11 +1864,12 @@ mod tests {
     #[test]
     fn selected_terminal_output_area_tracks_visible_main_pane_size() {
         let mut app = App::default();
-        app.selected = app
+        let selected = app
             .nav_items()
             .iter()
             .position(|item| matches!(item, NavItem::Terminal { .. }))
             .expect("seed state has a terminal");
+        app.select_nav_index(selected);
 
         let (_, area) = selected_terminal_output_area(&app, Rect::new(0, 0, 120, 40))
             .expect("terminal selection has output area");
@@ -1926,11 +1905,12 @@ mod tests {
     #[test]
     fn selected_chat_agent_output_area_tracks_visible_main_pane_size() {
         let mut app = App::default();
-        app.selected = app
+        let selected = app
             .nav_items()
             .iter()
             .position(|item| matches!(item, NavItem::Chat { .. }))
             .expect("seed state has a chat");
+        app.select_nav_index(selected);
 
         let (_, area) = selected_chat_agent_output_area(&app, Rect::new(0, 0, 120, 40))
             .expect("chat selection has pi output area");

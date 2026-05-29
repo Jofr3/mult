@@ -15,7 +15,11 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct App {
     pub project: ProjectState,
-    pub selected: usize,
+    /// The currently selected sidebar item by identity, or `None` when there are
+    /// no nav items. Stored as an identity (not a bare index) so it can never be
+    /// an out-of-range position; the invariant "valid item or None" is kept by
+    /// `reconcile_selection` after every structural change.
+    selected: Option<NavItem>,
     pub prompt: Option<Prompt>,
     pub focus: FocusMode,
     pub chat_buffers: BTreeMap<ChatId, ChatBuffer>,
@@ -216,7 +220,7 @@ impl App {
             .collect();
         let mut app = Self {
             project,
-            selected: 0,
+            selected: None,
             prompt: None,
             focus: FocusMode::Sidebar,
             chat_buffers,
@@ -229,7 +233,7 @@ impl App {
                 || titles_normalized
                 || chat_statuses_normalized,
         };
-        app.clamp_selection();
+        app.reconcile_selection(None);
         app.sync_focus_to_selection();
         app
     }
@@ -710,7 +714,24 @@ impl App {
     }
 
     pub fn selected_item(&self) -> Option<NavItem> {
-        self.nav_item_at(self.selected)
+        // Validate against the current tree so a selection left stale by a direct
+        // project mutation is never observable (it resolves to `None`, exactly as
+        // the old index-into-list lookup did when out of range).
+        self.selected
+            .filter(|item| self.nav_item_position(*item).is_some())
+    }
+
+    /// The position of the current selection in the nav list, if any. Used for
+    /// rendering (the sidebar highlight) and by `select_next`/`select_previous`.
+    pub fn selected_index(&self) -> Option<usize> {
+        self.selected.and_then(|item| self.nav_item_position(item))
+    }
+
+    /// Select the nav item at `index`, if one exists there (otherwise a no-op).
+    pub fn select_nav_index(&mut self, index: usize) {
+        if let Some(item) = self.nav_item_at(index) {
+            self.select_item(item);
+        }
     }
 
     pub fn selected_workspace_id(&self) -> Option<WorkspaceId> {
@@ -771,6 +792,9 @@ impl App {
     }
 
     fn delete_target(&mut self, target: DeleteTarget) -> Vec<TerminalId> {
+        // Remember where the selection sat so that, if the selected item is the
+        // one being removed, the selection lands on whatever shifts into its slot.
+        let previous_index = self.selected_index();
         let mut runtime_terminals = Vec::new();
         match target {
             DeleteTarget::Workspace(workspace_id) => {
@@ -806,7 +830,7 @@ impl App {
             }
         }
 
-        self.clamp_selection();
+        self.reconcile_selection(previous_index);
         self.normalize_focus();
         runtime_terminals
     }
@@ -1027,7 +1051,8 @@ impl App {
     pub fn select_next(&mut self) {
         let len = self.nav_len();
         if len > 0 {
-            self.selected = (self.selected + 1) % len;
+            let next = self.selected_index().map_or(0, |index| (index + 1) % len);
+            self.selected = self.nav_item_at(next);
             self.normalize_focus();
         }
     }
@@ -1035,7 +1060,10 @@ impl App {
     pub fn select_previous(&mut self) {
         let len = self.nav_len();
         if len > 0 {
-            self.selected = self.selected.checked_sub(1).unwrap_or(len - 1);
+            let previous = self
+                .selected_index()
+                .map_or(len - 1, |index| index.checked_sub(1).unwrap_or(len - 1));
+            self.selected = self.nav_item_at(previous);
             self.normalize_focus();
         }
     }
@@ -1333,18 +1361,18 @@ impl App {
         }
     }
 
-    fn select_item(&mut self, target: NavItem) {
-        if let Some(index) = self.nav_item_position(target) {
-            self.selected = index;
+    pub fn select_item(&mut self, target: NavItem) {
+        if self.nav_item_position(target).is_some() {
+            self.selected = Some(target);
         } else {
-            self.clamp_selection();
+            self.reconcile_selection(self.selected_index());
         }
         self.normalize_focus();
     }
 
     fn select_first_item_in_workspace(&mut self, workspace_id: WorkspaceId) -> bool {
         let Some(workspace) = self.project.workspace(workspace_id) else {
-            self.clamp_selection();
+            self.reconcile_selection(self.selected_index());
             self.normalize_focus();
             return false;
         };
@@ -1370,7 +1398,7 @@ impl App {
             self.select_item(target);
             true
         } else {
-            self.clamp_selection();
+            self.reconcile_selection(self.selected_index());
             self.normalize_focus();
             false
         }
@@ -1380,13 +1408,24 @@ impl App {
         self.nav_iter().position(|item| item == target)
     }
 
-    fn clamp_selection(&mut self) {
+    /// Re-establish the selection invariant after a structural change: keep the
+    /// current selection if it still exists, otherwise select the item now at
+    /// `preferred_index` (clamped to the list), or `None` when the list is empty.
+    /// This replaces the old index clamp and preserves position-stable selection
+    /// — e.g. deleting the selected item selects whatever shifts into its slot.
+    fn reconcile_selection(&mut self, preferred_index: Option<usize>) {
         let len = self.nav_len();
         if len == 0 {
-            self.selected = 0;
-        } else if self.selected >= len {
-            self.selected = len - 1;
+            self.selected = None;
+            return;
         }
+        if let Some(selected) = self.selected {
+            if self.nav_item_position(selected).is_some() {
+                return;
+            }
+        }
+        let index = preferred_index.unwrap_or(0).min(len - 1);
+        self.selected = self.nav_item_at(index);
     }
 }
 
@@ -1916,6 +1955,41 @@ mod tests {
     }
 
     #[test]
+    fn select_next_previous_wrap_around_the_nav_list() {
+        let mut app = App::default();
+        let items = app.nav_items();
+        assert!(
+            items.len() >= 2,
+            "default seed should have multiple nav items"
+        );
+
+        app.select_item(items[0]);
+        app.select_previous();
+        assert_eq!(app.selected_item(), items.last().copied());
+        app.select_next();
+        assert_eq!(app.selected_item(), Some(items[0]));
+    }
+
+    #[test]
+    fn deleting_the_selected_item_selects_the_successor_in_its_slot() {
+        let mut app = App::default();
+        let items = app.nav_items();
+        assert!(
+            items.len() >= 2,
+            "default seed should have multiple nav items"
+        );
+
+        app.select_item(items[0]);
+        assert_eq!(app.selected_item(), Some(items[0]));
+
+        app.delete_selected_immediately();
+
+        // The item that shifts into the vacated slot becomes selected (the old
+        // second item), matching the position-stable behavior.
+        assert_eq!(app.selected_item(), Some(items[1]));
+    }
+
+    #[test]
     fn deleting_last_workspace_item_closes_workspace() {
         let mut app = App::default();
         app.project.workspaces.truncate(1);
@@ -1939,7 +2013,7 @@ mod tests {
         app.project.workspaces[0].chats.clear();
         app.project.workspaces[0].terminals.clear();
         let workspace = app.project.workspaces[0].id;
-        app.clamp_selection();
+        app.reconcile_selection(None);
 
         let runtime_terminals = app.delete_selected_immediately();
 
@@ -1966,7 +2040,7 @@ mod tests {
     fn empty_selection_is_not_a_terminal_input_target() {
         let mut app = App::default();
         app.project.workspaces.clear();
-        app.clamp_selection();
+        app.reconcile_selection(None);
 
         assert!(!app.begin_terminal_input());
         assert_eq!(app.pty_input_target(), None);
