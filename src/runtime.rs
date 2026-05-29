@@ -1483,7 +1483,7 @@ fn mult_agent_status_path(chat: model::ChatId) -> PathBuf {
 
 fn ensure_mult_runtime_dir() -> io::Result<PathBuf> {
     let dir = mult_runtime_dir();
-    create_private_dir_all(&dir)?;
+    mult_protocol::ensure_private_dir(&dir)?;
     Ok(dir)
 }
 
@@ -1492,21 +1492,6 @@ fn mult_runtime_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join(format!("mult-{}", current_euid())))
         .join("mult")
-}
-
-fn create_private_dir_all(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700).create(path)
-    }
-
-    #[cfg(not(unix))]
-    {
-        fs::create_dir_all(path)
-    }
 }
 
 fn current_euid() -> u32 {

@@ -1,12 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
-    fs::{self, DirBuilder},
-    io,
-    io::{Read, Write},
+    env, fs,
+    io::{self, Read, Write},
     net::Shutdown,
     os::unix::{
-        fs::DirBuilderExt,
         io::AsRawFd,
         net::{UnixListener, UnixStream},
     },
@@ -20,9 +17,9 @@ use std::{
 };
 
 use mult_protocol::{
-    bounded_screen_dimensions, default_socket_path, read_message, write_message, ClientMessage,
-    ExitInfo, ForegroundProcessInfo, LaunchSpec, PaneId, PaneInfo, ServerMessage, SessionId,
-    SessionInfo, MAX_MESSAGE_BYTES, PROTOCOL_VERSION,
+    bounded_screen_dimensions, default_socket_path, ensure_private_dir, read_message,
+    write_message, ClientMessage, ExitInfo, ForegroundProcessInfo, LaunchSpec, PaneId, PaneInfo,
+    ServerMessage, SessionId, SessionInfo, MAX_MESSAGE_BYTES, PROTOCOL_VERSION,
 };
 use portable_pty::{native_pty_system, Child, CommandBuilder, ExitStatus, MasterPty, PtySize};
 
@@ -244,14 +241,9 @@ fn bind_socket_path(path: &PathBuf) -> io::Result<()> {
     }
 
     if let Some(parent) = path.parent() {
-        create_private_dir_all(parent)?;
+        ensure_private_dir(parent)?;
     }
     Ok(())
-}
-
-fn create_private_dir_all(path: &Path) -> io::Result<()> {
-    let mut builder = DirBuilder::new();
-    builder.recursive(true).mode(0o700).create(path)
 }
 
 fn bind_unix_listener(path: &Path) -> io::Result<UnixListener> {
