@@ -1737,6 +1737,59 @@ mod tests {
     }
 
     #[test]
+    fn wide_char_in_selection_is_highlighted() {
+        let mut app = App::default();
+        let nav_items = app.nav_items();
+        let (selected, terminal_id) = nav_items
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| match item {
+                NavItem::Terminal { terminal, .. } => Some((index, PtyKey::Terminal(*terminal))),
+                _ => None,
+            })
+            .expect("seed state has a terminal");
+        app.select_nav_index(selected);
+        // Select 'a' (col 0) through the wide '你' (col 1, spanning cols 1-2).
+        app.begin_text_selection(terminal_id, SelectionCell { row: 0, col: 0 });
+        app.update_text_selection(terminal_id, SelectionCell { row: 0, col: 1 });
+
+        let frame_area = Rect::new(0, 0, 50, 6);
+        let (_, output_area) = selected_terminal_output_area(&app, frame_area)
+            .expect("terminal selection has output area");
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime
+            .resize(
+                terminal_id,
+                crate::pty::PtyDimensions {
+                    rows: output_area.height,
+                    cols: output_area.width,
+                },
+            )
+            .expect("resize parser");
+        pty_runtime.process_terminal_output(terminal_id, "a你b".as_bytes());
+
+        let backend = TestBackend::new(frame_area.width, frame_area.height);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app, &pty_runtime, &config::Config::default()))
+            .expect("draw app");
+
+        let palette = test_palette();
+        let buffer = terminal.backend().buffer();
+        let narrow = buffer
+            .cell((output_area.x, output_area.y))
+            .expect("'a' cell is in bounds");
+        assert_eq!(narrow.symbol(), "a");
+        assert_eq!(narrow.bg, palette.foam);
+        // The wide glyph (one grid cell occupying two screen columns) is also
+        // highlighted; selecting its cell paints the whole glyph.
+        let wide = buffer
+            .cell((output_area.x + 1, output_area.y))
+            .expect("wide cell is in bounds");
+        assert_eq!(wide.bg, palette.foam);
+    }
+
+    #[test]
     fn offscreen_terminal_text_selection_is_not_pinned_to_pane_edge() {
         let mut app = App::default();
         let nav_items = app.nav_items();

@@ -1881,6 +1881,36 @@ mod tests {
     }
 
     #[test]
+    fn wide_char_text_selection_extracts_expected_cells() {
+        let terminal = PtyKey::Terminal(model::TerminalId(78));
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime
+            .resize(terminal, PtyDimensions { rows: 1, cols: 8 })
+            .expect("resize parser");
+        // 'a' at col 0; the wide '你' occupies cols 1-2 (glyph at 1, continuation
+        // at 2); 'b' at col 3.
+        pty_runtime.process_terminal_output(terminal, "a你b".as_bytes());
+
+        let select = |start: u16, end: u16| {
+            selected_text(
+                &pty_runtime,
+                TextSelection {
+                    terminal,
+                    anchor: SelectionCell { row: 0, col: start },
+                    focus: SelectionCell { row: 0, col: end },
+                    dragging: false,
+                },
+            )
+        };
+
+        assert_eq!(select(0, 3).as_deref(), Some("a你b"));
+        assert_eq!(select(0, 0).as_deref(), Some("a"));
+        assert_eq!(select(0, 1).as_deref(), Some("a你"));
+        assert_eq!(select(1, 3).as_deref(), Some("你b"));
+        assert_eq!(select(3, 3).as_deref(), Some("b"));
+    }
+
+    #[test]
     fn base64_encode_pads_clipboard_payloads() {
         assert_eq!(base64_encode(b""), "");
         assert_eq!(base64_encode(b"f"), "Zg==");
