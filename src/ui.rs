@@ -24,55 +24,39 @@ use crate::{
 
 const CHAT_AGENT_HEADER_LINES: u16 = 0;
 const TERMINAL_HEADER_LINES: u16 = 0;
-const CURSOR_COLOR: Color = Color::Rgb(255, 255, 255);
-const FINISHED_STATUS_COLOR: Color = Color::Rgb(62, 143, 84);
 const SIDEBAR_SELECTION_SYMBOL: &str = " ";
 const WORKSPACE_ICON: &str = "▣ ";
 const GIT_BRANCH_ICON: &str = "";
 
-#[allow(dead_code)]
 mod moon {
     use ratatui::style::Color;
 
     pub const NC: Color = Color::Rgb(31, 29, 48);
     pub const BASE: Color = Color::Rgb(35, 33, 54);
-    pub const SURFACE: Color = Color::Rgb(42, 39, 63);
-    pub const OVERLAY: Color = Color::Rgb(57, 53, 82);
     pub const MUTED: Color = Color::Rgb(110, 106, 134);
-    pub const SUBTLE: Color = Color::Rgb(144, 140, 170);
     pub const TEXT: Color = Color::Rgb(224, 222, 244);
     pub const LOVE: Color = Color::Rgb(235, 111, 146);
     pub const GOLD: Color = Color::Rgb(246, 193, 119);
-    pub const ROSE: Color = Color::Rgb(234, 154, 151);
     pub const PINE: Color = Color::Rgb(62, 143, 176);
     pub const FOAM: Color = Color::Rgb(156, 207, 216);
     pub const IRIS: Color = Color::Rgb(196, 167, 231);
-    pub const LEAF: Color = Color::Rgb(149, 177, 172);
-    pub const HIGHLIGHT_LOW: Color = Color::Rgb(42, 40, 62);
     pub const HIGHLIGHT_MED: Color = Color::Rgb(68, 65, 90);
-    pub const HIGHLIGHT_HIGH: Color = Color::Rgb(86, 82, 110);
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct Palette {
     nc: Color,
     base: Color,
-    surface: Color,
-    overlay: Color,
     muted: Color,
-    subtle: Color,
     text: Color,
     love: Color,
     gold: Color,
-    rose: Color,
     pine: Color,
     foam: Color,
     iris: Color,
-    leaf: Color,
-    highlight_low: Color,
     highlight_med: Color,
-    highlight_high: Color,
+    cursor: Color,
+    success: Color,
 }
 
 impl Palette {
@@ -80,22 +64,16 @@ impl Palette {
         Self {
             nc: parse_color(&colorscheme.nc).unwrap_or(moon::NC),
             base: parse_color(&colorscheme.base).unwrap_or(moon::BASE),
-            surface: parse_color(&colorscheme.surface).unwrap_or(moon::SURFACE),
-            overlay: parse_color(&colorscheme.overlay).unwrap_or(moon::OVERLAY),
             muted: parse_color(&colorscheme.muted).unwrap_or(moon::MUTED),
-            subtle: parse_color(&colorscheme.subtle).unwrap_or(moon::SUBTLE),
             text: parse_color(&colorscheme.text).unwrap_or(moon::TEXT),
             love: parse_color(&colorscheme.love).unwrap_or(moon::LOVE),
             gold: parse_color(&colorscheme.gold).unwrap_or(moon::GOLD),
-            rose: parse_color(&colorscheme.rose).unwrap_or(moon::ROSE),
             pine: parse_color(&colorscheme.pine).unwrap_or(moon::PINE),
             foam: parse_color(&colorscheme.foam).unwrap_or(moon::FOAM),
             iris: parse_color(&colorscheme.iris).unwrap_or(moon::IRIS),
-            leaf: parse_color(&colorscheme.leaf).unwrap_or(moon::LEAF),
-            highlight_low: parse_color(&colorscheme.highlight_low).unwrap_or(moon::HIGHLIGHT_LOW),
             highlight_med: parse_color(&colorscheme.highlight_med).unwrap_or(moon::HIGHLIGHT_MED),
-            highlight_high: parse_color(&colorscheme.highlight_high)
-                .unwrap_or(moon::HIGHLIGHT_HIGH),
+            cursor: parse_color(&colorscheme.cursor).unwrap_or(Color::Rgb(255, 255, 255)),
+            success: parse_color(&colorscheme.success).unwrap_or(Color::Rgb(62, 143, 84)),
         }
     }
 }
@@ -110,6 +88,44 @@ fn parse_color(input: &str) -> Option<Color> {
     let green = u8::from_str_radix(&hex[2..4], 16).ok()?;
     let blue = u8::from_str_radix(&hex[4..6], 16).ok()?;
     Some(Color::Rgb(red, green, blue))
+}
+
+/// Relative luminance per WCAG 2.x (sRGB). Non-RGB colors are treated as dark.
+fn relative_luminance(color: Color) -> f64 {
+    let Color::Rgb(red, green, blue) = color else {
+        return 0.0;
+    };
+    fn linearize(channel: u8) -> f64 {
+        let channel = f64::from(channel) / 255.0;
+        if channel <= 0.039_28 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * linearize(red) + 0.7152 * linearize(green) + 0.0722 * linearize(blue)
+}
+
+/// WCAG contrast ratio between two colors (1.0 = identical, up to 21.0).
+fn contrast_ratio(a: Color, b: Color) -> f64 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (high, low) = if la >= lb { (la, lb) } else { (lb, la) };
+    (high + 0.05) / (low + 0.05)
+}
+
+/// Foreground for text drawn on `background`: keep `preferred` while it stays
+/// legible there, otherwise fall back to black or white. This preserves the
+/// default (dark) theme's exact look while staying readable on light or
+/// inverted user palettes, where a fixed dark foreground would wash out.
+fn readable_fg(preferred: Color, background: Color) -> Color {
+    const MIN_CONTRAST: f64 = 4.5; // WCAG AA for normal-size text
+    if contrast_ratio(preferred, background) >= MIN_CONTRAST {
+        preferred
+    } else if relative_luminance(background) > 0.179 {
+        Color::Rgb(0, 0, 0)
+    } else {
+        Color::Rgb(255, 255, 255)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -752,8 +768,10 @@ fn render_terminal_parser(
     palette: Palette,
     selection: Option<&TextSelection>,
 ) {
-    let cursor_style = Style::default().fg(CURSOR_COLOR).bg(palette.base);
-    let cursor_overlay_style = Style::default().fg(palette.nc).bg(CURSOR_COLOR);
+    let cursor_style = Style::default().fg(palette.cursor).bg(palette.base);
+    let cursor_overlay_style = Style::default()
+        .fg(readable_fg(palette.nc, palette.cursor))
+        .bg(palette.cursor);
     let cursor = Cursor::default()
         .symbol("█")
         .style(cursor_style)
@@ -765,7 +783,17 @@ fn render_terminal_parser(
         .cursor(cursor);
     frame.render_widget(pseudo_term, area);
     if let Some(selection) = selection {
-        render_text_selection(frame, area, parser.screen().size().0, selection, palette);
+        let screen = parser.screen();
+        let (rows, cols) = screen.size();
+        let row_content_widths: Vec<u16> = (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .rev()
+                    .find(|&col| screen.cell(row, col).is_some_and(vt100::Cell::has_contents))
+                    .map_or(0, |col| col.saturating_add(1))
+            })
+            .collect();
+        render_text_selection(frame, area, &row_content_widths, selection, palette);
     }
 }
 
@@ -897,10 +925,11 @@ fn vt100_color_to_ratatui(color: vt100::Color) -> Color {
 fn render_text_selection(
     frame: &mut Frame,
     area: Rect,
-    terminal_rows: u16,
+    row_content_widths: &[u16],
     selection: &TextSelection,
     palette: Palette,
 ) {
+    let terminal_rows = u16::try_from(row_content_widths.len()).unwrap_or(u16::MAX);
     if area.is_empty() || terminal_rows == 0 {
         return;
     }
@@ -916,15 +945,31 @@ fn render_text_selection(
     let end_row = range.end.row.min(visible_last_row);
     let start_col = range.start.col.min(area.width.saturating_sub(1));
     let end_col = range.end.col.min(area.width.saturating_sub(1));
-    let style = Style::default().fg(palette.nc).bg(palette.foam);
+    let style = Style::default()
+        .fg(readable_fg(palette.nc, palette.foam))
+        .bg(palette.foam);
 
     for row in start_row..=end_row {
+        // Clip the highlight to the row's glyph extent so trailing blank cells
+        // of short lines are not painted as selected — matching the text that
+        // `contents_between` actually copies. A fully blank row highlights
+        // nothing.
+        let content_width = usize::try_from(row)
+            .ok()
+            .and_then(|index| row_content_widths.get(index))
+            .copied()
+            .unwrap_or(0);
+        if content_width == 0 {
+            continue;
+        }
+        let content_last_col = content_width.saturating_sub(1);
         let row_start_col = if row == range.start.row { start_col } else { 0 };
         let row_end_col = if row == range.end.row {
             end_col
         } else {
             area.width.saturating_sub(1)
-        };
+        }
+        .min(content_last_col);
         if row_start_col > row_end_col {
             continue;
         }
@@ -1061,7 +1106,7 @@ fn draw_open_workspace_prompt(
     let mut lines = vec![Line::from(vec![
         Span::styled("Project: ", Style::default().fg(palette.muted)),
         Span::raw(input.to_string()),
-        Span::styled("▌", Style::default().fg(CURSOR_COLOR)),
+        Span::styled("▌", Style::default().fg(palette.cursor)),
     ])];
 
     if let Some(error) = error {
@@ -1131,7 +1176,7 @@ fn draw_command_palette_prompt(
         Line::from(vec![
             Span::styled("Command: ", Style::default().fg(palette.muted)),
             Span::raw(input.to_string()),
-            Span::styled("▌", Style::default().fg(CURSOR_COLOR)),
+            Span::styled("▌", Style::default().fg(palette.cursor)),
         ]),
         Line::from(Span::styled(
             "type to filter • ↑/↓ select • enter runs • esc cancels".to_string(),
@@ -1205,7 +1250,7 @@ fn draw_text_prompt(
         Line::from(vec![
             Span::styled(label, Style::default().fg(palette.muted)),
             Span::raw(input.to_string()),
-            Span::styled("▌", Style::default().fg(CURSOR_COLOR)),
+            Span::styled("▌", Style::default().fg(palette.cursor)),
         ]),
         Line::from(Span::styled(message.to_string(), message_style)),
     ])
@@ -1244,7 +1289,7 @@ fn chat_status_style(status: ChatStatus, focused: bool, palette: Palette) -> Sty
     let color = match status {
         ChatStatus::Thinking | ChatStatus::Waiting => palette.pine,
         ChatStatus::Failed => palette.love,
-        ChatStatus::Done if !focused => FINISHED_STATUS_COLOR,
+        ChatStatus::Done if !focused => palette.success,
         ChatStatus::Done | ChatStatus::Idle => palette.muted,
     };
 
@@ -1264,7 +1309,7 @@ fn terminal_icon_style(
             if focused {
                 palette.muted
             } else {
-                FINISHED_STATUS_COLOR
+                palette.success
             }
         } else {
             palette.love
@@ -1388,7 +1433,7 @@ mod tests {
         );
         assert_eq!(
             terminal_icon_style(&command_terminal, &done_runtime, false, palette),
-            Style::default().fg(FINISHED_STATUS_COLOR)
+            Style::default().fg(palette.success)
         );
         assert_eq!(
             terminal_icon_style(&command_terminal, &done_runtime, true, palette),
@@ -1414,7 +1459,7 @@ mod tests {
         );
         assert_eq!(
             chat_status_style(ChatStatus::Done, false, palette),
-            Style::default().fg(FINISHED_STATUS_COLOR)
+            Style::default().fg(palette.success)
         );
         assert_eq!(
             chat_status_style(ChatStatus::Done, true, palette),
@@ -1681,7 +1726,7 @@ mod tests {
             .cell((output_area.x + 1, output_area.y))
             .expect("cursor cell is in bounds");
         assert_eq!(cursor_cell.symbol(), "█");
-        assert_eq!(cursor_cell.fg, CURSOR_COLOR);
+        assert_eq!(cursor_cell.fg, palette.cursor);
         assert_eq!(cursor_cell.bg, palette.base);
         assert_ne!(cursor_cell.fg, palette.nc);
     }
@@ -1732,6 +1777,117 @@ mod tests {
         assert_eq!(selected_cell.symbol(), "x");
         assert_eq!(selected_cell.fg, palette.nc);
         assert_eq!(selected_cell.bg, palette.foam);
+    }
+
+    #[test]
+    fn wide_char_in_selection_is_highlighted() {
+        let mut app = App::default();
+        let nav_items = app.nav_items();
+        let (selected, terminal_id) = nav_items
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| match item {
+                NavItem::Terminal { terminal, .. } => Some((index, PtyKey::Terminal(*terminal))),
+                _ => None,
+            })
+            .expect("seed state has a terminal");
+        app.select_nav_index(selected);
+        // Select 'a' (col 0) through the wide '你' (col 1, spanning cols 1-2).
+        app.begin_text_selection(terminal_id, SelectionCell { row: 0, col: 0 });
+        app.update_text_selection(terminal_id, SelectionCell { row: 0, col: 1 });
+
+        let frame_area = Rect::new(0, 0, 50, 6);
+        let (_, output_area) = selected_terminal_output_area(&app, frame_area)
+            .expect("terminal selection has output area");
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime
+            .resize(
+                terminal_id,
+                crate::pty::PtyDimensions {
+                    rows: output_area.height,
+                    cols: output_area.width,
+                },
+            )
+            .expect("resize parser");
+        pty_runtime.process_terminal_output(terminal_id, "a你b".as_bytes());
+
+        let backend = TestBackend::new(frame_area.width, frame_area.height);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app, &pty_runtime, &config::Config::default()))
+            .expect("draw app");
+
+        let palette = test_palette();
+        let buffer = terminal.backend().buffer();
+        let narrow = buffer
+            .cell((output_area.x, output_area.y))
+            .expect("'a' cell is in bounds");
+        assert_eq!(narrow.symbol(), "a");
+        assert_eq!(narrow.bg, palette.foam);
+        // The wide glyph (one grid cell occupying two screen columns) is also
+        // highlighted; selecting its cell paints the whole glyph.
+        let wide = buffer
+            .cell((output_area.x + 1, output_area.y))
+            .expect("wide cell is in bounds");
+        assert_eq!(wide.bg, palette.foam);
+    }
+
+    #[test]
+    fn multiline_selection_does_not_highlight_trailing_blanks_of_short_rows() {
+        let mut app = App::default();
+        let nav_items = app.nav_items();
+        let (selected, terminal_id) = nav_items
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| match item {
+                NavItem::Terminal { terminal, .. } => Some((index, PtyKey::Terminal(*terminal))),
+                _ => None,
+            })
+            .expect("seed state has a terminal");
+        app.select_nav_index(selected);
+        // Select three rows top-to-bottom; the middle row is shorter than the
+        // ones bracketing it.
+        app.begin_text_selection(terminal_id, SelectionCell { row: 0, col: 0 });
+        app.update_text_selection(terminal_id, SelectionCell { row: 2, col: 4 });
+
+        let frame_area = Rect::new(0, 0, 50, 12);
+        let (_, output_area) = selected_terminal_output_area(&app, frame_area)
+            .expect("terminal selection has output area");
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime
+            .resize(
+                terminal_id,
+                crate::pty::PtyDimensions {
+                    rows: output_area.height,
+                    cols: output_area.width,
+                },
+            )
+            .expect("resize parser");
+        pty_runtime.process_terminal_output(terminal_id, b"xxxxx\r\nab\r\nyyyyy");
+
+        let backend = TestBackend::new(frame_area.width, frame_area.height);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app, &pty_runtime, &config::Config::default()))
+            .expect("draw app");
+
+        let palette = test_palette();
+        let buffer = terminal.backend().buffer();
+        let bg_at = |col: u16, row: u16| {
+            buffer
+                .cell((output_area.x + col, output_area.y + row))
+                .expect("cell is in bounds")
+                .bg
+        };
+
+        // Middle row "ab": both glyphs are highlighted...
+        assert_eq!(bg_at(0, 1), palette.foam);
+        assert_eq!(bg_at(1, 1), palette.foam);
+        // ...but the blank cells past its content are not, even though the
+        // rows above and below extend across that column.
+        assert_ne!(bg_at(3, 1), palette.foam);
+        assert_eq!(bg_at(3, 0), palette.foam);
+        assert_eq!(bg_at(3, 2), palette.foam);
     }
 
     #[test]
@@ -1861,6 +2017,45 @@ mod tests {
 
     fn test_palette() -> Palette {
         Palette::from_colorscheme(&config::Config::default().colorscheme)
+    }
+
+    #[test]
+    fn readable_fg_keeps_legible_preferred_but_swaps_when_washed_out() {
+        let dark = Color::Rgb(31, 29, 48); // moon `nc`
+        let light = Color::Rgb(156, 207, 216); // moon `foam`
+
+        // Dark-on-light (the default selection/cursor) is legible, so the
+        // preferred foreground is kept verbatim — the default theme is unchanged.
+        assert_eq!(readable_fg(dark, light), dark);
+        // A light foreground on a light background would wash out: flip to black.
+        assert_eq!(readable_fg(light, light), Color::Rgb(0, 0, 0));
+        // A dark foreground on a dark background flips to white.
+        assert_eq!(readable_fg(dark, dark), Color::Rgb(255, 255, 255));
+    }
+
+    #[test]
+    fn custom_cursor_and_success_colors_are_themable() {
+        let mut colorscheme = config::Config::default().colorscheme;
+        colorscheme.cursor = "#010203".to_string();
+        colorscheme.success = "#0a0b0c".to_string();
+
+        let palette = Palette::from_colorscheme(&colorscheme);
+
+        assert_eq!(palette.cursor, Color::Rgb(1, 2, 3));
+        assert_eq!(palette.success, Color::Rgb(10, 11, 12));
+    }
+
+    #[test]
+    fn extreme_terminal_sizes_render_without_panicking() {
+        let app = App::default();
+        let pty_runtime = PtyRuntime::new_offline();
+
+        // Tiny / lopsided frames must not underflow the layout or cursor math.
+        // The sidebar is wider than these frames, so the main pane is starved;
+        // rendering should still succeed rather than panic.
+        for (width, height) in [(1, 1), (2, 3), (20, 5), (1, 40), (40, 1)] {
+            let _ = draw_text(&app, &pty_runtime, width, height);
+        }
     }
 
     #[test]

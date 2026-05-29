@@ -36,38 +36,26 @@ pub struct ColorSchemeConfig {
     pub nc: String,
     #[serde(default = "default_moon_base")]
     pub base: String,
-    #[serde(default = "default_moon_surface")]
-    pub surface: String,
-    #[serde(default = "default_moon_overlay")]
-    pub overlay: String,
     #[serde(default = "default_moon_muted")]
     pub muted: String,
-    #[serde(default = "default_moon_subtle")]
-    pub subtle: String,
     #[serde(default = "default_moon_text")]
     pub text: String,
     #[serde(default = "default_moon_love")]
     pub love: String,
     #[serde(default = "default_moon_gold")]
     pub gold: String,
-    #[serde(default = "default_moon_rose")]
-    pub rose: String,
     #[serde(default = "default_moon_pine")]
     pub pine: String,
     #[serde(default = "default_moon_foam")]
     pub foam: String,
     #[serde(default = "default_moon_iris")]
     pub iris: String,
-    #[serde(default = "default_moon_leaf")]
-    pub leaf: String,
-    #[serde(default = "default_moon_highlight_low")]
-    pub highlight_low: String,
     #[serde(default = "default_moon_highlight_med")]
     pub highlight_med: String,
-    #[serde(default = "default_moon_highlight_high")]
-    pub highlight_high: String,
-    #[serde(default = "default_moon_none")]
-    pub none: String,
+    #[serde(default = "default_cursor")]
+    pub cursor: String,
+    #[serde(default = "default_success")]
+    pub success: String,
 }
 
 impl Default for Config {
@@ -108,22 +96,16 @@ impl Default for ColorSchemeConfig {
         Self {
             nc: default_moon_nc(),
             base: default_moon_base(),
-            surface: default_moon_surface(),
-            overlay: default_moon_overlay(),
             muted: default_moon_muted(),
-            subtle: default_moon_subtle(),
             text: default_moon_text(),
             love: default_moon_love(),
             gold: default_moon_gold(),
-            rose: default_moon_rose(),
             pine: default_moon_pine(),
             foam: default_moon_foam(),
             iris: default_moon_iris(),
-            leaf: default_moon_leaf(),
-            highlight_low: default_moon_highlight_low(),
             highlight_med: default_moon_highlight_med(),
-            highlight_high: default_moon_highlight_high(),
-            none: default_moon_none(),
+            cursor: default_cursor(),
+            success: default_success(),
         }
     }
 }
@@ -179,20 +161,8 @@ fn default_moon_base() -> String {
     "#232136".to_string()
 }
 
-fn default_moon_surface() -> String {
-    "#2a273f".to_string()
-}
-
-fn default_moon_overlay() -> String {
-    "#393552".to_string()
-}
-
 fn default_moon_muted() -> String {
     "#6e6a86".to_string()
-}
-
-fn default_moon_subtle() -> String {
-    "#908caa".to_string()
 }
 
 fn default_moon_text() -> String {
@@ -207,10 +177,6 @@ fn default_moon_gold() -> String {
     "#f6c177".to_string()
 }
 
-fn default_moon_rose() -> String {
-    "#ea9a97".to_string()
-}
-
 fn default_moon_pine() -> String {
     "#3e8fb0".to_string()
 }
@@ -223,24 +189,16 @@ fn default_moon_iris() -> String {
     "#c4a7e7".to_string()
 }
 
-fn default_moon_leaf() -> String {
-    "#95b1ac".to_string()
-}
-
-fn default_moon_highlight_low() -> String {
-    "#2a283e".to_string()
-}
-
 fn default_moon_highlight_med() -> String {
     "#44415a".to_string()
 }
 
-fn default_moon_highlight_high() -> String {
-    "#56526e".to_string()
+fn default_cursor() -> String {
+    "#ffffff".to_string()
 }
 
-fn default_moon_none() -> String {
-    "NONE".to_string()
+fn default_success() -> String {
+    "#3e8f54".to_string()
 }
 
 fn invalid_data(error: serde_json::Error) -> io::Error {
