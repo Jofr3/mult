@@ -1,0 +1,16 @@
+{
+  "name": "mult-status-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "pi status-reporting extension bundled into mult (embedded via include_str! in src/main.rs).",
+  "license": "MIT OR Apache-2.0",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.73.1",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
