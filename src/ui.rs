@@ -301,10 +301,10 @@ fn sidebar_items(
         )));
 
         items.extend(workspace.chats.iter().map(|chat| {
-            let focused = chat_sidebar_item_is_focused(app, workspace.id, chat.id);
+            let done_seen = app.chat_done_seen(chat.id);
             ListItem::new(Line::from(vec![
                 Span::raw("  "),
-                Span::styled("● ", chat_status_style(chat.status, focused, palette)),
+                Span::styled("● ", chat_status_style(chat.status, done_seen, palette)),
                 Span::raw(chat.name.clone()),
             ]))
         }));
@@ -327,11 +327,6 @@ fn sidebar_items(
     }
 
     items
-}
-
-fn chat_sidebar_item_is_focused(app: &App, workspace: WorkspaceId, chat: ChatId) -> bool {
-    focus_is_active(app, FocusMode::Chat)
-        && app.selected_item() == Some(NavItem::Chat { workspace, chat })
 }
 
 fn terminal_sidebar_item_is_focused(
@@ -1285,11 +1280,18 @@ fn command_label_or_default(command: &str) -> String {
     }
 }
 
-fn chat_status_style(status: ChatStatus, focused: bool, palette: Palette) -> Style {
+/// Color of the agent status dot in the sidebar. Blue (`pine`, running) and
+/// gray (`muted`, inactive) are live states; green (`success`), yellow
+/// (`gold`), and red (`love`) act as notifications that the agent wants the
+/// user's attention. Green is suppressed once the finished agent has been seen
+/// (`done_seen`); yellow and red persist until the status itself changes — i.e.
+/// until a new prompt or an answered option moves the agent back to running.
+fn chat_status_style(status: ChatStatus, done_seen: bool, palette: Palette) -> Style {
     let color = match status {
-        ChatStatus::Thinking | ChatStatus::Waiting => palette.pine,
+        ChatStatus::Thinking => palette.pine,
+        ChatStatus::Waiting => palette.gold,
         ChatStatus::Failed => palette.love,
-        ChatStatus::Done if !focused => palette.success,
+        ChatStatus::Done if !done_seen => palette.success,
         ChatStatus::Done | ChatStatus::Idle => palette.muted,
     };
 
@@ -1451,12 +1453,13 @@ mod tests {
         );
         assert_eq!(
             chat_status_style(ChatStatus::Waiting, false, palette),
-            Style::default().fg(palette.pine)
+            Style::default().fg(palette.gold)
         );
         assert_eq!(
             chat_status_style(ChatStatus::Failed, false, palette),
             Style::default().fg(palette.love)
         );
+        // Green only while the finished agent has not been seen; gray once seen.
         assert_eq!(
             chat_status_style(ChatStatus::Done, false, palette),
             Style::default().fg(palette.success)
@@ -1527,6 +1530,36 @@ mod tests {
         assert_eq!(icon_cell.symbol(), "●");
         assert_eq!(icon_cell.fg, palette.muted);
         assert_eq!(icon_cell.bg, palette.highlight_med);
+    }
+
+    #[test]
+    fn waiting_sidebar_agent_icon_is_yellow() {
+        let mut app = App::default();
+        app.project.workspaces[0].chats[0].status = ChatStatus::Waiting;
+
+        let backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &app,
+                    &PtyRuntime::new_offline(),
+                    &config::Config::default(),
+                )
+            })
+            .expect("draw app");
+
+        let palette = test_palette();
+        let icon_cell = terminal
+            .backend()
+            .buffer()
+            .cell((3, 1))
+            .expect("chat icon is in bounds");
+        assert_eq!(icon_cell.symbol(), "●");
+        // Waiting (the agent is asking the user to pick an option) is yellow,
+        // and stays yellow even while selected — only an answer clears it.
+        assert_eq!(icon_cell.fg, palette.gold);
     }
 
     #[test]

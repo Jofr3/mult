@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -23,6 +23,14 @@ pub struct App {
     pub prompt: Option<Prompt>,
     pub focus: FocusMode,
     pub chat_buffers: BTreeMap<ChatId, ChatBuffer>,
+    /// Chats whose current `Done` state the user has already seen — either by
+    /// navigating onto them while finished, or because they finished while
+    /// already selected. A `Done` chat in this set renders gray (inactive); a
+    /// `Done` chat absent from it renders green (an unseen "finished"
+    /// notification). Entries are dropped the moment a chat leaves `Done`, so
+    /// re-prompting a finished agent arms a fresh notification. Runtime-only and
+    /// keyed by the globally-unique `ChatId`, exactly like `chat_buffers`.
+    seen_done: BTreeSet<ChatId>,
     pub workspace_git_branches: BTreeMap<WorkspaceId, String>,
     pub active_search: Option<SearchState>,
     pub text_selection: Option<TextSelection>,
@@ -215,6 +223,7 @@ impl App {
             prompt: None,
             focus: FocusMode::Sidebar,
             chat_buffers,
+            seen_done: BTreeSet::new(),
             workspace_git_branches: BTreeMap::new(),
             active_search: None,
             text_selection: None,
@@ -536,6 +545,46 @@ impl App {
 
     fn sync_focus_to_selection(&mut self) {
         self.focus = self.selected_main_focus().unwrap_or(FocusMode::Sidebar);
+        // Every selection change funnels through here (keyboard nav, mouse,
+        // startup, post-delete reconcile), so it is the single place to record
+        // that the user is now looking at the selected item: a finished agent
+        // the user navigates onto stops being an unseen notification.
+        self.mark_selected_done_seen();
+    }
+
+    /// Marks the currently selected chat's `Done` state as seen, if it is
+    /// finished. A no-op for any other status or when a terminal is selected.
+    fn mark_selected_done_seen(&mut self) {
+        if let Some((workspace, chat)) = self.selected_chat_id() {
+            if matches!(
+                self.project.chat(workspace, chat).map(|chat| chat.status),
+                Some(ChatStatus::Done)
+            ) {
+                self.seen_done.insert(chat);
+            }
+        }
+    }
+
+    /// Keeps `seen_done` consistent whenever a chat's status changes. A chat
+    /// that finishes while the user is already looking at it counts as seen
+    /// immediately (so it never flashes green); finishing in the background
+    /// arms the green notification; leaving `Done` clears the flag so the next
+    /// finish is notified afresh.
+    fn reconcile_done_seen(&mut self, chat: ChatId, status: ChatStatus) {
+        let seen_now = status == ChatStatus::Done
+            && self.selected_chat_id().map(|(_, chat)| chat) == Some(chat);
+        if seen_now {
+            self.seen_done.insert(chat);
+        } else {
+            self.seen_done.remove(&chat);
+        }
+    }
+
+    /// Whether the chat's current `Done` state has already been seen by the
+    /// user. Only meaningful for finished chats; the renderer uses it to choose
+    /// between the green "finished" notification and the gray inactive icon.
+    pub fn chat_done_seen(&self, chat: ChatId) -> bool {
+        self.seen_done.contains(&chat)
     }
 
     fn available_command_palette_entries(&self) -> Vec<CommandPaletteEntry> {
@@ -804,6 +853,7 @@ impl App {
                 if self.project.remove_chat(workspace, chat).is_some() {
                     runtime_terminals.push(PtyKey::ChatAgent(chat));
                     self.chat_buffers.remove(&chat);
+                    self.seen_done.remove(&chat);
                     self.dirty = true;
                     self.remove_workspace_if_empty(workspace);
                 }
@@ -1019,19 +1069,31 @@ impl App {
                 );
             }
             AgentEvent::StatusChanged { target, status } => {
-                if let Some(chat) = self.project.chat_mut(target.workspace, target.chat) {
-                    if chat.status != status {
+                let changed = self
+                    .project
+                    .chat_mut(target.workspace, target.chat)
+                    .is_some_and(|chat| {
+                        let changed = chat.status != status;
                         chat.status = status;
-                        self.dirty = true;
-                    }
+                        changed
+                    });
+                if changed {
+                    self.dirty = true;
+                    self.reconcile_done_seen(target.chat, status);
                 }
             }
             AgentEvent::Error { target, message } => {
-                if let Some(chat) = self.project.chat_mut(target.workspace, target.chat) {
-                    if chat.status != ChatStatus::Failed {
+                let changed = self
+                    .project
+                    .chat_mut(target.workspace, target.chat)
+                    .is_some_and(|chat| {
+                        let changed = chat.status != ChatStatus::Failed;
                         chat.status = ChatStatus::Failed;
-                        self.dirty = true;
-                    }
+                        changed
+                    });
+                if changed {
+                    self.dirty = true;
+                    self.reconcile_done_seen(target.chat, ChatStatus::Failed);
                 }
                 self.append_chat_message(target, ChatMessageRole::Error, message);
             }
@@ -1126,6 +1188,7 @@ impl App {
     /// Returns whether the chat's status actually changed (useful for deciding
     /// if a redraw is needed).
     pub fn mark_chat_status_by_id(&mut self, chat: ChatId, status: ChatStatus) -> bool {
+        let mut changed = false;
         for chat_session in self
             .project
             .workspaces
@@ -1136,12 +1199,15 @@ impl App {
                 if chat_session.status != status {
                     chat_session.status = status;
                     self.dirty = true;
-                    return true;
+                    changed = true;
                 }
-                return false;
+                break;
             }
         }
-        false
+        if changed {
+            self.reconcile_done_seen(chat, status);
+        }
+        changed
     }
 
     pub fn push_prompt_char(&mut self, c: char) {
@@ -1700,6 +1766,54 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn finished_background_agent_notification_clears_once_seen() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        // chats[0] is selected by default; chats[1] finishes in the background.
+        let foreground = app.project.workspaces[0].chats[0].id;
+        let background = app.project.workspaces[0].chats[1].id;
+
+        // Finishing off-screen arms the green "finished" notification (unseen).
+        assert!(app.mark_chat_status_by_id(background, ChatStatus::Done));
+        assert!(!app.chat_done_seen(background));
+
+        // Navigating onto the finished agent marks it seen -> gray.
+        app.select_item(NavItem::Chat {
+            workspace,
+            chat: background,
+        });
+        assert!(app.chat_done_seen(background));
+
+        // Navigating away keeps it gray indefinitely; it does not re-arm green.
+        app.select_item(NavItem::Chat {
+            workspace,
+            chat: foreground,
+        });
+        assert!(app.chat_done_seen(background));
+
+        // Re-prompting the agent (back to running) re-arms the notification so
+        // the next finish is shown again.
+        assert!(app.mark_chat_status_by_id(background, ChatStatus::Thinking));
+        assert!(!app.chat_done_seen(background));
+    }
+
+    #[test]
+    fn agent_finishing_while_selected_is_never_an_unseen_notification() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        let selected = app.project.workspaces[0].chats[0].id;
+        app.select_item(NavItem::Chat {
+            workspace,
+            chat: selected,
+        });
+
+        // Finishing while the user is already looking at the agent counts as
+        // seen at once, so the icon never flashes green for the watched agent.
+        assert!(app.mark_chat_status_by_id(selected, ChatStatus::Done));
+        assert!(app.chat_done_seen(selected));
+    }
 
     #[test]
     fn new_chats_use_agent_title() {
