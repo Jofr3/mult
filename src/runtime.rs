@@ -1683,7 +1683,17 @@ mod tests {
 
     #[test]
     fn mult_agent_status_file_updates_chat_status() {
-        let mut app = App::default();
+        // Startup no longer seeds agent chats, so add one explicitly for the
+        // status-file test (the lib's test-only seed helper is not visible to
+        // this bin-crate module).
+        let mut state = model::ProjectState::default();
+        let workspace = state.workspaces[0].id;
+        state.add_chat(
+            workspace,
+            model::DEFAULT_AGENT_CHAT_TITLE.to_string(),
+            ChatStatus::Idle,
+        );
+        let mut app = App::new(state);
         app.project.workspaces[0].chats[0].id = model::ChatId(9_001);
         let chat = app.project.workspaces[0].chats[0].id;
         let path = mult_agent_status_path(chat);

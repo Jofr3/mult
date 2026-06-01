@@ -115,18 +115,32 @@ impl Default for ProjectState {
         };
 
         let mult = state.add_workspace("mult".to_string(), std::env::current_dir().ok());
-        state.add_chat(mult, DEFAULT_AGENT_CHAT_TITLE.to_string(), ChatStatus::Idle);
-        state.add_chat(mult, DEFAULT_AGENT_CHAT_TITLE.to_string(), ChatStatus::Idle);
         state.add_terminal(mult, "dev server".to_string(), TerminalStatus::Stopped);
 
         let website = state.add_workspace("website".to_string(), None);
+        state.add_terminal(website, "shell".to_string(), TerminalStatus::Stopped);
+
+        state
+    }
+}
+
+#[cfg(test)]
+impl ProjectState {
+    /// Test fixture mirroring the historical first-run seed: the `mult`
+    /// workspace with two agent chats and the `website` workspace with one.
+    /// Startup no longer creates agent chats, so tests that need a populated
+    /// project construct one explicitly via this helper.
+    pub(crate) fn seeded() -> Self {
+        let mut state = Self::default();
+        let mult = state.workspaces[0].id;
+        state.add_chat(mult, DEFAULT_AGENT_CHAT_TITLE.to_string(), ChatStatus::Idle);
+        state.add_chat(mult, DEFAULT_AGENT_CHAT_TITLE.to_string(), ChatStatus::Idle);
+        let website = state.workspaces[1].id;
         state.add_chat(
             website,
             DEFAULT_AGENT_CHAT_TITLE.to_string(),
             ChatStatus::Idle,
         );
-        state.add_terminal(website, "shell".to_string(), TerminalStatus::Stopped);
-
         state
     }
 }
@@ -519,7 +533,7 @@ mod tests {
 
     #[test]
     fn ids_continue_after_seed_data() {
-        let mut state = ProjectState::default();
+        let mut state = ProjectState::seeded();
         let workspace = state.add_workspace("new".to_string(), None);
         let chat = state.add_chat(workspace, "agent".to_string(), ChatStatus::Idle);
 
@@ -559,7 +573,7 @@ mod tests {
 
     #[test]
     fn chat_deltas_append_to_last_message_with_same_role() {
-        let mut state = ProjectState::default();
+        let mut state = ProjectState::seeded();
         let workspace = state.workspaces[0].id;
         let chat = state.workspaces[0].chats[0].id;
 
@@ -579,7 +593,7 @@ mod tests {
             next_workspace_id: 1,
             next_chat_id: 1,
             next_terminal_id: 1,
-            ..ProjectState::default()
+            ..ProjectState::seeded()
         };
 
         assert!(state.normalize_next_ids());
@@ -608,7 +622,7 @@ mod tests {
 
     #[test]
     fn normalize_next_ids_repairs_duplicate_and_reserved_session_ids() {
-        let mut state = ProjectState::default();
+        let mut state = ProjectState::seeded();
         state.workspaces[0].chats[1].id = state.workspaces[0].chats[0].id;
         state.workspaces[1].chats[0].id = ChatId(RUNTIME_TERMINAL_ID_FLAG | 7);
         state.workspaces[1].terminals[0].id = state.workspaces[0].terminals[0].id;
@@ -640,7 +654,7 @@ mod tests {
 
     #[test]
     fn remove_workspace_chat_and_terminal_by_id() {
-        let mut state = ProjectState::default();
+        let mut state = ProjectState::seeded();
         let workspace = state.workspaces[0].id;
         let chat = state.workspaces[0].chats[0].id;
         let terminal = state.workspaces[0].terminals[0].id;

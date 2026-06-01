@@ -1476,7 +1476,7 @@ mod tests {
 
     #[test]
     fn default_sidebar_agent_icon_is_gray() {
-        let app = App::default();
+        let app = App::seeded();
         let backend = TestBackend::new(80, 6);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
@@ -1502,7 +1502,7 @@ mod tests {
 
     #[test]
     fn selected_done_sidebar_agent_icon_is_gray() {
-        let mut app = App::default();
+        let mut app = App::seeded();
         let workspace = app.project.workspaces[0].id;
         let chat = app.project.workspaces[0].chats[0].id;
         app.project.workspaces[0].chats[0].status = ChatStatus::Done;
@@ -1534,7 +1534,7 @@ mod tests {
 
     #[test]
     fn waiting_sidebar_agent_icon_is_yellow() {
-        let mut app = App::default();
+        let mut app = App::seeded();
         app.project.workspaces[0].chats[0].status = ChatStatus::Waiting;
 
         let backend = TestBackend::new(80, 6);
@@ -1579,7 +1579,7 @@ mod tests {
 
     #[test]
     fn blank_chat_hint_mentions_always_on_input() {
-        let mut app = App::default();
+        let mut app = App::seeded();
         let workspace = app.project.workspaces[0].id;
         let chat = app.project.workspaces[0].chats[0].id;
         app.project.workspaces[0].chats[0].status = ChatStatus::Waiting;
@@ -1650,7 +1650,7 @@ mod tests {
 
     #[test]
     fn sidebar_selection_skips_workspace_headers_and_spacers() {
-        let mut app = App::default();
+        let mut app = App::seeded();
         let second_workspace = app.project.workspaces[1].id;
         let second_chat = app.project.workspaces[1].chats[0].id;
         app.select_item(NavItem::Chat {
@@ -2124,7 +2124,7 @@ mod tests {
 
     #[test]
     fn selected_terminal_output_area_is_absent_for_non_terminal_selection() {
-        let app = App::default();
+        let app = App::seeded();
 
         assert_eq!(
             selected_terminal_output_area(&app, Rect::new(0, 0, 120, 40)),
@@ -2134,7 +2134,7 @@ mod tests {
 
     #[test]
     fn selected_chat_agent_output_area_tracks_visible_main_pane_size() {
-        let mut app = App::default();
+        let mut app = App::seeded();
         let selected = app
             .nav_items()
             .iter()

@@ -203,6 +203,15 @@ impl Default for App {
     }
 }
 
+#[cfg(test)]
+impl App {
+    /// Test fixture wrapping [`ProjectState::seeded`] — an app populated with
+    /// the historical agent-chat seed for tests that exercise chat behavior.
+    pub(crate) fn seeded() -> Self {
+        Self::new(ProjectState::seeded())
+    }
+}
+
 impl App {
     pub fn new(mut project: ProjectState) -> Self {
         let version_normalized = project.version != STATE_VERSION;
@@ -1319,20 +1328,11 @@ impl App {
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| workspace_name(&cwd));
         let workspace = self.project.add_workspace(name, Some(cwd));
-        let chat = self.project.add_chat(
-            workspace,
-            DEFAULT_AGENT_CHAT_TITLE.to_string(),
-            ChatStatus::Idle,
-        );
         self.project
             .add_terminal(workspace, "shell".to_string(), TerminalStatus::Stopped);
 
         self.prompt = None;
-        if let Some(chat) = chat {
-            self.select_item(NavItem::Chat { workspace, chat });
-        } else {
-            self.select_first_item_in_workspace(workspace);
-        }
+        self.select_first_item_in_workspace(workspace);
         self.dirty = true;
     }
 
@@ -1769,7 +1769,7 @@ mod tests {
 
     #[test]
     fn finished_background_agent_notification_clears_once_seen() {
-        let mut app = App::default();
+        let mut app = App::seeded();
         let workspace = app.project.workspaces[0].id;
         // chats[0] is selected by default; chats[1] finishes in the background.
         let foreground = app.project.workspaces[0].chats[0].id;
@@ -1801,7 +1801,7 @@ mod tests {
 
     #[test]
     fn agent_finishing_while_selected_is_never_an_unseen_notification() {
-        let mut app = App::default();
+        let mut app = App::seeded();
         let workspace = app.project.workspaces[0].id;
         let selected = app.project.workspaces[0].chats[0].id;
         app.select_item(NavItem::Chat {
@@ -1830,7 +1830,7 @@ mod tests {
 
     #[test]
     fn app_normalizes_chat_titles_to_agent_on_load() {
-        let mut state = ProjectState::default();
+        let mut state = ProjectState::seeded();
         state.workspaces[0].chats[0].name = "pi: old topic title".to_string();
         let app = App::new(state);
 
@@ -1843,7 +1843,7 @@ mod tests {
 
     #[test]
     fn app_normalizes_transient_chat_statuses_on_load() {
-        let mut state = ProjectState::default();
+        let mut state = ProjectState::seeded();
         state.workspaces[0].chats[0].status = ChatStatus::Thinking;
         state.workspaces[0].chats[1].status = ChatStatus::Waiting;
         state.workspaces[1].chats[0].status = ChatStatus::Done;
@@ -1862,7 +1862,7 @@ mod tests {
             next_workspace_id: 1,
             next_chat_id: 1,
             next_terminal_id: 1,
-            ..ProjectState::default()
+            ..ProjectState::seeded()
         };
 
         let app = App::new(state);
@@ -1985,7 +1985,7 @@ mod tests {
 
     #[test]
     fn chat_search_filters_persisted_transcript_lines() {
-        let mut state = ProjectState::default();
+        let mut state = ProjectState::seeded();
         let workspace = state.workspaces[0].id;
         let chat = state.workspaces[0].chats[0].id;
         state.append_chat_message(
@@ -2027,7 +2027,7 @@ mod tests {
 
     #[test]
     fn delete_selected_chat_removes_transcript_and_pi_runtime_id() {
-        let mut app = App::default();
+        let mut app = App::seeded();
         let workspace = app.project.workspaces[0].id;
         let chat = app.project.workspaces[0].chats[0].id;
         app.select_item(NavItem::Chat { workspace, chat });
@@ -2043,7 +2043,7 @@ mod tests {
 
     #[test]
     fn workspaces_are_not_selectable_nav_items() {
-        let app = App::default();
+        let app = App::seeded();
         let first_workspace = app.project.workspaces[0].id;
         let first_chat = app.project.workspaces[0].chats[0].id;
 
@@ -2095,7 +2095,7 @@ mod tests {
 
     #[test]
     fn deleting_last_workspace_item_closes_workspace() {
-        let mut app = App::default();
+        let mut app = App::seeded();
         app.project.workspaces.truncate(1);
         app.project.workspaces[0].terminals.clear();
         app.project.workspaces[0].chats.truncate(1);
@@ -2128,7 +2128,7 @@ mod tests {
 
     #[test]
     fn unchanged_status_updates_do_not_mark_dirty() {
-        let mut app = App::default();
+        let mut app = App::seeded();
         let terminal = app.project.workspaces[0].terminals[0].id;
         let chat = app.project.workspaces[0].chats[0].id;
         let chat_status = app.project.workspaces[0].chats[0].status;
@@ -2152,7 +2152,7 @@ mod tests {
 
     #[test]
     fn agent_message_event_appends_chat_transcript() {
-        let mut app = App::default();
+        let mut app = App::seeded();
         let workspace = app.project.workspaces[0].id;
         let chat = app.project.workspaces[0].chats[0].id;
         let target = crate::agent::AgentTarget { workspace, chat };
@@ -2184,7 +2184,7 @@ mod tests {
 
     #[test]
     fn app_hydrates_chat_transcript_from_project_state() {
-        let mut state = ProjectState::default();
+        let mut state = ProjectState::seeded();
         let workspace = state.workspaces[0].id;
         let chat = state.workspaces[0].chats[0].id;
         state.append_chat_message(workspace, chat, ChatMessageRole::User, "hello".to_string());
@@ -2206,7 +2206,7 @@ mod tests {
 
     #[test]
     fn agent_status_and_error_events_update_chat_status() {
-        let mut app = App::default();
+        let mut app = App::seeded();
         let workspace = app.project.workspaces[0].id;
         let chat = app.project.workspaces[0].chats[0].id;
         let target = crate::agent::AgentTarget { workspace, chat };
@@ -2267,7 +2267,7 @@ mod tests {
     }
 
     #[test]
-    fn importing_workspace_adds_cwd_chat_and_terminal() {
+    fn importing_workspace_adds_terminal_without_agent_chat() {
         let path = unique_temp_dir();
         let mut app = App::default();
         app.begin_open_workspace(&[]);
@@ -2279,17 +2279,16 @@ mod tests {
 
         let imported = app.project.workspaces.last().unwrap();
         assert_eq!(imported.cwd.as_deref(), Some(path.as_path()));
-        assert_eq!(imported.chats.len(), 1);
+        assert_eq!(imported.chats.len(), 0);
         assert_eq!(imported.terminals.len(), 1);
         assert_eq!(
             app.selected_item(),
-            Some(NavItem::Chat {
+            Some(NavItem::Terminal {
                 workspace: imported.id,
-                chat: imported.chats[0].id,
+                terminal: imported.terminals[0].id,
             })
         );
         assert_eq!(app.prompt, None);
-        assert_eq!(app.focus, FocusMode::Chat);
         assert!(app.is_dirty());
     }
 
@@ -2325,9 +2324,9 @@ mod tests {
         assert_eq!(imported.cwd.as_deref(), Some(selected_path.as_path()));
         assert_eq!(
             app.selected_item(),
-            Some(NavItem::Chat {
+            Some(NavItem::Terminal {
                 workspace: imported.id,
-                chat: imported.chats[0].id,
+                terminal: imported.terminals[0].id,
             })
         );
         assert_eq!(app.prompt, None);
