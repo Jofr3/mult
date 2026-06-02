@@ -39,6 +39,19 @@ and the project aims to adhere to
 
 ### Fixed
 
+- Modified special keys are now sent to the PTY using xterm's CSI modifier
+  encoding (`CSI 1 ; <mod> <final>` / `CSI <n> ; <mod> ~`) instead of being
+  blindly prefixed with ESC. `Alt`/`Ctrl`/`Shift` combined with the arrows,
+  `Home`/`End`, `PageUp`/`PageDown`, `Insert`/`Delete`, or the function keys now
+  reach the program correctly — e.g. `Alt+Left` sends `\x1b[1;3D` (move a word)
+  rather than `\x1b\x1b[D`, which the program rendered as literal characters.
+  `Ctrl+Arrow` and `Shift+Arrow`, which previously dropped their modifier, now
+  carry it too.
+- Unmodified arrows and `Home`/`End` follow the program's cursor-key mode
+  (DECCKM): full-screen apps that request application cursor keys (`vim`, `less`,
+  `fzf`, …) now receive the SS3 form (`\x1bOA`) they expect, while the shell keeps
+  the normal CSI form (`\x1b[A`). This mirrors the existing per-program handling
+  of bracketed paste and the mouse protocol.
 - Mouse-wheel scrolling over a chat agent or terminal whose program has grabbed
   the mouse (Claude Code, `nvim`, `less`, …) is now forwarded to that program,
   encoded in the protocol it requested (SGR/UTF-8/X10). Previously the wheel was
