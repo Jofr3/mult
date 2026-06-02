@@ -378,6 +378,18 @@ fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SpawnedPane
     if let Some(cwd) = &spec.cwd {
         command.cwd(cwd.as_os_str());
     }
+    // A PTY child talks to mult's built-in vt100 emulator, not to the terminal
+    // hosting the `mult` client, so it must advertise *that* emulator's
+    // capabilities rather than inherit the host's $TERM. Leaking e.g. TERM=foot
+    // makes nvim drive truecolor through foot's terminfo as `\e[38:2::r:g:bm`
+    // (colon form with an empty colorspace field) — a shape the emulator does
+    // not decode, so every color is dropped and the screen renders monochrome.
+    // xterm-256color matches the emulator (xterm-style, 256-color, universally
+    // present); COLORTERM=truecolor opts programs into RGB, which they then emit
+    // in the semicolon form the emulator understands. Applied before spec.env so
+    // a workspace that sets TERM/COLORTERM explicitly still wins.
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
     for (key, value) in spec.env {
         command.env(key, value);
     }
