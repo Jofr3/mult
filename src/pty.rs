@@ -16,7 +16,7 @@ use mult_protocol::{
     default_socket_path, read_message, write_message, ClientMessage, ForegroundProcessInfo,
     LaunchSpec, PaneId, ServerMessage, SessionId, PROTOCOL_VERSION, SOCKET_PATH_ENV,
 };
-use vt100::Parser;
+use vt100::{MouseProtocolEncoding, MouseProtocolMode, Parser};
 
 use crate::model::{ChatId, PtyKey, TerminalId, RUNTIME_TERMINAL_ID_FLAG};
 
@@ -77,6 +77,10 @@ const PRIMARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[?1;2c";
 const DEVICE_STATUS_OK_RESPONSE: &[u8] = b"\x1b[0n";
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+/// xterm button bytes reported for the scroll wheel (bit 6 set marks a wheel
+/// event; the low bit distinguishes up from down).
+const WHEEL_UP_BUTTON: u8 = 64;
+const WHEEL_DOWN_BUTTON: u8 = 65;
 
 struct ServerConnection {
     writer: Arc<Mutex<UnixStream>>,
@@ -460,6 +464,41 @@ impl PtyRuntime {
             .is_some_and(|parser| parser.screen().bracketed_paste());
         let bytes = terminal_paste_bytes(text, use_bracketed);
         self.send_input(terminal, &bytes)
+    }
+
+    /// Whether the program in `terminal` has switched on xterm mouse
+    /// reporting. When it has, the wheel belongs to the program (it scrolls its
+    /// own view) rather than to our local scrollback — which for an
+    /// alternate-screen app like Claude Code holds nothing to scroll anyway.
+    pub fn terminal_reports_mouse(&self, terminal: PtyKey) -> bool {
+        self.parsers
+            .get(&terminal)
+            .is_some_and(|parser| parser.screen().mouse_protocol_mode() != MouseProtocolMode::None)
+    }
+
+    /// Forward one scroll-wheel notch to a mouse-reporting program, encoded in
+    /// the protocol it requested. `col`/`row` are 1-based, screen-relative cell
+    /// coordinates. Returns false when the terminal has no live parser/pane or
+    /// is not reporting the mouse.
+    pub fn forward_wheel(&mut self, terminal: PtyKey, up: bool, col: u16, row: u16) -> bool {
+        let Some(parser) = self.parsers.get(&terminal) else {
+            return false;
+        };
+        let screen = parser.screen();
+        if screen.mouse_protocol_mode() == MouseProtocolMode::None {
+            return false;
+        }
+        let encoding = screen.mouse_protocol_encoding();
+        let button = if up {
+            WHEEL_UP_BUTTON
+        } else {
+            WHEEL_DOWN_BUTTON
+        };
+        let bytes = encode_mouse_event(encoding, button, col.max(1), row.max(1));
+        let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
+            return false;
+        };
+        self.send_input_inner(terminal, pane, &bytes, false).is_ok()
     }
 
     pub fn scroll_up(&mut self, terminal: PtyKey, rows: usize) -> io::Result<bool> {
@@ -888,6 +927,49 @@ fn clamp_parser_scrollback(parser: &mut Parser) {
     // in-memory scrollback after resizes, screen switches, or history trims.
     let current = parser.screen().scrollback();
     parser.set_scrollback(current);
+}
+
+/// Encode a single mouse event for a program that has enabled mouse
+/// reporting. `button` is the xterm button byte; `col`/`row` are 1-based,
+/// screen-relative cell coordinates.
+fn encode_mouse_event(encoding: MouseProtocolEncoding, button: u8, col: u16, row: u16) -> Vec<u8> {
+    match encoding {
+        // SGR (DECSET 1006): `ESC [ < b ; x ; y M`. Coordinates are unbounded
+        // here, and a wheel notch is always a press, so terminate with `M`.
+        MouseProtocolEncoding::Sgr => format!("\x1b[<{button};{col};{row}M").into_bytes(),
+        // UTF-8 (1005): `ESC [ M` then button and coordinates as `value + 32`,
+        // each written as a UTF-8 code point.
+        MouseProtocolEncoding::Utf8 => {
+            let mut bytes = b"\x1b[M".to_vec();
+            bytes.push(button.wrapping_add(32));
+            push_utf8_mouse_coord(&mut bytes, col);
+            push_utf8_mouse_coord(&mut bytes, row);
+            bytes
+        }
+        // X10/Default: one byte per field as `value + 32`, so anything past
+        // column/row 223 cannot be represented — clamp rather than wrap.
+        MouseProtocolEncoding::Default => {
+            let mut bytes = b"\x1b[M".to_vec();
+            bytes.push(button.wrapping_add(32));
+            bytes.push(default_mouse_coord(col));
+            bytes.push(default_mouse_coord(row));
+            bytes
+        }
+    }
+}
+
+fn default_mouse_coord(coord: u16) -> u8 {
+    (coord.min(223) as u8).wrapping_add(32)
+}
+
+fn push_utf8_mouse_coord(bytes: &mut Vec<u8>, coord: u16) {
+    match char::from_u32(u32::from(coord) + 32) {
+        Some(ch) => {
+            let mut buf = [0u8; 4];
+            bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+        None => bytes.push(b' '),
+    }
 }
 
 fn terminal_paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
@@ -1644,6 +1726,77 @@ mod tests {
                 bytes: b"x".to_vec(),
             }
         );
+    }
+
+    #[test]
+    fn encode_mouse_event_covers_each_protocol_encoding() {
+        // SGR: human-readable decimal coordinates, terminated with `M`.
+        assert_eq!(
+            encode_mouse_event(MouseProtocolEncoding::Sgr, WHEEL_UP_BUTTON, 12, 5),
+            b"\x1b[<64;12;5M".to_vec()
+        );
+        // X10/Default: one byte per field as `value + 32`, clamped at 223.
+        assert_eq!(
+            encode_mouse_event(MouseProtocolEncoding::Default, WHEEL_DOWN_BUTTON, 1, 1),
+            vec![0x1b, b'[', b'M', 65 + 32, 1 + 32, 1 + 32]
+        );
+        assert_eq!(
+            encode_mouse_event(MouseProtocolEncoding::Default, WHEEL_UP_BUTTON, 1000, 1),
+            vec![0x1b, b'[', b'M', 64 + 32, 223 + 32, 1 + 32]
+        );
+        // UTF-8: `value + 32` written as a code point (multi-byte past 223).
+        assert_eq!(
+            encode_mouse_event(MouseProtocolEncoding::Utf8, WHEEL_UP_BUTTON, 300, 1),
+            {
+                let mut expected = vec![0x1b, b'[', b'M', 64 + 32];
+                let mut buf = [0u8; 4];
+                expected.extend_from_slice(
+                    char::from_u32(300 + 32)
+                        .unwrap()
+                        .encode_utf8(&mut buf)
+                        .as_bytes(),
+                );
+                expected.push(1 + 32);
+                expected
+            }
+        );
+    }
+
+    #[test]
+    fn wheel_is_forwarded_to_a_mouse_reporting_program() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::Terminal(TerminalId(7));
+        let pane = PaneId(7);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 24, cols: 80 });
+        // Claude Code's startup: enter the alternate screen and request SGR
+        // mouse reporting. After this the program owns the wheel.
+        runtime.process_terminal_output(terminal, b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+        assert!(runtime.terminal_reports_mouse(terminal));
+
+        assert!(runtime.forward_wheel(terminal, true, 12, 5));
+
+        let message: ClientMessage =
+            read_message(&mut server_stream).expect("read forwarded wheel");
+        assert_eq!(
+            message,
+            ClientMessage::Input {
+                pane,
+                bytes: b"\x1b[<64;12;5M".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn wheel_is_not_forwarded_when_the_program_ignores_the_mouse() {
+        let mut runtime = PtyRuntime::new_offline();
+        let terminal = PtyKey::Terminal(TerminalId(7));
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
+        runtime.process_terminal_output(terminal, b"one\r\ntwo\r\nthree");
+
+        assert!(!runtime.terminal_reports_mouse(terminal));
+        assert!(!runtime.forward_wheel(terminal, true, 1, 1));
     }
 
     #[test]

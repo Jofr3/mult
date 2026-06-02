@@ -10,8 +10,11 @@ The current implementation is a Ratatui/Crossterm client plus a small `mult-serv
 - Persistent JSON project state for workspace/chat/terminal metadata and chat transcripts.
 - Runtime PTY sessions managed by `mult-server` over a Unix socket.
 - Shell terminals and command terminals.
-- Auto-start for the selected terminal or selected `pi` chat.
-- Per-chat `pi` processes using a bundled status extension.
+- Auto-start for the selected terminal or selected agent chat.
+- Two agent backends per chat — `pi` (via a bundled status extension) and
+  Claude Code (via generated lifecycle hooks) — chosen when the chat is created,
+  shown in the sidebar as `agent: pi` / `agent: cc`, and both reporting live
+  status into the sidebar dot.
 - Terminal scrollback, paste handling, mouse wheel scrolling, mouse text selection, and OSC52 clipboard copy.
 - Configurable project shortcuts and colorscheme.
 
@@ -73,7 +76,8 @@ Global controls when no prompt is open:
 | --- | --- |
 | `Ctrl+j` or `Ctrl+Enter` | Select next sidebar item |
 | `Ctrl+k` | Select previous sidebar item |
-| `Ctrl+a` | Add a new agent chat to the selected workspace |
+| `Ctrl+a` | Add a new `pi` agent chat to the selected workspace |
+| `Ctrl+x` | Add a new Claude Code agent chat to the selected workspace |
 | `Ctrl+t` | Add a new shell terminal to the selected workspace |
 | `Ctrl+f` | Open/import a workspace |
 | `Ctrl+p` | Open the command palette |
@@ -113,7 +117,9 @@ Example:
 ```json
 {
   "pi_agent_command": "pi",
+  "claude_code_command": "claude",
   "auto_start_pi_agent": true,
+  "auto_start_claude_code_agent": true,
   "auto_start_terminals": true,
   "mouse_capture": true,
   "projects": [
@@ -128,7 +134,7 @@ Example:
 }
 ```
 
-`pi_agent_command` is launched through your login shell (`$SHELL -lc …`), so shell features — pipelines, `$VAR` expansion, globbing — work inside it. This is intentionally different from `MULT_AGENT_CMD` (below), which `mult` splits into arguments itself with no shell involved.
+`pi_agent_command` and `claude_code_command` select the binary for each agent backend (`Ctrl+a` starts a `pi` chat, `Ctrl+x` a Claude Code chat); `auto_start_*` toggle whether the selected chat of that kind starts on focus. Both commands are launched through your login shell (`$SHELL -lc …`), so shell features — pipelines, `$VAR` expansion, globbing — work inside them. This is intentionally different from `MULT_AGENT_CMD` (below), which `mult` splits into arguments itself with no shell involved.
 
 Environment variables:
 
@@ -166,6 +172,7 @@ src/storage.rs           state loading/saving
 src/agent.rs             experimental process-agent backend
 crates/protocol          shared client/server protocol types
 extensions/mult-status.ts bundled pi status extension
+extensions/mult-claude-status.sh bundled Claude Code status hook script
 ```
 
 ## Runtime server and IPC

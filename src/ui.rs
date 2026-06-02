@@ -16,8 +16,8 @@ use crate::{
     },
     config::{self, ColorSchemeConfig},
     model::{
-        ChatId, ChatStatus, PtyKey, TerminalId, TerminalLaunch, TerminalSession, TerminalStatus,
-        Workspace, WorkspaceId,
+        ChatId, ChatSession, ChatStatus, PtyKey, TerminalId, TerminalLaunch, TerminalSession,
+        TerminalStatus, Workspace, WorkspaceId,
     },
     pty::PtyRuntime,
 };
@@ -305,7 +305,7 @@ fn sidebar_items(
             ListItem::new(Line::from(vec![
                 Span::raw("  "),
                 Span::styled("● ", chat_status_style(chat.status, done_seen, palette)),
-                Span::raw(chat.name.clone()),
+                Span::raw(chat_sidebar_label(chat)),
             ]))
         }));
 
@@ -1253,6 +1253,12 @@ fn draw_text_prompt(
     frame.render_widget(prompt, area);
 }
 
+/// Sidebar label for a chat, tagged with the agent backing it so running
+/// agents are distinguishable at a glance, e.g. `agent: pi` or `agent: cc`.
+fn chat_sidebar_label(chat: &ChatSession) -> String {
+    format!("{}: {}", chat.name, chat.agent.label())
+}
+
 fn terminal_display_label(
     terminal: &TerminalSession,
     pty_runtime: &PtyRuntime,
@@ -1334,6 +1340,22 @@ mod tests {
 
     use super::*;
     use crate::app::SelectionCell;
+    use crate::model::AgentKind;
+
+    #[test]
+    fn chat_sidebar_label_tags_the_agent_kind() {
+        let mut chat = ChatSession {
+            id: ChatId(1),
+            name: "agent".to_string(),
+            status: ChatStatus::Idle,
+            agent: AgentKind::Pi,
+            messages: Vec::new(),
+        };
+        assert_eq!(chat_sidebar_label(&chat), "agent: pi");
+
+        chat.agent = AgentKind::ClaudeCode;
+        assert_eq!(chat_sidebar_label(&chat), "agent: cc");
+    }
 
     #[test]
     fn draw_handles_empty_workspace_list() {

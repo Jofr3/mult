@@ -10,6 +10,18 @@ and the project aims to adhere to
 
 ### Added
 
+- Claude Code as a second chat-agent backend alongside `pi`. `Ctrl+x` (and the
+  "New Claude Code chat" command-palette entry) opens a Claude Code agent chat,
+  while `Ctrl+a` still opens a `pi` chat. The chosen backend is stored on the
+  chat (`AgentKind`, defaulting to `pi` for pre-existing state) and shown in the
+  sidebar as `agent: pi` / `agent: cc`. New `claude_code_command` and
+  `auto_start_claude_code_agent` config options mirror the `pi` ones.
+- Live sidebar status for Claude Code chats. `mult` generates a per-session
+  Claude Code hooks file (passed via `--settings`, merged over the user's config
+  without touching it on disk) whose `SessionStart` / `UserPromptSubmit` /
+  `PreToolUse` / `Notification` / `Stop` events run a bundled script
+  (`extensions/mult-claude-status.sh`) that writes the same status file `pi`'s
+  extension does, so `cc` chats drive the status dot like `pi` chats.
 - Minimum supported Rust version declared on both crates (`rust-version = "1.88"`)
   and the toolchain pinned via `rust-toolchain.toml` so CI and contributors align.
 - Release build profile: thin LTO, a single codegen unit, and stripped symbols
@@ -27,6 +39,11 @@ and the project aims to adhere to
 
 ### Fixed
 
+- Mouse-wheel scrolling over a chat agent or terminal whose program has grabbed
+  the mouse (Claude Code, `nvim`, `less`, …) is now forwarded to that program,
+  encoded in the protocol it requested (SGR/UTF-8/X10). Previously the wheel was
+  always applied to `mult`'s local scrollback, which is empty for an
+  alternate-screen app, so Claude Code agent tabs could not be scrolled at all.
 - Completed the truncated `LICENSE-APACHE` (added the standard appendix).
 
 ### Security

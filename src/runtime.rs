@@ -20,7 +20,7 @@ use mult::{
     app::{App, CommandAction, NavItem, Prompt, SelectionCell, TextSelection},
     config::Config,
     git,
-    model::{self, ChatStatus, PtyKey, TerminalLaunch, TerminalStatus},
+    model::{self, AgentKind, ChatStatus, PtyKey, TerminalLaunch, TerminalStatus},
     pty::{PtyDimensions, PtyEvent, PtyRuntime, PtySpawn},
     storage, ui,
 };
@@ -41,6 +41,7 @@ struct MultAgentStatusRecord {
 }
 
 const MULT_STATUS_EXTENSION_SOURCE: &str = include_str!("../extensions/mult-status.ts");
+const MULT_CLAUDE_STATUS_SCRIPT_SOURCE: &str = include_str!("../extensions/mult-claude-status.sh");
 
 enum RuntimeAgentBackend {
     Noop(NoopAgentBackend),
@@ -290,7 +291,7 @@ fn handle_event(
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             handle_key(app, pty_runtime, config, key, frame_area);
         }
-        Event::Mouse(mouse) => handle_mouse(app, pty_runtime, config, mouse, frame_area),
+        Event::Mouse(mouse) => handle_mouse(app, pty_runtime, mouse, frame_area),
         Event::Paste(text) => handle_paste(app, pty_runtime, config, text, frame_area),
         _ => {}
     }
@@ -319,13 +320,7 @@ fn handle_key(
     }
 }
 
-fn handle_mouse(
-    app: &mut App,
-    pty_runtime: &mut PtyRuntime,
-    config: &Config,
-    mouse: MouseEvent,
-    frame_area: Rect,
-) {
+fn handle_mouse(app: &mut App, pty_runtime: &mut PtyRuntime, mouse: MouseEvent, frame_area: Rect) {
     if app.is_prompt_active() {
         return;
     }
@@ -341,24 +336,10 @@ fn handle_mouse(
             finish_text_selection_at_mouse(app, pty_runtime, frame_area, mouse);
         }
         MouseEventKind::ScrollUp => {
-            scroll_output_at_mouse(
-                app,
-                pty_runtime,
-                config,
-                frame_area,
-                mouse,
-                ScrollDirection::Up,
-            );
+            scroll_output_at_mouse(app, pty_runtime, frame_area, mouse, ScrollDirection::Up);
         }
         MouseEventKind::ScrollDown => {
-            scroll_output_at_mouse(
-                app,
-                pty_runtime,
-                config,
-                frame_area,
-                mouse,
-                ScrollDirection::Down,
-            );
+            scroll_output_at_mouse(app, pty_runtime, frame_area, mouse, ScrollDirection::Down);
         }
         _ => {}
     }
@@ -572,15 +553,27 @@ enum ScrollDirection {
 fn scroll_output_at_mouse(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
-    config: &Config,
     frame_area: Rect,
     mouse: MouseEvent,
     direction: ScrollDirection,
 ) -> bool {
-    let Some(terminal) = output_terminal_at(app, config, frame_area, mouse.column, mouse.row)
+    let Some((terminal, area)) = output_terminal_at(app, frame_area, mouse.column, mouse.row)
     else {
         return false;
     };
+
+    // A program that has grabbed the mouse (Claude Code, nvim, less, ...)
+    // scrolls its own view. Our local scrollback holds nothing for it — the
+    // alternate screen keeps none — so hand the wheel notch to the program
+    // instead of swallowing it into a buffer that can never move.
+    if pty_runtime.terminal_reports_mouse(terminal) {
+        let Some(cell) = mouse_cell_in_area(area, mouse.column, mouse.row) else {
+            return false;
+        };
+        let col = cell.col.saturating_add(1);
+        let row = u16::try_from(cell.row).unwrap_or(0).saturating_add(1);
+        return pty_runtime.forward_wheel(terminal, direction == ScrollDirection::Up, col, row);
+    }
 
     match direction {
         ScrollDirection::Up => {
@@ -594,24 +587,11 @@ fn scroll_output_at_mouse(
 
 fn output_terminal_at(
     app: &App,
-    _config: &Config,
     frame_area: Rect,
     column: u16,
     row: u16,
-) -> Option<PtyKey> {
-    if let Some((terminal, area)) = ui::selected_terminal_output_area(app, frame_area) {
-        if rect_contains(area, column, row) {
-            return Some(PtyKey::Terminal(terminal));
-        }
-    }
-
-    if let Some((chat, area)) = ui::selected_chat_agent_output_area(app, frame_area) {
-        if rect_contains(area, column, row) {
-            return Some(PtyKey::ChatAgent(chat));
-        }
-    }
-
-    None
+) -> Option<(PtyKey, Rect)> {
+    selected_output_area(app, frame_area).filter(|(_, area)| rect_contains(*area, column, row))
 }
 
 fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
@@ -667,7 +647,17 @@ fn handle_control_key(
         return true;
     }
     if is_unshifted_control_char(key, 'a') {
-        add_agent_to_selected_workspace(app, pty_runtime, config, frame_area);
+        add_agent_to_selected_workspace(app, pty_runtime, config, frame_area, AgentKind::Pi);
+        return true;
+    }
+    if is_unshifted_control_char(key, 'x') {
+        add_agent_to_selected_workspace(
+            app,
+            pty_runtime,
+            config,
+            frame_area,
+            AgentKind::ClaudeCode,
+        );
         return true;
     }
     if is_unshifted_control_char(key, 't') {
@@ -770,8 +760,9 @@ fn add_agent_to_selected_workspace(
     pty_runtime: &mut PtyRuntime,
     config: &Config,
     frame_area: Rect,
+    agent: AgentKind,
 ) {
-    if let Some((workspace, chat)) = app.add_chat_to_selected_workspace_and_return() {
+    if let Some((workspace, chat)) = app.add_chat_to_selected_workspace_and_return(agent) {
         start_or_focus_chat_agent(app, pty_runtime, config, frame_area, workspace, chat, true);
     }
 }
@@ -942,7 +933,16 @@ fn execute_command_action(
         }
         CommandAction::StartInput => focus_selected_input(app, pty_runtime, config, frame_area),
         CommandAction::AddAgentChat => {
-            add_agent_to_selected_workspace(app, pty_runtime, config, frame_area);
+            add_agent_to_selected_workspace(app, pty_runtime, config, frame_area, AgentKind::Pi);
+        }
+        CommandAction::AddClaudeCodeChat => {
+            add_agent_to_selected_workspace(
+                app,
+                pty_runtime,
+                config,
+                frame_area,
+                AgentKind::ClaudeCode,
+            );
         }
         CommandAction::AddShellTerminal => app.add_terminal_to_selected_workspace(),
         CommandAction::AddCommandTerminal => {
@@ -1075,13 +1075,13 @@ fn start_or_focus_chat_agent(
     let Some(workspace) = app.project.workspace(workspace_id) else {
         return;
     };
-    let chat_name = workspace
+    let (chat_name, agent) = workspace
         .chats
         .iter()
         .find(|chat| chat.id == chat_id)
-        .map(|chat| chat.name.clone())
-        .unwrap_or_else(|| format!("chat {}", chat_id.0));
-    let command = pi_command_with_mult_status_extension(config);
+        .map(|chat| (chat.name.clone(), chat.agent))
+        .unwrap_or_else(|| (format!("chat {}", chat_id.0), AgentKind::default()));
+    let command = agent_command(config, agent);
     let status_path = mult_agent_status_path(chat_id);
     let _ = fs::remove_file(&status_path);
     let mut environment = workspace.environment.clone();
@@ -1109,7 +1109,10 @@ fn start_or_focus_chat_agent(
             app.mark_chat_status_by_id(chat_id, ChatStatus::Failed);
             pty_runtime.append_terminal_system_line(
                 terminal_id,
-                format!("failed to start pi agent for `{chat_name}`: {error}"),
+                format!(
+                    "failed to start {} agent for `{chat_name}`: {error}",
+                    agent.display_name()
+                ),
             );
         }
     }
@@ -1143,13 +1146,21 @@ fn auto_start_selected_chat_agent(
     config: &Config,
     frame_area: Rect,
 ) -> bool {
-    if !config.auto_start_pi_agent || app.is_prompt_active() {
+    if app.is_prompt_active() {
         return false;
     }
 
     let Some((workspace_id, chat_id)) = app.selected_chat_id() else {
         return false;
     };
+    let agent = app
+        .project
+        .chat(workspace_id, chat_id)
+        .map(|chat| chat.agent)
+        .unwrap_or_default();
+    if !auto_start_enabled(config, agent) {
+        return false;
+    }
     let terminal_id = PtyKey::ChatAgent(chat_id);
     if pty_runtime.is_running(terminal_id) || !pty_runtime.terminal_output_is_blank(terminal_id) {
         return false;
@@ -1167,10 +1178,39 @@ fn auto_start_selected_chat_agent(
     true
 }
 
+/// Whether the selected chat's agent should auto-start when its pane is
+/// focused with a blank buffer. Each agent backend has its own toggle.
+fn auto_start_enabled(config: &Config, agent: AgentKind) -> bool {
+    match agent {
+        AgentKind::Pi => config.auto_start_pi_agent,
+        AgentKind::ClaudeCode => config.auto_start_claude_code_agent,
+    }
+}
+
+/// Build the shell command line that backs a chat, chosen by its agent kind.
+/// Both backends report status into the same per-chat file that `mult` polls,
+/// but through different mechanisms: pi loads a bundled extension (`-e`), while
+/// Claude Code gets a generated hooks settings file (`--settings`).
+fn agent_command(config: &Config, agent: AgentKind) -> String {
+    match agent {
+        AgentKind::Pi => pi_command_with_mult_status_extension(config),
+        AgentKind::ClaudeCode => claude_code_command_with_mult_status_hooks(config),
+    }
+}
+
 fn pi_command(config: &Config) -> String {
     let command = config.pi_agent_command.trim();
     if command.is_empty() {
         "pi".to_string()
+    } else {
+        command.to_string()
+    }
+}
+
+fn claude_code_command(config: &Config) -> String {
+    let command = config.claude_code_command.trim();
+    if command.is_empty() {
+        "claude".to_string()
     } else {
         command.to_string()
     }
@@ -1188,15 +1228,87 @@ fn pi_command_with_mult_status_extension(config: &Config) -> String {
     )
 }
 
+/// Append `--settings <file>` pointing at a generated hooks file that reports
+/// chat status into the file `mult` polls. `--settings` merges over the user's
+/// own Claude Code settings for this session only, so it does not touch their
+/// config on disk. If the files cannot be written, fall back to the plain
+/// command — Claude Code still runs, just without a live status dot.
+fn claude_code_command_with_mult_status_hooks(config: &Config) -> String {
+    let command = claude_code_command(config);
+    let Some(settings) = write_mult_claude_status_files() else {
+        return command;
+    };
+
+    format!(
+        "{command} --settings {}",
+        shell_quote(&settings.display().to_string())
+    )
+}
+
 fn write_mult_status_extension_file() -> Option<PathBuf> {
     let dir = ensure_mult_runtime_dir().ok()?;
+    write_private_runtime_file(
+        &dir,
+        "mult-status-extension",
+        "ts",
+        MULT_STATUS_EXTENSION_SOURCE.as_bytes(),
+    )
+}
+
+/// Write the bundled status-writer script and a Claude Code settings file whose
+/// hooks invoke it, returning the settings path to hand to `--settings`. Two
+/// files because the settings JSON must reference the script by absolute path.
+fn write_mult_claude_status_files() -> Option<PathBuf> {
+    let dir = ensure_mult_runtime_dir().ok()?;
+    let script = write_private_runtime_file(
+        &dir,
+        "mult-claude-status",
+        "sh",
+        MULT_CLAUDE_STATUS_SCRIPT_SOURCE.as_bytes(),
+    )?;
+    let settings = mult_claude_status_settings_json(&script);
+    write_private_runtime_file(&dir, "mult-claude-settings", "json", settings.as_bytes())
+}
+
+/// Build the Claude Code `--settings` JSON that maps lifecycle hook events to
+/// `mult` statuses by invoking the bundled script with the status as its
+/// argument. Built with `serde_json` so the script path is correctly escaped
+/// into the embedded shell command.
+fn mult_claude_status_settings_json(script: &Path) -> String {
+    let script = shell_quote(&script.display().to_string());
+    let hook = |status: &str| {
+        serde_json::json!({
+            "matcher": "",
+            "hooks": [{ "type": "command", "command": format!("sh {script} {status}") }],
+        })
+    };
+
+    let settings = serde_json::json!({
+        "hooks": {
+            "SessionStart": [hook("idle")],
+            "UserPromptSubmit": [hook("running")],
+            "PreToolUse": [hook("running")],
+            "Notification": [hook("waiting")],
+            "Stop": [hook("finished")],
+        },
+    });
+
+    serde_json::to_string(&settings).unwrap_or_default()
+}
+
+fn write_private_runtime_file(
+    dir: &Path,
+    prefix: &str,
+    extension: &str,
+    contents: &[u8],
+) -> Option<PathBuf> {
     for _ in 0..16 {
         let path = dir.join(format!(
-            "mult-status-extension-{}-{:016x}.ts",
+            "{prefix}-{}-{:016x}.{extension}",
             std::process::id(),
             random_u64().ok()?
         ));
-        match write_private_file(&path, MULT_STATUS_EXTENSION_SOURCE.as_bytes()) {
+        match write_private_file(&path, contents) {
             Ok(()) => return Some(path),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(_) => return None,
@@ -1335,11 +1447,13 @@ fn drain_pty_events(app: &mut App, pty_runtime: &mut PtyRuntime) -> bool {
                     } else {
                         ChatStatus::Failed
                     };
+                    let agent = chat_agent_kind(app, chat_id);
                     app.mark_chat_status_by_id(chat_id, chat_status);
                     if app.pty_input_target() == Some(terminal) {
                         app.end_pty_input();
                     }
-                    let exit_message = format!("pi agent exited: {}", status.label());
+                    let exit_message =
+                        format!("{} agent exited: {}", agent.display_name(), status.label());
                     pty_runtime.append_terminal_system_line(terminal, exit_message.as_str());
                 }
                 PtyKey::Terminal(terminal_id) => {
@@ -1496,6 +1610,18 @@ fn mult_agent_status_to_chat_status(status: &str) -> Option<ChatStatus> {
     }
 }
 
+/// The agent backend a chat runs, looked up by chat id alone (the durable model
+/// keys chats under workspaces, but PTY events only carry the chat id).
+fn chat_agent_kind(app: &App, chat_id: model::ChatId) -> AgentKind {
+    app.project
+        .workspaces
+        .iter()
+        .flat_map(|workspace| workspace.chats.iter())
+        .find(|chat| chat.id == chat_id)
+        .map(|chat| chat.agent)
+        .unwrap_or_default()
+}
+
 fn mult_agent_status_path(chat: model::ChatId) -> PathBuf {
     let dir = ensure_mult_runtime_dir().unwrap_or_else(|_| mult_runtime_dir());
     dir.join(format!(
@@ -1637,24 +1763,34 @@ mod tests {
         assert_eq!(
             pi_command(&Config {
                 pi_agent_command: "pi -c".to_string(),
-                auto_start_pi_agent: false,
-                auto_start_terminals: false,
-                mouse_capture: false,
-                projects: Vec::new(),
-                colorscheme: Default::default(),
+                ..Config::default()
             }),
             "pi -c"
         );
         assert_eq!(
             pi_command(&Config {
                 pi_agent_command: "   ".to_string(),
-                auto_start_pi_agent: false,
-                auto_start_terminals: false,
-                mouse_capture: false,
-                projects: Vec::new(),
-                colorscheme: Default::default(),
+                ..Config::default()
             }),
             "pi"
+        );
+    }
+
+    #[test]
+    fn claude_code_command_comes_from_config_with_default_fallback() {
+        assert_eq!(
+            claude_code_command(&Config {
+                claude_code_command: "claude --resume".to_string(),
+                ..Config::default()
+            }),
+            "claude --resume"
+        );
+        assert_eq!(
+            claude_code_command(&Config {
+                claude_code_command: "   ".to_string(),
+                ..Config::default()
+            }),
+            "claude"
         );
     }
 
@@ -1662,16 +1798,107 @@ mod tests {
     fn pi_command_appends_mult_status_extension_when_available() {
         let command = pi_command_with_mult_status_extension(&Config {
             pi_agent_command: "pi --model test".to_string(),
-            auto_start_pi_agent: false,
-            auto_start_terminals: false,
-            mouse_capture: false,
-            projects: Vec::new(),
-            colorscheme: Default::default(),
+            ..Config::default()
         });
 
         assert!(command.starts_with("pi --model test"));
         assert!(command.contains(" -e "));
         assert!(command.contains("mult-status-extension-"));
+    }
+
+    #[test]
+    fn agent_command_routes_by_kind() {
+        let config = Config {
+            pi_agent_command: "pi".to_string(),
+            claude_code_command: "claude --here".to_string(),
+            ..Config::default()
+        };
+
+        // Pi takes the bundled status extension (`-e`); Claude Code takes a
+        // generated hooks settings file (`--settings`). Neither borrows the
+        // other's flag.
+        let pi = agent_command(&config, AgentKind::Pi);
+        assert!(pi.starts_with("pi"));
+        assert!(pi.contains(" -e "));
+        assert!(!pi.contains(" --settings "));
+
+        let cc = agent_command(&config, AgentKind::ClaudeCode);
+        assert!(cc.starts_with("claude --here"));
+        assert!(cc.contains(" --settings "));
+        assert!(!cc.contains(" -e "));
+    }
+
+    #[test]
+    fn claude_code_command_appends_mult_status_hooks_when_available() {
+        let command = claude_code_command_with_mult_status_hooks(&Config {
+            claude_code_command: "claude --model test".to_string(),
+            ..Config::default()
+        });
+
+        assert!(command.starts_with("claude --model test"));
+        assert!(command.contains(" --settings "));
+        assert!(command.contains("mult-claude-settings-"));
+    }
+
+    #[test]
+    fn mult_claude_status_settings_json_maps_each_event() {
+        let json = mult_claude_status_settings_json(Path::new("/run/mult/status.sh"));
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid settings json");
+
+        // Each lifecycle event registers one matcher-less command hook that runs
+        // the bundled script with the mult status for that event.
+        for (event, status) in [
+            ("SessionStart", "idle"),
+            ("UserPromptSubmit", "running"),
+            ("PreToolUse", "running"),
+            ("Notification", "waiting"),
+            ("Stop", "finished"),
+        ] {
+            let entry = &value["hooks"][event][0];
+            assert_eq!(entry["matcher"], "");
+            let command = entry["hooks"][0]["command"]
+                .as_str()
+                .expect("command is a string");
+            assert_eq!(entry["hooks"][0]["type"], "command");
+            assert!(
+                command.starts_with("sh /run/mult/status.sh "),
+                "unexpected command for {event}: {command}"
+            );
+            assert!(
+                command.ends_with(&format!(" {status}")),
+                "event {event} should map to status {status}, got {command}"
+            );
+        }
+    }
+
+    // The two halves of the feature must agree on the file schema: the bundled
+    // shell script has to write exactly what `read_mult_agent_status` parses.
+    #[cfg(unix)]
+    #[test]
+    fn bundled_claude_status_script_writes_a_status_mult_can_read() {
+        let script = unique_status_path("cc-script");
+        fs::write(&script, MULT_CLAUDE_STATUS_SCRIPT_SOURCE).expect("write script");
+        let status_path = unique_status_path("cc-status");
+        let _ = fs::remove_file(&status_path);
+
+        let output = std::process::Command::new("sh")
+            .arg(&script)
+            .arg("running")
+            .env(MULT_AGENT_STATUS_PATH_ENV, &status_path)
+            .env(MULT_AGENT_CHAT_ID_ENV, "7")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run status script");
+        assert!(output.status.success());
+
+        // `running` round-trips through the file into mult's Thinking status.
+        assert_eq!(
+            read_mult_agent_status(&status_path),
+            Some(ChatStatus::Thinking)
+        );
+
+        let _ = fs::remove_file(&script);
+        let _ = fs::remove_file(&status_path);
     }
 
     #[test]
@@ -1692,6 +1919,7 @@ mod tests {
             workspace,
             model::DEFAULT_AGENT_CHAT_TITLE.to_string(),
             ChatStatus::Idle,
+            AgentKind::Pi,
         );
         let mut app = App::new(state);
         app.project.workspaces[0].chats[0].id = model::ChatId(9_001);
@@ -1852,6 +2080,64 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             }),
             frame_area,
+        );
+        assert_eq!(
+            pty_runtime.terminal_lines(terminal_id),
+            vec!["four".to_string(), "five".to_string()]
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_does_not_scroll_local_buffer_when_program_grabs_mouse() {
+        let mut app = App::default();
+        let (selected, terminal_id) = app
+            .nav_items()
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| match item {
+                mult::app::NavItem::Terminal { terminal, .. } => {
+                    Some((index, PtyKey::Terminal(*terminal)))
+                }
+                _ => None,
+            })
+            .expect("seed state has a terminal");
+        app.select_nav_index(selected);
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime
+            .resize(terminal_id, PtyDimensions { rows: 2, cols: 8 })
+            .expect("resize parser");
+        pty_runtime.process_terminal_output(terminal_id, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        // The program turns on mouse reporting: the wheel is now its input, so
+        // our local scrollback must stay pinned to the bottom.
+        pty_runtime.process_terminal_output(terminal_id, b"\x1b[?1000h\x1b[?1006h");
+        let config = Config {
+            mouse_capture: true,
+            ..Config::default()
+        };
+        let frame_area = Rect::new(0, 0, 120, 40);
+        let (_, output_area) = ui::selected_terminal_output_area(&app, frame_area)
+            .expect("terminal selection has output area");
+
+        handle_event(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: output_area.x,
+                row: output_area.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            frame_area,
+        );
+
+        assert_eq!(
+            pty_runtime
+                .parser(terminal_id)
+                .unwrap()
+                .screen()
+                .scrollback(),
+            0
         );
         assert_eq!(
             pty_runtime.terminal_lines(terminal_id),
@@ -2042,6 +2328,34 @@ mod tests {
         );
         assert_eq!(app.prompt, None);
         assert_eq!(app.project.workspaces[0].terminals.len(), initial_terminals);
+    }
+
+    #[test]
+    fn ctrl_x_adds_a_claude_code_agent_chat() {
+        let mut app = App::default();
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let config = Config::default();
+        let frame_area = Rect::new(0, 0, 120, 40);
+        let workspace = app.project.workspaces[0].id;
+        assert!(app.project.workspaces[0].chats.is_empty());
+
+        handle_unprompted_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            frame_area,
+        );
+
+        // Ctrl+x adds and selects a chat backed by Claude Code, distinct from
+        // the pi chat that Ctrl+a creates.
+        assert_eq!(app.project.workspaces[0].chats.len(), 1);
+        assert_eq!(
+            app.project.workspaces[0].chats[0].agent,
+            AgentKind::ClaudeCode
+        );
+        let chat = app.project.workspaces[0].chats[0].id;
+        assert_eq!(app.selected_item(), Some(NavItem::Chat { workspace, chat }));
     }
 
     #[test]

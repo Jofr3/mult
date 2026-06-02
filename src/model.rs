@@ -35,7 +35,38 @@ pub struct ChatSession {
     pub name: String,
     pub status: ChatStatus,
     #[serde(default)]
+    pub agent: AgentKind,
+    #[serde(default)]
     pub messages: Vec<ChatMessage>,
+}
+
+/// Which agent backend a chat drives. Persisted with the chat so a restored
+/// session relaunches the same agent. Defaults to [`AgentKind::Pi`] so state
+/// files written before agent selection existed keep their pi chats.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentKind {
+    #[default]
+    Pi,
+    ClaudeCode,
+}
+
+impl AgentKind {
+    /// Compact tag shown next to a chat in the sidebar, e.g. the `pi` in
+    /// `agent: pi`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pi => "pi",
+            Self::ClaudeCode => "cc",
+        }
+    }
+
+    /// Human-readable name for command-palette entries and error messages.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Pi => "pi",
+            Self::ClaudeCode => "Claude Code",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,13 +164,24 @@ impl ProjectState {
     pub(crate) fn seeded() -> Self {
         let mut state = Self::default();
         let mult = state.workspaces[0].id;
-        state.add_chat(mult, DEFAULT_AGENT_CHAT_TITLE.to_string(), ChatStatus::Idle);
-        state.add_chat(mult, DEFAULT_AGENT_CHAT_TITLE.to_string(), ChatStatus::Idle);
+        state.add_chat(
+            mult,
+            DEFAULT_AGENT_CHAT_TITLE.to_string(),
+            ChatStatus::Idle,
+            AgentKind::Pi,
+        );
+        state.add_chat(
+            mult,
+            DEFAULT_AGENT_CHAT_TITLE.to_string(),
+            ChatStatus::Idle,
+            AgentKind::Pi,
+        );
         let website = state.workspaces[1].id;
         state.add_chat(
             website,
             DEFAULT_AGENT_CHAT_TITLE.to_string(),
             ChatStatus::Idle,
+            AgentKind::Pi,
         );
         state
     }
@@ -245,6 +287,7 @@ impl ProjectState {
         workspace_id: WorkspaceId,
         name: String,
         status: ChatStatus,
+        agent: AgentKind,
     ) -> Option<ChatId> {
         let workspace_index = self
             .workspaces
@@ -255,6 +298,7 @@ impl ProjectState {
             id,
             name,
             status,
+            agent,
             messages: Vec::new(),
         });
         Some(id)
@@ -535,7 +579,12 @@ mod tests {
     fn ids_continue_after_seed_data() {
         let mut state = ProjectState::seeded();
         let workspace = state.add_workspace("new".to_string(), None);
-        let chat = state.add_chat(workspace, "agent".to_string(), ChatStatus::Idle);
+        let chat = state.add_chat(
+            workspace,
+            "agent".to_string(),
+            ChatStatus::Idle,
+            AgentKind::Pi,
+        );
 
         assert_eq!(workspace, WorkspaceId(3));
         assert_eq!(chat, Some(ChatId(4)));
@@ -569,6 +618,9 @@ mod tests {
         let chat: ChatSession = serde_json::from_str(json).expect("deserialize chat");
 
         assert!(chat.messages.is_empty());
+        // State written before agent selection existed has no `agent` field and
+        // must keep running pi.
+        assert_eq!(chat.agent, AgentKind::Pi);
     }
 
     #[test]

@@ -7,8 +7,8 @@ use crate::{
     agent::{AgentEvent, AgentMessageRole, AgentTarget},
     config::ConfiguredProject,
     model::{
-        ChatId, ChatMessage, ChatMessageRole, ChatStatus, ProjectState, PtyKey, TerminalId,
-        TerminalStatus, WorkspaceId, DEFAULT_AGENT_CHAT_TITLE, STATE_VERSION,
+        AgentKind, ChatId, ChatMessage, ChatMessageRole, ChatStatus, ProjectState, PtyKey,
+        TerminalId, TerminalStatus, WorkspaceId, DEFAULT_AGENT_CHAT_TITLE, STATE_VERSION,
     },
 };
 
@@ -149,6 +149,7 @@ pub enum CommandAction {
     FocusSelectedPane,
     StartInput,
     AddAgentChat,
+    AddClaudeCodeChat,
     AddShellTerminal,
     AddCommandTerminal,
     OpenWorkspace,
@@ -623,8 +624,13 @@ impl App {
         if self.selected_workspace_id().is_some() {
             entries.push(CommandPaletteEntry {
                 action: CommandAction::AddAgentChat,
-                label: "New agent chat",
-                help: "add an agent chat to the selected workspace",
+                label: "New pi agent chat",
+                help: "add a pi agent chat to the selected workspace",
+            });
+            entries.push(CommandPaletteEntry {
+                action: CommandAction::AddClaudeCodeChat,
+                label: "New Claude Code chat",
+                help: "add a Claude Code agent chat to the selected workspace",
             });
             entries.push(CommandPaletteEntry {
                 action: CommandAction::AddShellTerminal,
@@ -1373,10 +1379,15 @@ impl App {
         }
     }
 
-    pub fn add_chat_to_selected_workspace_and_return(&mut self) -> Option<(WorkspaceId, ChatId)> {
+    pub fn add_chat_to_selected_workspace_and_return(
+        &mut self,
+        agent: AgentKind,
+    ) -> Option<(WorkspaceId, ChatId)> {
         let workspace = self.selected_workspace_id()?;
         let name = DEFAULT_AGENT_CHAT_TITLE.to_string();
-        let chat = self.project.add_chat(workspace, name, ChatStatus::Idle)?;
+        let chat = self
+            .project
+            .add_chat(workspace, name, ChatStatus::Idle, agent)?;
         self.select_item(NavItem::Chat { workspace, chat });
         self.dirty = true;
         Some((workspace, chat))
@@ -1818,13 +1829,29 @@ mod tests {
     #[test]
     fn new_chats_use_agent_title() {
         let mut app = App::default();
-        let Some((workspace, chat)) = app.add_chat_to_selected_workspace_and_return() else {
+        let Some((workspace, chat)) = app.add_chat_to_selected_workspace_and_return(AgentKind::Pi)
+        else {
             panic!("chat should be added");
         };
 
         assert_eq!(
             app.project.chat(workspace, chat).unwrap().name,
             DEFAULT_AGENT_CHAT_TITLE
+        );
+    }
+
+    #[test]
+    fn new_chats_record_their_agent_kind() {
+        let mut app = App::default();
+        let Some((workspace, chat)) =
+            app.add_chat_to_selected_workspace_and_return(AgentKind::ClaudeCode)
+        else {
+            panic!("chat should be added");
+        };
+
+        assert_eq!(
+            app.project.chat(workspace, chat).unwrap().agent,
+            AgentKind::ClaudeCode
         );
     }
 

@@ -12,8 +12,12 @@ const CONFIG_FILE_NAME: &str = "config.json";
 pub struct Config {
     #[serde(default = "default_pi_agent_command")]
     pub pi_agent_command: String,
+    #[serde(default = "default_claude_code_command")]
+    pub claude_code_command: String,
     #[serde(default = "default_auto_start_pi_agent")]
     pub auto_start_pi_agent: bool,
+    #[serde(default = "default_auto_start_claude_code_agent")]
+    pub auto_start_claude_code_agent: bool,
     #[serde(default = "default_auto_start_terminals")]
     pub auto_start_terminals: bool,
     #[serde(default = "default_mouse_capture")]
@@ -62,7 +66,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             pi_agent_command: default_pi_agent_command(),
+            claude_code_command: default_claude_code_command(),
             auto_start_pi_agent: default_auto_start_pi_agent(),
+            auto_start_claude_code_agent: default_auto_start_claude_code_agent(),
             auto_start_terminals: default_auto_start_terminals(),
             mouse_capture: default_mouse_capture(),
             projects: Vec::new(),
@@ -141,7 +147,15 @@ fn default_pi_agent_command() -> String {
     "pi".to_string()
 }
 
+fn default_claude_code_command() -> String {
+    "claude".to_string()
+}
+
 fn default_auto_start_pi_agent() -> bool {
+    true
+}
+
+fn default_auto_start_claude_code_agent() -> bool {
     true
 }
 
@@ -219,7 +233,9 @@ mod tests {
         let config = Config::default();
 
         assert_eq!(config.pi_agent_command, "pi");
+        assert_eq!(config.claude_code_command, "claude");
         assert!(config.auto_start_pi_agent);
+        assert!(config.auto_start_claude_code_agent);
         assert!(config.auto_start_terminals);
         assert!(config.mouse_capture);
         assert!(config.projects.is_empty());
@@ -284,7 +300,7 @@ mod tests {
         let path = unique_temp_file();
         fs::write(
             &path,
-            r#"{"auto_start_pi_agent":false,"auto_start_terminals":false}"#,
+            r#"{"auto_start_pi_agent":false,"auto_start_claude_code_agent":false,"auto_start_terminals":false}"#,
         )
         .expect("write config");
 
@@ -292,7 +308,21 @@ mod tests {
 
         assert_eq!(config.pi_agent_command, "pi");
         assert!(!config.auto_start_pi_agent);
+        assert!(!config.auto_start_claude_code_agent);
         assert!(!config.auto_start_terminals);
+    }
+
+    #[test]
+    fn config_loads_claude_code_command_from_json() {
+        let path = unique_temp_file();
+        fs::write(&path, r#"{"claude_code_command":"claude --resume"}"#).expect("write config");
+
+        let config = load_from_path(&path).expect("load config");
+
+        // The pi command keeps its default while the cc command is overridden.
+        assert_eq!(config.pi_agent_command, "pi");
+        assert_eq!(config.claude_code_command, "claude --resume");
+        assert!(config.auto_start_claude_code_agent);
     }
 
     #[test]
