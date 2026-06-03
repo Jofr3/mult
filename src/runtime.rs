@@ -1616,6 +1616,17 @@ fn base_key_to_pty_bytes(key: KeyEvent, application_cursor: bool) -> Option<Vec<
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
             vec![control_byte(c)?]
         }
+        // Under the Kitty disambiguate protocol the host reports Shift combined
+        // with Alt/Super as the unshifted base key plus a separate Shift bit
+        // (e.g. Alt+Shift+h -> Char('h') + SHIFT|ALT) instead of folding Shift
+        // into the glyph the way a legacy terminal does. Fold it back in here so
+        // the shifted character reaches the PTY; otherwise the modifier is
+        // dropped and Alt+Shift+h is indistinguishable from Alt+h to a legacy
+        // app like vim. (Ctrl+Shift is handled above, where Shift never changes
+        // the control byte.)
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            c.to_uppercase().to_string().into_bytes()
+        }
         KeyCode::Char(c) => c.to_string().into_bytes(),
         _ => return None,
     })
@@ -2590,6 +2601,25 @@ mod tests {
             key_to_pty_bytes(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)),
             b"\x1bx".to_vec()
         );
+    }
+
+    #[test]
+    fn alt_shift_letters_fold_shift_into_uppercase() {
+        // Regression: under the Kitty disambiguate protocol crossterm reports
+        // Alt+Shift+h as Char('h') + SHIFT|ALT (the unshifted base key). Shift
+        // must survive as an uppercase glyph so the PTY sees `ESC H` (<M-H>), not
+        // `ESC h` (<M-h>) — otherwise Alt+Shift+h/j/k/l collapse onto
+        // Alt+h/j/k/l inside vim.
+        for (lower, upper) in [('h', 'H'), ('j', 'J'), ('k', 'K'), ('l', 'L')] {
+            assert_eq!(
+                key_to_pty_bytes(KeyEvent::new(
+                    KeyCode::Char(lower),
+                    KeyModifiers::ALT | KeyModifiers::SHIFT,
+                )),
+                vec![0x1b, upper as u8],
+                "Alt+Shift+{lower} must encode as ESC {upper}",
+            );
+        }
     }
 
     #[test]

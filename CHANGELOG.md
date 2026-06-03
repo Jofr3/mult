@@ -47,6 +47,13 @@ and the project aims to adhere to
   rather than `\x1b\x1b[D`, which the program rendered as literal characters.
   `Ctrl+Arrow` and `Shift+Arrow`, which previously dropped their modifier, now
   carry it too.
+- `Alt+Shift+<letter>` no longer loses its `Shift`. Under the Kitty disambiguate
+  protocol the host reports the combination as the unshifted base key plus a
+  separate `Shift` bit (e.g. `Alt+Shift+h` → `Char('h')` + `SHIFT|ALT`), and the
+  character path dropped that bit — so `Alt+Shift+h/j/k/l` reached the PTY as
+  `\x1bh`/`…` (`<M-h>`), indistinguishable from `Alt+h`. `Shift` is now folded
+  back into the glyph, sending `\x1bH` (`<M-H>`) as a legacy app like `vim`
+  expects.
 - Unmodified arrows and `Home`/`End` follow the program's cursor-key mode
   (DECCKM): full-screen apps that request application cursor keys (`vim`, `less`,
   `fzf`, …) now receive the SS3 form (`\x1bOA`) they expect, while the shell keeps
