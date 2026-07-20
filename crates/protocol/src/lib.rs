@@ -7,7 +7,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 pub const DEFAULT_SOCKET_NAME: &str = "mult.sock";
 pub const SOCKET_PATH_ENV: &str = "MULT_SOCKET_PATH";
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -102,8 +102,10 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
 
         let mode = metadata.mode();
         // A sticky, world-writable directory (e.g. /tmp, /dev/shm) is a shared
-        // system root; the private subtree below it is what must be ours.
-        if mode & 0o1000 != 0 && mode & 0o002 != 0 {
+        // system root; the private subtree below it is what must be ours. Stop
+        // at the filesystem root as well: sandbox roots can be mapped to a
+        // synthetic UID even though every mutable descendant was checked.
+        if (mode & 0o1000 != 0 && mode & 0o002 != 0) || path.parent().is_none() {
             break;
         }
 
@@ -257,6 +259,11 @@ pub enum ServerMessage {
         pane: PaneId,
         exit: ExitInfo,
     },
+    StopResult {
+        pane: PaneId,
+        stopped: bool,
+        error: Option<String>,
+    },
     Error {
         message: String,
     },
@@ -334,6 +341,20 @@ mod tests {
         let mut bytes = Vec::new();
         write_message(&mut bytes, &message).expect("write message");
         let decoded: ClientMessage = read_message(&mut bytes.as_slice()).expect("read message");
+
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn round_trips_correlated_stop_result() {
+        let message = ServerMessage::StopResult {
+            pane: PaneId(7),
+            stopped: false,
+            error: Some("kill failed".to_string()),
+        };
+        let mut bytes = Vec::new();
+        write_message(&mut bytes, &message).expect("write message");
+        let decoded: ServerMessage = read_message(&mut bytes.as_slice()).expect("read message");
 
         assert_eq!(decoded, message);
     }

@@ -82,7 +82,7 @@ Global controls when no prompt is open:
 | `Ctrl+f` | Open/import a workspace |
 | `Ctrl+p` | Open the command palette |
 | `Ctrl+s` | Search the selected chat/terminal pane |
-| `Ctrl+q` | Delete the selected chat/terminal, or an empty workspace |
+| `Ctrl+q` | Ask to delete the selected chat/terminal, or an empty workspace |
 | `Ctrl+Esc` | Quit |
 
 Typing in a selected chat or terminal starts/focuses its PTY and forwards input to it.
@@ -91,8 +91,8 @@ Prompt controls:
 
 | Key | Action |
 | --- | --- |
-| `Enter` | Submit |
-| `Esc` or `Ctrl+c` | Cancel |
+| `Enter` | Submit or confirm a pending deletion |
+| `Esc` or `Ctrl+c` | Cancel, including a pending deletion |
 | `Backspace` | Delete one character |
 | `Up`/`Down` or `Ctrl+k`/`Ctrl+j` | Move through prompt results where supported |
 
@@ -157,6 +157,10 @@ State path:
 The state file is written atomically through an owner-only temporary file and final state files are set to `0600`. Newly-created state directories use owner-only permissions. Invalid JSON is moved aside with a `.corrupt-*` suffix before resetting to defaults; state files with a newer schema version are rejected without rewriting them.
 
 Durable state contains the workspace tree, chat messages, terminal metadata, terminal launch commands, and statuses. PTY processes, raw terminal buffers, and scrollback are runtime/server-owned and are not stored in the JSON state file.
+
+On startup, a command terminal persisted as running is attached only if its existing daemon session is available. `mult` never relaunches that command during restoration; an unavailable session is marked stopped and requires deliberate typing or **Start selected PTY** before it runs again. Persisted stopped command terminals are likewise not auto-started after a client restart.
+
+If saving state fails, the TUI remains open, keeps the state dirty, and shows the error until a later user action retries successfully. A quit request that cannot save is cancelled rather than discarding unsaved state.
 
 ## Project layout
 

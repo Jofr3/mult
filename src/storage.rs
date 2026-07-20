@@ -7,6 +7,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use serde::Deserialize;
+
 use crate::model::{ProjectState, STATE_VERSION};
 
 const STATE_PATH_ENV: &str = "MULT_STATE_PATH";
@@ -46,15 +48,26 @@ fn load_from_path(path: &Path) -> io::Result<ProjectState> {
 }
 
 fn decode_project_state(bytes: &[u8]) -> Result<ProjectState, StateDecodeError> {
+    // Inspect only the schema envelope first. A future schema may contain enum
+    // variants or fields this binary cannot decode, but its valid state file
+    // must still be recognized as future state and left untouched.
+    let envelope: StateVersionEnvelope =
+        serde_json::from_slice(bytes).map_err(StateDecodeError::InvalidJson)?;
+    if envelope.version > STATE_VERSION {
+        return Err(StateDecodeError::UnsupportedVersion(envelope.version));
+    }
+
     let mut state: ProjectState =
         serde_json::from_slice(bytes).map_err(StateDecodeError::InvalidJson)?;
-    if state.version > STATE_VERSION {
-        return Err(StateDecodeError::UnsupportedVersion(state.version));
-    }
     if state.version < STATE_VERSION {
         state.version = STATE_VERSION;
     }
     Ok(state)
+}
+
+#[derive(Debug, Deserialize)]
+struct StateVersionEnvelope {
+    version: u32,
 }
 
 #[derive(Debug)]
@@ -344,6 +357,48 @@ mod tests {
         assert!(fs::read_to_string(&path)
             .expect("future state remains")
             .contains(&format!("\"version\":{}", STATE_VERSION + 1)));
+    }
+
+    #[test]
+    fn future_state_with_unknown_enum_variants_is_left_untouched() {
+        let path = unique_temp_file();
+        let contents = format!(
+            r#"{{
+  "version": {},
+  "next_workspace_id": 2,
+  "next_chat_id": 2,
+  "next_terminal_id": 2,
+  "workspaces": [{{
+    "id": 1,
+    "name": "future",
+    "cwd": null,
+    "environment": {{}},
+    "chats": [{{
+      "id": 1,
+      "name": "agent",
+      "status": "FutureChatStatus",
+      "agent": "FutureAgent",
+      "messages": []
+    }}],
+    "terminals": [{{
+      "id": 1,
+      "name": "terminal",
+      "status": "FutureTerminalStatus",
+      "launch": {{"kind": "future_launch"}}
+    }}]
+  }}]
+}}"#,
+            STATE_VERSION + 1
+        );
+        fs::write(&path, &contents).expect("write future state");
+
+        let error = load_from_path(&path).expect_err("future state should be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read_to_string(&path).expect("future state remains readable"),
+            contents
+        );
     }
 
     #[cfg(unix)]

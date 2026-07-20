@@ -50,6 +50,12 @@ pub struct PtyExit {
     pub signal: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachExistingResult {
+    Attached,
+    Missing,
+}
+
 pub struct PtyRuntime {
     socket_path: PathBuf,
     connection: Option<ServerConnection>,
@@ -70,6 +76,7 @@ pub struct PtyRuntime {
 
 const SERVER_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 const ATTACH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const SERVER_EVENT_QUEUE_CAPACITY: usize = 4_096;
 const TERMINAL_SCROLLBACK_LINES: usize = 5_000;
 const TERMINAL_MAX_CSI_SEQUENCE_BYTES: usize = 128;
@@ -342,6 +349,42 @@ impl PtyRuntime {
             .unwrap_or(true)
     }
 
+    /// Attach to a daemon session that must already exist. Unlike [`Self::start`],
+    /// this path never sends `CreateSession` and therefore cannot launch a
+    /// persisted command as a side effect of client restoration.
+    pub fn attach_existing(
+        &mut self,
+        terminal: PtyKey,
+        size: PtyDimensions,
+    ) -> io::Result<AttachExistingResult> {
+        if self.is_running(terminal) {
+            return Ok(AttachExistingResult::Attached);
+        }
+
+        self.ensure_connected()?;
+        self.reset_parser(terminal, size);
+        self.foreground_processes.remove(&terminal);
+        self.command_trackers.remove(&terminal);
+        let session = session_for_key(terminal);
+        let pane = pane_for_key(terminal);
+        self.terminal_to_pane.insert(terminal, pane);
+        self.pane_to_terminal.insert(pane, terminal);
+
+        let result = self
+            .write(&ClientMessage::Attach {
+                session,
+                rows: size.rows,
+                cols: size.cols,
+            })
+            .and_then(|()| self.wait_for_existing_attach(session, ATTACH_ACK_TIMEOUT));
+
+        if result.is_err() {
+            self.terminal_to_pane.remove(&terminal);
+            self.pane_to_terminal.remove(&pane);
+        }
+        result
+    }
+
     pub fn start(&mut self, spawn: PtySpawn) -> io::Result<()> {
         if self.is_running(spawn.terminal) {
             return Err(io::Error::new(
@@ -403,10 +446,11 @@ impl PtyRuntime {
         };
 
         self.send(ClientMessage::Stop { pane })?;
+        let stopped = self.wait_for_stop_result(pane, STOP_ACK_TIMEOUT)?;
         self.terminal_to_pane.remove(&terminal);
         self.pane_to_terminal.remove(&pane);
         self.terminal_exit_statuses.remove(&terminal);
-        Ok(true)
+        Ok(stopped)
     }
 
     pub fn send_input(&mut self, terminal: PtyKey, input: &[u8]) -> io::Result<bool> {
@@ -577,6 +621,143 @@ impl PtyRuntime {
         events
     }
 
+    fn wait_for_stop_result(&mut self, pane: PaneId, timeout: Duration) -> io::Result<bool> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("timed out after {timeout:?} waiting for stop confirmation"),
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let message = {
+                let Some(connection) = self.connection.as_ref() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "not connected to mult-server",
+                    ));
+                };
+                connection.receiver.recv_timeout(remaining)
+            };
+
+            match message {
+                Ok(ServerMessage::StopResult {
+                    pane: stopped_pane,
+                    stopped,
+                    error,
+                }) if stopped_pane == pane => {
+                    return error.map_or(Ok(stopped), |message| Err(io::Error::other(message)));
+                }
+                Ok(ServerMessage::PaneExited {
+                    pane: exited_pane,
+                    exit,
+                }) if exited_pane == pane => {
+                    let mut events = Vec::new();
+                    self.handle_server_message(
+                        ServerMessage::PaneExited {
+                            pane: exited_pane,
+                            exit,
+                        },
+                        &mut events,
+                    );
+                    self.pending_events.extend(events);
+                    return Ok(true);
+                }
+                Ok(ServerMessage::Error { message }) => {
+                    return Err(io::Error::other(message));
+                }
+                Ok(message) => {
+                    let mut events = Vec::new();
+                    self.handle_server_message(message, &mut events);
+                    self.pending_events.extend(events);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("timed out after {timeout:?} waiting for stop confirmation"),
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.connection = None;
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "mult-server disconnected before stop confirmation",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn wait_for_existing_attach(
+        &mut self,
+        session: SessionId,
+        timeout: Duration,
+    ) -> io::Result<AttachExistingResult> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("timed out after {timeout:?} waiting for attach confirmation"),
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let message = {
+                let Some(connection) = self.connection.as_ref() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "not connected to mult-server",
+                    ));
+                };
+                connection.receiver.recv_timeout(remaining)
+            };
+
+            match message {
+                Ok(ServerMessage::Attached {
+                    session: attached, ..
+                }) if attached == session => return Ok(AttachExistingResult::Attached),
+                Ok(ServerMessage::PaneExited { pane, exit }) if pane.0 == session.0 => {
+                    let terminal = self.pane_to_terminal.remove(&pane);
+                    if let Some(terminal) = terminal {
+                        self.terminal_to_pane.remove(&terminal);
+                        self.terminal_exit_statuses.insert(
+                            terminal,
+                            PtyExit {
+                                code: exit.code,
+                                signal: exit.signal,
+                            },
+                        );
+                    }
+                    return Ok(AttachExistingResult::Missing);
+                }
+                Ok(ServerMessage::Error { message }) => {
+                    return Err(io::Error::other(message));
+                }
+                Ok(message) => {
+                    let mut events = Vec::new();
+                    self.handle_server_message(message, &mut events);
+                    self.pending_events.extend(events);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("timed out after {timeout:?} waiting for attach confirmation"),
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.connection = None;
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "mult-server disconnected before attach confirmation",
+                    ));
+                }
+            }
+        }
+    }
+
     fn wait_for_attach_ack(&mut self, session: SessionId, timeout: Duration) -> io::Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -691,6 +872,26 @@ impl PtyRuntime {
                     self.terminal_exit_statuses.insert(terminal, status.clone());
                     events.push(PtyEvent::Exited { terminal, status });
                 }
+            }
+            ServerMessage::StopResult {
+                pane, error: None, ..
+            } => {
+                if let Some(terminal) = self.pane_to_terminal.remove(&pane) {
+                    self.terminal_to_pane.remove(&terminal);
+                    self.terminal_exit_statuses.remove(&terminal);
+                }
+            }
+            ServerMessage::StopResult {
+                pane,
+                error: Some(message),
+                ..
+            } => {
+                let terminal = self
+                    .pane_to_terminal
+                    .get(&pane)
+                    .copied()
+                    .unwrap_or_else(|| key_for_pane_id(pane));
+                events.push(PtyEvent::Error { terminal, message });
             }
             ServerMessage::Error { message } => {
                 let terminal = self
@@ -1490,6 +1691,17 @@ mod tests {
 
     use super::*;
 
+    const TEST_IO_TIMEOUT: Duration = Duration::from_secs(2);
+
+    fn read_client_message(stream: &mut UnixStream, operation: &str) -> ClientMessage {
+        stream
+            .set_read_timeout(Some(TEST_IO_TIMEOUT))
+            .unwrap_or_else(|error| panic!("set timeout while {operation}: {error}"));
+        read_message(stream).unwrap_or_else(|error| {
+            panic!("timed out or failed after {TEST_IO_TIMEOUT:?} while {operation}: {error}")
+        })
+    }
+
     #[test]
     fn pty_spawn_uses_default_size() {
         let spawn = PtySpawn::shell(PtyKey::Terminal(TerminalId(7)), None, BTreeMap::new());
@@ -1579,7 +1791,7 @@ mod tests {
 
         assert!(runtime.send_paste(terminal, "one\ntwo").expect("paste"));
 
-        let message: ClientMessage = read_message(&mut server_stream).expect("read paste input");
+        let message = read_client_message(&mut server_stream, "reading paste input");
         assert_eq!(
             message,
             ClientMessage::Input {
@@ -1630,9 +1842,72 @@ mod tests {
     }
 
     #[test]
+    fn attach_existing_sends_only_attach_and_marks_terminal_running() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let terminal = PtyKey::Terminal(TerminalId(7));
+        let mut runtime = unattached_test_runtime(client_stream, receiver);
+        let server = thread::spawn(move || {
+            let message = read_client_message(&mut server_stream, "reading restoration Attach");
+            assert_eq!(
+                message,
+                ClientMessage::Attach {
+                    session: SessionId(7),
+                    rows: 6,
+                    cols: 20,
+                }
+            );
+            sender
+                .send(ServerMessage::Attached {
+                    session: SessionId(7),
+                    panes: Vec::new(),
+                })
+                .expect("send attach confirmation");
+        });
+
+        let result = runtime
+            .attach_existing(terminal, PtyDimensions { rows: 6, cols: 20 })
+            .expect("attach existing session");
+
+        assert_eq!(result, AttachExistingResult::Attached);
+        assert!(runtime.is_running(terminal));
+        server.join().expect("server thread should finish");
+    }
+
+    #[test]
+    fn attach_existing_reports_missing_without_creating_a_session() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let terminal = PtyKey::Terminal(TerminalId(8));
+        let mut runtime = unattached_test_runtime(client_stream, receiver);
+        let server = thread::spawn(move || {
+            let message = read_client_message(&mut server_stream, "reading missing-session Attach");
+            assert!(matches!(message, ClientMessage::Attach { .. }));
+            sender
+                .send(ServerMessage::PaneExited {
+                    pane: PaneId(8),
+                    exit: mult_protocol::ExitInfo {
+                        code: 1,
+                        signal: Some("server session unavailable".to_string()),
+                    },
+                })
+                .expect("send missing-session response");
+        });
+
+        let result = runtime
+            .attach_existing(terminal, PtyDimensions::default())
+            .expect("missing session is a recoverable result");
+
+        assert_eq!(result, AttachExistingResult::Missing);
+        assert!(!runtime.is_running(terminal));
+        server.join().expect("server thread should finish");
+    }
+
+    #[test]
     fn start_rolls_back_local_attachment_when_attach_is_rejected() {
         let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
         let (sender, receiver) = mpsc::sync_channel(8);
+        let (completed_tx, completed_rx) = mpsc::sync_channel(1);
         let terminal = PtyKey::Terminal(TerminalId(7));
         let pane = PaneId(7);
         let mut runtime = PtyRuntime {
@@ -1653,28 +1928,34 @@ mod tests {
             starting: None,
         };
         let server = thread::spawn(move || {
-            let create: ClientMessage = read_message(&mut server_stream).expect("read create");
-            assert!(matches!(
-                create,
-                ClientMessage::CreateSession {
-                    requested_id: Some(SessionId(7)),
-                    ..
-                }
-            ));
-            let attach: ClientMessage = read_message(&mut server_stream).expect("read attach");
-            assert_eq!(
-                attach,
-                ClientMessage::Attach {
-                    session: SessionId(7),
-                    rows: 24,
-                    cols: 80,
-                }
-            );
-            sender
-                .send(ServerMessage::Error {
-                    message: "session 7 is already attached".to_string(),
-                })
-                .expect("send attach rejection");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let create = read_client_message(&mut server_stream, "reading CreateSession");
+                assert!(matches!(
+                    create,
+                    ClientMessage::CreateSession {
+                        requested_id: Some(SessionId(7)),
+                        ..
+                    }
+                ));
+                let attach = read_client_message(&mut server_stream, "reading Attach");
+                assert_eq!(
+                    attach,
+                    ClientMessage::Attach {
+                        session: SessionId(7),
+                        rows: 24,
+                        cols: 80,
+                    }
+                );
+                sender
+                    .send(ServerMessage::Error {
+                        message: "session 7 is already attached".to_string(),
+                    })
+                    .expect("send attach rejection");
+            }));
+            let _ = completed_tx.send(());
+            if let Err(payload) = result {
+                std::panic::resume_unwind(payload);
+            }
         });
 
         let error = runtime
@@ -1684,23 +1965,57 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert!(!runtime.is_running(terminal));
         assert!(!runtime.pane_to_terminal.contains_key(&pane));
+        completed_rx
+            .recv_timeout(TEST_IO_TIMEOUT)
+            .expect("server thread should complete within the test timeout");
         server.join().expect("server thread should finish");
     }
 
     #[test]
     fn pty_stop_sends_stop_message_and_clears_local_attachment() {
         let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
-        let (_sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::channel();
         let terminal = PtyKey::Terminal(TerminalId(7));
         let pane = PaneId(7);
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        sender
+            .send(ServerMessage::StopResult {
+                pane,
+                stopped: true,
+                error: None,
+            })
+            .expect("send stop confirmation");
 
         assert!(runtime.stop(terminal).expect("stop terminal"));
 
-        let message: ClientMessage = read_message(&mut server_stream).expect("read stop message");
+        let message = read_client_message(&mut server_stream, "reading Stop");
         assert_eq!(message, ClientMessage::Stop { pane });
         assert!(!runtime.is_running(terminal));
         assert!(!runtime.pane_to_terminal.contains_key(&pane));
+    }
+
+    #[test]
+    fn pty_stop_keeps_local_attachment_when_server_rejects_stop() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::Terminal(TerminalId(7));
+        let pane = PaneId(7);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        sender
+            .send(ServerMessage::StopResult {
+                pane,
+                stopped: false,
+                error: Some("failed to kill child".to_string()),
+            })
+            .expect("send stop rejection");
+
+        let error = runtime.stop(terminal).expect_err("stop should fail");
+
+        assert_eq!(error.to_string(), "failed to kill child");
+        let message = read_client_message(&mut server_stream, "reading Stop");
+        assert_eq!(message, ClientMessage::Stop { pane });
+        assert!(runtime.is_running(terminal));
+        assert_eq!(runtime.pane_to_terminal.get(&pane), Some(&terminal));
     }
 
     #[test]
@@ -1718,7 +2033,7 @@ mod tests {
         assert!(runtime.send_input(terminal, b"x").expect("send input"));
 
         assert_eq!(runtime.parser(terminal).unwrap().screen().scrollback(), 0);
-        let message: ClientMessage = read_message(&mut server_stream).expect("read input");
+        let message = read_client_message(&mut server_stream, "reading input");
         assert_eq!(
             message,
             ClientMessage::Input {
@@ -1777,8 +2092,7 @@ mod tests {
 
         assert!(runtime.forward_wheel(terminal, true, 12, 5));
 
-        let message: ClientMessage =
-            read_message(&mut server_stream).expect("read forwarded wheel");
+        let message = read_client_message(&mut server_stream, "reading forwarded wheel");
         assert_eq!(
             message,
             ClientMessage::Input {
@@ -1832,7 +2146,7 @@ mod tests {
             .expect("missing"));
         assert!(runtime.send_paste(terminal, "one\ntwo").expect("paste"));
 
-        let message: ClientMessage = read_message(&mut server_stream).expect("read client message");
+        let message = read_client_message(&mut server_stream, "reading pasted client input");
         assert_eq!(
             message,
             ClientMessage::Input {
@@ -1929,11 +2243,11 @@ mod tests {
         assert!(runtime
             .send_input(terminal, b"cargo test")
             .expect("send command"));
-        let _: ClientMessage = read_message(&mut server_stream).expect("read command input");
+        let _ = read_client_message(&mut server_stream, "reading command input");
         assert_eq!(runtime.terminal_last_command(terminal), None);
 
         assert!(runtime.send_input(terminal, b"\r").expect("send enter"));
-        let _: ClientMessage = read_message(&mut server_stream).expect("read enter input");
+        let _ = read_client_message(&mut server_stream, "reading enter input");
 
         assert_eq!(runtime.terminal_last_command(terminal), Some("cargo test"));
     }
@@ -1948,14 +2262,14 @@ mod tests {
         runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
 
         assert!(runtime.send_input(terminal, b"nvim\r").expect("send nvim"));
-        let _: ClientMessage = read_message(&mut server_stream).expect("read nvim input");
+        let _ = read_client_message(&mut server_stream, "reading nvim input");
         assert_eq!(runtime.terminal_last_command(terminal), Some("nvim"));
 
         runtime.process_terminal_output(terminal, b"\x1b[?1049h");
         assert!(runtime
             .send_input(terminal, b"asdasdq\r")
             .expect("send editor input"));
-        let _: ClientMessage = read_message(&mut server_stream).expect("read editor input");
+        let _ = read_client_message(&mut server_stream, "reading editor input");
 
         assert_eq!(runtime.terminal_last_command(terminal), Some("nvim"));
     }
@@ -1984,7 +2298,7 @@ mod tests {
         assert!(runtime
             .send_input(terminal, b"print('typed text')\r")
             .expect("send child input"));
-        let _: ClientMessage = read_message(&mut server_stream).expect("read child input");
+        let _ = read_client_message(&mut server_stream, "reading child input");
         assert_eq!(runtime.terminal_last_command(terminal), Some("python"));
 
         sender
@@ -2001,7 +2315,7 @@ mod tests {
         assert!(runtime
             .send_input(terminal, b"cargo test\r")
             .expect("send shell input"));
-        let _: ClientMessage = read_message(&mut server_stream).expect("read shell input");
+        let _ = read_client_message(&mut server_stream, "reading shell input");
         assert_eq!(runtime.terminal_last_command(terminal), Some("cargo test"));
     }
 
@@ -2022,7 +2336,7 @@ mod tests {
             .expect("send terminal query");
 
         let events = runtime.drain_events();
-        let message: ClientMessage = read_message(&mut server_stream).expect("read DA response");
+        let message = read_client_message(&mut server_stream, "reading DA response");
 
         assert_eq!(
             events,
@@ -2061,7 +2375,7 @@ mod tests {
             .expect("send output with embedded cursor query");
 
         let _ = runtime.drain_events();
-        let message: ClientMessage = read_message(&mut server_stream).expect("read DSR response");
+        let message = read_client_message(&mut server_stream, "reading DSR response");
 
         assert_eq!(
             message,
@@ -2139,7 +2453,7 @@ mod tests {
 
         runtime.reattach_terminals();
 
-        let message: ClientMessage = read_message(&mut server_stream).expect("read reattach");
+        let message = read_client_message(&mut server_stream, "reading reattach");
         assert_eq!(
             message,
             ClientMessage::Attach {
@@ -2197,11 +2511,9 @@ mod tests {
         fs::remove_file(&regular_file).expect("remove collision file");
     }
 
-    fn test_runtime(
+    fn unattached_test_runtime(
         client_stream: UnixStream,
         receiver: Receiver<ServerMessage>,
-        terminal: PtyKey,
-        pane: PaneId,
     ) -> PtyRuntime {
         PtyRuntime {
             socket_path: unique_socket_path(),
@@ -2209,8 +2521,8 @@ mod tests {
                 writer: Arc::new(Mutex::new(client_stream)),
                 receiver,
             }),
-            terminal_to_pane: HashMap::from([(terminal, pane)]),
-            pane_to_terminal: HashMap::from([(pane, terminal)]),
+            terminal_to_pane: HashMap::new(),
+            pane_to_terminal: HashMap::new(),
             parsers: HashMap::new(),
             responders: HashMap::new(),
             terminals_with_output: HashSet::new(),
@@ -2220,6 +2532,18 @@ mod tests {
             pending_events: Vec::new(),
             starting: None,
         }
+    }
+
+    fn test_runtime(
+        client_stream: UnixStream,
+        receiver: Receiver<ServerMessage>,
+        terminal: PtyKey,
+        pane: PaneId,
+    ) -> PtyRuntime {
+        let mut runtime = unattached_test_runtime(client_stream, receiver);
+        runtime.terminal_to_pane = HashMap::from([(terminal, pane)]);
+        runtime.pane_to_terminal = HashMap::from([(pane, terminal)]);
+        runtime
     }
 
     fn unique_socket_path() -> PathBuf {

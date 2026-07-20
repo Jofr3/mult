@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt,
     path::PathBuf,
 };
 
@@ -9,6 +10,26 @@ pub const STATE_VERSION: u32 = 1;
 pub const DEFAULT_AGENT_CHAT_TITLE: &str = "agent";
 pub const RUNTIME_TERMINAL_ID_FLAG: u64 = 1 << 63;
 pub const MAX_DURABLE_SESSION_ID: u64 = RUNTIME_TERMINAL_ID_FLAG - 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdAllocationError {
+    Workspace,
+    Chat,
+    Terminal,
+}
+
+impl fmt::Display for IdAllocationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let namespace = match self {
+            Self::Workspace => "workspace",
+            Self::Chat => "chat",
+            Self::Terminal => "terminal",
+        };
+        write!(formatter, "{namespace} ID space is exhausted")
+    }
+}
+
+impl std::error::Error for IdAllocationError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectState {
@@ -145,11 +166,19 @@ impl Default for ProjectState {
             workspaces: Vec::new(),
         };
 
-        let mult = state.add_workspace("mult".to_string(), std::env::current_dir().ok());
-        state.add_terminal(mult, "dev server".to_string(), TerminalStatus::Stopped);
+        let mult = state
+            .add_workspace("mult".to_string(), std::env::current_dir().ok())
+            .expect("initial workspace ID is available");
+        let _ = state
+            .add_terminal(mult, "dev server".to_string(), TerminalStatus::Stopped)
+            .expect("initial terminal ID is available");
 
-        let website = state.add_workspace("website".to_string(), None);
-        state.add_terminal(website, "shell".to_string(), TerminalStatus::Stopped);
+        let website = state
+            .add_workspace("website".to_string(), None)
+            .expect("initial workspace ID is available");
+        let _ = state
+            .add_terminal(website, "shell".to_string(), TerminalStatus::Stopped)
+            .expect("initial terminal ID is available");
 
         state
     }
@@ -164,113 +193,182 @@ impl ProjectState {
     pub(crate) fn seeded() -> Self {
         let mut state = Self::default();
         let mult = state.workspaces[0].id;
-        state.add_chat(
-            mult,
-            DEFAULT_AGENT_CHAT_TITLE.to_string(),
-            ChatStatus::Idle,
-            AgentKind::Pi,
-        );
-        state.add_chat(
-            mult,
-            DEFAULT_AGENT_CHAT_TITLE.to_string(),
-            ChatStatus::Idle,
-            AgentKind::Pi,
-        );
+        let _ = state
+            .add_chat(
+                mult,
+                DEFAULT_AGENT_CHAT_TITLE.to_string(),
+                ChatStatus::Idle,
+                AgentKind::Pi,
+            )
+            .expect("seed chat ID is available");
+        let _ = state
+            .add_chat(
+                mult,
+                DEFAULT_AGENT_CHAT_TITLE.to_string(),
+                ChatStatus::Idle,
+                AgentKind::Pi,
+            )
+            .expect("seed chat ID is available");
         let website = state.workspaces[1].id;
-        state.add_chat(
-            website,
-            DEFAULT_AGENT_CHAT_TITLE.to_string(),
-            ChatStatus::Idle,
-            AgentKind::Pi,
-        );
+        let _ = state
+            .add_chat(
+                website,
+                DEFAULT_AGENT_CHAT_TITLE.to_string(),
+                ChatStatus::Idle,
+                AgentKind::Pi,
+            )
+            .expect("seed chat ID is available");
         state
     }
 }
 
 impl ProjectState {
-    pub fn normalize_next_ids(&mut self) -> bool {
-        let mut changed = false;
-        changed |= self.normalize_existing_ids();
+    pub fn normalize_next_ids(&mut self) -> Result<bool, IdAllocationError> {
+        self.ensure_id_capacity()?;
 
-        let required_workspace_id = next_unbounded_after(
-            self.workspaces
-                .iter()
-                .map(|workspace| workspace.id.0)
-                .collect(),
-        );
-        let required_chat_id = next_durable_after(
-            self.workspaces
-                .iter()
-                .flat_map(|workspace| workspace.chats.iter().map(|chat| chat.id.0))
-                .collect(),
-        );
-        let required_terminal_id = next_durable_after(
-            self.workspaces
-                .iter()
-                .flat_map(|workspace| workspace.terminals.iter().map(|terminal| terminal.id.0))
-                .collect(),
-        );
+        let mut changed = self.normalize_existing_ids()?;
 
-        if self.next_workspace_id < required_workspace_id || self.next_workspace_id == 0 {
-            self.next_workspace_id = required_workspace_id;
+        let workspace_ids = self
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.0)
+            .collect::<BTreeSet<_>>();
+        let chat_ids = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.chats.iter().map(|chat| chat.id.0))
+            .collect::<BTreeSet<_>>();
+        let terminal_ids = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.terminals.iter().map(|terminal| terminal.id.0))
+            .collect::<BTreeSet<_>>();
+
+        let next_workspace_id =
+            normalized_allocator_hint(self.next_workspace_id, &workspace_ids, u64::MAX);
+        let next_chat_id =
+            normalized_allocator_hint(self.next_chat_id, &chat_ids, MAX_DURABLE_SESSION_ID);
+        let next_terminal_id =
+            normalized_allocator_hint(self.next_terminal_id, &terminal_ids, MAX_DURABLE_SESSION_ID);
+
+        if self.next_workspace_id != next_workspace_id {
+            self.next_workspace_id = next_workspace_id;
             changed = true;
         }
-        if self.next_chat_id < required_chat_id || !is_valid_durable_session_id(self.next_chat_id) {
-            self.next_chat_id = required_chat_id;
+        if self.next_chat_id != next_chat_id {
+            self.next_chat_id = next_chat_id;
             changed = true;
         }
-        if self.next_terminal_id < required_terminal_id
-            || !is_valid_durable_session_id(self.next_terminal_id)
-        {
-            self.next_terminal_id = required_terminal_id;
+        if self.next_terminal_id != next_terminal_id {
+            self.next_terminal_id = next_terminal_id;
             changed = true;
         }
 
-        changed
+        Ok(changed)
     }
 
-    fn normalize_existing_ids(&mut self) -> bool {
-        let mut changed = false;
-        let mut workspaces = BTreeSet::new();
-        let mut next_workspace = 1;
-        let mut chats = BTreeSet::new();
-        let mut next_chat = 1;
-        let mut terminals = BTreeSet::new();
-        let mut next_terminal = 1;
+    fn ensure_id_capacity(&self) -> Result<(), IdAllocationError> {
+        let chat_count = self.workspaces.iter().fold(0_u128, |count, workspace| {
+            count.saturating_add(workspace.chats.len() as u128)
+        });
+        if chat_count > u128::from(MAX_DURABLE_SESSION_ID) {
+            return Err(IdAllocationError::Chat);
+        }
 
+        let terminal_count = self.workspaces.iter().fold(0_u128, |count, workspace| {
+            count.saturating_add(workspace.terminals.len() as u128)
+        });
+        if terminal_count > u128::from(MAX_DURABLE_SESSION_ID) {
+            return Err(IdAllocationError::Terminal);
+        }
+
+        Ok(())
+    }
+
+    fn normalize_existing_ids(&mut self) -> Result<bool, IdAllocationError> {
+        let mut changed = false;
+
+        let mut workspace_ids = self
+            .workspaces
+            .iter()
+            .filter_map(|workspace| (workspace.id.0 != 0).then_some(workspace.id.0))
+            .collect::<BTreeSet<_>>();
+        let mut seen_workspace_ids = BTreeSet::new();
+        let mut next_workspace_id = 1;
         for workspace in &mut self.workspaces {
-            if workspace.id.0 == 0 || !workspaces.insert(workspace.id.0) {
-                workspace.id =
-                    WorkspaceId(take_next_unbounded_id(&workspaces, &mut next_workspace));
-                workspaces.insert(workspace.id.0);
-                changed = true;
-            }
-            next_workspace = next_workspace.max(workspace.id.0.saturating_add(1));
-
-            for chat in &mut workspace.chats {
-                if !is_valid_durable_session_id(chat.id.0) || !chats.insert(chat.id.0) {
-                    chat.id = ChatId(take_next_durable_id(&chats, &mut next_chat));
-                    chats.insert(chat.id.0);
-                    changed = true;
-                }
-                next_chat = next_chat.max(chat.id.0.saturating_add(1));
+            if workspace.id.0 != 0 && seen_workspace_ids.insert(workspace.id.0) {
+                continue;
             }
 
-            for terminal in &mut workspace.terminals {
-                if !is_valid_durable_session_id(terminal.id.0) || !terminals.insert(terminal.id.0) {
-                    terminal.id = TerminalId(take_next_durable_id(&terminals, &mut next_terminal));
-                    terminals.insert(terminal.id.0);
-                    changed = true;
-                }
-                next_terminal = next_terminal.max(terminal.id.0.saturating_add(1));
-            }
+            let (id, next) = take_available_id(&mut workspace_ids, next_workspace_id, u64::MAX)
+                .ok_or(IdAllocationError::Workspace)?;
+            workspace.id = WorkspaceId(id);
+            seen_workspace_ids.insert(id);
+            next_workspace_id = next;
+            changed = true;
         }
 
-        changed
+        let mut chat_ids = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.chats.iter().map(|chat| chat.id.0))
+            .filter(|id| is_valid_durable_session_id(*id))
+            .collect::<BTreeSet<_>>();
+        let mut seen_chat_ids = BTreeSet::new();
+        let mut next_chat_id = 1;
+        for chat in self
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| workspace.chats.iter_mut())
+        {
+            if is_valid_durable_session_id(chat.id.0) && seen_chat_ids.insert(chat.id.0) {
+                continue;
+            }
+
+            let (id, next) = take_available_id(&mut chat_ids, next_chat_id, MAX_DURABLE_SESSION_ID)
+                .ok_or(IdAllocationError::Chat)?;
+            chat.id = ChatId(id);
+            seen_chat_ids.insert(id);
+            next_chat_id = next;
+            changed = true;
+        }
+
+        let mut terminal_ids = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.terminals.iter().map(|terminal| terminal.id.0))
+            .filter(|id| is_valid_durable_session_id(*id))
+            .collect::<BTreeSet<_>>();
+        let mut seen_terminal_ids = BTreeSet::new();
+        let mut next_terminal_id = 1;
+        for terminal in self
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| workspace.terminals.iter_mut())
+        {
+            if is_valid_durable_session_id(terminal.id.0) && seen_terminal_ids.insert(terminal.id.0)
+            {
+                continue;
+            }
+
+            let (id, next) =
+                take_available_id(&mut terminal_ids, next_terminal_id, MAX_DURABLE_SESSION_ID)
+                    .ok_or(IdAllocationError::Terminal)?;
+            terminal.id = TerminalId(id);
+            seen_terminal_ids.insert(id);
+            next_terminal_id = next;
+            changed = true;
+        }
+
+        Ok(changed)
     }
 
-    pub fn add_workspace(&mut self, name: String, cwd: Option<PathBuf>) -> WorkspaceId {
-        let id = self.allocate_workspace_id();
+    pub fn add_workspace(
+        &mut self,
+        name: String,
+        cwd: Option<PathBuf>,
+    ) -> Result<WorkspaceId, IdAllocationError> {
+        let id = self.allocate_workspace_id()?;
         self.workspaces.push(Workspace {
             id,
             name,
@@ -279,7 +377,7 @@ impl ProjectState {
             chats: Vec::new(),
             terminals: Vec::new(),
         });
-        id
+        Ok(id)
     }
 
     pub fn add_chat(
@@ -288,12 +386,15 @@ impl ProjectState {
         name: String,
         status: ChatStatus,
         agent: AgentKind,
-    ) -> Option<ChatId> {
-        let workspace_index = self
+    ) -> Result<Option<ChatId>, IdAllocationError> {
+        let Some(workspace_index) = self
             .workspaces
             .iter()
-            .position(|workspace| workspace.id == workspace_id)?;
-        let id = self.allocate_chat_id();
+            .position(|workspace| workspace.id == workspace_id)
+        else {
+            return Ok(None);
+        };
+        let id = self.allocate_chat_id()?;
         self.workspaces[workspace_index].chats.push(ChatSession {
             id,
             name,
@@ -301,7 +402,7 @@ impl ProjectState {
             agent,
             messages: Vec::new(),
         });
-        Some(id)
+        Ok(Some(id))
     }
 
     pub fn append_chat_message(
@@ -359,7 +460,7 @@ impl ProjectState {
         workspace_id: WorkspaceId,
         name: String,
         status: TerminalStatus,
-    ) -> Option<TerminalId> {
+    ) -> Result<Option<TerminalId>, IdAllocationError> {
         self.add_terminal_with_launch(workspace_id, name, status, TerminalLaunch::Shell)
     }
 
@@ -369,7 +470,7 @@ impl ProjectState {
         name: String,
         status: TerminalStatus,
         command: String,
-    ) -> Option<TerminalId> {
+    ) -> Result<Option<TerminalId>, IdAllocationError> {
         self.add_terminal_with_launch(workspace_id, name, status, TerminalLaunch::Command(command))
     }
 
@@ -379,12 +480,15 @@ impl ProjectState {
         name: String,
         status: TerminalStatus,
         launch: TerminalLaunch,
-    ) -> Option<TerminalId> {
-        let workspace_index = self
+    ) -> Result<Option<TerminalId>, IdAllocationError> {
+        let Some(workspace_index) = self
             .workspaces
             .iter()
-            .position(|workspace| workspace.id == workspace_id)?;
-        let id = self.allocate_terminal_id();
+            .position(|workspace| workspace.id == workspace_id)
+        else {
+            return Ok(None);
+        };
+        let id = self.allocate_terminal_id()?;
         self.workspaces[workspace_index]
             .terminals
             .push(TerminalSession {
@@ -393,7 +497,7 @@ impl ProjectState {
                 status,
                 launch,
             });
-        Some(id)
+        Ok(Some(id))
     }
 
     pub fn remove_workspace(&mut self, workspace_id: WorkspaceId) -> Option<Workspace> {
@@ -473,22 +577,43 @@ impl ProjectState {
             .find(|terminal| terminal.id == terminal_id)
     }
 
-    fn allocate_workspace_id(&mut self) -> WorkspaceId {
-        let id = WorkspaceId(self.next_workspace_id);
-        self.next_workspace_id += 1;
-        id
+    fn allocate_workspace_id(&mut self) -> Result<WorkspaceId, IdAllocationError> {
+        let mut used = self
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.0)
+            .collect::<BTreeSet<_>>();
+        let (id, next) = take_available_id(&mut used, self.next_workspace_id, u64::MAX)
+            .ok_or(IdAllocationError::Workspace)?;
+        self.next_workspace_id = next;
+        Ok(WorkspaceId(id))
     }
 
-    fn allocate_chat_id(&mut self) -> ChatId {
-        let id = ChatId(self.next_chat_id);
-        self.next_chat_id = next_durable_candidate(self.next_chat_id.saturating_add(1));
-        id
+    fn allocate_chat_id(&mut self) -> Result<ChatId, IdAllocationError> {
+        let mut used = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.chats.iter().map(|chat| chat.id.0))
+            .filter(|id| is_valid_durable_session_id(*id))
+            .collect::<BTreeSet<_>>();
+        let (id, next) = take_available_id(&mut used, self.next_chat_id, MAX_DURABLE_SESSION_ID)
+            .ok_or(IdAllocationError::Chat)?;
+        self.next_chat_id = next;
+        Ok(ChatId(id))
     }
 
-    fn allocate_terminal_id(&mut self) -> TerminalId {
-        let id = TerminalId(self.next_terminal_id);
-        self.next_terminal_id = next_durable_candidate(self.next_terminal_id.saturating_add(1));
-        id
+    fn allocate_terminal_id(&mut self) -> Result<TerminalId, IdAllocationError> {
+        let mut used = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.terminals.iter().map(|terminal| terminal.id.0))
+            .filter(|id| is_valid_durable_session_id(*id))
+            .collect::<BTreeSet<_>>();
+        let (id, next) =
+            take_available_id(&mut used, self.next_terminal_id, MAX_DURABLE_SESSION_ID)
+                .ok_or(IdAllocationError::Terminal)?;
+        self.next_terminal_id = next;
+        Ok(TerminalId(id))
     }
 }
 
@@ -496,45 +621,65 @@ fn is_valid_durable_session_id(id: u64) -> bool {
     (1..=MAX_DURABLE_SESSION_ID).contains(&id)
 }
 
-fn next_durable_candidate(candidate: u64) -> u64 {
-    if is_valid_durable_session_id(candidate) {
-        candidate
+/// Takes a free ID at or after `hint`, wrapping once at `max`. The returned
+/// next hint is zero only when taking this ID exhausted the supplied range.
+fn take_available_id(used: &mut BTreeSet<u64>, hint: u64, max: u64) -> Option<(u64, u64)> {
+    let id = find_available_id(used, hint, max)?;
+    used.insert(id);
+    let next = find_available_id(used, successor(id, max), max).unwrap_or(0);
+    Some((id, next))
+}
+
+fn find_available_id(used: &BTreeSet<u64>, hint: u64, max: u64) -> Option<u64> {
+    if max == 0 {
+        return None;
+    }
+
+    let start = if (1..=max).contains(&hint) { hint } else { 1 };
+    first_available_in_range(used, start, max).or_else(|| {
+        if start > 1 {
+            first_available_in_range(used, 1, start - 1)
+        } else {
+            None
+        }
+    })
+}
+
+fn first_available_in_range(used: &BTreeSet<u64>, start: u64, end: u64) -> Option<u64> {
+    let mut candidate = start;
+    for &id in used.range(start..=end) {
+        if id > candidate {
+            return Some(candidate);
+        }
+        if id == candidate {
+            if candidate == end {
+                return None;
+            }
+            candidate += 1;
+        }
+    }
+    Some(candidate)
+}
+
+fn successor(id: u64, max: u64) -> u64 {
+    if id == max {
+        1
+    } else {
+        id + 1
+    }
+}
+
+fn normalized_allocator_hint(current: u64, used: &BTreeSet<u64>, max: u64) -> u64 {
+    let highest = used.range(1..=max).next_back().copied().unwrap_or(0);
+    let start = if highest < max && (!(1..=max).contains(&current) || current <= highest) {
+        highest + 1
+    } else if (1..=max).contains(&current) {
+        current
     } else {
         1
-    }
-}
+    };
 
-fn take_next_unbounded_id(used: &BTreeSet<u64>, next: &mut u64) -> u64 {
-    while *next == 0 || used.contains(next) {
-        *next = next.saturating_add(1).max(1);
-    }
-    let id = *next;
-    *next = next.saturating_add(1);
-    id
-}
-
-fn take_next_durable_id(used: &BTreeSet<u64>, next: &mut u64) -> u64 {
-    *next = next_durable_candidate(*next);
-    while used.contains(next) {
-        *next = next_durable_candidate(next.saturating_add(1));
-    }
-    let id = *next;
-    *next = next_durable_candidate(next.saturating_add(1));
-    id
-}
-
-fn next_unbounded_after(used: BTreeSet<u64>) -> u64 {
-    used.into_iter().max().unwrap_or(0).saturating_add(1).max(1)
-}
-
-fn next_durable_after(used: BTreeSet<u64>) -> u64 {
-    next_durable_candidate(
-        used.into_iter()
-            .filter(|id| is_valid_durable_session_id(*id))
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1),
-    )
+    find_available_id(used, start, max).unwrap_or(0)
 }
 
 impl ChatStatus {
@@ -578,13 +723,17 @@ mod tests {
     #[test]
     fn ids_continue_after_seed_data() {
         let mut state = ProjectState::seeded();
-        let workspace = state.add_workspace("new".to_string(), None);
-        let chat = state.add_chat(
-            workspace,
-            "agent".to_string(),
-            ChatStatus::Idle,
-            AgentKind::Pi,
-        );
+        let workspace = state
+            .add_workspace("new".to_string(), None)
+            .expect("workspace ID is available");
+        let chat = state
+            .add_chat(
+                workspace,
+                "agent".to_string(),
+                ChatStatus::Idle,
+                AgentKind::Pi,
+            )
+            .expect("chat ID is available");
 
         assert_eq!(workspace, WorkspaceId(3));
         assert_eq!(chat, Some(ChatId(4)));
@@ -648,12 +797,19 @@ mod tests {
             ..ProjectState::seeded()
         };
 
-        assert!(state.normalize_next_ids());
+        assert!(state
+            .normalize_next_ids()
+            .expect("ID normalization should succeed"));
 
         assert_eq!(state.next_workspace_id, 3);
         assert_eq!(state.next_chat_id, 4);
         assert_eq!(state.next_terminal_id, 3);
-        assert_eq!(state.add_workspace("new".to_string(), None), WorkspaceId(3));
+        assert_eq!(
+            state
+                .add_workspace("new".to_string(), None)
+                .expect("workspace ID is available"),
+            WorkspaceId(3)
+        );
     }
 
     #[test]
@@ -665,7 +821,9 @@ mod tests {
             ..ProjectState::default()
         };
 
-        assert!(!state.normalize_next_ids());
+        assert!(!state
+            .normalize_next_ids()
+            .expect("ID normalization should succeed"));
 
         assert_eq!(state.next_workspace_id, 99);
         assert_eq!(state.next_chat_id, 99);
@@ -681,7 +839,9 @@ mod tests {
         state.next_chat_id = RUNTIME_TERMINAL_ID_FLAG;
         state.next_terminal_id = RUNTIME_TERMINAL_ID_FLAG;
 
-        assert!(state.normalize_next_ids());
+        assert!(state
+            .normalize_next_ids()
+            .expect("ID normalization should succeed"));
 
         let chat_ids = state
             .workspaces
@@ -705,6 +865,163 @@ mod tests {
     }
 
     #[test]
+    fn workspace_allocation_wraps_safely_at_u64_max() {
+        let mut state = empty_state();
+        state.next_workspace_id = u64::MAX;
+
+        let max = state
+            .add_workspace("max".to_string(), None)
+            .expect("u64::MAX is a valid workspace ID");
+        let wrapped = state
+            .add_workspace("wrapped".to_string(), None)
+            .expect("allocation should wrap to a free ID");
+
+        assert_eq!(max, WorkspaceId(u64::MAX));
+        assert_eq!(wrapped, WorkspaceId(1));
+        assert_eq!(state.next_workspace_id, 2);
+    }
+
+    #[test]
+    fn durable_allocators_use_the_upper_bound_then_wrap() {
+        let mut state = empty_state();
+        let workspace = state
+            .add_workspace("workspace".to_string(), None)
+            .expect("workspace ID is available");
+        state.next_chat_id = MAX_DURABLE_SESSION_ID;
+        state.next_terminal_id = MAX_DURABLE_SESSION_ID;
+
+        let max_chat = state
+            .add_chat(
+                workspace,
+                "max chat".to_string(),
+                ChatStatus::Idle,
+                AgentKind::Pi,
+            )
+            .expect("chat allocation should succeed");
+        let max_terminal = state
+            .add_terminal(
+                workspace,
+                "max terminal".to_string(),
+                TerminalStatus::Stopped,
+            )
+            .expect("terminal allocation should succeed");
+        let wrapped_chat = state
+            .add_chat(
+                workspace,
+                "wrapped chat".to_string(),
+                ChatStatus::Idle,
+                AgentKind::Pi,
+            )
+            .expect("chat allocation should wrap");
+        let wrapped_terminal = state
+            .add_terminal(
+                workspace,
+                "wrapped terminal".to_string(),
+                TerminalStatus::Stopped,
+            )
+            .expect("terminal allocation should wrap");
+
+        assert_eq!(max_chat, Some(ChatId(MAX_DURABLE_SESSION_ID)));
+        assert_eq!(max_terminal, Some(TerminalId(MAX_DURABLE_SESSION_ID)));
+        assert_eq!(wrapped_chat, Some(ChatId(1)));
+        assert_eq!(wrapped_terminal, Some(TerminalId(1)));
+        assert_eq!(state.next_chat_id, 2);
+        assert_eq!(state.next_terminal_id, 2);
+    }
+
+    #[test]
+    fn durable_normalization_wraps_at_the_upper_bound() {
+        let mut state = empty_state();
+        state.next_chat_id = MAX_DURABLE_SESSION_ID;
+        state.next_terminal_id = MAX_DURABLE_SESSION_ID;
+        let mut workspace = empty_workspace(WorkspaceId(1), "workspace");
+        workspace.chats.push(ChatSession {
+            id: ChatId(MAX_DURABLE_SESSION_ID),
+            name: "chat".to_string(),
+            status: ChatStatus::Idle,
+            agent: AgentKind::Pi,
+            messages: Vec::new(),
+        });
+        workspace.terminals.push(TerminalSession {
+            id: TerminalId(MAX_DURABLE_SESSION_ID),
+            name: "terminal".to_string(),
+            status: TerminalStatus::Stopped,
+            launch: TerminalLaunch::Shell,
+        });
+        state.workspaces.push(workspace);
+
+        assert!(state
+            .normalize_next_ids()
+            .expect("normalization should wrap to a free durable ID"));
+
+        assert_eq!(
+            state.workspaces[0].chats[0].id,
+            ChatId(MAX_DURABLE_SESSION_ID)
+        );
+        assert_eq!(
+            state.workspaces[0].terminals[0].id,
+            TerminalId(MAX_DURABLE_SESSION_ID)
+        );
+        assert_eq!(state.next_chat_id, 1);
+        assert_eq!(state.next_terminal_id, 1);
+    }
+
+    #[test]
+    fn allocation_skips_colliding_hints() {
+        let mut state = ProjectState::default();
+        state.next_workspace_id = state.workspaces[0].id.0;
+        state.next_chat_id = 7;
+        state.workspaces[0].chats.push(ChatSession {
+            id: ChatId(7),
+            name: "existing".to_string(),
+            status: ChatStatus::Idle,
+            agent: AgentKind::Pi,
+            messages: Vec::new(),
+        });
+
+        let workspace = state
+            .add_workspace("new".to_string(), None)
+            .expect("workspace allocator should skip collisions");
+        let chat = state
+            .add_chat(
+                workspace,
+                "new".to_string(),
+                ChatStatus::Idle,
+                AgentKind::Pi,
+            )
+            .expect("chat allocator should skip collisions");
+
+        assert_eq!(workspace, WorkspaceId(3));
+        assert_eq!(chat, Some(ChatId(8)));
+    }
+
+    #[test]
+    fn normalization_repairs_duplicate_u64_max_ids_without_looping() {
+        let mut state = empty_state();
+        state.next_workspace_id = u64::MAX;
+        state.workspaces = vec![
+            empty_workspace(WorkspaceId(u64::MAX), "first"),
+            empty_workspace(WorkspaceId(u64::MAX), "duplicate"),
+        ];
+
+        assert!(state
+            .normalize_next_ids()
+            .expect("normalization should find the wrapped gap"));
+
+        assert_eq!(state.workspaces[0].id, WorkspaceId(u64::MAX));
+        assert_eq!(state.workspaces[1].id, WorkspaceId(1));
+        assert_eq!(state.next_workspace_id, 2);
+    }
+
+    #[test]
+    fn bounded_allocator_reports_exhaustion_after_taking_last_id() {
+        let mut used = BTreeSet::from([1, 2]);
+
+        assert_eq!(take_available_id(&mut used, 3, 3), Some((3, 0)));
+        assert_eq!(take_available_id(&mut used, 0, 3), None);
+    }
+
+    #[test]
     fn remove_workspace_chat_and_terminal_by_id() {
         let mut state = ProjectState::seeded();
         let workspace = state.workspaces[0].id;
@@ -722,5 +1039,26 @@ mod tests {
 
         assert_eq!(state.remove_workspace(workspace).unwrap().id, workspace);
         assert!(state.workspace(workspace).is_none());
+    }
+
+    fn empty_state() -> ProjectState {
+        ProjectState {
+            version: STATE_VERSION,
+            next_workspace_id: 1,
+            next_chat_id: 1,
+            next_terminal_id: 1,
+            workspaces: Vec::new(),
+        }
+    }
+
+    fn empty_workspace(id: WorkspaceId, name: &str) -> Workspace {
+        Workspace {
+            id,
+            name: name.to_string(),
+            cwd: None,
+            environment: BTreeMap::new(),
+            chats: Vec::new(),
+            terminals: Vec::new(),
+        }
     }
 }

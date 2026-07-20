@@ -36,6 +36,9 @@ pub struct App {
     pub text_selection: Option<TextSelection>,
     pub should_quit: bool,
     dirty: bool,
+    recoverable_terminals: BTreeSet<TerminalId>,
+    save_error: Option<String>,
+    operation_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +47,7 @@ pub enum Prompt {
     NewTerminalCommand(TerminalCommandPrompt),
     CommandPalette(CommandPalettePrompt),
     Search(SearchPrompt),
+    ConfirmDelete(DeleteConfirmationPrompt),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -90,6 +94,13 @@ pub struct CommandPalettePrompt {
 pub struct SearchPrompt {
     pub input: String,
     pub scope: SearchScope,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteConfirmationPrompt {
+    target: DeleteTarget,
+    pub description: String,
     pub error: Option<String>,
 }
 
@@ -217,7 +228,13 @@ impl App {
     pub fn new(mut project: ProjectState) -> Self {
         let version_normalized = project.version != STATE_VERSION;
         project.version = STATE_VERSION;
-        let ids_normalized = project.normalize_next_ids();
+        let (ids_normalized, operation_error) = match project.normalize_next_ids() {
+            Ok(changed) => (changed, None),
+            Err(error) => (
+                false,
+                Some(format!("could not normalize persisted IDs: {error}")),
+            ),
+        };
         let titles_normalized = normalize_agent_chat_titles(&mut project);
         let chat_statuses_normalized = normalize_transient_chat_statuses(&mut project);
         let chat_buffers = project
@@ -226,6 +243,20 @@ impl App {
             .flat_map(|workspace| workspace.chats.iter())
             .map(|chat| (chat.id, ChatBuffer::from_messages(&chat.messages)))
             .filter(|(_, buffer)| !buffer.is_empty())
+            .collect();
+        // A stopped command loaded from disk must require a deliberate start.
+        // This also carries restoration safety across client restarts without
+        // changing the durable schema: a vanished Running command is saved as
+        // Stopped, then reconstructed here as recovery-required on next load.
+        let recoverable_terminals = project
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.terminals.iter())
+            .filter_map(|terminal| {
+                (terminal.status == TerminalStatus::Stopped
+                    && matches!(terminal.launch, crate::model::TerminalLaunch::Command(_)))
+                .then_some(terminal.id)
+            })
             .collect();
         let mut app = Self {
             project,
@@ -242,6 +273,9 @@ impl App {
                 || ids_normalized
                 || titles_normalized
                 || chat_statuses_normalized,
+            recoverable_terminals,
+            save_error: None,
+            operation_error,
         };
         app.reconcile_selection(None);
         app.sync_focus_to_selection();
@@ -252,12 +286,41 @@ impl App {
         self.should_quit = true;
     }
 
+    pub fn cancel_quit(&mut self) {
+        self.should_quit = false;
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
 
     pub fn mark_clean(&mut self) {
+        self.mark_saved();
+    }
+
+    pub fn mark_saved(&mut self) {
         self.dirty = false;
+        self.save_error = None;
+    }
+
+    pub fn record_save_failure(&mut self, message: impl Into<String>) {
+        self.save_error = Some(message.into());
+    }
+
+    pub fn save_error(&self) -> Option<&str> {
+        self.save_error.as_deref()
+    }
+
+    pub fn operation_error(&self) -> Option<&str> {
+        self.operation_error.as_deref()
+    }
+
+    fn record_operation_failure(&mut self, message: impl Into<String>) {
+        self.operation_error = Some(message.into());
+    }
+
+    fn clear_operation_error(&mut self) {
+        self.operation_error = None;
     }
 
     pub fn is_prompt_active(&self) -> bool {
@@ -838,12 +901,45 @@ impl App {
         self.selected_search_scope().is_some()
     }
 
-    pub fn delete_selected_immediately(&mut self) -> Vec<PtyKey> {
+    pub fn begin_delete_selected(&mut self) -> bool {
         let Some(target) = self.selected_delete_target() else {
+            return false;
+        };
+        let description = self.delete_target_description(target);
+        self.prompt = Some(Prompt::ConfirmDelete(DeleteConfirmationPrompt {
+            target,
+            description,
+            error: None,
+        }));
+        true
+    }
+
+    pub fn pending_delete_target(&self) -> Option<DeleteTarget> {
+        match &self.prompt {
+            Some(Prompt::ConfirmDelete(prompt)) => Some(prompt.target),
+            _ => None,
+        }
+    }
+
+    pub fn pending_delete_pty(&self) -> Option<PtyKey> {
+        match self.pending_delete_target()? {
+            DeleteTarget::Workspace(_) => None,
+            DeleteTarget::Chat { chat, .. } => Some(PtyKey::ChatAgent(chat)),
+            DeleteTarget::Terminal { terminal, .. } => Some(PtyKey::Terminal(terminal)),
+        }
+    }
+
+    pub fn set_delete_error(&mut self, message: impl Into<String>) {
+        if let Some(Prompt::ConfirmDelete(prompt)) = &mut self.prompt {
+            prompt.error = Some(message.into());
+        }
+    }
+
+    pub fn confirm_delete(&mut self) -> Vec<PtyKey> {
+        let Some(Prompt::ConfirmDelete(prompt)) = self.prompt.take() else {
             return Vec::new();
         };
-        self.prompt = None;
-        self.delete_target(target)
+        self.delete_target(prompt.target)
     }
 
     fn delete_target(&mut self, target: DeleteTarget) -> Vec<PtyKey> {
@@ -879,6 +975,7 @@ impl App {
             } => {
                 if self.project.remove_terminal(workspace, terminal).is_some() {
                     runtime_terminals.push(PtyKey::Terminal(terminal));
+                    self.recoverable_terminals.remove(&terminal);
                     self.dirty = true;
                     self.remove_workspace_if_empty(workspace);
                 }
@@ -888,6 +985,29 @@ impl App {
         self.reconcile_selection(previous_index);
         self.normalize_focus();
         runtime_terminals
+    }
+
+    fn delete_target_description(&self, target: DeleteTarget) -> String {
+        match target {
+            DeleteTarget::Workspace(workspace) => self
+                .project
+                .workspace(workspace)
+                .map(|workspace| format!("empty workspace `{}`", workspace.name))
+                .unwrap_or_else(|| "missing workspace".to_string()),
+            DeleteTarget::Chat { workspace, chat } => self
+                .project
+                .chat(workspace, chat)
+                .map(|chat| format!("{} chat `{}`", chat.agent.display_name(), chat.name))
+                .unwrap_or_else(|| "missing chat".to_string()),
+            DeleteTarget::Terminal {
+                workspace,
+                terminal,
+            } => self
+                .project
+                .terminal(workspace, terminal)
+                .map(|terminal| format!("terminal `{}`", terminal.name))
+                .unwrap_or_else(|| "missing terminal".to_string()),
+        }
     }
 
     fn selected_delete_target(&self) -> Option<DeleteTarget> {
@@ -928,12 +1048,29 @@ impl App {
     }
 
     pub fn mark_terminal_running(&mut self, terminal: TerminalId) {
+        self.recoverable_terminals.remove(&terminal);
         if let Some(terminal) = self.project.terminal_mut_by_id(terminal) {
             if terminal.status != TerminalStatus::Running {
                 terminal.status = TerminalStatus::Running;
                 self.dirty = true;
             }
         }
+    }
+
+    pub fn mark_terminal_recoverable(&mut self, terminal: TerminalId) {
+        if self
+            .project
+            .terminal_mut_by_id(terminal)
+            .is_some_and(|terminal| {
+                matches!(terminal.launch, crate::model::TerminalLaunch::Command(_))
+            })
+        {
+            self.recoverable_terminals.insert(terminal);
+        }
+    }
+
+    pub fn terminal_requires_recovery(&self, terminal: TerminalId) -> bool {
+        self.recoverable_terminals.contains(&terminal)
     }
 
     pub fn mark_terminal_stopped(&mut self, terminal: TerminalId) {
@@ -1333,12 +1470,32 @@ impl App {
             .filter(|name| !name.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| workspace_name(&cwd));
-        let workspace = self.project.add_workspace(name, Some(cwd));
-        self.project
-            .add_terminal(workspace, "shell".to_string(), TerminalStatus::Stopped);
+        // Stage both allocations so terminal-ID exhaustion cannot leave a
+        // half-imported workspace in memory.
+        let mut project = self.project.clone();
+        let workspace = match project.add_workspace(name, Some(cwd)) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                self.set_open_workspace_error(error.to_string());
+                return;
+            }
+        };
+        match project.add_terminal(workspace, "shell".to_string(), TerminalStatus::Stopped) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                self.set_open_workspace_error("new workspace disappeared during import");
+                return;
+            }
+            Err(error) => {
+                self.set_open_workspace_error(error.to_string());
+                return;
+            }
+        }
+        self.project = project;
 
         self.prompt = None;
         self.select_first_item_in_workspace(workspace);
+        self.clear_operation_error();
         self.dirty = true;
     }
 
@@ -1364,18 +1521,23 @@ impl App {
             .unwrap_or(1);
         let name = command_terminal_name(&command, next);
 
-        if let Some(terminal) = self.project.add_command_terminal(
+        match self.project.add_command_terminal(
             workspace,
             name.clone(),
             TerminalStatus::Stopped,
             command,
         ) {
-            self.prompt = None;
-            self.select_item(NavItem::Terminal {
-                workspace,
-                terminal,
-            });
-            self.dirty = true;
+            Ok(Some(terminal)) => {
+                self.prompt = None;
+                self.select_item(NavItem::Terminal {
+                    workspace,
+                    terminal,
+                });
+                self.clear_operation_error();
+                self.dirty = true;
+            }
+            Ok(None) => self.set_terminal_command_error("selected workspace no longer exists"),
+            Err(error) => self.set_terminal_command_error(error.to_string()),
         }
     }
 
@@ -1385,10 +1547,22 @@ impl App {
     ) -> Option<(WorkspaceId, ChatId)> {
         let workspace = self.selected_workspace_id()?;
         let name = DEFAULT_AGENT_CHAT_TITLE.to_string();
-        let chat = self
+        let chat = match self
             .project
-            .add_chat(workspace, name, ChatStatus::Idle, agent)?;
+            .add_chat(workspace, name, ChatStatus::Idle, agent)
+        {
+            Ok(Some(chat)) => chat,
+            Ok(None) => {
+                self.record_operation_failure("selected workspace no longer exists");
+                return None;
+            }
+            Err(error) => {
+                self.record_operation_failure(error.to_string());
+                return None;
+            }
+        };
         self.select_item(NavItem::Chat { workspace, chat });
+        self.clear_operation_error();
         self.dirty = true;
         Some((workspace, chat))
     }
@@ -1404,15 +1578,20 @@ impl App {
             .unwrap_or(1);
 
         let name = format!("terminal-{next}");
-        if let Some(terminal) =
-            self.project
-                .add_terminal(workspace, name.clone(), TerminalStatus::Stopped)
+        match self
+            .project
+            .add_terminal(workspace, name.clone(), TerminalStatus::Stopped)
         {
-            self.select_item(NavItem::Terminal {
-                workspace,
-                terminal,
-            });
-            self.dirty = true;
+            Ok(Some(terminal)) => {
+                self.select_item(NavItem::Terminal {
+                    workspace,
+                    terminal,
+                });
+                self.clear_operation_error();
+                self.dirty = true;
+            }
+            Ok(None) => self.record_operation_failure("selected workspace no longer exists"),
+            Err(error) => self.record_operation_failure(error.to_string()),
         }
     }
 
@@ -1966,6 +2145,21 @@ mod tests {
     }
 
     #[test]
+    fn persisted_stopped_command_requires_deliberate_recovery_until_running() {
+        let mut state = ProjectState::default();
+        let terminal = state.workspaces[0].terminals[0].id;
+        state.workspaces[0].terminals[0].launch =
+            crate::model::TerminalLaunch::Command("cargo test".to_string());
+        state.workspaces[0].terminals[0].status = TerminalStatus::Stopped;
+
+        let mut app = App::new(state);
+        assert!(app.terminal_requires_recovery(terminal));
+
+        app.mark_terminal_running(terminal);
+        assert!(!app.terminal_requires_recovery(terminal));
+    }
+
+    #[test]
     fn command_palette_filters_and_returns_existing_actions() {
         let mut app = App::default();
 
@@ -2037,7 +2231,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_selected_terminal_removes_it_immediately() {
+    fn delete_selected_terminal_requires_confirmation() {
         let mut app = App::default();
         let workspace = app.project.workspaces[0].id;
         let terminal = app.project.workspaces[0].terminals[0].id;
@@ -2045,11 +2239,34 @@ mod tests {
             workspace,
             terminal,
         });
-        let runtime_terminals = app.delete_selected_immediately();
 
+        assert!(app.begin_delete_selected());
+        assert_eq!(app.pending_delete_pty(), Some(PtyKey::Terminal(terminal)));
+        assert!(app.project.terminal(workspace, terminal).is_some());
+
+        let runtime_terminals = app.confirm_delete();
         assert_eq!(runtime_terminals, vec![PtyKey::Terminal(terminal)]);
         assert!(app.project.terminal(workspace, terminal).is_none());
         assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn delete_confirmation_can_be_cancelled_without_mutation() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        let terminal = app.project.workspaces[0].terminals[0].id;
+        app.select_item(NavItem::Terminal {
+            workspace,
+            terminal,
+        });
+        app.mark_clean();
+
+        assert!(app.begin_delete_selected());
+        app.cancel_prompt();
+
+        assert!(app.project.terminal(workspace, terminal).is_some());
+        assert_eq!(app.prompt, None);
+        assert!(!app.is_dirty());
     }
 
     #[test]
@@ -2060,7 +2277,8 @@ mod tests {
         app.select_item(NavItem::Chat { workspace, chat });
         app.chat_buffers.insert(chat, ChatBuffer::default());
         let pi_terminal = PtyKey::ChatAgent(chat);
-        let runtime_terminals = app.delete_selected_immediately();
+        assert!(app.begin_delete_selected());
+        let runtime_terminals = app.confirm_delete();
 
         assert_eq!(runtime_terminals, vec![pi_terminal]);
         assert!(app.project.chat(workspace, chat).is_none());
@@ -2113,7 +2331,8 @@ mod tests {
         app.select_item(items[0]);
         assert_eq!(app.selected_item(), Some(items[0]));
 
-        app.delete_selected_immediately();
+        assert!(app.begin_delete_selected());
+        app.confirm_delete();
 
         // The item that shifts into the vacated slot becomes selected (the old
         // second item), matching the position-stable behavior.
@@ -2130,7 +2349,8 @@ mod tests {
         let chat = app.project.workspaces[0].chats[0].id;
         app.select_item(NavItem::Chat { workspace, chat });
 
-        let runtime_terminals = app.delete_selected_immediately();
+        assert!(app.begin_delete_selected());
+        let runtime_terminals = app.confirm_delete();
 
         assert_eq!(runtime_terminals, vec![PtyKey::ChatAgent(chat)]);
         assert!(app.project.workspace(workspace).is_none());
@@ -2146,7 +2366,8 @@ mod tests {
         let workspace = app.project.workspaces[0].id;
         app.reconcile_selection(None);
 
-        let runtime_terminals = app.delete_selected_immediately();
+        assert!(app.begin_delete_selected());
+        let runtime_terminals = app.confirm_delete();
 
         assert!(runtime_terminals.is_empty());
         assert!(app.project.workspace(workspace).is_none());

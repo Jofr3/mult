@@ -602,13 +602,20 @@ fn handle_client_messages(
             ClientMessage::Stop { pane } => {
                 let target = { server.lock().map_err(lock_error)?.pane_by_id(pane) };
                 let Some(target) = target else {
+                    let _ = client.sender.try_send(ServerMessage::StopResult {
+                        pane,
+                        stopped: false,
+                        error: None,
+                    });
                     continue;
                 };
 
                 // Take the child out under a brief lock, then kill+reap with the
                 // pane lock released so the blocking wait never stalls the reader
                 // thread. Remove the session by identity so a recycled id created
-                // in the meantime is never torn down by mistake.
+                // in the meantime is never torn down by mistake. The correlated
+                // result lets clients retain durable state unless cleanup was
+                // confirmed successful (or the pane was already absent).
                 let (session, child) = {
                     let mut target = target.lock().map_err(lock_error)?;
                     (target.session, target.take_child())
@@ -619,10 +626,17 @@ fn handle_client_messages(
                             .lock()
                             .map_err(lock_error)?
                             .remove_session_if_same(session, &target);
+                        let _ = client.sender.try_send(ServerMessage::StopResult {
+                            pane,
+                            stopped: true,
+                            error: None,
+                        });
                     }
                     Err(error) => {
-                        let _ = client.sender.try_send(ServerMessage::Error {
-                            message: format!("failed to stop pane: {error}"),
+                        let _ = client.sender.try_send(ServerMessage::StopResult {
+                            pane,
+                            stopped: false,
+                            error: Some(format!("failed to stop pane: {error}")),
                         });
                     }
                 }
@@ -1014,8 +1028,7 @@ fn kill_and_reap(child: Option<Box<dyn Child + Send + Sync>>) -> io::Result<()> 
         return Ok(());
     };
     child.kill()?;
-    let _ = child.wait();
-    Ok(())
+    child.wait().map(|_| ())
 }
 
 fn bounded_pty_dimensions(rows: u16, cols: u16) -> (u16, u16) {
@@ -1103,6 +1116,8 @@ mod tests {
 
     use super::*;
 
+    const TEST_IO_TIMEOUT: Duration = Duration::from_secs(2);
+
     #[test]
     fn exit_info_preserves_child_exit_code() {
         let info = exit_info(ExitStatus::with_exit_code(7));
@@ -1167,10 +1182,10 @@ mod tests {
     fn server_rejects_incompatible_client_protocol_version() {
         let (mut client_stream, server_stream) = UnixStream::pair().expect("create socket pair");
         client_stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
+            .set_read_timeout(Some(TEST_IO_TIMEOUT))
             .expect("set read timeout");
         let server = Arc::new(Mutex::new(ServerState::default()));
-        let server_thread = thread::spawn(move || handle_client(server_stream, server));
+        let (server_thread, completion) = spawn_client_handler(server_stream, server);
 
         write_message(
             &mut client_stream,
@@ -1184,20 +1199,21 @@ mod tests {
         assert!(
             matches!(message, ServerMessage::Error { message } if message.contains("incompatible"))
         );
-        server_thread
-            .join()
-            .expect("server thread should not panic")
-            .expect("server handles incompatible hello");
+        await_client_handler(
+            server_thread,
+            completion,
+            "server handling an incompatible protocol hello",
+        );
     }
 
     #[test]
     fn server_rejects_non_hello_first_message() {
         let (mut client_stream, server_stream) = UnixStream::pair().expect("create socket pair");
         client_stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
+            .set_read_timeout(Some(TEST_IO_TIMEOUT))
             .expect("set read timeout");
         let server = Arc::new(Mutex::new(ServerState::default()));
-        let server_thread = thread::spawn(move || handle_client(server_stream, server));
+        let (server_thread, completion) = spawn_client_handler(server_stream, server);
 
         write_message(&mut client_stream, &ClientMessage::ListSessions)
             .expect("write non-hello message");
@@ -1206,10 +1222,38 @@ mod tests {
         assert!(
             matches!(message, ServerMessage::Error { message } if message.contains("expected protocol hello"))
         );
+        await_client_handler(
+            server_thread,
+            completion,
+            "server rejecting a non-hello first message",
+        );
+    }
+
+    fn spawn_client_handler(
+        stream: UnixStream,
+        server: SharedServer,
+    ) -> (thread::JoinHandle<()>, mpsc::Receiver<io::Result<()>>) {
+        let (completion_sender, completion) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let _ = completion_sender.send(handle_client(stream, server));
+        });
+        (server_thread, completion)
+    }
+
+    fn await_client_handler(
+        server_thread: thread::JoinHandle<()>,
+        completion: mpsc::Receiver<io::Result<()>>,
+        operation: &str,
+    ) {
+        let result = completion
+            .recv_timeout(TEST_IO_TIMEOUT)
+            .unwrap_or_else(|error| {
+                panic!("timed out after {TEST_IO_TIMEOUT:?} waiting for {operation}: {error}")
+            });
         server_thread
             .join()
-            .expect("server thread should not panic")
-            .expect("server rejects non-hello first message");
+            .expect("completed server thread should not panic");
+        result.unwrap_or_else(|error| panic!("failed while {operation}: {error}"));
     }
 
     #[test]
@@ -1360,10 +1404,21 @@ mod tests {
             broadcast_pty_output(PaneId(3), b"data".to_vec(), std::slice::from_ref(&client));
 
         assert!(dropped.is_empty());
-        assert!(matches!(
-            receiver.recv(),
-            Ok(ServerMessage::PtyOutput { pane, bytes }) if pane == PaneId(3) && bytes == b"data"
-        ));
+        let message = receiver
+            .recv_timeout(TEST_IO_TIMEOUT)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "timed out after {TEST_IO_TIMEOUT:?} waiting for PTY output for pane 3: {error}"
+                )
+            });
+        assert!(
+            matches!(
+                &message,
+                ServerMessage::PtyOutput { pane, bytes }
+                    if *pane == PaneId(3) && bytes.as_slice() == b"data"
+            ),
+            "expected PTY output for pane 3, got {message:?}"
+        );
     }
 
     #[test]

@@ -215,7 +215,7 @@ impl PaneLayout {
 }
 
 fn prompt_height(app: &App) -> u16 {
-    match &app.prompt {
+    let prompt_height = match &app.prompt {
         Some(Prompt::CommandPalette(_)) => 7,
         Some(Prompt::OpenWorkspace(prompt))
             if prompt.mode == OpenWorkspaceMode::ConfiguredProjects =>
@@ -224,7 +224,10 @@ fn prompt_height(app: &App) -> u16 {
         }
         Some(_) => 3,
         None => 0,
-    }
+    };
+    let error_height =
+        u16::from(app.save_error().is_some()) + u16::from(app.operation_error().is_some());
+    prompt_height + error_height
 }
 
 fn terminal_output_area(main: Rect) -> Rect {
@@ -724,12 +727,18 @@ fn draw_terminal_details(
     }
 
     if pty_runtime.terminal_output_is_blank(PtyKey::Terminal(terminal_id)) {
-        let mut lines = vec![match terminal.status {
-            TerminalStatus::Running => {
-                Line::from("Terminal is running; waiting for output. Type to send PTY input.")
-            }
-            TerminalStatus::Stopped => {
-                Line::from("Terminal is stopped. Type to start it and send input.")
+        let mut lines = vec![if app.terminal_requires_recovery(terminal_id) {
+            Line::from(
+                "Command was not restored or auto-started. Type or use Start selected PTY to run it deliberately.",
+            )
+        } else {
+            match terminal.status {
+                TerminalStatus::Running => {
+                    Line::from("Terminal is running; waiting for output. Type to send PTY input.")
+                }
+                TerminalStatus::Stopped => {
+                    Line::from("Terminal is stopped. Type to start it and send input.")
+                }
             }
         }];
         if let TerminalLaunch::Command(command) = &terminal.launch {
@@ -1028,9 +1037,33 @@ fn draw_prompt_area(
     palette: Palette,
     config: &config::Config,
 ) {
+    let errors = [
+        app.save_error()
+            .map(|error| format!("State save failed: {error} — edit or quit to retry")),
+        app.operation_error()
+            .map(|error| format!("Operation failed: {error}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let error_height = u16::try_from(errors.len()).unwrap_or(u16::MAX);
+    let [error_area, prompt_area] =
+        Layout::vertical([Constraint::Length(error_height), Constraint::Min(0)]).areas(area);
+    if !errors.is_empty() {
+        let lines = errors
+            .into_iter()
+            .map(|error| Line::from(Span::styled(error, Style::default().fg(palette.love))))
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().fg(palette.text).bg(palette.base)),
+            error_area,
+        );
+    }
+
     let Some(prompt) = &app.prompt else {
         return;
     };
+    let area = prompt_area;
 
     match prompt {
         Prompt::OpenWorkspace(prompt) if prompt.mode == OpenWorkspaceMode::ConfiguredProjects => {
@@ -1079,7 +1112,42 @@ fn draw_prompt_area(
             prompt.error.as_deref(),
             "enter applies filter • empty enter clears • esc/ctrl-c cancels",
         ),
+        Prompt::ConfirmDelete(prompt) => draw_delete_confirmation_prompt(
+            frame,
+            area,
+            palette,
+            &prompt.description,
+            prompt.error.as_deref(),
+        ),
     }
+}
+
+fn draw_delete_confirmation_prompt(
+    frame: &mut Frame,
+    area: Rect,
+    palette: Palette,
+    description: &str,
+    error: Option<&str>,
+) {
+    let mut lines = vec![Line::from(vec![
+        Span::styled("Delete ", Style::default().fg(palette.love)),
+        Span::raw(description.to_string()),
+        Span::raw("?"),
+    ])];
+    if let Some(error) = error {
+        lines.push(Line::from(Span::styled(
+            error.to_string(),
+            Style::default().fg(palette.love),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "enter confirms • esc/ctrl-c cancels",
+        Style::default().fg(palette.muted),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(palette.text).bg(palette.base)),
+        area,
+    );
 }
 
 fn search_prompt_label(scope: SearchScope) -> &'static str {
@@ -1629,6 +1697,35 @@ mod tests {
         assert!(text.contains("Type to start it and send input."));
         assert!(!text.contains("Press `i`"));
         assert!(!text.contains("input mode"));
+    }
+
+    #[test]
+    fn save_failure_is_rendered_persistently_without_a_prompt() {
+        let mut app = App::default();
+        app.record_save_failure("disk full");
+
+        let text = draw_text(&app, &PtyRuntime::new_offline(), 100, 30);
+
+        assert!(text.contains("State save failed: disk full"));
+        assert!(text.contains("edit or quit to retry"));
+    }
+
+    #[test]
+    fn delete_confirmation_names_the_target_and_controls() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        let terminal = app.project.workspaces[0].terminals[0].id;
+        app.select_item(NavItem::Terminal {
+            workspace,
+            terminal,
+        });
+        assert!(app.begin_delete_selected());
+
+        let text = draw_text(&app, &PtyRuntime::new_offline(), 100, 30);
+
+        assert!(text.contains("Delete terminal"));
+        assert!(text.contains("enter confirms"));
+        assert!(text.contains("esc/ctrl-c cancels"));
     }
 
     #[test]

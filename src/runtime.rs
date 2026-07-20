@@ -6,6 +6,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -21,7 +22,7 @@ use mult::{
     config::Config,
     git,
     model::{self, AgentKind, ChatStatus, PtyKey, TerminalLaunch, TerminalStatus},
-    pty::{PtyDimensions, PtyEvent, PtyRuntime, PtySpawn},
+    pty::{AttachExistingResult, PtyDimensions, PtyEvent, PtyRuntime, PtySpawn},
     storage, ui,
 };
 use ratatui::{layout::Rect, DefaultTerminal};
@@ -163,7 +164,12 @@ fn split_process_agent_command(raw: &str) -> Result<Vec<String>, &'static str> {
     Ok(args)
 }
 
-pub fn run(terminal: &mut DefaultTerminal, mut app: App, config: Config) -> io::Result<()> {
+pub fn run(
+    terminal: &mut DefaultTerminal,
+    mut app: App,
+    config: Config,
+    shutdown: &AtomicBool,
+) -> io::Result<()> {
     let mut pty_runtime = PtyRuntime::default();
     let mut agent_backend = RuntimeAgentBackend::from_env();
     let size = terminal.size()?;
@@ -180,6 +186,13 @@ pub fn run(terminal: &mut DefaultTerminal, mut app: App, config: Config) -> io::
     // auto-start/resize that altered state.
     let mut needs_redraw = true;
     while !app.should_quit {
+        if shutdown.load(Ordering::Relaxed) {
+            // Signals must not strand the terminal in raw mode. Make one
+            // best-effort checkpoint, then return so the terminal guard can
+            // restore the user's TTY even when persistence remains broken.
+            save_if_dirty_with(&mut app, true, storage::save);
+            return Ok(());
+        }
         if last_git_branch_refresh.elapsed() >= GIT_BRANCH_REFRESH_INTERVAL {
             refresh_workspace_git_branches(&mut app);
             last_git_branch_refresh = Instant::now();
@@ -188,7 +201,7 @@ pub fn run(terminal: &mut DefaultTerminal, mut app: App, config: Config) -> io::
         needs_redraw |= drain_pty_events(&mut app, &mut pty_runtime);
         needs_redraw |= drain_agent_events(&mut app, &mut agent_backend);
         needs_redraw |= drain_mult_agent_status_events(&mut app);
-        save_if_dirty(&mut app)?;
+        needs_redraw |= save_if_dirty_with(&mut app, false, storage::save);
         needs_redraw |= resize_visible_terminal(&mut app, &mut pty_runtime, &config, frame_area);
         needs_redraw |= resize_visible_chat_agent(&mut app, &mut pty_runtime, &config, frame_area);
         needs_redraw |=
@@ -221,11 +234,10 @@ pub fn run(terminal: &mut DefaultTerminal, mut app: App, config: Config) -> io::
                     frame_area,
                 );
             }
-            save_if_dirty(&mut app)?;
+            needs_redraw |= save_if_dirty_with(&mut app, true, storage::save);
         }
     }
 
-    save_if_dirty(&mut app)?;
     Ok(())
 }
 
@@ -254,13 +266,50 @@ fn restore_persisted_sessions(
         .iter()
         .flat_map(|workspace| {
             workspace.terminals.iter().filter_map(|terminal| {
-                (terminal.status == TerminalStatus::Running).then_some((workspace.id, terminal.id))
+                (terminal.status == TerminalStatus::Running).then_some((
+                    workspace.id,
+                    terminal.id,
+                    terminal.name.clone(),
+                    matches!(terminal.launch, TerminalLaunch::Command(_)),
+                ))
             })
         })
         .collect::<Vec<_>>();
 
-    for (workspace, terminal) in terminals {
-        start_terminal(app, pty_runtime, config, frame_area, workspace, terminal);
+    for (workspace, terminal, name, is_command) in terminals {
+        let key = PtyKey::Terminal(terminal);
+        let size = terminal_dimensions(app, frame_area);
+        match pty_runtime.attach_existing(key, size) {
+            Ok(AttachExistingResult::Attached) => app.mark_terminal_running(terminal),
+            Ok(AttachExistingResult::Missing) => {
+                app.mark_terminal_stopped(terminal);
+                if is_command {
+                    app.mark_terminal_recoverable(terminal);
+                    pty_runtime.append_terminal_system_line(
+                        key,
+                        format!(
+                            "command terminal `{name}` was not relaunched because its daemon session is unavailable; type or use Start selected PTY to start it deliberately"
+                        ),
+                    );
+                } else {
+                    // Preserve existing shell restoration behavior. The strict
+                    // no-relaunch rule applies to configured command terminals.
+                    start_terminal(app, pty_runtime, config, frame_area, workspace, terminal);
+                }
+            }
+            Err(error) if is_command => {
+                app.mark_terminal_stopped(terminal);
+                app.mark_terminal_recoverable(terminal);
+                pty_runtime.append_terminal_system_line(
+                    key,
+                    format!("failed to restore terminal `{name}` without relaunching it: {error}"),
+                );
+            }
+            Err(_) => {
+                app.mark_terminal_stopped(terminal);
+                start_terminal(app, pty_runtime, config, frame_area, workspace, terminal);
+            }
+        }
     }
 
     let chats = app
@@ -316,6 +365,7 @@ fn handle_key(
             handle_command_palette_key(app, pty_runtime, config, key, frame_area);
         }
         Some(Prompt::Search(_)) => handle_search_key(app, key),
+        Some(Prompt::ConfirmDelete(_)) => handle_delete_confirmation_key(app, pty_runtime, key),
         None => handle_unprompted_key(app, pty_runtime, config, key, frame_area),
     }
 }
@@ -636,7 +686,7 @@ fn handle_control_key(
         return true;
     }
     if is_unshifted_control_char(key, 'q') {
-        delete_selected_now(app, pty_runtime);
+        app.begin_delete_selected();
         return true;
     }
     if is_unshifted_control_char(key, 'p') {
@@ -767,11 +817,28 @@ fn add_agent_to_selected_workspace(
     }
 }
 
-fn delete_selected_now(app: &mut App, pty_runtime: &mut PtyRuntime) {
-    for terminal in app.delete_selected_immediately() {
-        let _ = pty_runtime.stop(terminal);
+fn confirm_pending_delete(app: &mut App, pty_runtime: &mut PtyRuntime) {
+    let removed =
+        confirm_pending_delete_with(app, |_, terminal| pty_runtime.stop(terminal).map(|_| ()));
+    for terminal in removed {
         pty_runtime.remove_terminal(terminal);
     }
+}
+
+fn confirm_pending_delete_with(
+    app: &mut App,
+    mut stop: impl FnMut(&App, PtyKey) -> io::Result<()>,
+) -> Vec<PtyKey> {
+    if let Some(terminal) = app.pending_delete_pty() {
+        // The target is still present here. Durable state is mutated only after
+        // the daemon accepted the stop request (or no attachment existed).
+        if let Err(error) = stop(app, terminal) {
+            app.set_delete_error(format!("failed to stop PTY; item was not deleted: {error}"));
+            return Vec::new();
+        }
+    }
+
+    app.confirm_delete()
 }
 
 fn handle_selected_pty_input_key(
@@ -927,6 +994,15 @@ fn handle_search_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn handle_delete_confirmation_key(app: &mut App, pty_runtime: &mut PtyRuntime, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel_prompt(),
+        KeyCode::Enter => confirm_pending_delete(app, pty_runtime),
+        _ if is_unshifted_control_char(key, 'c') => app.cancel_prompt(),
+        _ => {}
+    }
+}
+
 fn execute_command_action(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
@@ -957,7 +1033,9 @@ fn execute_command_action(
             app.begin_new_terminal_command();
         }
         CommandAction::OpenWorkspace => app.begin_open_workspace(&config.projects),
-        CommandAction::DeleteSelected => delete_selected_now(app, pty_runtime),
+        CommandAction::DeleteSelected => {
+            app.begin_delete_selected();
+        }
         CommandAction::SearchSelectedPane => {
             app.begin_search();
         }
@@ -1139,6 +1217,9 @@ fn auto_start_selected_terminal(
     let Some((_, terminal_id)) = app.selected_terminal_id() else {
         return false;
     };
+    if app.terminal_requires_recovery(terminal_id) {
+        return false;
+    }
     let key = PtyKey::Terminal(terminal_id);
     if pty_runtime.is_running(key) || !pty_runtime.terminal_output_is_blank(key) {
         return false;
@@ -1758,18 +1839,325 @@ fn random_u64() -> io::Result<u64> {
     Ok(u64::from_ne_bytes(bytes))
 }
 
-fn save_if_dirty(app: &mut App) -> io::Result<()> {
-    if app.is_dirty() {
-        storage::save(&app.project)?;
-        app.mark_clean();
+fn save_if_dirty_with(
+    app: &mut App,
+    force_retry: bool,
+    mut saver: impl FnMut(&model::ProjectState) -> io::Result<()>,
+) -> bool {
+    if !app.is_dirty() || (!force_retry && app.save_error().is_some()) {
+        return false;
     }
 
-    Ok(())
+    match saver(&app.project) {
+        Ok(()) => {
+            app.mark_saved();
+            true
+        }
+        Err(error) => {
+            app.record_save_failure(error.to_string());
+            // A normal quit is never allowed to discard dirty state. Return to
+            // the TUI and require a fresh quit request after a later retry.
+            app.cancel_quit();
+            true
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, os::unix::net::UnixListener, sync::mpsc, thread};
+
+    use mult_protocol::{
+        read_message, write_message, ClientMessage, ExitInfo, PaneId, ServerMessage, SessionId,
+        PROTOCOL_VERSION,
+    };
+
     use super::*;
+
+    #[derive(Clone, Copy)]
+    enum RestorationReply {
+        Attached,
+        Missing,
+    }
+
+    fn connected_restoration_runtime(
+        terminal: model::TerminalId,
+        reply: RestorationReply,
+    ) -> (
+        PtyRuntime,
+        mpsc::Receiver<ClientMessage>,
+        thread::JoinHandle<()>,
+        PathBuf,
+    ) {
+        let socket_path = unique_status_path("restore").with_extension("sock");
+        let _ = fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("bind restoration test socket");
+        let (observed_tx, observed_rx) = mpsc::sync_channel(1);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept restoration client");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("bound restoration server reads");
+            let hello: ClientMessage = read_message(&mut stream).expect("read client hello");
+            assert!(matches!(hello, ClientMessage::Hello { .. }));
+            write_message(
+                &mut stream,
+                &ServerMessage::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                },
+            )
+            .expect("write server hello");
+            let message: ClientMessage =
+                read_message(&mut stream).expect("read restoration request");
+            observed_tx
+                .send(message)
+                .expect("report restoration request");
+            let response = match reply {
+                RestorationReply::Attached => ServerMessage::Attached {
+                    session: SessionId(terminal.0),
+                    panes: Vec::new(),
+                },
+                RestorationReply::Missing => ServerMessage::PaneExited {
+                    pane: PaneId(terminal.0),
+                    exit: ExitInfo {
+                        code: 1,
+                        signal: Some("server session unavailable".to_string()),
+                    },
+                },
+            };
+            write_message(&mut stream, &response).expect("write restoration response");
+        });
+        let runtime = PtyRuntime::connect_to_socket(socket_path.clone())
+            .expect("connect restoration runtime");
+        (runtime, observed_rx, server, socket_path)
+    }
+
+    fn running_command_app(command: String) -> (App, model::WorkspaceId, model::TerminalId) {
+        let mut state = model::ProjectState::default();
+        let workspace = state.workspaces[0].id;
+        let terminal = state.workspaces[0].terminals[0].id;
+        let session = state
+            .terminal_mut_by_id(terminal)
+            .expect("default terminal exists");
+        session.status = TerminalStatus::Running;
+        session.launch = TerminalLaunch::Command(command);
+        let mut app = App::new(state);
+        app.select_item(NavItem::Terminal {
+            workspace,
+            terminal,
+        });
+        (app, workspace, terminal)
+    }
+
+    #[test]
+    fn restoration_attaches_to_an_existing_command_session_without_creating_it() {
+        let (mut app, _, terminal) = running_command_app("echo restored".to_string());
+        let (mut runtime, observed, server, socket_path) =
+            connected_restoration_runtime(terminal, RestorationReply::Attached);
+
+        restore_persisted_sessions(
+            &mut app,
+            &mut runtime,
+            &Config::default(),
+            Rect::new(0, 0, 120, 40),
+        );
+
+        assert!(matches!(
+            observed
+                .recv_timeout(Duration::from_secs(2))
+                .expect("observe restoration request"),
+            ClientMessage::Attach { session, .. } if session == SessionId(terminal.0)
+        ));
+        assert!(runtime.is_running(PtyKey::Terminal(terminal)));
+        assert_eq!(
+            app.project.terminal_mut_by_id(terminal).unwrap().status,
+            TerminalStatus::Running
+        );
+        assert!(!app.terminal_requires_recovery(terminal));
+        server.join().expect("restoration server exits");
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[test]
+    fn missing_persisted_command_session_is_stopped_without_command_execution() {
+        let side_effect = unique_status_path("must-not-run");
+        let _ = fs::remove_file(&side_effect);
+        let command = format!(
+            "printf launched > {}",
+            shell_quote(&side_effect.display().to_string())
+        );
+        let (mut app, workspace, terminal) = running_command_app(command);
+        let (mut runtime, observed, server, socket_path) =
+            connected_restoration_runtime(terminal, RestorationReply::Missing);
+
+        restore_persisted_sessions(
+            &mut app,
+            &mut runtime,
+            &Config::default(),
+            Rect::new(0, 0, 120, 40),
+        );
+
+        assert!(matches!(
+            observed
+                .recv_timeout(Duration::from_secs(2))
+                .expect("observe restoration request"),
+            ClientMessage::Attach { .. }
+        ));
+        assert!(
+            !side_effect.exists(),
+            "restoration must not execute the command"
+        );
+        assert_eq!(
+            app.project.terminal(workspace, terminal).unwrap().status,
+            TerminalStatus::Stopped
+        );
+        assert!(app.terminal_requires_recovery(terminal));
+
+        // Saving the Stopped status and loading it again remains conservative:
+        // a blank pane still cannot auto-start until deliberate user input.
+        let mut reloaded = App::new(app.project.clone());
+        reloaded.select_item(NavItem::Terminal {
+            workspace,
+            terminal,
+        });
+        let offline_socket = unique_status_path("offline-restore").with_extension("sock");
+        let mut offline = PtyRuntime::with_socket_path(offline_socket);
+        assert!(!auto_start_selected_terminal(
+            &mut reloaded,
+            &mut offline,
+            &Config::default(),
+            Rect::new(0, 0, 120, 40),
+        ));
+        assert!(!side_effect.exists());
+
+        server.join().expect("restoration server exits");
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[test]
+    fn unreachable_daemon_marks_running_command_recoverable_without_execution() {
+        let side_effect = unique_status_path("unreachable-must-not-run");
+        let _ = fs::remove_file(&side_effect);
+        let command = format!(
+            "printf launched > {}",
+            shell_quote(&side_effect.display().to_string())
+        );
+        let (mut app, workspace, terminal) = running_command_app(command);
+        let socket = unique_status_path("unreachable-daemon").with_extension("sock");
+        let mut runtime = PtyRuntime::with_socket_path(socket);
+
+        restore_persisted_sessions(
+            &mut app,
+            &mut runtime,
+            &Config::default(),
+            Rect::new(0, 0, 120, 40),
+        );
+
+        assert_eq!(
+            app.project.terminal(workspace, terminal).unwrap().status,
+            TerminalStatus::Stopped
+        );
+        assert!(app.terminal_requires_recovery(terminal));
+        assert!(!side_effect.exists());
+    }
+
+    #[test]
+    fn failed_save_stays_dirty_and_retries_only_when_requested() {
+        let mut app = App::default();
+        app.add_terminal_to_selected_workspace();
+        let attempts = Cell::new(0);
+        let mut saver = |_: &model::ProjectState| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                Err(io::Error::other("disk full"))
+            } else {
+                Ok(())
+            }
+        };
+
+        assert!(save_if_dirty_with(&mut app, false, &mut saver));
+        assert!(app.is_dirty());
+        assert_eq!(app.save_error(), Some("disk full"));
+        assert!(!save_if_dirty_with(&mut app, false, &mut saver));
+        assert_eq!(attempts.get(), 1);
+
+        assert!(save_if_dirty_with(&mut app, true, &mut saver));
+        assert_eq!(attempts.get(), 2);
+        assert!(!app.is_dirty());
+        assert_eq!(app.save_error(), None);
+    }
+
+    #[test]
+    fn failed_quit_save_returns_to_tui_and_requires_a_fresh_quit() {
+        let mut app = App::default();
+        app.add_terminal_to_selected_workspace();
+        app.quit();
+
+        assert!(save_if_dirty_with(&mut app, true, |_| {
+            Err(io::Error::other("read-only filesystem"))
+        }));
+        assert!(!app.should_quit);
+        assert!(app.is_dirty());
+        assert_eq!(app.save_error(), Some("read-only filesystem"));
+
+        assert!(save_if_dirty_with(&mut app, true, |_| Ok(())));
+        assert!(
+            !app.should_quit,
+            "retry success does not revive the old quit"
+        );
+        assert!(!app.is_dirty());
+        app.quit();
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn delete_stop_failure_keeps_the_target_and_confirmation_open() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        let terminal = app.project.workspaces[0].terminals[0].id;
+        app.select_item(NavItem::Terminal {
+            workspace,
+            terminal,
+        });
+        app.mark_clean();
+        assert!(app.begin_delete_selected());
+
+        let removed = confirm_pending_delete_with(&mut app, |current, key| {
+            assert_eq!(key, PtyKey::Terminal(terminal));
+            assert!(current.project.terminal(workspace, terminal).is_some());
+            Err(io::Error::other("daemon refused stop"))
+        });
+
+        assert!(removed.is_empty());
+        assert!(app.project.terminal(workspace, terminal).is_some());
+        assert!(!app.is_dirty());
+        assert!(matches!(
+            app.prompt,
+            Some(Prompt::ConfirmDelete(ref prompt))
+                if prompt.error.as_deref().is_some_and(|error| error.contains("daemon refused stop"))
+        ));
+    }
+
+    #[test]
+    fn successful_delete_stops_before_mutating_project_state() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        let terminal = app.project.workspaces[0].terminals[0].id;
+        app.select_item(NavItem::Terminal {
+            workspace,
+            terminal,
+        });
+        assert!(app.begin_delete_selected());
+
+        let removed = confirm_pending_delete_with(&mut app, |current, key| {
+            assert_eq!(key, PtyKey::Terminal(terminal));
+            assert!(current.project.terminal(workspace, terminal).is_some());
+            Ok(())
+        });
+
+        assert_eq!(removed, vec![PtyKey::Terminal(terminal)]);
+        assert!(app.project.terminal(workspace, terminal).is_none());
+    }
 
     #[test]
     fn process_agent_command_parses_from_env_style_string() {
@@ -2019,12 +2407,14 @@ mod tests {
         // this bin-crate module).
         let mut state = model::ProjectState::default();
         let workspace = state.workspaces[0].id;
-        state.add_chat(
-            workspace,
-            model::DEFAULT_AGENT_CHAT_TITLE.to_string(),
-            ChatStatus::Idle,
-            AgentKind::Pi,
-        );
+        state
+            .add_chat(
+                workspace,
+                model::DEFAULT_AGENT_CHAT_TITLE.to_string(),
+                ChatStatus::Idle,
+                AgentKind::Pi,
+            )
+            .expect("chat ID is available");
         let mut app = App::new(state);
         app.project.workspaces[0].chats[0].id = model::ChatId(9_001);
         let chat = app.project.workspaces[0].chats[0].id;
@@ -2422,12 +2812,45 @@ mod tests {
             initial_terminals + 1
         );
 
-        app.should_quit = false;
+        app.cancel_quit();
         handle_unprompted_key(
             &mut app,
             &mut pty_runtime,
             &config,
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            frame_area,
+        );
+        assert!(matches!(app.prompt, Some(Prompt::ConfirmDelete(_))));
+        assert_eq!(
+            app.project.workspaces[0].terminals.len(),
+            initial_terminals + 1
+        );
+
+        handle_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            frame_area,
+        );
+        assert_eq!(app.prompt, None);
+        assert_eq!(
+            app.project.workspaces[0].terminals.len(),
+            initial_terminals + 1
+        );
+
+        handle_unprompted_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            frame_area,
+        );
+        handle_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             frame_area,
         );
         assert_eq!(app.prompt, None);

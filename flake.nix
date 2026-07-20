@@ -28,6 +28,9 @@
             # buildRustPackage runs inside a Nix sandbox where PTY-backed
             # integration tests cannot reliably create interactive devices.
             MULT_SKIP_PTY_INTEGRATION = "1";
+            # Runtime-file tests need a writable base inside the sandbox rather
+            # than inheriting a host XDG_RUNTIME_DIR.
+            XDG_RUNTIME_DIR = "/tmp";
           };
         });
 

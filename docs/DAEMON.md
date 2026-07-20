@@ -32,6 +32,8 @@ IPC messages are length-prefixed and encoded with `postcard`. Oversized frames a
 
 Session IDs are reserved under the server lock before spawning PTYs, so duplicate requested IDs cannot race with creation. If spawning fails, the reservation is released. The client waits for attach confirmation and rolls back local attachment state if attach is rejected.
 
+Client startup restores persisted running command terminals with an attach-only request. It does not send `CreateSession` on that path, so a missing or unreachable daemon session can never relaunch a persisted command. The client marks that terminal stopped/recoverable and requires deliberate user input before creating a replacement session. Deletion similarly waits for a pane-correlated `StopResult` before removing an attached PTY from client state; a rejected, timed-out, or disconnected stop leaves the item intact.
+
 ## Operational notes
 
 - Start manually with `just server` or `cargo run --bin mult-server`.

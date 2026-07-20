@@ -1,11 +1,16 @@
 #![cfg(unix)]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs,
+    io::Read,
     os::unix::net::UnixStream,
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -17,16 +22,90 @@ use mult::{
 use mult_protocol::SOCKET_PATH_ENV;
 
 const INTEGRATION_TIMEOUT: Duration = Duration::from_secs(5);
+const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+
+struct CapturedStderr {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    complete: Arc<AtomicBool>,
+}
+
+impl CapturedStderr {
+    fn start(mut stderr: impl Read + Send + 'static) -> Self {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let complete = Arc::new(AtomicBool::new(false));
+        let captured_bytes = Arc::clone(&bytes);
+        let capture_complete = Arc::clone(&complete);
+        let _stderr_reader = thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match stderr.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => captured_bytes
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .extend_from_slice(&buffer[..read]),
+                    Err(error) => {
+                        captured_bytes
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .extend_from_slice(
+                                format!("\n[failed to capture mult-server stderr: {error}]")
+                                    .as_bytes(),
+                            );
+                        break;
+                    }
+                }
+            }
+            capture_complete.store(true, Ordering::Release);
+        });
+        Self { bytes, complete }
+    }
+
+    fn snapshot(&self) -> String {
+        let deadline = Instant::now() + STDERR_DRAIN_TIMEOUT;
+        while !self.complete.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let bytes = self
+            .bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if bytes.is_empty() {
+            "<empty>".to_string()
+        } else {
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
+}
 
 struct ServerGuard {
     child: Child,
     socket_path: PathBuf,
+    server_bin: PathBuf,
+    shell: PathBuf,
+    stderr: CapturedStderr,
+}
+
+impl ServerGuard {
+    fn terminate(&mut self) -> Result<ExitStatus, String> {
+        terminate_child(&mut self.child).map_err(|error| {
+            format!(
+                "failed to terminate mult-server (binary={}, socket={}, shell={}): {error}; stderr:\n{}",
+                self.server_bin.display(),
+                self.socket_path.display(),
+                self.shell.display(),
+                self.stderr.snapshot()
+            )
+        })
+    }
 }
 
 impl Drop for ServerGuard {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Err(error) = self.terminate() {
+            eprintln!("{error}");
+        }
         let _ = fs::remove_file(&self.socket_path);
     }
 }
@@ -36,9 +115,7 @@ fn client_receives_scrollback_output_and_real_exit_from_server_pty() {
     if integration_tests_are_skipped() {
         return;
     }
-    let Some(server) = start_isolated_server() else {
-        return;
-    };
+    let server = start_isolated_server().expect("start isolated mult-server fixture");
     let mut runtime = PtyRuntime::connect_to_socket(server.socket_path.clone())
         .expect("connect to isolated mult-server");
     let terminal = PtyKey::Terminal(TerminalId(7001));
@@ -67,9 +144,7 @@ fn reconnect_replays_raw_scrollback_into_fresh_parser() {
     if integration_tests_are_skipped() {
         return;
     }
-    let Some(server) = start_isolated_server() else {
-        return;
-    };
+    let server = start_isolated_server().expect("start isolated mult-server fixture");
     let terminal = PtyKey::Terminal(TerminalId(7003));
 
     {
@@ -93,9 +168,7 @@ fn second_client_takes_over_session_from_a_still_attached_client() {
     if integration_tests_are_skipped() {
         return;
     }
-    let Some(server) = start_isolated_server() else {
-        return;
-    };
+    let server = start_isolated_server().expect("start isolated mult-server fixture");
     let terminal = PtyKey::Terminal(TerminalId(7005));
 
     // Client A attaches to a long-running session and observes its output.
@@ -135,9 +208,7 @@ fn reattach_after_server_restart_reports_vanished_session_as_exited() {
     if integration_tests_are_skipped() {
         return;
     }
-    let Some(server) = start_isolated_server() else {
-        return;
-    };
+    let server = start_isolated_server().expect("start isolated mult-server fixture");
     let socket_path = server.socket_path.clone();
     let terminal = PtyKey::Terminal(TerminalId(7006));
 
@@ -153,9 +224,8 @@ fn reattach_after_server_restart_reports_vanished_session_as_exited() {
 
     // Restart the daemon on the same socket path: the previous session is gone.
     drop(server);
-    let Some(_server2) = start_isolated_server_at(socket_path) else {
-        return;
-    };
+    let _server2 =
+        start_isolated_server_at(socket_path).expect("restart isolated mult-server fixture");
 
     // Nudging the runtime makes it reconnect to the fresh server and re-attach;
     // because the session no longer exists, the server answers with PaneExited
@@ -171,9 +241,7 @@ fn terminal_is_retired_when_the_daemon_is_gone_and_not_autospawned() {
     if integration_tests_are_skipped() {
         return;
     }
-    let Some(mut server) = start_isolated_server() else {
-        return;
-    };
+    let mut server = start_isolated_server().expect("start isolated mult-server fixture");
     let terminal = PtyKey::Terminal(TerminalId(7007));
 
     let mut runtime =
@@ -189,8 +257,9 @@ fn terminal_is_retired_when_the_daemon_is_gone_and_not_autospawned() {
     // Kill the daemon and do NOT restart it. Integration tests never autospawn
     // (the test binary is not named `mult`, so server_executable() is None), so
     // this reproduces the "daemon gone, autospawn unavailable" case.
-    let _ = server.child.kill();
-    let _ = server.child.wait();
+    server
+        .terminate()
+        .expect("terminate isolated mult-server within deadline");
 
     let status = wait_for_terminal_exit_after_reconnect(&mut runtime, terminal)
         .expect("client should retire the terminal once the daemon is unreachable");
@@ -206,9 +275,7 @@ fn server_ignores_sighup_and_keeps_sessions_running() {
     if integration_tests_are_skipped() {
         return;
     }
-    let Some(mut server) = start_isolated_server() else {
-        return;
-    };
+    let mut server = start_isolated_server().expect("start isolated mult-server fixture");
     let mut runtime = PtyRuntime::connect_to_socket(server.socket_path.clone())
         .expect("connect to isolated mult-server");
     let terminal = PtyKey::Terminal(TerminalId(7004));
@@ -235,9 +302,7 @@ fn rapid_stop_restart_and_chat_runtime_ids_keep_client_registry_consistent() {
     if integration_tests_are_skipped() {
         return;
     }
-    let Some(server) = start_isolated_server() else {
-        return;
-    };
+    let server = start_isolated_server().expect("start isolated mult-server fixture");
     let mut runtime = PtyRuntime::connect_to_socket(server.socket_path.clone())
         .expect("connect to isolated mult-server");
     let terminal = PtyKey::Terminal(TerminalId(7002));
@@ -276,12 +341,21 @@ fn start_short_lived_command(runtime: &mut PtyRuntime, terminal: PtyKey, command
     runtime.start(spawn).expect("start PTY command");
 }
 
-fn wait_for_output(runtime: &mut PtyRuntime, terminal: PtyKey, needle: &str) -> Option<()> {
+fn wait_for_output(runtime: &mut PtyRuntime, terminal: PtyKey, needle: &str) -> Result<(), String> {
     let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    let mut recent_events = VecDeque::new();
     while Instant::now() < deadline {
         for event in runtime.drain_events() {
-            if let PtyEvent::Error { terminal, message } = event {
-                panic!("server reported PTY error for terminal {terminal:?}: {message}");
+            remember_event(&mut recent_events, &event);
+            if let PtyEvent::Error {
+                terminal: event_terminal,
+                message,
+            } = event
+            {
+                return Err(format!(
+                    "server reported PTY error for terminal {event_terminal:?}: {message}; {}",
+                    terminal_runtime_diagnostics(runtime, terminal)
+                ));
             }
         }
         if runtime
@@ -289,20 +363,28 @@ fn wait_for_output(runtime: &mut PtyRuntime, terminal: PtyKey, needle: &str) -> 
             .join("\n")
             .contains(needle)
         {
-            return Some(());
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(20));
     }
-    None
+    Err(format!(
+        "timed out after {INTEGRATION_TIMEOUT:?} waiting for {needle:?} from {terminal:?}; {}; recent events: {recent_events:?}",
+        terminal_runtime_diagnostics(runtime, terminal)
+    ))
 }
 
-fn wait_for_terminal_exit(runtime: &mut PtyRuntime, terminal: PtyKey) -> Option<ObservedTerminal> {
+fn wait_for_terminal_exit(
+    runtime: &mut PtyRuntime,
+    terminal: PtyKey,
+) -> Result<ObservedTerminal, String> {
     let deadline = Instant::now() + INTEGRATION_TIMEOUT;
     let mut saw_scrollback = false;
     let mut saw_output = false;
+    let mut recent_events = VecDeque::new();
 
     while Instant::now() < deadline {
         for event in runtime.drain_events() {
+            remember_event(&mut recent_events, &event);
             match event {
                 PtyEvent::Scrollback {
                     terminal: event_terminal,
@@ -320,15 +402,21 @@ fn wait_for_terminal_exit(runtime: &mut PtyRuntime, terminal: PtyKey) -> Option<
                     terminal: event_terminal,
                     status,
                 } if event_terminal == terminal => {
-                    return Some(ObservedTerminal {
+                    return Ok(ObservedTerminal {
                         saw_scrollback,
                         saw_output,
                         exit: status,
                         output: runtime.terminal_all_lines(terminal).join("\n"),
                     });
                 }
-                PtyEvent::Error { terminal, message } => {
-                    panic!("server reported PTY error for terminal {terminal:?}: {message}");
+                PtyEvent::Error {
+                    terminal: event_terminal,
+                    message,
+                } => {
+                    return Err(format!(
+                        "server reported PTY error for terminal {event_terminal:?}: {message}; {}",
+                        terminal_runtime_diagnostics(runtime, terminal)
+                    ));
                 }
                 _ => {}
             }
@@ -336,34 +424,63 @@ fn wait_for_terminal_exit(runtime: &mut PtyRuntime, terminal: PtyKey) -> Option<
         thread::sleep(Duration::from_millis(20));
     }
 
-    None
+    Err(format!(
+        "timed out after {INTEGRATION_TIMEOUT:?} waiting for {terminal:?} to exit; saw scrollback={saw_scrollback}, saw output={saw_output}; {}; recent events: {recent_events:?}",
+        terminal_runtime_diagnostics(runtime, terminal)
+    ))
 }
 
 fn wait_for_terminal_exit_after_reconnect(
     runtime: &mut PtyRuntime,
     terminal: PtyKey,
-) -> Option<PtyExit> {
+) -> Result<PtyExit, String> {
     let deadline = Instant::now() + INTEGRATION_TIMEOUT;
     let size = PtyDimensions { rows: 6, cols: 40 };
+    let mut last_resize_error = None;
+    let mut recent_events = VecDeque::new();
     while Instant::now() < deadline {
         // Any send forces a transparent reconnect to the restarted server and a
         // re-attach of the still-tracked terminal; errors here are expected
-        // mid-reconnect and ignored.
-        let _ = runtime.resize(terminal, size);
+        // mid-reconnect and retained for timeout diagnostics.
+        if let Err(error) = runtime.resize(terminal, size) {
+            last_resize_error = Some(error.to_string());
+        }
         for event in runtime.drain_events() {
+            remember_event(&mut recent_events, &event);
             if let PtyEvent::Exited {
                 terminal: event_terminal,
                 status,
             } = event
             {
                 if event_terminal == terminal {
-                    return Some(status);
+                    return Ok(status);
                 }
             }
         }
         thread::sleep(Duration::from_millis(20));
     }
-    None
+    Err(format!(
+        "timed out after {INTEGRATION_TIMEOUT:?} waiting for {terminal:?} to exit after reconnect; last resize error: {last_resize_error:?}; {}; recent events: {recent_events:?}",
+        terminal_runtime_diagnostics(runtime, terminal)
+    ))
+}
+
+fn remember_event(recent_events: &mut VecDeque<String>, event: &PtyEvent) {
+    const MAX_RECENT_EVENTS: usize = 12;
+    if recent_events.len() == MAX_RECENT_EVENTS {
+        recent_events.pop_front();
+    }
+    recent_events.push_back(format!("{event:?}"));
+}
+
+fn terminal_runtime_diagnostics(runtime: &PtyRuntime, terminal: PtyKey) -> String {
+    const MAX_DIAGNOSTIC_LINES: usize = 12;
+    let lines = runtime.terminal_all_lines(terminal);
+    let recent_lines = &lines[lines.len().saturating_sub(MAX_DIAGNOSTIC_LINES)..];
+    format!(
+        "runtime running={}, last terminal lines={recent_lines:?}",
+        runtime.is_running(terminal)
+    )
 }
 
 fn assert_server_still_running(server: &mut ServerGuard) {
@@ -387,48 +504,139 @@ fn integration_tests_are_skipped() -> bool {
     }
 }
 
-fn start_isolated_server() -> Option<ServerGuard> {
+fn start_isolated_server() -> Result<ServerGuard, String> {
     start_isolated_server_at(unique_socket_path())
 }
 
-fn start_isolated_server_at(socket_path: PathBuf) -> Option<ServerGuard> {
-    let Some(server_bin) = option_env!("CARGO_BIN_EXE_mult-server") else {
-        eprintln!("skipping PTY integration tests: CARGO_BIN_EXE_mult-server is unavailable");
-        return None;
-    };
-    let mut child = match Command::new(server_bin)
+fn start_isolated_server_at(socket_path: PathBuf) -> Result<ServerGuard, String> {
+    let shell = integration_test_shell();
+    let server_bin = option_env!("CARGO_BIN_EXE_mult-server")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            format!(
+                "CARGO_BIN_EXE_mult-server is unavailable; cannot start required PTY integration fixture (socket={}, shell={})",
+                socket_path.display(),
+                shell.display()
+            )
+        })?;
+    let mut child = Command::new(&server_bin)
         .env(SOCKET_PATH_ENV, &socket_path)
-        .env("SHELL", integration_test_shell())
+        .env("SHELL", &shell)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            eprintln!("skipping PTY integration tests: failed to spawn mult-server: {error}");
-            return None;
+        .map_err(|error| {
+            format!(
+                "failed to spawn required mult-server fixture (binary={}, socket={}, shell={}): {error}",
+                server_bin.display(),
+                socket_path.display(),
+                shell.display()
+            )
+        })?;
+    let stderr_pipe = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let termination = terminate_child(&mut child);
+            let _ = fs::remove_file(&socket_path);
+            return Err(format!(
+                "mult-server fixture stderr was not captured (binary={}, socket={}, shell={}); termination result: {termination:?}",
+                server_bin.display(),
+                socket_path.display(),
+                shell.display()
+            ));
         }
     };
+    let stderr = CapturedStderr::start(stderr_pipe);
 
     let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    let mut last_connect_error = None;
     while Instant::now() < deadline {
         match child.try_wait() {
-            Ok(Some(status)) => panic!("mult-server exited before accepting connections: {status}"),
+            Ok(Some(status)) => {
+                let _ = fs::remove_file(&socket_path);
+                return Err(format!(
+                    "mult-server fixture exited before accepting connections (binary={}, socket={}, shell={}, status={status}); stderr:\n{}",
+                    server_bin.display(),
+                    socket_path.display(),
+                    shell.display(),
+                    stderr.snapshot()
+                ));
+            }
             Ok(None) => {}
-            Err(error) => panic!("failed to poll mult-server child: {error}"),
+            Err(error) => {
+                let termination = terminate_child(&mut child);
+                let _ = fs::remove_file(&socket_path);
+                return Err(format!(
+                    "failed to poll mult-server fixture (binary={}, socket={}, shell={}): {error}; termination result: {termination:?}; stderr:\n{}",
+                    server_bin.display(),
+                    socket_path.display(),
+                    shell.display(),
+                    stderr.snapshot()
+                ));
+            }
         }
 
-        if UnixStream::connect(&socket_path).is_ok() {
-            return Some(ServerGuard { child, socket_path });
+        match UnixStream::connect(&socket_path) {
+            Ok(_) => {
+                return Ok(ServerGuard {
+                    child,
+                    socket_path,
+                    server_bin,
+                    shell,
+                    stderr,
+                });
+            }
+            Err(error) => last_connect_error = Some(error.to_string()),
         }
         thread::sleep(Duration::from_millis(20));
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
-    eprintln!("skipping PTY integration tests: mult-server did not create a usable socket in time");
-    None
+    let termination = terminate_child(&mut child);
+    let _ = fs::remove_file(&socket_path);
+    Err(format!(
+        "mult-server fixture did not create a usable socket within {INTEGRATION_TIMEOUT:?} (binary={}, socket={}, shell={}, last connect error={last_connect_error:?}); termination result: {termination:?}; stderr:\n{}",
+        server_bin.display(),
+        socket_path.display(),
+        shell.display(),
+        stderr.snapshot()
+    ))
+}
+
+fn terminate_child(child: &mut Child) -> Result<ExitStatus, String> {
+    let initial_poll_error = match child.try_wait() {
+        Ok(Some(status)) => return Ok(status),
+        Ok(None) => None,
+        Err(error) => Some(error),
+    };
+
+    if let Err(kill_error) = child.kill() {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                return Err(format!(
+                    "failed to kill child: {kill_error}; initial poll error: {initial_poll_error:?}"
+                ));
+            }
+            Err(poll_error) => {
+                return Err(format!(
+                    "failed to kill child: {kill_error}; initial poll error: {initial_poll_error:?}; subsequent poll failed: {poll_error}"
+                ));
+            }
+        }
+    }
+
+    let deadline = Instant::now() + CHILD_REAP_TIMEOUT;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => return Err(format!("failed to poll killed child: {error}")),
+        }
+    }
+    Err(format!(
+        "child was not reaped within {CHILD_REAP_TIMEOUT:?} after kill"
+    ))
 }
 
 fn integration_test_shell() -> PathBuf {

@@ -1,64 +1,63 @@
-use std::io;
-
-use crossterm::{
-    event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-    },
-    execute,
+use std::{
+    io,
+    panic::{self, AssertUnwindSafe},
+    sync::{atomic::AtomicBool, Arc},
 };
+
 use mult::{app::App, config, storage};
+use signal_hook::{
+    consts::signal::{SIGHUP, SIGINT, SIGTERM},
+    flag,
+};
 
 mod runtime;
+mod terminal_guard;
+
+use terminal_guard::TerminalGuard;
 
 fn main() -> io::Result<()> {
     let project = storage::load_or_default()?;
     let config = config::load_or_default()?;
-    let mouse_capture = config.mouse_capture;
-    let mut terminal = ratatui::init();
-    if let Err(error) = enable_terminal_features(mouse_capture) {
-        ratatui::restore();
-        return Err(error);
-    }
+    let shutdown = install_shutdown_signals()?;
+    let mut terminal = TerminalGuard::new(config.mouse_capture)?;
 
-    let result = runtime::run(&mut terminal, App::new(project), config);
-    let terminal_features_result = disable_terminal_features(mouse_capture);
-    ratatui::restore();
-    result.and(terminal_features_result)
-}
+    let runtime_result = panic::catch_unwind(AssertUnwindSafe(|| {
+        runtime::run(
+            terminal.terminal_mut(),
+            App::new(project),
+            config,
+            shutdown.as_ref(),
+        )
+    }));
+    let cleanup_result = terminal.cleanup();
 
-fn enable_terminal_features(mouse_capture: bool) -> io::Result<()> {
-    // Preserve Shift on modified keys in terminals that support the kitty keyboard
-    // protocol, so Ctrl+Shift+C does not arrive looking identical to Ctrl+C.
-    if mouse_capture {
-        execute!(
-            io::stdout(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-            EnableMouseCapture,
-            EnableBracketedPaste,
-        )
-    } else {
-        execute!(
-            io::stdout(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-            EnableBracketedPaste,
-        )
+    match runtime_result {
+        Ok(Ok(())) => cleanup_result,
+        Ok(Err(runtime_error)) => {
+            if let Err(cleanup_error) = cleanup_result {
+                eprintln!("terminal cleanup after runtime error also failed: {cleanup_error}");
+            }
+            Err(runtime_error)
+        }
+        Err(payload) => {
+            if let Err(cleanup_error) = cleanup_result {
+                eprintln!("terminal cleanup while unwinding also failed: {cleanup_error}");
+            }
+            panic::resume_unwind(payload)
+        }
     }
 }
 
-fn disable_terminal_features(mouse_capture: bool) -> io::Result<()> {
-    if mouse_capture {
-        execute!(
-            io::stdout(),
-            DisableBracketedPaste,
-            DisableMouseCapture,
-            PopKeyboardEnhancementFlags,
-        )
-    } else {
-        execute!(
-            io::stdout(),
-            DisableBracketedPaste,
-            PopKeyboardEnhancementFlags,
-        )
+fn install_shutdown_signals() -> io::Result<Arc<AtomicBool>> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    for signal in [SIGINT, SIGTERM, SIGHUP] {
+        // Registration order matters: on the first signal the conditional
+        // action observes false, then the flag action requests graceful
+        // shutdown. A second signal is an escape hatch if shutdown stalls.
+        flag::register_conditional_shutdown(signal, 128 + signal, Arc::clone(&shutdown))?;
+        flag::register(signal, Arc::clone(&shutdown))?;
     }
+
+    Ok(shutdown)
 }
