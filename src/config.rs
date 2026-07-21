@@ -5,6 +5,8 @@ use std::{
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::paths;
+
 const CONFIG_PATH_ENV: &str = "MULT_CONFIG_PATH";
 const CONFIG_FILE_NAME: &str = "config.json";
 
@@ -117,15 +119,21 @@ impl Default for ColorSchemeConfig {
 }
 
 pub fn load_or_default() -> io::Result<Config> {
-    load_from_path(&config_path())
+    load_from_path(&resolve_config_path()?)
 }
 
-pub fn config_path() -> PathBuf {
+pub fn resolve_config_path() -> io::Result<PathBuf> {
     if let Some(path) = env::var_os(CONFIG_PATH_ENV) {
-        return PathBuf::from(path);
+        return Ok(PathBuf::from(path));
     }
 
-    config_home().join("mult").join(CONFIG_FILE_NAME)
+    Ok(paths::config_home()?.join("mult").join(CONFIG_FILE_NAME))
+}
+
+/// Display-oriented compatibility helper. Loading uses [`resolve_config_path`]
+/// and returns an error instead of ever selecting the current directory.
+pub fn config_path() -> PathBuf {
+    resolve_config_path().unwrap_or_else(|_| PathBuf::from("<configuration path unavailable>"))
 }
 
 fn load_from_path(path: &Path) -> io::Result<Config> {
@@ -134,13 +142,6 @@ fn load_from_path(path: &Path) -> io::Result<Config> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Config::default()),
         Err(error) => Err(error),
     }
-}
-
-fn config_home() -> PathBuf {
-    env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn default_pi_agent_command() -> String {

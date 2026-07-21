@@ -4,7 +4,7 @@ This document is the handoff plan for work remaining after the Phase 1 safety pa
 
 ## Current handoff state
 
-Phase 1 is implemented in the current working tree. Before starting later work, inspect `git status` and `git diff`; do not revert or independently reimplement those changes.
+Phases 1 and 2 are implemented. Phase 2 is present in the current working tree. Phase 3 is **partially implemented** on top of it and upgrades the wire protocol to version 10 and durable state to version 2. Remaining Phase 3 blockers are production end-to-end status-bridge reconnect/finalization coverage and authoritative normal Pi/Claude message boundaries with transcript-journal integration; do not claim Phase 3 complete until the deferred checklist and restart tests below are complete. Before continuing, inspect `git status` and `git diff`; do not revert or independently reimplement the existing work.
 
 Phase 1 includes:
 
@@ -18,7 +18,27 @@ Phase 1 includes:
 - protocol version 8 with pane-correlated `StopResult`;
 - `anyhow` 1.0.103 for `RUSTSEC-2026-0190`.
 
-The last Phase 1 validation passed:
+Phase 2 additionally includes:
+
+- correlated, resumable, idempotent create/attach/stop requests;
+- connection-bound attachment leases with structured takeover;
+- sequence-numbered, truncation-aware attach replay ordered before live output;
+- exactly-once child finalization and process-group termination;
+- explicit uncertain-delivery handling that never replays input or paste;
+- deterministic protocol, ownership, replay, shutdown, and lifecycle regression tests.
+
+The Phase 1 baseline validation passed:
+
+```sh
+nix develop -c just ci
+nix shell nixpkgs#cargo-deny -c cargo deny --locked check
+rustup run 1.88.0 cargo check --locked --workspace --all-targets --all-features
+(cd extensions && npm ci --ignore-scripts && npm run typecheck)
+nix shell nixpkgs#actionlint -c actionlint .github/workflows/ci.yml
+nix flake check "path:$PWD"
+```
+
+The current Phase 3 partial implementation was validated with:
 
 ```sh
 nix develop -c just ci
@@ -31,8 +51,8 @@ nix flake check "path:$PWD"
 
 Known non-blocking dependency warnings remain:
 
-- cargo-deny reports existing duplicate dependency families;
-- npm reports three extension dependency vulnerabilities and deprecated upstream Pi package names.
+- cargo-deny reports existing duplicate dependency families and unmatched license allowances;
+- npm reports four extension dependency vulnerabilities (one moderate, three high) and deprecated upstream Pi package names.
 
 ## Rules for every phase
 
@@ -68,6 +88,8 @@ Phases 4 and 5 may proceed independently after Phase 2 if their files are kept s
 ---
 
 # Phase 2 — IPC and PTY lifecycle correctness
+
+**Status:** completed in protocol version 9. The details below are retained as the implementation and regression-test checklist.
 
 ## Goal
 
@@ -179,6 +201,25 @@ The client currently reconnects and may replay a message after a failed write.
 ---
 
 # Phase 3 — Durable ownership, session identity, status, and transcripts
+
+**Status: partial.** Work packages 3.1, 3.2, 3.5, and 3.6 are implemented in the current working tree. Package 3.3 has production plumbing and daemon-level regression coverage but still needs an end-to-end bridge reconnect/finalization test and tombstone-recovery cleanup coverage. Package 3.4 has a bounded journal codec but remains deferred at the production-capture boundary.
+
+Implemented foundation checklist:
+
+- [x] Process-lifetime owner lock acquired before load and retained through TUI/terminal cleanup; all runtime saves target that locked directory and unlocked library saves must acquire the same lock.
+- [x] State schema v2 with a random persistent namespace, immutable per-chat/terminal tokens, explicit V1 migration, `needs_save`, exact migration fixtures, safe modes, and future-version byte preservation.
+- [x] Protocol v10 identity on namespaced list/create/attach/stop, local rejection of unregistered production operations, daemon identity indexes/checks, and attach-only restoration without command relaunch.
+- [x] Persisted random agent generation saved before launch; real Pi/Claude bridges emit PID-independent append-only identity-complete records; client and daemon validate schema/chat/backend/identity/generation; daemon final status is reconnectable and monotonic.
+- [x] Private, bounded status files, fixed versioned generated bridge artifacts, observed-finalization cleanup, and stale generation count rotation.
+- [x] HOME/XDG resolution uses absolute XDG/HOME, then the effective user's passwd home, and otherwise fails instead of selecting the current project directory.
+- [x] Separate bounded append-only transcript primitives validate identity/order and recover a truncated final record without scraping PTY bytes.
+
+Deferred acceptance checklist and missing completion tests:
+
+- [ ] Exercise the production file → TUI → daemon status bridge across disconnect/reconnect and finalization. When only a recovered daemon tombstone proves finality, remove the obsolete journal or explicitly retain it for bounded rotation.
+- [ ] Define and implement authoritative structured user/assistant/tool message boundaries for normal Pi and Claude Code sessions. Lifecycle hooks and arbitrary PTY read chunks are not message boundaries.
+- [ ] Append those structured events to the transcript journal, hydrate ordered search from it, and define retention/compaction behavior without silently losing records.
+- [ ] Persist normal Pi/Claude chat output, restart both daemon and TUI, and verify ordered searchable recovery. Until this test exists, normal Pi/Claude PTY output is documented as daemon-lifetime raw history only.
 
 ## Goal
 
@@ -657,4 +698,4 @@ Read AGENTS.md, README.md, docs/DAEMON.md, and docs/REMAINING_WORK.md completely
 
 ## Recommended next action
 
-Start with **Phase 2 — IPC and PTY lifecycle correctness**. It is the dependency for safe session identity, status ownership, replay, and later performance work.
+Finish the deferred **Phase 3.3 production status-bridge reconnect/finalization test and cleanup**, then the **Phase 3.4 authoritative Pi/Claude transcript event contract and restart test**. Do not proceed on the assumption that raw PTY bytes or process stdout read chunks are structured message boundaries. The other Phase 3 foundations are implemented, but the phase remains partial until these items are complete.

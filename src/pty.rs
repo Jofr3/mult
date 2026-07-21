@@ -1,6 +1,7 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    env, fs, io,
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    env, fs,
+    io::{self, Write},
     os::unix::{io::AsRawFd, net::UnixStream, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -13,12 +14,19 @@ use std::{
 };
 
 use mult_protocol::{
-    default_socket_path, read_message, write_message, ClientMessage, ForegroundProcessInfo,
-    LaunchSpec, PaneId, ServerMessage, SessionId, PROTOCOL_VERSION, SOCKET_PATH_ENV,
+    default_socket_path, read_message, write_message, AgentSessionMetadata, AgentStatusError,
+    AgentStatusOutcome, AgentStatusQuery, AgentStatusRecord, AttachError, AttachOutcome,
+    AttachmentLease, ClientMessage, ClientScopeId, CreateError, CreateOutcome,
+    ForegroundProcessInfo, LaunchSpec, LeaseRejectionReason, OutputSequence, PaneId, RequestId,
+    ServerInstanceId, ServerMessage, SessionId, SessionIdentity as WireSessionIdentity,
+    SessionInfo, StateNamespace as WireStateNamespace, StopError, StopOutcome,
+    MAX_PENDING_REQUESTS_PER_CLIENT, PROTOCOL_VERSION, SOCKET_PATH_ENV,
 };
 use vt100::{MouseProtocolEncoding, MouseProtocolMode, Parser};
 
-use crate::model::{ChatId, PtyKey, TerminalId, RUNTIME_TERMINAL_ID_FLAG};
+use crate::model::{
+    ChatId, PtyKey, SessionIdentity, StateNamespace, TerminalId, RUNTIME_TERMINAL_ID_FLAG,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtySpawn {
@@ -38,11 +46,56 @@ pub struct PtyDimensions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PtyEvent {
-    Scrollback { terminal: PtyKey, bytes: Vec<u8> },
-    Output { terminal: PtyKey, bytes: Vec<u8> },
-    Exited { terminal: PtyKey, status: PtyExit },
-    Error { terminal: PtyKey, message: String },
+    Scrollback {
+        terminal: PtyKey,
+        bytes: Vec<u8>,
+    },
+    ReplayTruncated {
+        terminal: PtyKey,
+        omitted_bytes: u64,
+    },
+    Output {
+        terminal: PtyKey,
+        bytes: Vec<u8>,
+    },
+    TakenOver {
+        terminal: PtyKey,
+    },
+    Exited {
+        terminal: PtyKey,
+        status: PtyExit,
+    },
+    Error {
+        terminal: PtyKey,
+        message: String,
+    },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtyDeliveryOperation {
+    Input,
+    Paste,
+    Resize,
+    Detach,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PtyDeliveryError {
+    pub operation: PtyDeliveryOperation,
+    pub pane: PaneId,
+}
+
+impl std::fmt::Display for PtyDeliveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{:?} delivery to pane {} is uncertain; it was not replayed",
+            self.operation, self.pane.0
+        )
+    }
+}
+
+impl std::error::Error for PtyDeliveryError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtyExit {
@@ -61,6 +114,10 @@ pub struct PtyRuntime {
     connection: Option<ServerConnection>,
     terminal_to_pane: HashMap<PtyKey, PaneId>,
     pane_to_terminal: HashMap<PaneId, PtyKey>,
+    pane_leases: HashMap<PaneId, AttachmentLease>,
+    expected_output: HashMap<PaneId, OutputSequence>,
+    session_identities: HashMap<PtyKey, WireSessionIdentity>,
+    agent_sessions: HashMap<PtyKey, AgentSessionMetadata>,
     parsers: HashMap<PtyKey, Parser>,
     responders: HashMap<PtyKey, TerminalResponseDetector>,
     terminals_with_output: HashSet<PtyKey>,
@@ -68,6 +125,11 @@ pub struct PtyRuntime {
     foreground_processes: HashMap<PtyKey, ForegroundProcessInfo>,
     command_trackers: HashMap<PtyKey, TerminalCommandTracker>,
     pending_events: Vec<PtyEvent>,
+    client_scope: Option<ClientScopeId>,
+    server_instance: Option<ServerInstanceId>,
+    next_request_id: Option<RequestId>,
+    pending_requests: HashSet<RequestId>,
+    deferred_messages: VecDeque<ServerMessage>,
     // The terminal currently being created by `start`, if any. It is excluded
     // from reconnect re-attach because its session does not exist on the server
     // until `start`'s own CreateSession completes.
@@ -76,7 +138,7 @@ pub struct PtyRuntime {
 
 const SERVER_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 const ATTACH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
-const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_EVENT_QUEUE_CAPACITY: usize = 4_096;
 const TERMINAL_SCROLLBACK_LINES: usize = 5_000;
 const TERMINAL_MAX_CSI_SEQUENCE_BYTES: usize = 128;
@@ -167,6 +229,10 @@ impl PtyRuntime {
             connection: None,
             terminal_to_pane: HashMap::new(),
             pane_to_terminal: HashMap::new(),
+            pane_leases: HashMap::new(),
+            expected_output: HashMap::new(),
+            session_identities: HashMap::new(),
+            agent_sessions: HashMap::new(),
             parsers: HashMap::new(),
             responders: HashMap::new(),
             terminals_with_output: HashSet::new(),
@@ -174,6 +240,11 @@ impl PtyRuntime {
             foreground_processes: HashMap::new(),
             command_trackers: HashMap::new(),
             pending_events,
+            client_scope: None,
+            server_instance: None,
+            next_request_id: Some(RequestId::MIN),
+            pending_requests: HashSet::new(),
+            deferred_messages: VecDeque::new(),
             starting: None,
         }
     }
@@ -216,7 +287,68 @@ impl Default for PtyDimensions {
 
 impl PtyRuntime {
     pub fn is_running(&self, terminal: PtyKey) -> bool {
-        self.terminal_to_pane.contains_key(&terminal)
+        self.terminal_to_pane.get(&terminal).is_some_and(|pane| {
+            self.pane_leases.contains_key(pane) && self.expected_output.contains_key(pane)
+        })
+    }
+
+    /// Bind a durable model identity to its runtime key. Rebinding a key to a
+    /// different token is refused, so create/attach/stop always use one
+    /// immutable logical identity for the lifetime of this adapter.
+    pub fn register_session_identity(
+        &mut self,
+        terminal: PtyKey,
+        identity: SessionIdentity,
+    ) -> io::Result<()> {
+        let identity = wire_session_identity(identity);
+        if self
+            .session_identities
+            .get(&terminal)
+            .is_some_and(|current| *current != identity)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot replace an immutable PTY session identity",
+            ));
+        }
+        self.session_identities.insert(terminal, identity);
+        Ok(())
+    }
+
+    pub fn registered_session_identity(&self, terminal: PtyKey) -> Option<WireSessionIdentity> {
+        self.session_identities.get(&terminal).copied()
+    }
+
+    pub fn register_agent_session(
+        &mut self,
+        terminal: PtyKey,
+        metadata: AgentSessionMetadata,
+    ) -> io::Result<()> {
+        if !matches!(terminal, PtyKey::ChatAgent(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "agent metadata may only be registered for a chat PTY",
+            ));
+        }
+        if !self.session_identities.contains_key(&terminal) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "register the durable session identity before agent metadata",
+            ));
+        }
+        if self.is_running(terminal)
+            && self
+                .agent_sessions
+                .get(&terminal)
+                .is_some_and(|current| *current != metadata)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "cannot replace agent generation while its PTY is running",
+            ));
+        }
+        self.agent_sessions.insert(terminal, metadata);
+        Ok(())
     }
 
     pub fn parser(&self, terminal: PtyKey) -> Option<&Parser> {
@@ -238,6 +370,8 @@ impl PtyRuntime {
         let pane = pane_for_key(terminal);
         self.terminal_to_pane.insert(terminal, pane);
         self.pane_to_terminal.insert(pane, terminal);
+        self.pane_leases.insert(pane, AttachmentLease::MIN);
+        self.expected_output.insert(pane, OutputSequence::ZERO);
     }
 
     #[cfg(test)]
@@ -273,6 +407,8 @@ impl PtyRuntime {
     pub fn remove_terminal(&mut self, terminal: PtyKey) {
         if let Some(pane) = self.terminal_to_pane.remove(&terminal) {
             self.pane_to_terminal.remove(&pane);
+            self.pane_leases.remove(&pane);
+            self.expected_output.remove(&pane);
         }
         self.parsers.remove(&terminal);
         self.responders.remove(&terminal);
@@ -280,6 +416,8 @@ impl PtyRuntime {
         self.terminal_exit_statuses.remove(&terminal);
         self.foreground_processes.remove(&terminal);
         self.command_trackers.remove(&terminal);
+        self.session_identities.remove(&terminal);
+        self.agent_sessions.remove(&terminal);
     }
 
     pub fn process_terminal_output(&mut self, terminal: PtyKey, bytes: &[u8]) {
@@ -360,8 +498,11 @@ impl PtyRuntime {
         if self.is_running(terminal) {
             return Ok(AttachExistingResult::Attached);
         }
-
         self.ensure_connected()?;
+        let identity = self.identity_for_key(terminal)?;
+        if self.is_running(terminal) {
+            return Ok(AttachExistingResult::Attached);
+        }
         self.reset_parser(terminal, size);
         self.foreground_processes.remove(&terminal);
         self.command_trackers.remove(&terminal);
@@ -370,19 +511,29 @@ impl PtyRuntime {
         self.terminal_to_pane.insert(terminal, pane);
         self.pane_to_terminal.insert(pane, terminal);
 
-        let result = self
-            .write(&ClientMessage::Attach {
-                session,
-                rows: size.rows,
-                cols: size.cols,
-            })
-            .and_then(|()| self.wait_for_existing_attach(session, ATTACH_ACK_TIMEOUT));
-
-        if result.is_err() {
-            self.terminal_to_pane.remove(&terminal);
-            self.pane_to_terminal.remove(&pane);
+        let request_id = self.allocate_request()?;
+        let request = ClientMessage::Attach {
+            request_id,
+            identity,
+            session,
+            rows: size.rows,
+            cols: size.cols,
+        };
+        let result = self.perform_attach(terminal, session, size, request_id, request);
+        self.finish_request(request_id);
+        match result {
+            Ok(()) => Ok(AttachExistingResult::Attached),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.clear_attachment(pane);
+                Ok(AttachExistingResult::Missing)
+            }
+            Err(error) => {
+                if !is_reconciliation_uncertain(&error) {
+                    self.clear_attachment(pane);
+                }
+                Err(error)
+            }
         }
-        result
     }
 
     pub fn start(&mut self, spawn: PtySpawn) -> io::Result<()> {
@@ -392,10 +543,12 @@ impl PtyRuntime {
                 "terminal already has a server attachment",
             ));
         }
-
-        // Mark this terminal as starting so a reconnect triggered mid-start does
-        // not re-attach it before its CreateSession exists on the server. Cleared
-        // on every exit path.
+        if self.terminal_to_pane.contains_key(&spawn.terminal) {
+            match self.attach_existing(spawn.terminal, spawn.size)? {
+                AttachExistingResult::Attached => return Ok(()),
+                AttachExistingResult::Missing => {}
+            }
+        }
         self.starting = Some(spawn.terminal);
         let result = self.start_attached(spawn);
         self.starting = None;
@@ -407,6 +560,7 @@ impl PtyRuntime {
         self.reset_parser(spawn.terminal, spawn.size);
         self.foreground_processes.remove(&spawn.terminal);
         self.command_trackers.remove(&spawn.terminal);
+        let identity = self.identity_for_key(spawn.terminal)?;
         let session = session_for_key(spawn.terminal);
         let pane = pane_for_key(spawn.terminal);
         let launch = launch_spec(&spawn);
@@ -414,28 +568,42 @@ impl PtyRuntime {
         self.terminal_to_pane.insert(spawn.terminal, pane);
         self.pane_to_terminal.insert(pane, spawn.terminal);
 
-        let result = self
-            .send(ClientMessage::CreateSession {
-                requested_id: Some(session),
-                name,
-                cwd: spawn.cwd.clone(),
-                env: spawn.env.clone(),
-                launch,
-                rows: spawn.size.rows,
-                cols: spawn.size.cols,
-            })
-            .and_then(|()| {
-                self.send(ClientMessage::Attach {
-                    session,
-                    rows: spawn.size.rows,
-                    cols: spawn.size.cols,
-                })
-            })
-            .and_then(|()| self.wait_for_attach_ack(session, ATTACH_ACK_TIMEOUT));
+        let create_id = self.allocate_request()?;
+        let create = ClientMessage::CreateSession {
+            request_id: create_id,
+            identity,
+            requested_id: Some(session),
+            agent: self.agent_sessions.get(&spawn.terminal).copied(),
+            name,
+            cwd: spawn.cwd.clone(),
+            env: spawn.env.clone(),
+            launch,
+            rows: spawn.size.rows,
+            cols: spawn.size.cols,
+        };
+        let create_result = self.perform_create(create_id, create);
+        self.finish_request(create_id);
+        if let Err(error) = create_result {
+            if !is_reconciliation_uncertain(&error) {
+                self.clear_attachment(pane);
+            }
+            return Err(error);
+        }
 
-        if result.is_err() {
-            self.terminal_to_pane.remove(&spawn.terminal);
-            self.pane_to_terminal.remove(&pane);
+        let attach_id = self.allocate_request()?;
+        let attach = ClientMessage::Attach {
+            request_id: attach_id,
+            identity,
+            session,
+            rows: spawn.size.rows,
+            cols: spawn.size.cols,
+        };
+        let result = self.perform_attach(spawn.terminal, session, spawn.size, attach_id, attach);
+        self.finish_request(attach_id);
+        if let Err(error) = &result {
+            if !is_reconciliation_uncertain(error) {
+                self.clear_attachment(pane);
+            }
         }
         result
     }
@@ -444,13 +612,98 @@ impl PtyRuntime {
         let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
             return Ok(false);
         };
-
-        self.send(ClientMessage::Stop { pane })?;
-        let stopped = self.wait_for_stop_result(pane, STOP_ACK_TIMEOUT)?;
-        self.terminal_to_pane.remove(&terminal);
-        self.pane_to_terminal.remove(&pane);
+        self.ensure_connected()?;
+        let lease = self.lease_for_pane(pane)?;
+        let identity = self.identity_for_key(terminal)?;
+        let request_id = self.allocate_request()?;
+        let request = ClientMessage::Stop {
+            request_id,
+            identity,
+            pane,
+            lease,
+        };
+        let result = self.perform_stop(request_id, request);
+        self.finish_request(request_id);
+        result?;
+        self.clear_attachment(pane);
         self.terminal_exit_statuses.remove(&terminal);
-        Ok(stopped)
+        Ok(true)
+    }
+
+    pub fn list_sessions(&mut self, namespace: StateNamespace) -> io::Result<Vec<SessionInfo>> {
+        self.ensure_connected()?;
+        let namespace = wire_state_namespace(namespace);
+        self.write(&ClientMessage::ListSessions { namespace })?;
+        let deadline = Instant::now() + ATTACH_ACK_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for the namespaced session list",
+                ));
+            }
+            let Some(connection) = self.connection.as_ref() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "mult-server disconnected while listing sessions",
+                ));
+            };
+            match connection.receiver.recv_timeout(remaining) {
+                Ok(ServerMessage::Sessions {
+                    namespace: received,
+                    sessions,
+                }) if received == namespace => return Ok(sessions),
+                Ok(message) => self.route_during_request(message),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for the namespaced session list",
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.connection = None;
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "mult-server disconnected while listing sessions",
+                    ));
+                }
+            }
+        }
+    }
+
+    pub fn update_agent_status(
+        &mut self,
+        record: AgentStatusRecord,
+    ) -> io::Result<AgentStatusRecord> {
+        let request_id = self.allocate_request()?;
+        let request = ClientMessage::UpdateAgentStatus { request_id, record };
+        let outcome = self.perform_agent_status(request_id, request);
+        self.finish_request(request_id);
+        match outcome? {
+            AgentStatusOutcome::Updated(record) => Ok(record),
+            AgentStatusOutcome::Error(error) => Err(agent_status_error(error)),
+            AgentStatusOutcome::Current(_) => Err(protocol_order_error(
+                "status update received a query response",
+            )),
+        }
+    }
+
+    pub fn get_agent_status(
+        &mut self,
+        query: AgentStatusQuery,
+    ) -> io::Result<Option<AgentStatusRecord>> {
+        let request_id = self.allocate_request()?;
+        let request = ClientMessage::GetAgentStatus { request_id, query };
+        let outcome = self.perform_agent_status(request_id, request);
+        self.finish_request(request_id);
+        match outcome? {
+            AgentStatusOutcome::Current(record) => Ok(record),
+            AgentStatusOutcome::Error(error) => Err(agent_status_error(error)),
+            AgentStatusOutcome::Updated(_) => Err(protocol_order_error(
+                "status query received an update response",
+            )),
+        }
     }
 
     pub fn send_input(&mut self, terminal: PtyKey, input: &[u8]) -> io::Result<bool> {
@@ -483,18 +736,23 @@ impl PtyRuntime {
                     .record_input(input);
             }
         }
-        self.send(ClientMessage::Input {
+        self.ensure_connected()?;
+        let lease = self.lease_for_pane(pane)?;
+        self.write_non_replayable(
+            &ClientMessage::Input {
+                pane,
+                lease,
+                bytes: input.to_vec(),
+            },
+            PtyDeliveryOperation::Input,
             pane,
-            bytes: input.to_vec(),
-        })?;
-        Ok(())
+        )
     }
 
     fn terminal_accepts_shell_input(&self, terminal: PtyKey) -> bool {
         let Some(process) = self.foreground_processes.get(&terminal) else {
             return true;
         };
-
         match (process.root_pid, process.foreground_pid) {
             (Some(root_pid), Some(foreground_pid)) => root_pid == foreground_pid,
             _ => true,
@@ -502,12 +760,37 @@ impl PtyRuntime {
     }
 
     pub fn send_paste(&mut self, terminal: PtyKey, text: &str) -> io::Result<bool> {
+        let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
+            return Ok(false);
+        };
         let use_bracketed = self
             .parsers
             .get(&terminal)
             .is_some_and(|parser| parser.screen().bracketed_paste());
         let bytes = terminal_paste_bytes(text, use_bracketed);
-        self.send_input(terminal, &bytes)
+        if !bytes.is_empty() {
+            let alternate_screen = self
+                .parsers
+                .get(&terminal)
+                .is_some_and(|parser| parser.screen().alternate_screen());
+            if let Some(parser) = self.parsers.get_mut(&terminal) {
+                parser.set_scrollback(0);
+            }
+            if !alternate_screen && self.terminal_accepts_shell_input(terminal) {
+                self.command_trackers
+                    .entry(terminal)
+                    .or_default()
+                    .record_input(&bytes);
+            }
+        }
+        self.ensure_connected()?;
+        let lease = self.lease_for_pane(pane)?;
+        self.write_non_replayable(
+            &ClientMessage::Paste { pane, lease, bytes },
+            PtyDeliveryOperation::Paste,
+            pane,
+        )?;
+        Ok(true)
     }
 
     /// Whether the program in `terminal` has switched on xterm mouse
@@ -542,7 +825,16 @@ impl PtyRuntime {
         let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
             return false;
         };
-        self.send_input_inner(terminal, pane, &bytes, false).is_ok()
+        match self.send_input_inner(terminal, pane, &bytes, false) {
+            Ok(()) => true,
+            Err(error) => {
+                self.pending_events.push(PtyEvent::Error {
+                    terminal,
+                    message: error.to_string(),
+                });
+                false
+            }
+        }
     }
 
     pub fn scroll_up(&mut self, terminal: PtyKey, rows: usize) -> io::Result<bool> {
@@ -577,240 +869,390 @@ impl PtyRuntime {
         let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
             return Ok(());
         };
-        self.send(ClientMessage::Resize {
+        self.ensure_connected()?;
+        let lease = self.lease_for_pane(pane)?;
+        let result = self.write_non_replayable(
+            &ClientMessage::Resize {
+                pane,
+                lease,
+                rows: size.rows,
+                cols: size.cols,
+            },
+            PtyDeliveryOperation::Resize,
             pane,
-            rows: size.rows,
-            cols: size.cols,
-        })
+        );
+        if let Err(error) = &result {
+            self.pending_events.push(PtyEvent::Error {
+                terminal,
+                message: error.to_string(),
+            });
+        }
+        result
     }
 
     pub fn drain_events(&mut self) -> Vec<PtyEvent> {
         let mut events = std::mem::take(&mut self.pending_events);
         let was_connected = self.connection.is_some();
-        let mut disconnected = !was_connected;
-
-        while self.connection.is_some() {
-            let message = self
-                .connection
-                .as_ref()
-                .map(|connection| connection.receiver.try_recv());
-            match message {
-                Some(Ok(message)) => self.handle_server_message(message, &mut events),
-                Some(Err(TryRecvError::Empty)) => break,
-                Some(Err(TryRecvError::Disconnected)) | None => {
-                    disconnected = true;
+        while let Some(connection) = self.connection.as_ref() {
+            match connection.receiver.try_recv() {
+                Ok(message) => self.handle_server_message(message, &mut events),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.connection = None;
                     break;
                 }
             }
         }
-
-        if disconnected {
-            self.connection = None;
-            // Only react to the moment a *live* connection drops, not to every
-            // idle frame while already disconnected (which would busy-loop). The
-            // daemon's sessions outlive the connection, so try to restore it and
-            // re-attach; if the daemon is truly gone, the terminals are retired
-            // rather than left frozen as "running".
-            if was_connected {
-                self.reconnect_or_retire();
-                // Surface any exit events queued by a retire on this same frame.
-                events.append(&mut self.pending_events);
-            }
+        if was_connected && self.connection.is_none() {
+            self.reconnect_or_report();
+            events.append(&mut self.pending_events);
         }
-
         events
     }
 
-    fn wait_for_stop_result(&mut self, pane: PaneId, timeout: Duration) -> io::Result<bool> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("timed out after {timeout:?} waiting for stop confirmation"),
-                ));
-            }
-            let remaining = deadline.saturating_duration_since(now);
-            let message = {
-                let Some(connection) = self.connection.as_ref() else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "not connected to mult-server",
-                    ));
-                };
-                connection.receiver.recv_timeout(remaining)
-            };
+    fn allocate_request(&mut self) -> io::Result<RequestId> {
+        if self.pending_requests.len() >= MAX_PENDING_REQUESTS_PER_CLIENT {
+            return Err(io::Error::other("too many pending PTY requests"));
+        }
+        let request_id = self
+            .next_request_id
+            .ok_or_else(|| io::Error::other("PTY request ID space exhausted"))?;
+        self.next_request_id = request_id.checked_next();
+        self.pending_requests.insert(request_id);
+        Ok(request_id)
+    }
 
+    fn finish_request(&mut self, request_id: RequestId) {
+        self.pending_requests.remove(&request_id);
+        self.deferred_messages
+            .retain(|message| message_request_id(message) != Some(request_id));
+    }
+
+    fn perform_create(&mut self, request_id: RequestId, request: ClientMessage) -> io::Result<()> {
+        let (expected_identity, expected_session) = match &request {
+            ClientMessage::CreateSession {
+                identity,
+                requested_id,
+                ..
+            } => (*identity, *requested_id),
+            _ => unreachable!("perform_create requires CreateSession"),
+        };
+        self.write_idempotent_request(&request)?;
+        let deadline = Instant::now() + ATTACH_ACK_TIMEOUT;
+        loop {
+            let message = match self.receive_for_request(request_id, deadline) {
+                Ok(message) => message,
+                Err(error) if is_disconnected_error(&error) => {
+                    self.resume_and_resend(&request)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             match message {
-                Ok(ServerMessage::StopResult {
-                    pane: stopped_pane,
-                    stopped,
-                    error,
-                }) if stopped_pane == pane => {
-                    return error.map_or(Ok(stopped), |message| Err(io::Error::other(message)));
+                ServerMessage::CreateResult {
+                    request_id: received,
+                    outcome,
+                } if received == request_id => {
+                    return match outcome {
+                        CreateOutcome::Created { session }
+                            if session.identity == expected_identity
+                                && expected_session.is_none_or(|id| id == session.id) =>
+                        {
+                            Ok(())
+                        }
+                        CreateOutcome::Created { .. } => Err(protocol_order_error(
+                            "create result identifies the wrong logical session",
+                        )),
+                        CreateOutcome::Error(error) => Err(create_error(error)),
+                    };
                 }
-                Ok(ServerMessage::PaneExited {
-                    pane: exited_pane,
-                    exit,
-                }) if exited_pane == pane => {
-                    let mut events = Vec::new();
-                    self.handle_server_message(
-                        ServerMessage::PaneExited {
-                            pane: exited_pane,
-                            exit,
-                        },
-                        &mut events,
-                    );
-                    self.pending_events.extend(events);
-                    return Ok(true);
-                }
-                Ok(ServerMessage::Error { message }) => {
-                    return Err(io::Error::other(message));
-                }
-                Ok(message) => {
-                    let mut events = Vec::new();
-                    self.handle_server_message(message, &mut events);
-                    self.pending_events.extend(events);
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!("timed out after {timeout:?} waiting for stop confirmation"),
-                    ));
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    self.connection = None;
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "mult-server disconnected before stop confirmation",
-                    ));
-                }
+                ServerMessage::Error { message } => return Err(io::Error::other(message)),
+                message => self.route_during_request(message),
             }
         }
     }
 
-    fn wait_for_existing_attach(
+    fn perform_attach(
         &mut self,
+        terminal: PtyKey,
         session: SessionId,
-        timeout: Duration,
-    ) -> io::Result<AttachExistingResult> {
-        let deadline = Instant::now() + timeout;
+        size: PtyDimensions,
+        request_id: RequestId,
+        request: ClientMessage,
+    ) -> io::Result<()> {
+        self.write_idempotent_request(&request)?;
+        let pane_id = pane_for_key(terminal);
+        let deadline = Instant::now() + ATTACH_ACK_TIMEOUT;
+        let mut accepted_lease = None;
+        let mut replay_next = None;
+        let mut replay_watermark = None;
+        let mut replay_bytes = Vec::new();
+        let mut replay_omitted = 0;
         loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("timed out after {timeout:?} waiting for attach confirmation"),
-                ));
-            }
-            let remaining = deadline.saturating_duration_since(now);
-            let message = {
-                let Some(connection) = self.connection.as_ref() else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "not connected to mult-server",
-                    ));
-                };
-                connection.receiver.recv_timeout(remaining)
+            let message = match self.receive_for_request(request_id, deadline) {
+                Ok(message) => message,
+                Err(error) if is_disconnected_error(&error) => {
+                    self.resume_and_resend(&request)?;
+                    self.reset_parser(terminal, size);
+                    self.pane_leases.remove(&pane_id);
+                    self.expected_output.remove(&pane_id);
+                    accepted_lease = None;
+                    replay_next = None;
+                    replay_watermark = None;
+                    replay_bytes.clear();
+                    replay_omitted = 0;
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
-
             match message {
-                Ok(ServerMessage::Attached {
-                    session: attached, ..
-                }) if attached == session => return Ok(AttachExistingResult::Attached),
-                Ok(ServerMessage::PaneExited { pane, exit }) if pane.0 == session.0 => {
-                    let terminal = self.pane_to_terminal.remove(&pane);
-                    if let Some(terminal) = terminal {
-                        self.terminal_to_pane.remove(&terminal);
-                        self.terminal_exit_statuses.insert(
+                ServerMessage::AttachResult {
+                    request_id: received,
+                    outcome,
+                } if received == request_id => match outcome {
+                    AttachOutcome::Attached {
+                        session: attached,
+                        pane,
+                        lease,
+                    } if attached == session && pane.id == pane_id => {
+                        if accepted_lease.replace(lease).is_some() {
+                            return Err(protocol_order_error("duplicate attach acceptance"));
+                        }
+                        self.resize_parser(
                             terminal,
-                            PtyExit {
-                                code: exit.code,
-                                signal: exit.signal,
+                            PtyDimensions {
+                                rows: pane.rows,
+                                cols: pane.cols,
                             },
                         );
                     }
-                    return Ok(AttachExistingResult::Missing);
+                    AttachOutcome::Attached { .. } => {
+                        return Err(protocol_order_error(
+                            "attach result identifies the wrong pane",
+                        ));
+                    }
+                    AttachOutcome::Error(error) => return Err(attach_error(error)),
+                },
+                ServerMessage::ReplayBegin {
+                    request_id: received,
+                    pane,
+                    lease,
+                    first_sequence,
+                    watermark,
+                    omitted_prefix_bytes,
+                } if received == request_id => {
+                    if pane != pane_id || accepted_lease != Some(lease) || replay_next.is_some() {
+                        return Err(protocol_order_error(
+                            "replay began before matching attach acceptance",
+                        ));
+                    }
+                    if first_sequence > watermark || omitted_prefix_bytes != first_sequence.get() {
+                        return Err(protocol_order_error(
+                            "invalid replay watermark or truncation boundary",
+                        ));
+                    }
+                    replay_next = Some(first_sequence);
+                    replay_watermark = Some(watermark);
+                    replay_omitted = omitted_prefix_bytes;
                 }
-                Ok(ServerMessage::Error { message }) => {
-                    return Err(io::Error::other(message));
+                ServerMessage::ReplayChunk {
+                    request_id: received,
+                    pane,
+                    lease,
+                    sequence,
+                    bytes,
+                } if received == request_id => {
+                    let Some(expected) = replay_next else {
+                        return Err(protocol_order_error(
+                            "replay chunk arrived before replay begin",
+                        ));
+                    };
+                    if pane != pane_id || accepted_lease != Some(lease) || sequence != expected {
+                        return Err(protocol_order_error(
+                            "replay output has a gap, duplicate, or wrong lease",
+                        ));
+                    }
+                    let next = sequence
+                        .checked_add_bytes(bytes.len())
+                        .ok_or_else(|| protocol_order_error("replay sequence overflow"))?;
+                    if replay_watermark.is_some_and(|watermark| next > watermark) {
+                        return Err(protocol_order_error("replay chunk exceeds its watermark"));
+                    }
+                    replay_bytes.extend_from_slice(&bytes);
+                    replay_next = Some(next);
                 }
-                Ok(message) => {
-                    let mut events = Vec::new();
-                    self.handle_server_message(message, &mut events);
-                    self.pending_events.extend(events);
+                ServerMessage::ReplayEnd {
+                    request_id: received,
+                    pane,
+                    lease,
+                    watermark,
+                } if received == request_id => {
+                    if pane != pane_id
+                        || accepted_lease != Some(lease)
+                        || replay_watermark != Some(watermark)
+                        || replay_next != Some(watermark)
+                    {
+                        return Err(protocol_order_error(
+                            "replay ended with a gap or mismatched watermark",
+                        ));
+                    }
+                    // Commit the replay to the parser only after the complete
+                    // transaction validates. A malformed or partial replay can
+                    // therefore never leave half-applied terminal state.
+                    self.feed_terminal_output(terminal, &replay_bytes, false);
+                    self.pending_events.push(PtyEvent::Scrollback {
+                        terminal,
+                        bytes: std::mem::take(&mut replay_bytes),
+                    });
+                    if replay_omitted > 0 {
+                        self.pending_events.push(PtyEvent::ReplayTruncated {
+                            terminal,
+                            omitted_bytes: replay_omitted,
+                        });
+                    }
+                    self.pane_leases.insert(pane_id, lease);
+                    self.expected_output.insert(pane_id, watermark);
+                    return Ok(());
                 }
+                ServerMessage::PtyOutput { pane, lease, .. }
+                    if pane == pane_id && accepted_lease == Some(lease) =>
+                {
+                    return Err(protocol_order_error(
+                        "live output arrived before replay end",
+                    ));
+                }
+                ServerMessage::Error { message } => return Err(io::Error::other(message)),
+                message => self.route_during_request(message),
+            }
+        }
+    }
+
+    fn perform_agent_status(
+        &mut self,
+        request_id: RequestId,
+        request: ClientMessage,
+    ) -> io::Result<AgentStatusOutcome> {
+        self.write_idempotent_request(&request)?;
+        let deadline = Instant::now() + ATTACH_ACK_TIMEOUT;
+        loop {
+            let message = match self.receive_for_request(request_id, deadline) {
+                Ok(message) => message,
+                Err(error) if is_disconnected_error(&error) => {
+                    self.resume_and_resend(&request)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match message {
+                ServerMessage::AgentStatusResult {
+                    request_id: received,
+                    outcome,
+                } if received == request_id => return Ok(outcome),
+                ServerMessage::Error { message } => return Err(io::Error::other(message)),
+                message => self.route_during_request(message),
+            }
+        }
+    }
+
+    fn perform_stop(&mut self, request_id: RequestId, request: ClientMessage) -> io::Result<()> {
+        let (stop_pane, stop_lease) = match &request {
+            ClientMessage::Stop { pane, lease, .. } => (*pane, *lease),
+            _ => unreachable!("perform_stop requires Stop"),
+        };
+        self.write_idempotent_request(&request)?;
+        let deadline = Instant::now() + STOP_ACK_TIMEOUT;
+        loop {
+            let message = match self.receive_for_request(request_id, deadline) {
+                Ok(message) => message,
+                Err(error) if is_disconnected_error(&error) => {
+                    self.resume_and_resend(&request)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match message {
+                ServerMessage::StopResult {
+                    request_id: received,
+                    outcome,
+                } if received == request_id => {
+                    return match outcome {
+                        StopOutcome::Stopped { .. } | StopOutcome::AlreadyAbsent => Ok(()),
+                        StopOutcome::Error(error @ StopError::LeaseRejected(_)) => {
+                            self.clear_attachment(stop_pane);
+                            Err(stop_error(error))
+                        }
+                        StopOutcome::Error(error) => Err(stop_error(error)),
+                    };
+                }
+                ServerMessage::PaneExited { pane, lease, .. }
+                    if pane == stop_pane && lease == stop_lease =>
+                {
+                    // The correlated StopResult is the synchronous completion.
+                    // Consume its definitive lifecycle event here so it cannot
+                    // be mistaken for a later incarnation reusing this pane ID.
+                    self.clear_attachment(pane);
+                }
+                ServerMessage::Error { message } => return Err(io::Error::other(message)),
+                message => self.route_during_request(message),
+            }
+        }
+    }
+
+    fn receive_for_request(
+        &mut self,
+        request_id: RequestId,
+        deadline: Instant,
+    ) -> io::Result<ServerMessage> {
+        if let Some(index) = self
+            .deferred_messages
+            .iter()
+            .position(|message| message_request_id(message) == Some(request_id))
+        {
+            return Ok(self
+                .deferred_messages
+                .remove(index)
+                .expect("deferred message index exists"));
+        }
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for correlated mult-server response",
+                ));
+            }
+            let Some(connection) = self.connection.as_ref() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "not connected to mult-server",
+                ));
+            };
+            match connection.receiver.recv_timeout(remaining) {
+                Ok(message) if message_request_id(&message).is_some_and(|id| id != request_id) => {
+                    self.deferred_messages.push_back(message);
+                }
+                Ok(message) => return Ok(message),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        format!("timed out after {timeout:?} waiting for attach confirmation"),
+                        "timed out waiting for correlated mult-server response",
                     ));
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.connection = None;
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
-                        "mult-server disconnected before attach confirmation",
+                        "mult-server disconnected before correlated response",
                     ));
                 }
             }
         }
     }
 
-    fn wait_for_attach_ack(&mut self, session: SessionId, timeout: Duration) -> io::Result<()> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("timed out after {timeout:?} waiting for attach confirmation"),
-                ));
-            }
-            let remaining = deadline.saturating_duration_since(now);
-            let message = {
-                let Some(connection) = self.connection.as_ref() else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "not connected to mult-server",
-                    ));
-                };
-                connection.receiver.recv_timeout(remaining)
-            };
-
-            match message {
-                Ok(ServerMessage::Attached {
-                    session: attached, ..
-                }) if attached == session => return Ok(()),
-                Ok(ServerMessage::Error { message }) => {
-                    let kind = if message.contains("already attached") {
-                        io::ErrorKind::AlreadyExists
-                    } else {
-                        io::ErrorKind::Other
-                    };
-                    return Err(io::Error::new(kind, message));
-                }
-                Ok(message) => {
-                    let mut events = Vec::new();
-                    self.handle_server_message(message, &mut events);
-                    self.pending_events.extend(events);
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!("timed out after {timeout:?} waiting for attach confirmation"),
-                    ));
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    self.connection = None;
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "mult-server disconnected before attach confirmation",
-                    ));
-                }
-            }
-        }
+    fn route_during_request(&mut self, message: ServerMessage) {
+        let mut events = Vec::new();
+        self.handle_server_message(message, &mut events);
+        self.pending_events.extend(events);
     }
 
     fn resize_parser(&mut self, terminal: PtyKey, size: PtyDimensions) {
@@ -842,29 +1284,77 @@ impl PtyRuntime {
 
     fn handle_server_message(&mut self, message: ServerMessage, events: &mut Vec<PtyEvent>) {
         match message {
-            ServerMessage::Hello { .. }
-            | ServerMessage::Sessions(_)
-            | ServerMessage::Attached { .. } => {}
-            ServerMessage::ForegroundProcess { pane, process } => {
-                if let Some(terminal) = self.key_for_pane(pane) {
-                    self.record_foreground_process(terminal, process);
+            ServerMessage::Hello { .. } | ServerMessage::Sessions { .. } => {}
+            message @ (ServerMessage::CreateResult { .. }
+            | ServerMessage::AttachResult { .. }
+            | ServerMessage::ReplayBegin { .. }
+            | ServerMessage::ReplayChunk { .. }
+            | ServerMessage::ReplayEnd { .. }
+            | ServerMessage::StopResult { .. }
+            | ServerMessage::AgentStatusResult { .. }) => {
+                self.deferred_messages.push_back(message);
+            }
+            ServerMessage::ForegroundProcess {
+                pane,
+                lease,
+                process,
+            } => {
+                if self.pane_leases.get(&pane) == Some(&lease) {
+                    if let Some(terminal) = self.key_for_pane(pane) {
+                        self.record_foreground_process(terminal, process);
+                    }
                 }
             }
-            ServerMessage::PtyScrollback { pane, bytes } => {
-                if let Some(terminal) = self.key_for_pane(pane) {
-                    self.feed_terminal_output(terminal, &bytes, false);
-                    events.push(PtyEvent::Scrollback { terminal, bytes });
+            ServerMessage::PtyOutput {
+                pane,
+                lease,
+                sequence,
+                bytes,
+            } => {
+                if self.pane_leases.get(&pane) != Some(&lease) {
+                    return;
                 }
-            }
-            ServerMessage::PtyOutput { pane, bytes } => {
+                let Some(expected) = self.expected_output.get(&pane).copied() else {
+                    if let Some(terminal) = self.key_for_pane(pane) {
+                        events.push(PtyEvent::Error {
+                            terminal,
+                            message: "live PTY output arrived before replay completion".to_string(),
+                        });
+                    }
+                    return;
+                };
+                if sequence != expected {
+                    self.mark_attachment_unreconciled(
+                        pane,
+                        events,
+                        format!(
+                            "PTY output sequence gap: expected {}, received {}; a fresh attach replay is required",
+                            expected.get(),
+                            sequence.get()
+                        ),
+                    );
+                    return;
+                }
+                let Some(next) = sequence.checked_add_bytes(bytes.len()) else {
+                    self.mark_attachment_unreconciled(
+                        pane,
+                        events,
+                        "PTY output sequence overflow; a fresh attach replay is required"
+                            .to_string(),
+                    );
+                    return;
+                };
+                self.expected_output.insert(pane, next);
                 if let Some(terminal) = self.key_for_pane(pane) {
                     self.feed_terminal_output(terminal, &bytes, true);
                     events.push(PtyEvent::Output { terminal, bytes });
                 }
             }
-            ServerMessage::PaneExited { pane, exit } => {
-                if let Some(terminal) = self.pane_to_terminal.remove(&pane) {
-                    self.terminal_to_pane.remove(&terminal);
+            ServerMessage::PaneExited { pane, lease, exit } => {
+                if self.pane_leases.get(&pane) != Some(&lease) {
+                    return;
+                }
+                if let Some(terminal) = self.clear_attachment(pane) {
                     let status = PtyExit {
                         code: exit.code,
                         signal: exit.signal,
@@ -873,25 +1363,31 @@ impl PtyRuntime {
                     events.push(PtyEvent::Exited { terminal, status });
                 }
             }
-            ServerMessage::StopResult {
-                pane, error: None, ..
-            } => {
-                if let Some(terminal) = self.pane_to_terminal.remove(&pane) {
-                    self.terminal_to_pane.remove(&terminal);
-                    self.terminal_exit_statuses.remove(&terminal);
+            ServerMessage::TakenOver { pane, lease } => {
+                if self.pane_leases.get(&pane) == Some(&lease) {
+                    if let Some(terminal) = self.clear_attachment(pane) {
+                        events.push(PtyEvent::TakenOver { terminal });
+                    }
                 }
             }
-            ServerMessage::StopResult {
+            ServerMessage::LeaseRejected {
                 pane,
-                error: Some(message),
-                ..
+                lease,
+                operation,
+                reason,
             } => {
-                let terminal = self
-                    .pane_to_terminal
-                    .get(&pane)
-                    .copied()
-                    .unwrap_or_else(|| key_for_pane_id(pane));
-                events.push(PtyEvent::Error { terminal, message });
+                if self.pane_leases.get(&pane) == Some(&lease) {
+                    let terminal = self
+                        .clear_attachment(pane)
+                        .unwrap_or_else(|| key_for_pane_id(pane));
+                    events.push(PtyEvent::Error {
+                        terminal,
+                        message: format!(
+                            "{:?} rejected for pane {}: {:?}",
+                            operation, pane.0, reason
+                        ),
+                    });
+                }
             }
             ServerMessage::Error { message } => {
                 let terminal = self
@@ -905,11 +1401,55 @@ impl PtyRuntime {
         }
     }
 
+    fn mark_attachment_unreconciled(
+        &mut self,
+        pane: PaneId,
+        events: &mut Vec<PtyEvent>,
+        message: String,
+    ) {
+        self.pane_leases.remove(&pane);
+        self.expected_output.remove(&pane);
+        if let Some(terminal) = self.key_for_pane(pane) {
+            events.push(PtyEvent::Error { terminal, message });
+        }
+    }
+
+    fn clear_attachment(&mut self, pane: PaneId) -> Option<PtyKey> {
+        self.pane_leases.remove(&pane);
+        self.expected_output.remove(&pane);
+        let terminal = self.pane_to_terminal.remove(&pane)?;
+        self.terminal_to_pane.remove(&terminal);
+        Some(terminal)
+    }
+
+    fn identity_for_key(&self, terminal: PtyKey) -> io::Result<WireSessionIdentity> {
+        if let Some(identity) = self.session_identities.get(&terminal) {
+            return Ok(*identity);
+        }
+        #[cfg(test)]
+        {
+            Ok(test_wire_session_identity(terminal))
+        }
+        #[cfg(not(test))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("PTY session {terminal:?} has no registered durable identity"),
+            ))
+        }
+    }
+
+    fn lease_for_pane(&self, pane: PaneId) -> io::Result<AttachmentLease> {
+        self.pane_leases.get(&pane).copied().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("pane {} attachment has not been reconciled", pane.0),
+            )
+        })
+    }
+
     fn key_for_pane(&self, pane: PaneId) -> Option<PtyKey> {
-        self.pane_to_terminal
-            .get(&pane)
-            .copied()
-            .or_else(|| Some(key_for_pane_id(pane)))
+        self.pane_to_terminal.get(&pane).copied()
     }
 
     fn record_foreground_process(&mut self, terminal: PtyKey, process: ForegroundProcessInfo) {
@@ -932,73 +1472,69 @@ impl PtyRuntime {
         if self.connection.is_some() {
             return Ok(());
         }
-        match self.connect_inner(true) {
-            Ok(()) => {
-                self.reattach_terminals();
-                Ok(())
-            }
-            Err(error) => {
-                self.connection_lost();
-                Err(error)
-            }
+        self.connect_inner(true)?;
+        self.reattach_terminals()
+    }
+
+    fn reconnect_or_report(&mut self) {
+        let result = self
+            .connect_inner(false)
+            .and_then(|_| self.reattach_terminals());
+        if let Err(error) = result {
+            let terminal = self
+                .terminal_to_pane
+                .keys()
+                .next()
+                .copied()
+                .unwrap_or(PtyKey::Terminal(TerminalId(0)));
+            self.pending_events.push(PtyEvent::Error {
+                terminal,
+                message: format!(
+                    "mult-server connection lost; attachment state is retained pending reconciliation: {error}"
+                ),
+            });
         }
     }
 
-    /// React to a dropped connection from the event loop: try to restore it
-    /// *without* autospawning a new daemon (autospawn stays a deliberate,
-    /// send-driven action, never something the render loop does behind the
-    /// user's back). On success the running terminals are re-attached; on
-    /// failure they are retired.
-    fn reconnect_or_retire(&mut self) {
-        match self.connect_inner(false) {
-            Ok(()) => self.reattach_terminals(),
-            Err(_) => self.connection_lost(),
-        }
-    }
-
-    /// The daemon is unreachable and was not autospawned. Retire every terminal
-    /// we were tracking so they stop appearing live: record a connection-lost
-    /// exit, drop the attachment mappings (so `is_running` becomes false and the
-    /// app can restart them), and emit an exit event for each.
-    fn connection_lost(&mut self) {
-        let terminals: Vec<PtyKey> = self.terminal_to_pane.keys().copied().collect();
-        for terminal in terminals {
-            if let Some(pane) = self.terminal_to_pane.remove(&terminal) {
-                self.pane_to_terminal.remove(&pane);
-            }
-            let status = PtyExit {
-                code: 1,
-                signal: Some("mult-server connection lost".to_string()),
-            };
-            self.terminal_exit_statuses.insert(terminal, status.clone());
-            self.pending_events
-                .push(PtyEvent::Exited { terminal, status });
-        }
-    }
-
-    /// Re-attach every terminal we still believe is running after establishing a
-    /// fresh connection. The daemon's sessions outlive a dropped connection, so
-    /// this restores live output without re-spawning anything. The server
-    /// replays full scrollback on attach, so each parser is reset first to
-    /// rebuild cleanly from the authoritative history rather than appending to
-    /// stale content. A session the server no longer has answers with
-    /// `PaneExited`, which surfaces as a normal exit and clears the terminal.
-    fn reattach_terminals(&mut self) {
-        let terminals: Vec<PtyKey> = self
+    fn reattach_terminals(&mut self) -> io::Result<()> {
+        let terminals = self
             .terminal_to_pane
             .keys()
             .copied()
             .filter(|terminal| Some(*terminal) != self.starting)
-            .collect();
+            .collect::<Vec<_>>();
         for terminal in terminals {
             let size = self.parser_dimensions(terminal);
             self.reset_parser(terminal, size);
-            let _ = self.write(&ClientMessage::Attach {
-                session: session_for_key(terminal),
+            let identity = self.identity_for_key(terminal)?;
+            let session = session_for_key(terminal);
+            let request_id = self.allocate_request()?;
+            let request = ClientMessage::Attach {
+                request_id,
+                identity,
+                session,
                 rows: size.rows,
                 cols: size.cols,
-            });
+            };
+            let result = self.perform_attach(terminal, session, size, request_id, request);
+            self.finish_request(request_id);
+            match result {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let pane = pane_for_key(terminal);
+                    self.clear_attachment(pane);
+                    let status = PtyExit {
+                        code: 1,
+                        signal: Some("server session unavailable".to_string()),
+                    };
+                    self.terminal_exit_statuses.insert(terminal, status.clone());
+                    self.pending_events
+                        .push(PtyEvent::Exited { terminal, status });
+                }
+                Err(error) => return Err(error),
+            }
         }
+        Ok(())
     }
 
     fn parser_dimensions(&self, terminal: PtyKey) -> PtyDimensions {
@@ -1012,10 +1548,12 @@ impl PtyRuntime {
     }
 
     fn connect(&mut self) -> io::Result<()> {
-        self.connect_inner(true)
+        self.connect_inner(true).map(|_| ())
     }
 
-    fn connect_inner(&mut self, allow_spawn: bool) -> io::Result<()> {
+    /// Connect and return whether the daemon resumed the exact previous
+    /// client-scope/server-instance pair.
+    fn connect_inner(&mut self, allow_spawn: bool) -> io::Result<bool> {
         let mut stream = if allow_spawn {
             connect_or_spawn_server(&self.socket_path)?
         } else {
@@ -1028,9 +1566,22 @@ impl PtyRuntime {
             &mut writer_stream,
             &ClientMessage::Hello {
                 protocol_version: PROTOCOL_VERSION,
+                resume: self.client_scope,
             },
         )?;
-        validate_server_hello_with_timeout(&mut stream, SERVER_HELLO_TIMEOUT)?;
+        let hello = validate_server_hello_with_timeout(&mut stream, SERVER_HELLO_TIMEOUT)?;
+        let resumed_same = hello.resumed
+            && self.client_scope == Some(hello.client_scope)
+            && self.server_instance == Some(hello.server_instance);
+        if self.client_scope.is_some() && !resumed_same {
+            self.pending_requests.clear();
+            self.deferred_messages.clear();
+            self.next_request_id = Some(RequestId::MIN);
+            self.pane_leases.clear();
+            self.expected_output.clear();
+        }
+        self.client_scope = Some(hello.client_scope);
+        self.server_instance = Some(hello.server_instance);
 
         let writer = Arc::new(Mutex::new(writer_stream));
         let (sender, receiver) = mpsc::sync_channel(SERVER_EVENT_QUEUE_CAPACITY);
@@ -1062,22 +1613,64 @@ impl PtyRuntime {
                 }
             }
         });
-
         self.connection = Some(ServerConnection { writer, receiver });
-        Ok(())
+        Ok(resumed_same)
     }
 
-    fn send(&mut self, message: ClientMessage) -> io::Result<()> {
+    fn write_idempotent_request(&mut self, message: &ClientMessage) -> io::Result<()> {
         self.ensure_connected()?;
-        match self.write(&message) {
+        match self.write(message) {
             Ok(()) => Ok(()),
-            Err(error) if is_disconnected_error(&error) => {
-                self.connection = None;
-                self.ensure_connected()?;
-                self.write(&message)
-            }
+            Err(error) if is_disconnected_error(&error) => self.resume_and_resend(message),
             Err(error) => Err(error),
         }
+    }
+
+    fn resume_and_resend(&mut self, message: &ClientMessage) -> io::Result<()> {
+        let previous_scope = self.client_scope;
+        let previous_instance = self.server_instance;
+        self.connection = None;
+        let resumed_same = self.connect_inner(true)?;
+        if !resumed_same
+            || self.client_scope != previous_scope
+            || self.server_instance != previous_instance
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "mult-server identity changed; refusing to replay an unresolved request",
+            ));
+        }
+        self.write(message)
+    }
+
+    fn write_non_replayable(
+        &mut self,
+        message: &ClientMessage,
+        operation: PtyDeliveryOperation,
+        pane: PaneId,
+    ) -> io::Result<()> {
+        let Some(connection) = &self.connection else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "not connected to mult-server",
+            ));
+        };
+        let result = {
+            let mut writer = connection
+                .writer
+                .lock()
+                .map_err(|_| io::Error::other("server socket writer lock poisoned"))?;
+            write_non_replayable_frame(&mut *writer, message, operation, pane)
+        };
+        if result.as_ref().is_err_and(|error| {
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<PtyDeliveryError>())
+                .is_some()
+        }) {
+            self.connection = None;
+        }
+        result
     }
 
     fn write(&self, message: &ClientMessage) -> io::Result<()> {
@@ -1095,11 +1688,58 @@ impl PtyRuntime {
     }
 }
 
+struct AttemptTrackingWriter<'a, W: Write + ?Sized> {
+    inner: &'a mut W,
+    attempted: bool,
+}
+
+impl<W: Write + ?Sized> Write for AttemptTrackingWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if !bytes.is_empty() {
+            self.attempted = true;
+        }
+        self.inner.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn write_non_replayable_frame(
+    writer: &mut (impl Write + ?Sized),
+    message: &ClientMessage,
+    operation: PtyDeliveryOperation,
+    pane: PaneId,
+) -> io::Result<()> {
+    let mut tracked = AttemptTrackingWriter {
+        inner: writer,
+        attempted: false,
+    };
+    match write_message(&mut tracked, message) {
+        Ok(()) => Ok(()),
+        Err(error) if !tracked.attempted => Err(error),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            PtyDeliveryError { operation, pane },
+        )),
+    }
+}
+
 impl Drop for PtyRuntime {
     fn drop(&mut self) {
-        if let Some(connection) = &self.connection {
-            if let Ok(mut writer) = connection.writer.lock() {
-                let _ = write_message(&mut *writer, &ClientMessage::Detach);
+        let Some(connection) = &self.connection else {
+            return;
+        };
+        if let Ok(mut writer) = connection.writer.lock() {
+            for (pane, lease) in &self.pane_leases {
+                let _ = write_message(
+                    &mut *writer,
+                    &ClientMessage::Detach {
+                        pane: *pane,
+                        lease: *lease,
+                    },
+                );
             }
         }
     }
@@ -1384,19 +2024,28 @@ fn param_or_default(params: &[usize], index: usize, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServerHello {
+    server_instance: ServerInstanceId,
+    client_scope: ClientScopeId,
+    resumed: bool,
+}
+
 fn validate_server_hello_with_timeout(
     stream: &mut UnixStream,
     timeout: Duration,
-) -> io::Result<()> {
+) -> io::Result<ServerHello> {
     stream.set_read_timeout(Some(timeout))?;
     let result = validate_server_hello(stream);
     let reset_result = stream.set_read_timeout(None);
 
-    if let Err(error) = result {
-        return Err(map_server_hello_error(error, timeout));
+    match result {
+        Ok(hello) => {
+            reset_result?;
+            Ok(hello)
+        }
+        Err(error) => Err(map_server_hello_error(error, timeout)),
     }
-
-    reset_result
 }
 
 fn map_server_hello_error(error: io::Error, timeout: Duration) -> io::Error {
@@ -1413,10 +2062,21 @@ fn map_server_hello_error(error: io::Error, timeout: Duration) -> io::Error {
     }
 }
 
-fn validate_server_hello(reader: &mut impl io::Read) -> io::Result<()> {
+fn validate_server_hello(reader: &mut impl io::Read) -> io::Result<ServerHello> {
     match read_message::<ServerMessage>(reader)? {
-        ServerMessage::Hello { protocol_version } if protocol_version == PROTOCOL_VERSION => Ok(()),
-        ServerMessage::Hello { protocol_version } => Err(io::Error::new(
+        ServerMessage::Hello {
+            protocol_version,
+            server_instance,
+            client_scope,
+            resumed,
+        } if protocol_version == PROTOCOL_VERSION => Ok(ServerHello {
+            server_instance,
+            client_scope,
+            resumed,
+        }),
+        ServerMessage::Hello {
+            protocol_version, ..
+        } => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "mult-server protocol version {protocol_version} is incompatible with client version {PROTOCOL_VERSION}; restart mult-server"
@@ -1428,6 +2088,126 @@ fn validate_server_hello(reader: &mut impl io::Read) -> io::Result<()> {
             format!("unexpected mult-server hello response: {message:?}"),
         )),
     }
+}
+
+fn message_request_id(message: &ServerMessage) -> Option<RequestId> {
+    match message {
+        ServerMessage::CreateResult { request_id, .. }
+        | ServerMessage::AttachResult { request_id, .. }
+        | ServerMessage::ReplayBegin { request_id, .. }
+        | ServerMessage::ReplayChunk { request_id, .. }
+        | ServerMessage::ReplayEnd { request_id, .. }
+        | ServerMessage::StopResult { request_id, .. }
+        | ServerMessage::AgentStatusResult { request_id, .. } => Some(*request_id),
+        _ => None,
+    }
+}
+
+fn protocol_order_error(message: &str) -> io::Error {
+    // Keep the terminal/session mapping but mark this attach unreconciled. A
+    // later explicit attach can rebuild from an authoritative replay.
+    io::Error::new(io::ErrorKind::ConnectionAborted, message)
+}
+
+fn create_error(error: CreateError) -> io::Error {
+    match error {
+        CreateError::SessionAlreadyExists { session }
+        | CreateError::IdentityAlreadyExists { session } => io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("session {} already exists", session.id.0),
+        ),
+        CreateError::IdentityMismatch { session, mismatch } => io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("session {} identity mismatch: {mismatch:?}", session.0),
+        ),
+        CreateError::InvalidAgentMetadata(error) => agent_status_error(error),
+        CreateError::RequestCollision => {
+            io::Error::new(io::ErrorKind::InvalidData, "create request ID collision")
+        }
+        CreateError::RetryExpired => {
+            io::Error::new(io::ErrorKind::InvalidData, "create request retry expired")
+        }
+        CreateError::Failed { message } => io::Error::other(message),
+    }
+}
+
+fn attach_error(error: AttachError) -> io::Error {
+    match error {
+        AttachError::SessionNotFound { session } => io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("server session {} is unavailable", session.0),
+        ),
+        AttachError::IdentityMismatch { session, mismatch } => io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "server session {} identity mismatch: {mismatch:?}",
+                session.0
+            ),
+        ),
+        AttachError::Superseded => io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "attachment request was superseded by a takeover",
+        ),
+        AttachError::RequestCollision => {
+            io::Error::new(io::ErrorKind::InvalidData, "attach request ID collision")
+        }
+        AttachError::RetryExpired => {
+            io::Error::new(io::ErrorKind::InvalidData, "attach request retry expired")
+        }
+        AttachError::Failed { message } => io::Error::other(message),
+    }
+}
+
+fn stop_error(error: StopError) -> io::Error {
+    match error {
+        StopError::RequestCollision => {
+            io::Error::new(io::ErrorKind::InvalidData, "stop request ID collision")
+        }
+        StopError::RetryExpired => {
+            io::Error::new(io::ErrorKind::InvalidData, "stop request retry expired")
+        }
+        StopError::IdentityMismatch { pane, mismatch } => io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("pane {} identity mismatch: {mismatch:?}", pane.0),
+        ),
+        StopError::LeaseRejected(reason) => {
+            let kind = if reason == LeaseRejectionReason::PaneMissing {
+                io::ErrorKind::NotFound
+            } else {
+                io::ErrorKind::PermissionDenied
+            };
+            io::Error::new(kind, format!("stop lease rejected: {reason:?}"))
+        }
+        StopError::Failed { message } => io::Error::other(message),
+    }
+}
+
+fn agent_status_error(error: AgentStatusError) -> io::Error {
+    let kind = match error {
+        AgentStatusError::SessionNotFound { .. } => io::ErrorKind::NotFound,
+        AgentStatusError::IdentityMismatch(_)
+        | AgentStatusError::NotAgentSession { .. }
+        | AgentStatusError::WrongChat { .. }
+        | AgentStatusError::WrongAgent { .. }
+        | AgentStatusError::StaleGeneration { .. }
+        | AgentStatusError::FinalStatusConflict { .. } => io::ErrorKind::PermissionDenied,
+        AgentStatusError::RequestCollision
+        | AgentStatusError::RetryExpired
+        | AgentStatusError::WrongSchema { .. } => io::ErrorKind::InvalidData,
+        AgentStatusError::Failed { .. } => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, format!("agent status rejected: {error:?}"))
+}
+
+fn is_reconciliation_uncertain(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+    )
 }
 
 fn validate_peer_owner(stream: &UnixStream, peer_label: &str) -> io::Result<()> {
@@ -1608,6 +2388,32 @@ fn is_disconnected_error(error: &io::Error) -> bool {
     )
 }
 
+fn wire_session_identity(identity: SessionIdentity) -> WireSessionIdentity {
+    WireSessionIdentity {
+        namespace: wire_state_namespace(identity.namespace),
+        token: mult_protocol::SessionToken::from_bytes(identity.token.as_bytes())
+            .expect("durable model tokens are non-zero"),
+    }
+}
+
+fn wire_state_namespace(namespace: StateNamespace) -> WireStateNamespace {
+    WireStateNamespace::from_bytes(namespace.as_bytes())
+        .expect("durable model namespaces are non-zero")
+}
+
+#[cfg(test)]
+fn test_wire_session_identity(key: PtyKey) -> WireSessionIdentity {
+    let mut token = [0_u8; 16];
+    token[8..].copy_from_slice(&wire_id(key).to_be_bytes());
+    if token == [0; 16] {
+        token[15] = 1;
+    }
+    WireSessionIdentity {
+        namespace: WireStateNamespace::from_bytes([0xa1; 16]).unwrap(),
+        token: mult_protocol::SessionToken::from_bytes(token).unwrap(),
+    }
+}
+
 fn session_for_key(key: PtyKey) -> SessionId {
     SessionId(wire_id(key))
 }
@@ -1693,6 +2499,22 @@ mod tests {
 
     const TEST_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
+    fn test_request_id(value: u64) -> RequestId {
+        RequestId::new(value).expect("non-zero request ID")
+    }
+
+    fn test_lease() -> AttachmentLease {
+        AttachmentLease::MIN
+    }
+
+    fn test_scope() -> ClientScopeId {
+        ClientScopeId::from_bytes([2; 16])
+    }
+
+    fn test_server_instance() -> ServerInstanceId {
+        ServerInstanceId::from_bytes([1; 16])
+    }
+
     fn read_client_message(stream: &mut UnixStream, operation: &str) -> ClientMessage {
         stream
             .set_read_timeout(Some(TEST_IO_TIMEOUT))
@@ -1777,6 +2599,10 @@ mod tests {
             }),
             terminal_to_pane: HashMap::from([(terminal, pane)]),
             pane_to_terminal: HashMap::from([(pane, terminal)]),
+            pane_leases: HashMap::from([(pane, test_lease())]),
+            expected_output: HashMap::from([(pane, OutputSequence::ZERO)]),
+            session_identities: HashMap::from([(terminal, test_wire_session_identity(terminal))]),
+            agent_sessions: HashMap::new(),
             parsers: HashMap::new(),
             responders: HashMap::new(),
             terminals_with_output: HashSet::new(),
@@ -1784,6 +2610,11 @@ mod tests {
             foreground_processes: HashMap::new(),
             command_trackers: HashMap::new(),
             pending_events: Vec::new(),
+            client_scope: Some(test_scope()),
+            server_instance: Some(test_server_instance()),
+            next_request_id: Some(RequestId::MIN),
+            pending_requests: HashSet::new(),
+            deferred_messages: VecDeque::new(),
             starting: None,
         };
         runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
@@ -1794,8 +2625,9 @@ mod tests {
         let message = read_client_message(&mut server_stream, "reading paste input");
         assert_eq!(
             message,
-            ClientMessage::Input {
+            ClientMessage::Paste {
                 pane,
+                lease: test_lease(),
                 bytes: b"\x1b[200~one\ntwo\x1b[201~".to_vec(),
             }
         );
@@ -1808,6 +2640,9 @@ mod tests {
             &mut bytes,
             &ServerMessage::Hello {
                 protocol_version: PROTOCOL_VERSION + 1,
+                server_instance: test_server_instance(),
+                client_scope: test_scope(),
+                resumed: false,
             },
         )
         .expect("write hello");
@@ -1849,20 +2684,51 @@ mod tests {
         let mut runtime = unattached_test_runtime(client_stream, receiver);
         let server = thread::spawn(move || {
             let message = read_client_message(&mut server_stream, "reading restoration Attach");
-            assert_eq!(
-                message,
-                ClientMessage::Attach {
-                    session: SessionId(7),
-                    rows: 6,
-                    cols: 20,
-                }
-            );
+            let ClientMessage::Attach {
+                request_id,
+                session,
+                rows,
+                cols,
+                ..
+            } = message
+            else {
+                panic!("expected Attach");
+            };
+            assert_eq!((session, rows, cols), (SessionId(7), 6, 20));
+            let lease = test_lease();
             sender
-                .send(ServerMessage::Attached {
-                    session: SessionId(7),
-                    panes: Vec::new(),
+                .send(ServerMessage::AttachResult {
+                    request_id,
+                    outcome: AttachOutcome::Attached {
+                        session,
+                        pane: mult_protocol::PaneInfo {
+                            id: PaneId(7),
+                            title: "test".to_string(),
+                            rows,
+                            cols,
+                        },
+                        lease,
+                    },
                 })
                 .expect("send attach confirmation");
+            sender
+                .send(ServerMessage::ReplayBegin {
+                    request_id,
+                    pane: PaneId(7),
+                    lease,
+                    first_sequence: OutputSequence::ZERO,
+                    watermark: OutputSequence::ZERO,
+                    omitted_prefix_bytes: 0,
+                })
+                .expect("send replay begin");
+            sender
+                .send(ServerMessage::ReplayEnd {
+                    request_id,
+                    pane: PaneId(7),
+                    lease,
+                    watermark: OutputSequence::ZERO,
+                })
+                .expect("send replay end");
         });
 
         let result = runtime
@@ -1875,6 +2741,199 @@ mod tests {
     }
 
     #[test]
+    fn registered_durable_identity_is_carried_by_attach_without_create() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("socket pair");
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let terminal = PtyKey::Terminal(TerminalId(12));
+        let identity = test_model_session_identity(0x31, 0x32);
+        let expected = wire_session_identity(identity);
+        let mut runtime = unattached_test_runtime(client_stream, receiver);
+        runtime
+            .register_session_identity(terminal, identity)
+            .expect("register identity");
+        let server = thread::spawn(move || {
+            let ClientMessage::Attach {
+                request_id,
+                identity,
+                session,
+                ..
+            } = read_client_message(&mut server_stream, "identity Attach")
+            else {
+                panic!("expected Attach")
+            };
+            assert_eq!(identity, expected);
+            sender
+                .send(ServerMessage::AttachResult {
+                    request_id,
+                    outcome: AttachOutcome::Error(AttachError::SessionNotFound { session }),
+                })
+                .unwrap();
+        });
+
+        assert_eq!(
+            runtime
+                .attach_existing(terminal, PtyDimensions::default())
+                .unwrap(),
+            AttachExistingResult::Missing
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn agent_status_adapter_round_trips_update_and_reconnect_query() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("socket pair");
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let mut runtime = unattached_test_runtime(client_stream, receiver);
+        let identity = test_wire_session_identity(PtyKey::ChatAgent(ChatId(9)));
+        let generation = mult_protocol::AgentGeneration::from_bytes([0x71; 16]).unwrap();
+        let record = AgentStatusRecord {
+            schema_version: mult_protocol::AGENT_STATUS_SCHEMA_VERSION,
+            identity,
+            chat_id: 9,
+            agent: mult_protocol::AgentKind::Pi,
+            generation,
+            status: mult_protocol::AgentStatus::Running,
+        };
+        let server = thread::spawn(move || {
+            let ClientMessage::UpdateAgentStatus { request_id, record } =
+                read_client_message(&mut server_stream, "status update")
+            else {
+                panic!("expected status update")
+            };
+            sender
+                .send(ServerMessage::AgentStatusResult {
+                    request_id,
+                    outcome: AgentStatusOutcome::Updated(record),
+                })
+                .unwrap();
+            let ClientMessage::GetAgentStatus { request_id, .. } =
+                read_client_message(&mut server_stream, "status query")
+            else {
+                panic!("expected status query")
+            };
+            sender
+                .send(ServerMessage::AgentStatusResult {
+                    request_id,
+                    outcome: AgentStatusOutcome::Current(Some(record)),
+                })
+                .unwrap();
+        });
+
+        assert_eq!(runtime.update_agent_status(record).unwrap(), record);
+        assert_eq!(
+            runtime
+                .get_agent_status(AgentStatusQuery {
+                    schema_version: mult_protocol::AGENT_STATUS_SCHEMA_VERSION,
+                    identity,
+                    chat_id: 9,
+                    agent: mult_protocol::AgentKind::Pi,
+                    generation: record.generation,
+                })
+                .unwrap(),
+            Some(record)
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn attach_replay_is_contiguous_through_the_live_watermark() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("socket pair");
+        let (sender, receiver) = mpsc::sync_channel(16);
+        let terminal = PtyKey::Terminal(TerminalId(11));
+        let pane = PaneId(11);
+        let mut runtime = unattached_test_runtime(client_stream, receiver);
+        let server = thread::spawn(move || {
+            let ClientMessage::Attach { request_id, .. } =
+                read_client_message(&mut server_stream, "reading ordered Attach")
+            else {
+                panic!("expected Attach");
+            };
+            let lease = test_lease();
+            sender
+                .send(ServerMessage::AttachResult {
+                    request_id,
+                    outcome: AttachOutcome::Attached {
+                        session: SessionId(11),
+                        pane: mult_protocol::PaneInfo {
+                            id: pane,
+                            title: "ordered".to_string(),
+                            rows: 2,
+                            cols: 20,
+                        },
+                        lease,
+                    },
+                })
+                .unwrap();
+            sender
+                .send(ServerMessage::ReplayBegin {
+                    request_id,
+                    pane,
+                    lease,
+                    first_sequence: OutputSequence::new(5),
+                    watermark: OutputSequence::new(11),
+                    omitted_prefix_bytes: 5,
+                })
+                .unwrap();
+            for (sequence, bytes) in [(5, b"abc".to_vec()), (8, b"def".to_vec())] {
+                sender
+                    .send(ServerMessage::ReplayChunk {
+                        request_id,
+                        pane,
+                        lease,
+                        sequence: OutputSequence::new(sequence),
+                        bytes,
+                    })
+                    .unwrap();
+            }
+            sender
+                .send(ServerMessage::ReplayEnd {
+                    request_id,
+                    pane,
+                    lease,
+                    watermark: OutputSequence::new(11),
+                })
+                .unwrap();
+            sender
+                .send(ServerMessage::PtyOutput {
+                    pane,
+                    lease,
+                    sequence: OutputSequence::new(11),
+                    bytes: b"!".to_vec(),
+                })
+                .unwrap();
+        });
+
+        assert_eq!(
+            runtime
+                .attach_existing(terminal, PtyDimensions { rows: 2, cols: 20 })
+                .expect("ordered attach"),
+            AttachExistingResult::Attached
+        );
+        server.join().unwrap();
+        let events = runtime.drain_events();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PtyEvent::ReplayTruncated {
+                terminal: event_terminal,
+                omitted_bytes: 5,
+            } if *event_terminal == terminal
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PtyEvent::Output {
+                terminal: event_terminal,
+                bytes,
+            } if *event_terminal == terminal && bytes == b"!"
+        )));
+        assert!(runtime.terminal_lines(terminal)[0].contains("abcdef!"));
+        assert_eq!(
+            runtime.expected_output.get(&pane),
+            Some(&OutputSequence::new(12))
+        );
+    }
+
+    #[test]
     fn attach_existing_reports_missing_without_creating_a_session() {
         let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
         let (sender, receiver) = mpsc::sync_channel(8);
@@ -1882,14 +2941,15 @@ mod tests {
         let mut runtime = unattached_test_runtime(client_stream, receiver);
         let server = thread::spawn(move || {
             let message = read_client_message(&mut server_stream, "reading missing-session Attach");
-            assert!(matches!(message, ClientMessage::Attach { .. }));
+            let ClientMessage::Attach { request_id, .. } = message else {
+                panic!("expected Attach");
+            };
             sender
-                .send(ServerMessage::PaneExited {
-                    pane: PaneId(8),
-                    exit: mult_protocol::ExitInfo {
-                        code: 1,
-                        signal: Some("server session unavailable".to_string()),
-                    },
+                .send(ServerMessage::AttachResult {
+                    request_id,
+                    outcome: AttachOutcome::Error(AttachError::SessionNotFound {
+                        session: SessionId(8),
+                    }),
                 })
                 .expect("send missing-session response");
         });
@@ -1918,6 +2978,10 @@ mod tests {
             }),
             terminal_to_pane: HashMap::new(),
             pane_to_terminal: HashMap::new(),
+            pane_leases: HashMap::new(),
+            expected_output: HashMap::new(),
+            session_identities: HashMap::new(),
+            agent_sessions: HashMap::new(),
             parsers: HashMap::new(),
             responders: HashMap::new(),
             terminals_with_output: HashSet::new(),
@@ -1925,30 +2989,54 @@ mod tests {
             foreground_processes: HashMap::new(),
             command_trackers: HashMap::new(),
             pending_events: Vec::new(),
+            client_scope: Some(test_scope()),
+            server_instance: Some(test_server_instance()),
+            next_request_id: Some(RequestId::MIN),
+            pending_requests: HashSet::new(),
+            deferred_messages: VecDeque::new(),
             starting: None,
         };
         let server = thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let create = read_client_message(&mut server_stream, "reading CreateSession");
-                assert!(matches!(
-                    create,
-                    ClientMessage::CreateSession {
-                        requested_id: Some(SessionId(7)),
-                        ..
-                    }
-                ));
-                let attach = read_client_message(&mut server_stream, "reading Attach");
-                assert_eq!(
-                    attach,
-                    ClientMessage::Attach {
-                        session: SessionId(7),
-                        rows: 24,
-                        cols: 80,
-                    }
-                );
+                let ClientMessage::CreateSession {
+                    request_id: create_id,
+                    requested_id: Some(session),
+                    ..
+                } = create
+                else {
+                    panic!("expected requested CreateSession");
+                };
                 sender
-                    .send(ServerMessage::Error {
-                        message: "session 7 is already attached".to_string(),
+                    .send(ServerMessage::CreateResult {
+                        request_id: create_id,
+                        outcome: CreateOutcome::Created {
+                            session: mult_protocol::SessionInfo {
+                                id: session,
+                                identity: test_wire_session_identity(terminal),
+                                name: "test".to_string(),
+                                pane: PaneId(7),
+                                attached: false,
+                            },
+                        },
+                    })
+                    .expect("send create result");
+                let attach = read_client_message(&mut server_stream, "reading Attach");
+                let ClientMessage::Attach {
+                    request_id: attach_id,
+                    session,
+                    rows,
+                    cols,
+                    ..
+                } = attach
+                else {
+                    panic!("expected Attach");
+                };
+                assert_eq!((session, rows, cols), (SessionId(7), 24, 80));
+                sender
+                    .send(ServerMessage::AttachResult {
+                        request_id: attach_id,
+                        outcome: AttachOutcome::Error(AttachError::Superseded),
                     })
                     .expect("send attach rejection");
             }));
@@ -1980,16 +3068,28 @@ mod tests {
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
         sender
             .send(ServerMessage::StopResult {
-                pane,
-                stopped: true,
-                error: None,
+                request_id: RequestId::MIN,
+                outcome: StopOutcome::Stopped {
+                    exit: mult_protocol::ExitInfo {
+                        code: 0,
+                        signal: None,
+                    },
+                },
             })
             .expect("send stop confirmation");
 
         assert!(runtime.stop(terminal).expect("stop terminal"));
 
         let message = read_client_message(&mut server_stream, "reading Stop");
-        assert_eq!(message, ClientMessage::Stop { pane });
+        assert_eq!(
+            message,
+            ClientMessage::Stop {
+                request_id: RequestId::MIN,
+                identity: test_wire_session_identity(terminal),
+                pane,
+                lease: test_lease(),
+            }
+        );
         assert!(!runtime.is_running(terminal));
         assert!(!runtime.pane_to_terminal.contains_key(&pane));
     }
@@ -2003,9 +3103,10 @@ mod tests {
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
         sender
             .send(ServerMessage::StopResult {
-                pane,
-                stopped: false,
-                error: Some("failed to kill child".to_string()),
+                request_id: RequestId::MIN,
+                outcome: StopOutcome::Error(StopError::Failed {
+                    message: "failed to kill child".to_string(),
+                }),
             })
             .expect("send stop rejection");
 
@@ -2013,7 +3114,15 @@ mod tests {
 
         assert_eq!(error.to_string(), "failed to kill child");
         let message = read_client_message(&mut server_stream, "reading Stop");
-        assert_eq!(message, ClientMessage::Stop { pane });
+        assert_eq!(
+            message,
+            ClientMessage::Stop {
+                request_id: RequestId::MIN,
+                identity: test_wire_session_identity(terminal),
+                pane,
+                lease: test_lease(),
+            }
+        );
         assert!(runtime.is_running(terminal));
         assert_eq!(runtime.pane_to_terminal.get(&pane), Some(&terminal));
     }
@@ -2038,6 +3147,7 @@ mod tests {
             message,
             ClientMessage::Input {
                 pane,
+                lease: test_lease(),
                 bytes: b"x".to_vec(),
             }
         );
@@ -2097,6 +3207,7 @@ mod tests {
             message,
             ClientMessage::Input {
                 pane,
+                lease: test_lease(),
                 bytes: b"\x1b[<64;12;5M".to_vec(),
             }
         );
@@ -2149,8 +3260,9 @@ mod tests {
         let message = read_client_message(&mut server_stream, "reading pasted client input");
         assert_eq!(
             message,
-            ClientMessage::Input {
+            ClientMessage::Paste {
                 pane,
+                lease: test_lease(),
                 bytes: b"one\ntwo".to_vec(),
             }
         );
@@ -2174,6 +3286,10 @@ mod tests {
             connection: Some(ServerConnection { writer, receiver }),
             terminal_to_pane: HashMap::from([(terminal, pane)]),
             pane_to_terminal: HashMap::from([(pane, terminal)]),
+            pane_leases: HashMap::from([(pane, test_lease())]),
+            expected_output: HashMap::from([(pane, OutputSequence::ZERO)]),
+            session_identities: HashMap::from([(terminal, test_wire_session_identity(terminal))]),
+            agent_sessions: HashMap::new(),
             parsers: HashMap::new(),
             responders: HashMap::new(),
             terminals_with_output: HashSet::new(),
@@ -2181,6 +3297,11 @@ mod tests {
             foreground_processes: HashMap::new(),
             command_trackers: HashMap::new(),
             pending_events: Vec::new(),
+            client_scope: Some(test_scope()),
+            server_instance: Some(test_server_instance()),
+            next_request_id: Some(RequestId::MIN),
+            pending_requests: HashSet::new(),
+            deferred_messages: VecDeque::new(),
             starting: None,
         };
 
@@ -2202,6 +3323,7 @@ mod tests {
         sender
             .send(ServerMessage::PaneExited {
                 pane,
+                lease: test_lease(),
                 exit: mult_protocol::ExitInfo {
                     code: 3,
                     signal: None,
@@ -2285,6 +3407,7 @@ mod tests {
         sender
             .send(ServerMessage::ForegroundProcess {
                 pane,
+                lease: test_lease(),
                 process: ForegroundProcessInfo {
                     root_pid: Some(10),
                     foreground_pid: Some(20),
@@ -2304,6 +3427,7 @@ mod tests {
         sender
             .send(ServerMessage::ForegroundProcess {
                 pane,
+                lease: test_lease(),
                 process: ForegroundProcessInfo {
                     root_pid: Some(10),
                     foreground_pid: Some(10),
@@ -2331,6 +3455,8 @@ mod tests {
         sender
             .send(ServerMessage::PtyOutput {
                 pane,
+                lease: test_lease(),
+                sequence: OutputSequence::ZERO,
                 bytes: b"\x1b[c".to_vec(),
             })
             .expect("send terminal query");
@@ -2349,6 +3475,7 @@ mod tests {
             message,
             ClientMessage::Input {
                 pane,
+                lease: test_lease(),
                 bytes: PRIMARY_DEVICE_ATTRIBUTES_RESPONSE.to_vec(),
             }
         );
@@ -2370,6 +3497,8 @@ mod tests {
         sender
             .send(ServerMessage::PtyOutput {
                 pane,
+                lease: test_lease(),
+                sequence: OutputSequence::ZERO,
                 bytes: b"abc\x1b[6n".to_vec(),
             })
             .expect("send output with embedded cursor query");
@@ -2381,6 +3510,7 @@ mod tests {
             message,
             ClientMessage::Input {
                 pane,
+                lease: test_lease(),
                 bytes: b"\x1b[1;4R".to_vec(),
             }
         );
@@ -2398,6 +3528,8 @@ mod tests {
         sender
             .send(ServerMessage::PtyOutput {
                 pane,
+                lease: test_lease(),
+                sequence: OutputSequence::ZERO,
                 bytes: b"hello".to_vec(),
             })
             .expect("send output event");
@@ -2415,7 +3547,7 @@ mod tests {
     }
 
     #[test]
-    fn lost_connection_retires_terminals_when_reconnect_fails() {
+    fn lost_connection_retains_terminals_when_reconnect_fails() {
         let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
         let (sender, receiver) = mpsc::channel();
         let terminal = PtyKey::Terminal(TerminalId(10));
@@ -2426,42 +3558,77 @@ mod tests {
 
         let events = runtime.drain_events();
 
-        // The test socket has no server and tests never autospawn, so the dropped
-        // connection cannot be restored. The terminal is retired with a
-        // connection-lost exit instead of being left to look like it is running,
-        // while its parser (last output) is kept until a restart resets it.
+        // Unknown transport loss is not proof that the daemon lost the pane.
+        // Keep the lease/mapping until a correlated attach reconciliation.
         assert!(runtime.connection.is_none());
-        assert!(!runtime.is_running(terminal));
-        assert!(runtime.pane_to_terminal.is_empty());
+        assert!(runtime.is_running(terminal));
+        assert_eq!(runtime.pane_to_terminal.get(&pane), Some(&terminal));
         assert!(runtime.parser(terminal).is_some());
         assert!(events.iter().any(|event| matches!(
             event,
-            PtyEvent::Exited { terminal: event_terminal, status }
-                if *event_terminal == terminal
-                    && status.signal.as_deref() == Some("mult-server connection lost")
+            PtyEvent::Error { terminal: event_terminal, message }
+                if *event_terminal == terminal && message.contains("retained pending reconciliation")
         )));
     }
 
     #[test]
     fn reattach_terminals_reattaches_known_sessions_with_parser_dimensions() {
         let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
-        let (_sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::channel();
         let terminal = PtyKey::Terminal(TerminalId(5));
         let pane = pane_for_key(terminal);
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
         runtime.ensure_parser(terminal, PtyDimensions { rows: 6, cols: 20 });
+        let server = thread::spawn(move || {
+            let message = read_client_message(&mut server_stream, "reading reattach");
+            let ClientMessage::Attach {
+                request_id,
+                session,
+                rows,
+                cols,
+                ..
+            } = message
+            else {
+                panic!("expected Attach");
+            };
+            assert_eq!((session, rows, cols), (session_for_key(terminal), 6, 20));
+            sender
+                .send(ServerMessage::AttachResult {
+                    request_id,
+                    outcome: AttachOutcome::Attached {
+                        session,
+                        pane: mult_protocol::PaneInfo {
+                            id: pane,
+                            title: "reattached".to_string(),
+                            rows,
+                            cols,
+                        },
+                        lease: test_lease(),
+                    },
+                })
+                .unwrap();
+            sender
+                .send(ServerMessage::ReplayBegin {
+                    request_id,
+                    pane,
+                    lease: test_lease(),
+                    first_sequence: OutputSequence::ZERO,
+                    watermark: OutputSequence::ZERO,
+                    omitted_prefix_bytes: 0,
+                })
+                .unwrap();
+            sender
+                .send(ServerMessage::ReplayEnd {
+                    request_id,
+                    pane,
+                    lease: test_lease(),
+                    watermark: OutputSequence::ZERO,
+                })
+                .unwrap();
+        });
 
-        runtime.reattach_terminals();
-
-        let message = read_client_message(&mut server_stream, "reading reattach");
-        assert_eq!(
-            message,
-            ClientMessage::Attach {
-                session: session_for_key(terminal),
-                rows: 6,
-                cols: 20,
-            }
-        );
+        runtime.reattach_terminals().expect("reattach");
+        server.join().unwrap();
     }
 
     #[test]
@@ -2474,13 +3641,342 @@ mod tests {
         runtime.ensure_parser(terminal, PtyDimensions { rows: 6, cols: 20 });
         runtime.starting = Some(terminal);
 
-        runtime.reattach_terminals();
+        runtime
+            .reattach_terminals()
+            .expect("skip starting terminal");
 
         // The terminal being started must not be re-attached, so nothing is sent.
         server_stream
             .set_nonblocking(true)
             .expect("set nonblocking");
         assert!(read_message::<ClientMessage>(&mut server_stream).is_err());
+    }
+
+    #[test]
+    fn request_allocator_is_bounded_and_never_wraps() {
+        let mut runtime = PtyRuntime::new_offline();
+        runtime.next_request_id = Some(RequestId::MAX);
+
+        let last = runtime
+            .allocate_request()
+            .expect("allocate final request ID");
+        assert_eq!(last, RequestId::MAX);
+        runtime.finish_request(last);
+        let error = runtime
+            .allocate_request()
+            .expect_err("request IDs must not wrap");
+        assert!(error.to_string().contains("exhausted"));
+    }
+
+    #[test]
+    fn correlated_results_are_deferred_across_operation_types_and_output() {
+        let (client_stream, _server_stream) = UnixStream::pair().expect("socket pair");
+        let (sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::Terminal(TerminalId(22));
+        let pane = PaneId(22);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 20 });
+        let create_id = test_request_id(1);
+        let attach_id = test_request_id(2);
+        let stop_id = test_request_id(3);
+        sender
+            .send(ServerMessage::StopResult {
+                request_id: stop_id,
+                outcome: StopOutcome::AlreadyAbsent,
+            })
+            .unwrap();
+        sender
+            .send(ServerMessage::PtyOutput {
+                pane,
+                lease: test_lease(),
+                sequence: OutputSequence::ZERO,
+                bytes: b"pane-b-output".to_vec(),
+            })
+            .unwrap();
+        sender
+            .send(ServerMessage::AttachResult {
+                request_id: attach_id,
+                outcome: AttachOutcome::Error(AttachError::RetryExpired),
+            })
+            .unwrap();
+        sender
+            .send(ServerMessage::CreateResult {
+                request_id: create_id,
+                outcome: CreateOutcome::Error(CreateError::RetryExpired),
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + TEST_IO_TIMEOUT;
+        loop {
+            let message = runtime.receive_for_request(create_id, deadline).unwrap();
+            if message_request_id(&message) == Some(create_id) {
+                break;
+            }
+            runtime.route_during_request(message);
+        }
+        assert_eq!(
+            message_request_id(&runtime.receive_for_request(attach_id, deadline).unwrap()),
+            Some(attach_id)
+        );
+        assert_eq!(
+            message_request_id(&runtime.receive_for_request(stop_id, deadline).unwrap()),
+            Some(stop_id)
+        );
+        assert!(runtime.terminal_lines(terminal)[0].contains("pane-b-output"));
+        assert!(runtime.pending_events.iter().any(|event| matches!(
+            event,
+            PtyEvent::Output {
+                terminal: event_terminal,
+                bytes,
+            } if *event_terminal == terminal && bytes == b"pane-b-output"
+        )));
+    }
+
+    #[test]
+    fn pane_a_attach_error_does_not_abort_pane_b_replay() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("socket pair");
+        let (sender, receiver) = mpsc::channel();
+        let terminal_b = PtyKey::Terminal(TerminalId(32));
+        let pane_b = PaneId(32);
+        let mut runtime = unattached_test_runtime(client_stream, receiver);
+        runtime.terminal_to_pane.insert(terminal_b, pane_b);
+        runtime.pane_to_terminal.insert(pane_b, terminal_b);
+        runtime.ensure_parser(terminal_b, PtyDimensions { rows: 2, cols: 20 });
+        let pane_a_request = test_request_id(1);
+        let pane_b_request = test_request_id(2);
+        sender
+            .send(ServerMessage::AttachResult {
+                request_id: pane_a_request,
+                outcome: AttachOutcome::Error(AttachError::SessionNotFound {
+                    session: SessionId(31),
+                }),
+            })
+            .unwrap();
+        sender
+            .send(ServerMessage::AttachResult {
+                request_id: pane_b_request,
+                outcome: AttachOutcome::Attached {
+                    session: SessionId(32),
+                    pane: mult_protocol::PaneInfo {
+                        id: pane_b,
+                        title: "pane b".to_string(),
+                        rows: 2,
+                        cols: 20,
+                    },
+                    lease: test_lease(),
+                },
+            })
+            .unwrap();
+        sender
+            .send(ServerMessage::ReplayBegin {
+                request_id: pane_b_request,
+                pane: pane_b,
+                lease: test_lease(),
+                first_sequence: OutputSequence::ZERO,
+                watermark: OutputSequence::new(1),
+                omitted_prefix_bytes: 0,
+            })
+            .unwrap();
+        sender
+            .send(ServerMessage::ReplayChunk {
+                request_id: pane_b_request,
+                pane: pane_b,
+                lease: test_lease(),
+                sequence: OutputSequence::ZERO,
+                bytes: b"b".to_vec(),
+            })
+            .unwrap();
+        sender
+            .send(ServerMessage::ReplayEnd {
+                request_id: pane_b_request,
+                pane: pane_b,
+                lease: test_lease(),
+                watermark: OutputSequence::new(1),
+            })
+            .unwrap();
+
+        runtime
+            .perform_attach(
+                terminal_b,
+                SessionId(32),
+                PtyDimensions { rows: 2, cols: 20 },
+                pane_b_request,
+                ClientMessage::Attach {
+                    request_id: pane_b_request,
+                    identity: test_wire_session_identity(terminal_b),
+                    session: SessionId(32),
+                    rows: 2,
+                    cols: 20,
+                },
+            )
+            .expect("pane B attaches despite pane A failure");
+        assert!(matches!(
+            read_client_message(&mut server_stream, "pane B Attach"),
+            ClientMessage::Attach {
+                request_id,
+                session: SessionId(32),
+                ..
+            } if request_id == pane_b_request
+        ));
+        assert!(runtime.is_running(terminal_b));
+        assert_eq!(
+            message_request_id(
+                &runtime
+                    .receive_for_request(pane_a_request, Instant::now() + TEST_IO_TIMEOUT)
+                    .unwrap()
+            ),
+            Some(pane_a_request)
+        );
+    }
+
+    #[test]
+    fn takeover_clears_only_the_displaced_pane_lease() {
+        let (client_stream, _server_stream) = UnixStream::pair().expect("socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let first_terminal = PtyKey::Terminal(TerminalId(1));
+        let first_pane = PaneId(1);
+        let mut runtime = test_runtime(client_stream, receiver, first_terminal, first_pane);
+        let second_terminal = PtyKey::Terminal(TerminalId(2));
+        let second_pane = PaneId(2);
+        let second_lease = test_lease().checked_next().expect("second lease");
+        runtime
+            .terminal_to_pane
+            .insert(second_terminal, second_pane);
+        runtime
+            .pane_to_terminal
+            .insert(second_pane, second_terminal);
+        runtime.pane_leases.insert(second_pane, second_lease);
+        runtime
+            .expected_output
+            .insert(second_pane, OutputSequence::ZERO);
+        let mut events = Vec::new();
+
+        runtime.handle_server_message(
+            ServerMessage::TakenOver {
+                pane: first_pane,
+                lease: test_lease(),
+            },
+            &mut events,
+        );
+
+        assert!(!runtime.is_running(first_terminal));
+        assert!(runtime.is_running(second_terminal));
+        assert_eq!(runtime.pane_leases.get(&second_pane), Some(&second_lease));
+        assert_eq!(
+            events,
+            vec![PtyEvent::TakenOver {
+                terminal: first_terminal
+            }]
+        );
+    }
+
+    #[test]
+    fn live_output_gap_marks_attachment_unreconciled() {
+        let (client_stream, _server_stream) = UnixStream::pair().expect("socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::Terminal(TerminalId(33));
+        let pane = PaneId(33);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        let mut events = Vec::new();
+
+        runtime.handle_server_message(
+            ServerMessage::PtyOutput {
+                pane,
+                lease: test_lease(),
+                sequence: OutputSequence::new(1),
+                bytes: b"gap".to_vec(),
+            },
+            &mut events,
+        );
+
+        assert!(!runtime.is_running(terminal));
+        assert_eq!(runtime.terminal_to_pane.get(&terminal), Some(&pane));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PtyEvent::Error { message, .. } if message.contains("fresh attach replay")
+        )));
+    }
+
+    #[test]
+    fn failed_input_delivery_is_uncertain_and_is_not_replayed() {
+        let (client_stream, server_stream) = UnixStream::pair().expect("socket pair");
+        server_stream
+            .shutdown(std::net::Shutdown::Both)
+            .expect("shut down peer");
+        let (_sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::Terminal(TerminalId(3));
+        let pane = PaneId(3);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+
+        let error = runtime
+            .send_input(terminal, b"must-not-replay")
+            .expect_err("closed peer makes delivery uncertain");
+
+        assert!(error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<PtyDeliveryError>())
+            .is_some_and(|error| error.operation == PtyDeliveryOperation::Input));
+        assert!(runtime.connection.is_none());
+        assert!(runtime.is_running(terminal));
+        assert_eq!(runtime.pane_leases.get(&pane), Some(&test_lease()));
+    }
+
+    #[test]
+    fn possibly_delivered_input_and_paste_are_reported_uncertain_once() {
+        #[derive(Default)]
+        struct FailAfterFrame {
+            bytes: Vec<u8>,
+            flushes: usize,
+        }
+
+        impl Write for FailAfterFrame {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "disconnect after possible delivery",
+                ))
+            }
+        }
+
+        let pane = PaneId(44);
+        for (operation, message) in [
+            (
+                PtyDeliveryOperation::Input,
+                ClientMessage::Input {
+                    pane,
+                    lease: test_lease(),
+                    bytes: b"input-once".to_vec(),
+                },
+            ),
+            (
+                PtyDeliveryOperation::Paste,
+                ClientMessage::Paste {
+                    pane,
+                    lease: test_lease(),
+                    bytes: b"paste-once".to_vec(),
+                },
+            ),
+        ] {
+            let mut writer = FailAfterFrame::default();
+            let error = write_non_replayable_frame(&mut writer, &message, operation, pane)
+                .expect_err("flush failure after a complete frame is uncertain");
+            assert!(error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<PtyDeliveryError>())
+                .is_some_and(|delivery| delivery.operation == operation));
+            assert_eq!(writer.flushes, 1, "the frame is never replayed");
+            assert_eq!(
+                read_message::<ClientMessage>(&mut writer.bytes.as_slice()).unwrap(),
+                message,
+                "the one possibly delivered frame is complete"
+            );
+        }
     }
 
     #[test]
@@ -2523,6 +4019,10 @@ mod tests {
             }),
             terminal_to_pane: HashMap::new(),
             pane_to_terminal: HashMap::new(),
+            pane_leases: HashMap::new(),
+            expected_output: HashMap::new(),
+            session_identities: HashMap::new(),
+            agent_sessions: HashMap::new(),
             parsers: HashMap::new(),
             responders: HashMap::new(),
             terminals_with_output: HashSet::new(),
@@ -2530,7 +4030,19 @@ mod tests {
             foreground_processes: HashMap::new(),
             command_trackers: HashMap::new(),
             pending_events: Vec::new(),
+            client_scope: Some(test_scope()),
+            server_instance: Some(test_server_instance()),
+            next_request_id: Some(RequestId::MIN),
+            pending_requests: HashSet::new(),
+            deferred_messages: VecDeque::new(),
             starting: None,
+        }
+    }
+
+    fn test_model_session_identity(namespace: u8, token: u8) -> SessionIdentity {
+        SessionIdentity {
+            namespace: StateNamespace::from_bytes([namespace; 16]).unwrap(),
+            token: crate::model::SessionToken::from_bytes([token; 16]).unwrap(),
         }
     }
 
@@ -2543,6 +4055,8 @@ mod tests {
         let mut runtime = unattached_test_runtime(client_stream, receiver);
         runtime.terminal_to_pane = HashMap::from([(terminal, pane)]);
         runtime.pane_to_terminal = HashMap::from([(pane, terminal)]);
+        runtime.pane_leases = HashMap::from([(pane, test_lease())]);
+        runtime.expected_output = HashMap::from([(pane, OutputSequence::ZERO)]);
         runtime
     }
 

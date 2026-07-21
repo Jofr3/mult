@@ -1,21 +1,24 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    fs::File,
+    io::{self, Read},
     path::PathBuf,
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 2;
 pub const DEFAULT_AGENT_CHAT_TITLE: &str = "agent";
 pub const RUNTIME_TERMINAL_ID_FLAG: u64 = 1 << 63;
 pub const MAX_DURABLE_SESSION_ID: u64 = RUNTIME_TERMINAL_ID_FLAG - 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdAllocationError {
     Workspace,
     Chat,
     Terminal,
+    Identity(String),
 }
 
 impl fmt::Display for IdAllocationError {
@@ -24,6 +27,12 @@ impl fmt::Display for IdAllocationError {
             Self::Workspace => "workspace",
             Self::Chat => "chat",
             Self::Terminal => "terminal",
+            Self::Identity(error) => {
+                return write!(
+                    formatter,
+                    "could not allocate secure session identity: {error}"
+                );
+            }
         };
         write!(formatter, "{namespace} ID space is exhausted")
     }
@@ -31,9 +40,126 @@ impl fmt::Display for IdAllocationError {
 
 impl std::error::Error for IdAllocationError {}
 
+const IDENTITY_BYTES: usize = 16;
+const MAX_IDENTITY_ATTEMPTS: usize = 64;
+
+macro_rules! opaque_identity {
+    ($name:ident, $description:literal) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name([u8; IDENTITY_BYTES]);
+
+        impl $name {
+            pub fn from_bytes(bytes: [u8; IDENTITY_BYTES]) -> Option<Self> {
+                (bytes != [0; IDENTITY_BYTES]).then_some(Self(bytes))
+            }
+
+            pub fn as_bytes(self) -> [u8; IDENTITY_BYTES] {
+                self.0
+            }
+
+            fn from_random_bytes(bytes: [u8; IDENTITY_BYTES]) -> Option<Self> {
+                Self::from_bytes(bytes)
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                for byte in self.0 {
+                    write!(formatter, "{byte:02x}")?;
+                }
+                Ok(())
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(&self.to_string())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let encoded = String::deserialize(deserializer)?;
+                decode_identity(&encoded)
+                    .and_then(Self::from_random_bytes)
+                    .ok_or_else(|| {
+                        de::Error::custom(concat!(
+                            $description,
+                            " must be 32 lowercase hexadecimal characters and not all zero"
+                        ))
+                    })
+            }
+        }
+    };
+}
+
+opaque_identity!(StateNamespace, "state namespace");
+opaque_identity!(SessionToken, "session token");
+opaque_identity!(AgentGeneration, "agent generation");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionIdentity {
+    pub namespace: StateNamespace,
+    pub token: SessionToken,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SessionIdentities {
+    chats: BTreeMap<ChatId, SessionToken>,
+    terminals: BTreeMap<TerminalId, SessionToken>,
+}
+
+impl SessionIdentities {
+    fn chat(&self, id: ChatId) -> Option<SessionToken> {
+        self.chats.get(&id).copied()
+    }
+
+    fn terminal(&self, id: TerminalId) -> Option<SessionToken> {
+        self.terminals.get(&id).copied()
+    }
+
+    fn len(&self) -> usize {
+        self.chats.len() + self.terminals.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.chats.is_empty() && self.terminals.is_empty()
+    }
+}
+
+pub trait IdentitySource {
+    fn fill_bytes(&mut self, bytes: &mut [u8]) -> io::Result<()>;
+}
+
+pub struct SecureIdentitySource(File);
+
+impl SecureIdentitySource {
+    pub fn new() -> io::Result<Self> {
+        Ok(Self(File::open("/dev/urandom")?))
+    }
+}
+
+impl IdentitySource for SecureIdentitySource {
+    fn fill_bytes(&mut self, bytes: &mut [u8]) -> io::Result<()> {
+        self.0.read_exact(bytes)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectState {
     pub version: u32,
+    pub(crate) namespace: StateNamespace,
+    pub(crate) session_identities: SessionIdentities,
+    /// Active daemon process incarnations for agent chats. Kept in a private
+    /// identity table so ordinary chat edits cannot replace generations.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) agent_generations: BTreeMap<ChatId, AgentGeneration>,
     pub next_workspace_id: u64,
     pub next_chat_id: u64,
     pub next_terminal_id: u64,
@@ -158,8 +284,22 @@ pub enum TerminalLaunch {
 
 impl Default for ProjectState {
     fn default() -> Self {
+        Self::try_default().expect("secure entropy is required to create project state")
+    }
+}
+
+impl ProjectState {
+    pub fn try_default() -> io::Result<Self> {
+        let mut source = SecureIdentitySource::new()?;
+        Self::try_default_with(&mut source)
+    }
+
+    pub fn try_default_with(source: &mut impl IdentitySource) -> io::Result<Self> {
         let mut state = Self {
             version: STATE_VERSION,
+            namespace: generate_identity(source, |_| false)?,
+            session_identities: SessionIdentities::default(),
+            agent_generations: BTreeMap::new(),
             next_workspace_id: 1,
             next_chat_id: 1,
             next_terminal_id: 1,
@@ -169,18 +309,171 @@ impl Default for ProjectState {
         let mult = state
             .add_workspace("mult".to_string(), std::env::current_dir().ok())
             .expect("initial workspace ID is available");
-        let _ = state
-            .add_terminal(mult, "dev server".to_string(), TerminalStatus::Stopped)
-            .expect("initial terminal ID is available");
+        state
+            .add_terminal_with_source(
+                mult,
+                "dev server".to_string(),
+                TerminalStatus::Stopped,
+                TerminalLaunch::Shell,
+                source,
+            )
+            .map_err(allocation_io_error)?;
 
         let website = state
             .add_workspace("website".to_string(), None)
             .expect("initial workspace ID is available");
-        let _ = state
-            .add_terminal(website, "shell".to_string(), TerminalStatus::Stopped)
-            .expect("initial terminal ID is available");
-
         state
+            .add_terminal_with_source(
+                website,
+                "shell".to_string(),
+                TerminalStatus::Stopped,
+                TerminalLaunch::Shell,
+                source,
+            )
+            .map_err(allocation_io_error)?;
+
+        Ok(state)
+    }
+
+    pub fn namespace(&self) -> StateNamespace {
+        self.namespace
+    }
+
+    pub fn session_identity(&self, key: PtyKey) -> Option<SessionIdentity> {
+        let token = match key {
+            PtyKey::Terminal(id) => self.session_identities.terminal(id),
+            PtyKey::ChatAgent(id) => self.session_identities.chat(id),
+        }?;
+        Some(SessionIdentity {
+            namespace: self.namespace,
+            token,
+        })
+    }
+
+    pub fn validate_session_identities(&self) -> Result<(), &'static str> {
+        let workspace_count = self.workspaces.len();
+        let workspace_ids = self
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.0)
+            .collect::<BTreeSet<_>>();
+        if workspace_ids.len() != workspace_count || workspace_ids.contains(&0) {
+            return Err("workspace IDs must be non-zero and unique");
+        }
+
+        let chat_count = self
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.chats.len())
+            .sum::<usize>();
+        let chat_ids = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.chats.iter().map(|chat| chat.id))
+            .collect::<BTreeSet<_>>();
+        if chat_ids.len() != chat_count
+            || chat_ids.iter().any(|id| !is_valid_durable_session_id(id.0))
+        {
+            return Err("chat IDs must be unique, non-zero durable IDs");
+        }
+
+        let terminal_count = self
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.terminals.len())
+            .sum::<usize>();
+        let terminal_ids = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.terminals.iter().map(|terminal| terminal.id))
+            .collect::<BTreeSet<_>>();
+        if terminal_ids.len() != terminal_count
+            || terminal_ids
+                .iter()
+                .any(|id| !is_valid_durable_session_id(id.0))
+        {
+            return Err("terminal IDs must be unique, non-zero durable IDs");
+        }
+
+        if chat_ids.len() != self.session_identities.chats.len()
+            || chat_ids
+                .iter()
+                .any(|id| !self.session_identities.chats.contains_key(id))
+        {
+            return Err("chat session identity table does not match durable chats");
+        }
+        if terminal_ids.len() != self.session_identities.terminals.len()
+            || terminal_ids
+                .iter()
+                .any(|id| !self.session_identities.terminals.contains_key(id))
+        {
+            return Err("terminal session identity table does not match durable terminals");
+        }
+
+        let unique_tokens = self
+            .session_identities
+            .chats
+            .values()
+            .chain(self.session_identities.terminals.values())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if unique_tokens.len() != self.session_identities.len() {
+            return Err("durable session tokens must be unique within a state namespace");
+        }
+
+        if self
+            .agent_generations
+            .keys()
+            .any(|chat_id| !chat_ids.contains(chat_id))
+        {
+            return Err("active agent generation table references a missing chat");
+        }
+        let active_generations = self
+            .agent_generations
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if active_generations.len() != self.agent_generations.len() {
+            return Err("active agent generations must be unique within durable state");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn assign_session_identities(
+        &mut self,
+        source: &mut impl IdentitySource,
+    ) -> io::Result<()> {
+        if !self.session_identities.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "session identity table must be empty before assignment",
+            ));
+        }
+
+        let chat_ids = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.chats.iter().map(|chat| chat.id))
+            .collect::<Vec<_>>();
+        for id in chat_ids {
+            let token = self
+                .allocate_session_token(source)
+                .map_err(allocation_io_error)?;
+            self.session_identities.chats.insert(id, token);
+        }
+
+        let terminal_ids = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.terminals.iter().map(|terminal| terminal.id))
+            .collect::<Vec<_>>();
+        for id in terminal_ids {
+            let token = self
+                .allocate_session_token(source)
+                .map_err(allocation_io_error)?;
+            self.session_identities.terminals.insert(id, token);
+        }
+        Ok(())
     }
 }
 
@@ -387,6 +680,18 @@ impl ProjectState {
         status: ChatStatus,
         agent: AgentKind,
     ) -> Result<Option<ChatId>, IdAllocationError> {
+        let mut source = SecureIdentitySource::new().map_err(identity_allocation_error)?;
+        self.add_chat_with_source(workspace_id, name, status, agent, &mut source)
+    }
+
+    pub fn add_chat_with_source(
+        &mut self,
+        workspace_id: WorkspaceId,
+        name: String,
+        status: ChatStatus,
+        agent: AgentKind,
+        source: &mut impl IdentitySource,
+    ) -> Result<Option<ChatId>, IdAllocationError> {
         let Some(workspace_index) = self
             .workspaces
             .iter()
@@ -394,6 +699,7 @@ impl ProjectState {
         else {
             return Ok(None);
         };
+        let token = self.allocate_session_token(source)?;
         let id = self.allocate_chat_id()?;
         self.workspaces[workspace_index].chats.push(ChatSession {
             id,
@@ -402,7 +708,52 @@ impl ProjectState {
             agent,
             messages: Vec::new(),
         });
+        self.session_identities.chats.insert(id, token);
         Ok(Some(id))
+    }
+
+    pub fn active_agent_generation(&self, chat_id: ChatId) -> Option<AgentGeneration> {
+        self.agent_generations.get(&chat_id).copied()
+    }
+
+    pub fn begin_agent_generation(
+        &mut self,
+        chat_id: ChatId,
+    ) -> Result<Option<AgentGeneration>, IdAllocationError> {
+        let mut source = SecureIdentitySource::new().map_err(identity_allocation_error)?;
+        self.begin_agent_generation_with_source(chat_id, &mut source)
+    }
+
+    pub fn begin_agent_generation_with_source(
+        &mut self,
+        chat_id: ChatId,
+        source: &mut impl IdentitySource,
+    ) -> Result<Option<AgentGeneration>, IdAllocationError> {
+        if !self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.chats.iter())
+            .any(|chat| chat.id == chat_id)
+        {
+            return Ok(None);
+        }
+
+        let generation = generate_identity(source, |candidate| {
+            self.agent_generations
+                .values()
+                .any(|current| current == candidate)
+        })
+        .map_err(identity_allocation_error)?;
+        self.agent_generations.insert(chat_id, generation);
+        Ok(Some(generation))
+    }
+
+    pub fn clear_agent_generation(&mut self, chat_id: ChatId, generation: AgentGeneration) -> bool {
+        if self.agent_generations.get(&chat_id) != Some(&generation) {
+            return false;
+        }
+        self.agent_generations.remove(&chat_id);
+        true
     }
 
     pub fn append_chat_message(
@@ -481,6 +832,18 @@ impl ProjectState {
         status: TerminalStatus,
         launch: TerminalLaunch,
     ) -> Result<Option<TerminalId>, IdAllocationError> {
+        let mut source = SecureIdentitySource::new().map_err(identity_allocation_error)?;
+        self.add_terminal_with_source(workspace_id, name, status, launch, &mut source)
+    }
+
+    fn add_terminal_with_source(
+        &mut self,
+        workspace_id: WorkspaceId,
+        name: String,
+        status: TerminalStatus,
+        launch: TerminalLaunch,
+        source: &mut impl IdentitySource,
+    ) -> Result<Option<TerminalId>, IdAllocationError> {
         let Some(workspace_index) = self
             .workspaces
             .iter()
@@ -488,6 +851,7 @@ impl ProjectState {
         else {
             return Ok(None);
         };
+        let token = self.allocate_session_token(source)?;
         let id = self.allocate_terminal_id()?;
         self.workspaces[workspace_index]
             .terminals
@@ -497,6 +861,7 @@ impl ProjectState {
                 status,
                 launch,
             });
+        self.session_identities.terminals.insert(id, token);
         Ok(Some(id))
     }
 
@@ -505,7 +870,15 @@ impl ProjectState {
             .workspaces
             .iter()
             .position(|workspace| workspace.id == workspace_id)?;
-        Some(self.workspaces.remove(index))
+        let removed = self.workspaces.remove(index);
+        for chat in &removed.chats {
+            self.session_identities.chats.remove(&chat.id);
+            self.agent_generations.remove(&chat.id);
+        }
+        for terminal in &removed.terminals {
+            self.session_identities.terminals.remove(&terminal.id);
+        }
+        Some(removed)
     }
 
     pub fn remove_chat(
@@ -515,7 +888,10 @@ impl ProjectState {
     ) -> Option<ChatSession> {
         let workspace = self.workspace_mut(workspace_id)?;
         let index = workspace.chats.iter().position(|chat| chat.id == chat_id)?;
-        Some(workspace.chats.remove(index))
+        let removed = workspace.chats.remove(index);
+        self.session_identities.chats.remove(&chat_id);
+        self.agent_generations.remove(&chat_id);
+        Some(removed)
     }
 
     pub fn remove_terminal(
@@ -528,7 +904,9 @@ impl ProjectState {
             .terminals
             .iter()
             .position(|terminal| terminal.id == terminal_id)?;
-        Some(workspace.terminals.remove(index))
+        let removed = workspace.terminals.remove(index);
+        self.session_identities.terminals.remove(&terminal_id);
+        Some(removed)
     }
 
     pub fn workspace(&self, id: WorkspaceId) -> Option<&Workspace> {
@@ -577,6 +955,20 @@ impl ProjectState {
             .find(|terminal| terminal.id == terminal_id)
     }
 
+    fn allocate_session_token(
+        &self,
+        source: &mut impl IdentitySource,
+    ) -> Result<SessionToken, IdAllocationError> {
+        generate_identity(source, |candidate| {
+            self.session_identities
+                .chats
+                .values()
+                .chain(self.session_identities.terminals.values())
+                .any(|token| token == candidate)
+        })
+        .map_err(identity_allocation_error)
+    }
+
     fn allocate_workspace_id(&mut self) -> Result<WorkspaceId, IdAllocationError> {
         let mut used = self
             .workspaces
@@ -614,6 +1006,85 @@ impl ProjectState {
                 .ok_or(IdAllocationError::Terminal)?;
         self.next_terminal_id = next;
         Ok(TerminalId(id))
+    }
+}
+
+fn decode_identity(encoded: &str) -> Option<[u8; IDENTITY_BYTES]> {
+    if encoded.len() != IDENTITY_BYTES * 2
+        || encoded
+            .bytes()
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+
+    let mut decoded = [0_u8; IDENTITY_BYTES];
+    for (index, byte) in decoded.iter_mut().enumerate() {
+        let high = decode_hex_digit(encoded.as_bytes()[index * 2])?;
+        let low = decode_hex_digit(encoded.as_bytes()[index * 2 + 1])?;
+        *byte = (high << 4) | low;
+    }
+    Some(decoded)
+}
+
+fn decode_hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn generate_identity<T>(
+    source: &mut impl IdentitySource,
+    collision: impl Fn(&T) -> bool,
+) -> io::Result<T>
+where
+    T: RandomIdentity,
+{
+    for _ in 0..MAX_IDENTITY_ATTEMPTS {
+        let mut bytes = [0_u8; IDENTITY_BYTES];
+        source.fill_bytes(&mut bytes)?;
+        if let Some(identity) = T::from_random_bytes(bytes).filter(|value| !collision(value)) {
+            return Ok(identity);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "secure entropy repeatedly produced zero or colliding identities",
+    ))
+}
+
+trait RandomIdentity: Sized {
+    fn from_random_bytes(bytes: [u8; IDENTITY_BYTES]) -> Option<Self>;
+}
+
+impl RandomIdentity for StateNamespace {
+    fn from_random_bytes(bytes: [u8; IDENTITY_BYTES]) -> Option<Self> {
+        StateNamespace::from_random_bytes(bytes)
+    }
+}
+
+impl RandomIdentity for SessionToken {
+    fn from_random_bytes(bytes: [u8; IDENTITY_BYTES]) -> Option<Self> {
+        SessionToken::from_random_bytes(bytes)
+    }
+}
+
+impl RandomIdentity for AgentGeneration {
+    fn from_random_bytes(bytes: [u8; IDENTITY_BYTES]) -> Option<Self> {
+        AgentGeneration::from_random_bytes(bytes)
+    }
+}
+
+fn identity_allocation_error(error: io::Error) -> IdAllocationError {
+    IdAllocationError::Identity(error.to_string())
+}
+
+fn allocation_io_error(error: IdAllocationError) -> io::Error {
+    match error {
+        IdAllocationError::Identity(message) => io::Error::other(message),
+        other => io::Error::other(other.to_string()),
     }
 }
 
@@ -712,12 +1183,76 @@ mod tests {
 
     #[test]
     fn project_state_round_trips_through_json() {
-        let state = ProjectState::default();
+        let mut state = ProjectState::default();
+        let workspace = state.workspaces[0].id;
+        let chat = state
+            .add_chat(
+                workspace,
+                "agent".to_string(),
+                ChatStatus::Idle,
+                AgentKind::Pi,
+            )
+            .unwrap()
+            .unwrap();
+        state.begin_agent_generation(chat).unwrap().unwrap();
 
         let json = serde_json::to_string(&state).expect("serialize project state");
         let decoded: ProjectState = serde_json::from_str(&json).expect("deserialize project state");
 
         assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn opaque_identities_reject_zero_and_noncanonical_encodings() {
+        assert!(StateNamespace::from_bytes([0; 16]).is_none());
+        assert!(
+            serde_json::from_str::<StateNamespace>("\"00000000000000000000000000000000\"").is_err()
+        );
+        assert!(
+            serde_json::from_str::<SessionToken>("\"ABCDEFABCDEFABCDEFABCDEFABCDEFAB\"").is_err()
+        );
+    }
+
+    #[test]
+    fn entropy_failure_does_not_partially_add_a_chat() {
+        struct FailingSource;
+        impl IdentitySource for FailingSource {
+            fn fill_bytes(&mut self, _bytes: &mut [u8]) -> io::Result<()> {
+                Err(io::Error::other("injected entropy failure"))
+            }
+        }
+
+        let mut state = ProjectState::default();
+        let workspace = state.workspaces[0].id;
+        let before = state.clone();
+        let error = state
+            .add_chat_with_source(
+                workspace,
+                "agent".to_string(),
+                ChatStatus::Idle,
+                AgentKind::Pi,
+                &mut FailingSource,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("injected entropy failure"));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn agent_generations_are_nonzero_unique_and_cleared_only_by_exact_value() {
+        let mut state = ProjectState::seeded();
+        let first = state.workspaces[0].chats[0].id;
+        let second = state.workspaces[0].chats[1].id;
+
+        let first_generation = state.begin_agent_generation(first).unwrap().unwrap();
+        let second_generation = state.begin_agent_generation(second).unwrap().unwrap();
+
+        assert_ne!(first_generation, second_generation);
+        assert_eq!(state.active_agent_generation(first), Some(first_generation));
+        assert!(!state.clear_agent_generation(first, second_generation));
+        assert!(state.clear_agent_generation(first, first_generation));
+        assert_eq!(state.active_agent_generation(first), None);
     }
 
     #[test]
@@ -1042,8 +1577,15 @@ mod tests {
     }
 
     fn empty_state() -> ProjectState {
+        let mut state = ProjectState::default();
+        state.workspaces.clear();
+        state.session_identities = SessionIdentities::default();
+        state.agent_generations.clear();
         ProjectState {
             version: STATE_VERSION,
+            namespace: state.namespace,
+            session_identities: state.session_identities,
+            agent_generations: BTreeMap::new(),
             next_workspace_id: 1,
             next_chat_id: 1,
             next_terminal_id: 1,

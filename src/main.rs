@@ -16,7 +16,17 @@ mod terminal_guard;
 use terminal_guard::TerminalGuard;
 
 fn main() -> io::Result<()> {
-    let project = storage::load_or_default()?;
+    // Acquire ownership before reading mutable state and retain it until after
+    // terminal cleanup. Kernel descriptor cleanup releases the lock on unwind,
+    // signals, and forced process termination.
+    let state_store = storage::StateStore::acquire_default()?;
+    let loaded = state_store.load_or_default()?;
+    if loaded.needs_save {
+        // Persist migrations and first-run identities before terminal setup or
+        // any runtime restoration can attach to or launch a command.
+        state_store.save(&loaded.state)?;
+    }
+    let project = loaded.state;
     let config = config::load_or_default()?;
     let shutdown = install_shutdown_signals()?;
     let mut terminal = TerminalGuard::new(config.mouse_capture)?;

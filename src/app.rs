@@ -7,8 +7,8 @@ use crate::{
     agent::{AgentEvent, AgentMessageRole, AgentTarget},
     config::ConfiguredProject,
     model::{
-        AgentKind, ChatId, ChatMessage, ChatMessageRole, ChatStatus, ProjectState, PtyKey,
-        TerminalId, TerminalStatus, WorkspaceId, DEFAULT_AGENT_CHAT_TITLE, STATE_VERSION,
+        AgentGeneration, AgentKind, ChatId, ChatMessage, ChatMessageRole, ChatStatus, ProjectState,
+        PtyKey, TerminalId, TerminalStatus, WorkspaceId, DEFAULT_AGENT_CHAT_TITLE,
     },
 };
 
@@ -226,17 +226,10 @@ impl App {
 
 impl App {
     pub fn new(mut project: ProjectState) -> Self {
-        let version_normalized = project.version != STATE_VERSION;
-        project.version = STATE_VERSION;
-        let (ids_normalized, operation_error) = match project.normalize_next_ids() {
-            Ok(changed) => (changed, None),
-            Err(error) => (
-                false,
-                Some(format!("could not normalize persisted IDs: {error}")),
-            ),
-        };
+        // Durable schema/version/identity repair belongs exclusively to
+        // storage. App construction only applies the existing presentation
+        // normalization for historical agent titles.
         let titles_normalized = normalize_agent_chat_titles(&mut project);
-        let chat_statuses_normalized = normalize_transient_chat_statuses(&mut project);
         let chat_buffers = project
             .workspaces
             .iter()
@@ -269,13 +262,10 @@ impl App {
             active_search: None,
             text_selection: None,
             should_quit: false,
-            dirty: version_normalized
-                || ids_normalized
-                || titles_normalized
-                || chat_statuses_normalized,
+            dirty: titles_normalized,
             recoverable_terminals,
             save_error: None,
-            operation_error,
+            operation_error: None,
         };
         app.reconcile_selection(None);
         app.sync_focus_to_selection();
@@ -1337,6 +1327,23 @@ impl App {
         self.sync_focus_to_selection();
     }
 
+    pub fn begin_agent_generation(
+        &mut self,
+        chat: ChatId,
+    ) -> Result<Option<AgentGeneration>, crate::model::IdAllocationError> {
+        let generation = self.project.begin_agent_generation(chat)?;
+        if generation.is_some() {
+            self.dirty = true;
+        }
+        Ok(generation)
+    }
+
+    pub fn clear_agent_generation(&mut self, chat: ChatId, generation: AgentGeneration) -> bool {
+        let changed = self.project.clear_agent_generation(chat, generation);
+        self.dirty |= changed;
+        changed
+    }
+
     /// Returns whether the chat's status actually changed (useful for deciding
     /// if a redraw is needed).
     pub fn mark_chat_status_by_id(&mut self, chat: ChatId, status: ChatStatus) -> bool {
@@ -1914,22 +1921,6 @@ fn normalize_agent_chat_titles(project: &mut ProjectState) -> bool {
     changed
 }
 
-fn normalize_transient_chat_statuses(project: &mut ProjectState) -> bool {
-    let mut changed = false;
-    for chat in project
-        .workspaces
-        .iter_mut()
-        .flat_map(|workspace| workspace.chats.iter_mut())
-    {
-        if matches!(chat.status, ChatStatus::Thinking | ChatStatus::Waiting) {
-            chat.status = ChatStatus::Idle;
-            changed = true;
-        }
-    }
-
-    changed
-}
-
 fn command_terminal_name(command: &str, next: usize) -> String {
     let command = command.trim();
     if command.is_empty() {
@@ -2048,35 +2039,23 @@ mod tests {
     }
 
     #[test]
-    fn app_normalizes_transient_chat_statuses_on_load() {
+    fn app_preserves_storage_owned_status_and_allocator_state() {
         let mut state = ProjectState::seeded();
         state.workspaces[0].chats[0].status = ChatStatus::Thinking;
-        state.workspaces[0].chats[1].status = ChatStatus::Waiting;
-        state.workspaces[1].chats[0].status = ChatStatus::Done;
+        state.next_workspace_id = 1;
+        state.next_chat_id = 1;
+        state.next_terminal_id = 1;
 
         let app = App::new(state);
 
-        assert_eq!(app.project.workspaces[0].chats[0].status, ChatStatus::Idle);
-        assert_eq!(app.project.workspaces[0].chats[1].status, ChatStatus::Idle);
-        assert_eq!(app.project.workspaces[1].chats[0].status, ChatStatus::Done);
-        assert!(app.is_dirty());
-    }
-
-    #[test]
-    fn app_repairs_low_allocators_on_load() {
-        let state = ProjectState {
-            next_workspace_id: 1,
-            next_chat_id: 1,
-            next_terminal_id: 1,
-            ..ProjectState::seeded()
-        };
-
-        let app = App::new(state);
-
-        assert_eq!(app.project.next_workspace_id, 3);
-        assert_eq!(app.project.next_chat_id, 4);
-        assert_eq!(app.project.next_terminal_id, 3);
-        assert!(app.is_dirty());
+        assert_eq!(
+            app.project.workspaces[0].chats[0].status,
+            ChatStatus::Thinking
+        );
+        assert_eq!(app.project.next_workspace_id, 1);
+        assert_eq!(app.project.next_chat_id, 1);
+        assert_eq!(app.project.next_terminal_id, 1);
+        assert!(!app.is_dirty());
     }
 
     #[test]

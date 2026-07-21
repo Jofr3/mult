@@ -1,0 +1,71 @@
+{
+  "version": 2,
+  "namespace": "000102030405060708090a0b0c0d0e0f",
+  "session_identities": {
+    "chats": {
+      "1": "101112131415161718191a1b1c1d1e1f",
+      "2": "202122232425262728292a2b2c2d2e2f"
+    },
+    "terminals": {
+      "1": "303132333435363738393a3b3c3d3e3f",
+      "2": "404142434445464748494a4b4c4d4e4f"
+    }
+  },
+  "next_workspace_id": 2,
+  "next_chat_id": 3,
+  "next_terminal_id": 3,
+  "workspaces": [
+    {
+      "id": 1,
+      "name": "complete",
+      "cwd": "/work/project",
+      "environment": {
+        "RUST_LOG": "debug"
+      },
+      "chats": [
+        {
+          "id": 1,
+          "name": "agent",
+          "status": "Done",
+          "agent": "Pi",
+          "messages": [
+            {
+              "role": "User",
+              "text": "question"
+            },
+            {
+              "role": "Assistant",
+              "text": "answer"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "name": "agent",
+          "status": "Idle",
+          "agent": "ClaudeCode",
+          "messages": []
+        }
+      ],
+      "terminals": [
+        {
+          "id": 1,
+          "name": "shell",
+          "status": "Stopped",
+          "launch": {
+            "kind": "shell"
+          }
+        },
+        {
+          "id": 2,
+          "name": "command",
+          "status": "Running",
+          "launch": {
+            "kind": "command",
+            "command": "printf migrated-only"
+          }
+        }
+      ]
+    }
+  ]
+}

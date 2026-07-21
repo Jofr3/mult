@@ -3,8 +3,9 @@
 //! keeps only terminal setup/teardown and calls `runtime::run`.
 
 use std::{
+    collections::HashMap,
     fs::{self, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
@@ -25,20 +26,48 @@ use mult::{
     pty::{AttachExistingResult, PtyDimensions, PtyEvent, PtyRuntime, PtySpawn},
     storage, ui,
 };
+use mult_protocol::{
+    AgentGeneration as WireAgentGeneration, AgentKind as WireAgentKind, AgentSessionMetadata,
+    AgentStatus, AgentStatusQuery, AgentStatusRecord, AGENT_STATUS_SCHEMA_VERSION,
+};
 use ratatui::{layout::Rect, DefaultTerminal};
 use serde::Deserialize;
 
 const AGENT_CMD_ENV: &str = "MULT_AGENT_CMD";
 const MULT_AGENT_STATUS_PATH_ENV: &str = "MULT_AGENT_STATUS_PATH";
 const MULT_AGENT_CHAT_ID_ENV: &str = "MULT_AGENT_CHAT_ID";
+const MULT_AGENT_STATUS_VERSION_ENV: &str = "MULT_AGENT_STATUS_VERSION";
+const MULT_AGENT_NAMESPACE_ENV: &str = "MULT_AGENT_NAMESPACE";
+const MULT_AGENT_SESSION_TOKEN_ENV: &str = "MULT_AGENT_SESSION_TOKEN";
+const MULT_AGENT_KIND_ENV: &str = "MULT_AGENT_KIND";
+const MULT_AGENT_GENERATION_ENV: &str = "MULT_AGENT_GENERATION";
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const READY_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(0);
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const MOUSE_SCROLL_ROWS: usize = 3;
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct MultAgentStatusRecord {
+    version: u16,
+    namespace: String,
+    session_token: String,
+    chat_id: String,
+    agent_kind: String,
+    generation: String,
     status: String,
+}
+
+#[derive(Default)]
+struct AgentStatusBridgeState {
+    cursors: HashMap<PathBuf, AgentStatusCursor>,
+}
+
+#[derive(Default)]
+struct AgentStatusCursor {
+    device: u64,
+    inode: u64,
+    offset: u64,
 }
 
 const MULT_STATUS_EXTENSION_SOURCE: &str = include_str!("../extensions/mult-status.ts");
@@ -172,8 +201,10 @@ pub fn run(
 ) -> io::Result<()> {
     let mut pty_runtime = PtyRuntime::default();
     let mut agent_backend = RuntimeAgentBackend::from_env();
+    let mut agent_status_bridges = AgentStatusBridgeState::default();
     let size = terminal.size()?;
     let mut frame_area = Rect::new(0, 0, size.width, size.height);
+    register_project_session_identities(&app, &mut pty_runtime);
     restore_persisted_sessions(&mut app, &mut pty_runtime, &config, frame_area);
     refresh_workspace_git_branches(&mut app);
     let mut last_git_branch_refresh = Instant::now();
@@ -200,7 +231,8 @@ pub fn run(
         }
         needs_redraw |= drain_pty_events(&mut app, &mut pty_runtime);
         needs_redraw |= drain_agent_events(&mut app, &mut agent_backend);
-        needs_redraw |= drain_mult_agent_status_events(&mut app);
+        needs_redraw |=
+            drain_mult_agent_status_events(&mut app, &mut pty_runtime, &mut agent_status_bridges);
         needs_redraw |= save_if_dirty_with(&mut app, false, storage::save);
         needs_redraw |= resize_visible_terminal(&mut app, &mut pty_runtime, &config, frame_area);
         needs_redraw |= resize_visible_chat_agent(&mut app, &mut pty_runtime, &config, frame_area);
@@ -241,6 +273,23 @@ pub fn run(
     Ok(())
 }
 
+fn register_project_session_identities(app: &App, pty_runtime: &mut PtyRuntime) {
+    for workspace in &app.project.workspaces {
+        for chat in &workspace.chats {
+            let key = PtyKey::ChatAgent(chat.id);
+            if let Some(identity) = app.project.session_identity(key) {
+                let _ = pty_runtime.register_session_identity(key, identity);
+            }
+        }
+        for terminal in &workspace.terminals {
+            let key = PtyKey::Terminal(terminal.id);
+            if let Some(identity) = app.project.session_identity(key) {
+                let _ = pty_runtime.register_session_identity(key, identity);
+            }
+        }
+    }
+}
+
 fn refresh_workspace_git_branches(app: &mut App) {
     let branches = app
         .project
@@ -260,6 +309,7 @@ fn restore_persisted_sessions(
     config: &Config,
     frame_area: Rect,
 ) {
+    register_project_session_identities(app, pty_runtime);
     let terminals = app
         .project
         .workspaces
@@ -318,14 +368,49 @@ fn restore_persisted_sessions(
         .iter()
         .flat_map(|workspace| {
             workspace.chats.iter().filter_map(|chat| {
-                matches!(chat.status, ChatStatus::Thinking | ChatStatus::Waiting)
-                    .then_some((workspace.id, chat.id))
+                app.project
+                    .active_agent_generation(chat.id)
+                    .map(|generation| (workspace.id, chat.id, chat.agent, generation))
             })
         })
         .collect::<Vec<_>>();
 
-    for (workspace, chat) in chats {
-        start_or_focus_chat_agent(app, pty_runtime, config, frame_area, workspace, chat, false);
+    for (_workspace, chat, agent, generation) in chats {
+        let key = PtyKey::ChatAgent(chat);
+        let metadata = agent_session_metadata(chat, agent, generation);
+        if let Err(error) = pty_runtime.register_agent_session(key, metadata) {
+            app.mark_chat_status_by_id(chat, ChatStatus::Failed);
+            pty_runtime.append_terminal_system_line(
+                key,
+                format!("failed to restore agent generation metadata: {error}"),
+            );
+            continue;
+        }
+        let size = chat_agent_dimensions(app, frame_area);
+        match pty_runtime.attach_existing(key, size) {
+            Ok(AttachExistingResult::Attached) => {
+                reconcile_agent_status(app, pty_runtime, chat, agent, generation);
+            }
+            Ok(AttachExistingResult::Missing) => {
+                let recovered_final =
+                    reconcile_agent_status(app, pty_runtime, chat, agent, generation);
+                if !recovered_final {
+                    app.mark_chat_status_by_id(chat, ChatStatus::Failed);
+                }
+                app.clear_agent_generation(chat, generation);
+                pty_runtime.append_terminal_system_line(
+                    key,
+                    "agent session is unavailable; it was not relaunched during restoration",
+                );
+            }
+            Err(error) => {
+                app.mark_chat_status_by_id(chat, ChatStatus::Failed);
+                pty_runtime.append_terminal_system_line(
+                    key,
+                    format!("failed to restore agent without relaunching it: {error}"),
+                );
+            }
+        }
     }
 }
 
@@ -818,10 +903,22 @@ fn add_agent_to_selected_workspace(
 }
 
 fn confirm_pending_delete(app: &mut App, pty_runtime: &mut PtyRuntime) {
+    let status_file = app.pending_delete_pty().and_then(|key| match key {
+        PtyKey::ChatAgent(chat) => Some(mult_agent_status_path(
+            app.project.session_identity(key)?,
+            app.project.active_agent_generation(chat)?,
+        )),
+        PtyKey::Terminal(_) => None,
+    });
     let removed =
         confirm_pending_delete_with(app, |_, terminal| pty_runtime.stop(terminal).map(|_| ()));
-    for terminal in removed {
-        pty_runtime.remove_terminal(terminal);
+    for terminal in &removed {
+        pty_runtime.remove_terminal(*terminal);
+    }
+    if !removed.is_empty() {
+        if let Some(path) = status_file {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -1090,6 +1187,17 @@ fn start_terminal(
     };
 
     let terminal_name = terminal.name.clone();
+    let Some(identity) = app.project.session_identity(key) else {
+        pty_runtime.append_terminal_system_line(key, "durable terminal identity is missing");
+        return false;
+    };
+    if let Err(error) = pty_runtime.register_session_identity(key, identity) {
+        pty_runtime.append_terminal_system_line(
+            key,
+            format!("failed to register durable terminal identity: {error}"),
+        );
+        return false;
+    }
     let mut spawn = match &terminal.launch {
         TerminalLaunch::Shell => {
             PtySpawn::shell(key, workspace.cwd.clone(), workspace.environment.clone())
@@ -1161,27 +1269,150 @@ fn start_or_focus_chat_agent(
     let Some(workspace) = app.project.workspace(workspace_id) else {
         return;
     };
-    let (chat_name, agent) = workspace
+    let (chat_name, agent, cwd, workspace_environment) = workspace
         .chats
         .iter()
         .find(|chat| chat.id == chat_id)
-        .map(|chat| (chat.name.clone(), chat.agent))
-        .unwrap_or_else(|| (format!("chat {}", chat_id.0), AgentKind::default()));
+        .map(|chat| {
+            (
+                chat.name.clone(),
+                chat.agent,
+                workspace.cwd.clone(),
+                workspace.environment.clone(),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                format!("chat {}", chat_id.0),
+                AgentKind::default(),
+                workspace.cwd.clone(),
+                workspace.environment.clone(),
+            )
+        });
+    let Some(identity) = app.project.session_identity(terminal_id) else {
+        pty_runtime.append_terminal_system_line(terminal_id, "durable chat identity is missing");
+        app.mark_chat_status_by_id(chat_id, ChatStatus::Failed);
+        return;
+    };
+    if let Err(error) = pty_runtime.register_session_identity(terminal_id, identity) {
+        pty_runtime.append_terminal_system_line(
+            terminal_id,
+            format!("failed to register durable chat identity: {error}"),
+        );
+        app.mark_chat_status_by_id(chat_id, ChatStatus::Failed);
+        return;
+    }
+
+    // A persisted generation is restoration state, not permission to launch.
+    // Reconcile it with the daemon using Attach only. If it is absent, persist
+    // that fact before a later deliberate invocation may allocate a successor.
+    if let Some(generation) = app.project.active_agent_generation(chat_id) {
+        let metadata = agent_session_metadata(chat_id, agent, generation);
+        if let Err(error) = pty_runtime.register_agent_session(terminal_id, metadata) {
+            pty_runtime.append_terminal_system_line(
+                terminal_id,
+                format!("failed to register agent generation: {error}"),
+            );
+            app.mark_chat_status_by_id(chat_id, ChatStatus::Failed);
+            return;
+        }
+        match pty_runtime.attach_existing(terminal_id, chat_agent_dimensions(app, frame_area)) {
+            Ok(AttachExistingResult::Attached) => {
+                reconcile_agent_status(app, pty_runtime, chat_id, agent, generation);
+                if focus_after_start {
+                    app.begin_chat_agent_input();
+                }
+                return;
+            }
+            Ok(AttachExistingResult::Missing) => {
+                app.clear_agent_generation(chat_id, generation);
+                app.mark_chat_status_by_id(chat_id, ChatStatus::Failed);
+                if !persist_before_agent_launch(app) {
+                    pty_runtime.append_terminal_system_line(
+                        terminal_id,
+                        "could not save missing agent generation; refusing to launch",
+                    );
+                    return;
+                }
+            }
+            Err(error) => {
+                app.mark_chat_status_by_id(chat_id, ChatStatus::Failed);
+                pty_runtime.append_terminal_system_line(
+                    terminal_id,
+                    format!("failed to reconcile existing agent; refusing to relaunch: {error}"),
+                );
+                return;
+            }
+        }
+    }
+
+    let generation = match app.begin_agent_generation(chat_id) {
+        Ok(Some(generation)) => generation,
+        Ok(None) => return,
+        Err(error) => {
+            app.mark_chat_status_by_id(chat_id, ChatStatus::Failed);
+            pty_runtime.append_terminal_system_line(
+                terminal_id,
+                format!("failed to allocate secure agent generation: {error}"),
+            );
+            return;
+        }
+    };
+    if !persist_before_agent_launch(app) {
+        pty_runtime.append_terminal_system_line(
+            terminal_id,
+            "could not save agent generation; refusing to launch",
+        );
+        return;
+    }
+
+    let metadata = agent_session_metadata(chat_id, agent, generation);
+    if let Err(error) = pty_runtime.register_agent_session(terminal_id, metadata) {
+        app.mark_chat_status_by_id(chat_id, ChatStatus::Failed);
+        pty_runtime.append_terminal_system_line(
+            terminal_id,
+            format!("failed to register agent generation: {error}"),
+        );
+        return;
+    }
+
     let command = agent_command(config, agent);
-    let status_path = mult_agent_status_path(chat_id);
-    let _ = fs::remove_file(&status_path);
-    let mut environment = workspace.environment.clone();
+    let status_path = mult_agent_status_path(identity, generation);
+    if let Err(error) = prepare_mult_agent_status_file(&status_path) {
+        app.mark_chat_status_by_id(chat_id, ChatStatus::Failed);
+        pty_runtime.append_terminal_system_line(
+            terminal_id,
+            format!("failed to prepare private agent status journal: {error}"),
+        );
+        return;
+    }
+    let mut environment = workspace_environment;
     environment.insert(
         MULT_AGENT_STATUS_PATH_ENV.to_string(),
         status_path.display().to_string(),
     );
     environment.insert(MULT_AGENT_CHAT_ID_ENV.to_string(), chat_id.0.to_string());
-    let mut spawn = PtySpawn::command_line(
-        terminal_id,
-        command.clone(),
-        workspace.cwd.clone(),
-        environment,
+    environment.insert(
+        MULT_AGENT_STATUS_VERSION_ENV.to_string(),
+        AGENT_STATUS_SCHEMA_VERSION.to_string(),
     );
+    environment.insert(
+        MULT_AGENT_NAMESPACE_ENV.to_string(),
+        identity.namespace.to_string(),
+    );
+    environment.insert(
+        MULT_AGENT_SESSION_TOKEN_ENV.to_string(),
+        identity.token.to_string(),
+    );
+    environment.insert(
+        MULT_AGENT_KIND_ENV.to_string(),
+        agent_status_kind(agent).to_string(),
+    );
+    environment.insert(
+        MULT_AGENT_GENERATION_ENV.to_string(),
+        generation.to_string(),
+    );
+    let mut spawn = PtySpawn::command_line(terminal_id, command.clone(), cwd, environment);
     spawn.size = chat_agent_dimensions(app, frame_area);
 
     match pty_runtime.start(spawn) {
@@ -1192,6 +1423,9 @@ fn start_or_focus_chat_agent(
             }
         }
         Err(error) => {
+            // Keep the saved generation: create delivery may be uncertain, and
+            // a later attach is the only safe way to reconcile without a
+            // duplicate command launch.
             app.mark_chat_status_by_id(chat_id, ChatStatus::Failed);
             pty_runtime.append_terminal_system_line(
                 terminal_id,
@@ -1201,6 +1435,80 @@ fn start_or_focus_chat_agent(
                 ),
             );
         }
+    }
+}
+
+fn persist_before_agent_launch(app: &mut App) -> bool {
+    save_if_dirty_with(app, true, storage::save);
+    !app.is_dirty()
+}
+
+fn agent_session_metadata(
+    chat: model::ChatId,
+    agent: AgentKind,
+    generation: model::AgentGeneration,
+) -> AgentSessionMetadata {
+    AgentSessionMetadata {
+        schema_version: AGENT_STATUS_SCHEMA_VERSION,
+        chat_id: chat.0,
+        agent: wire_agent_kind(agent),
+        generation: wire_agent_generation(generation),
+    }
+}
+
+fn wire_agent_generation(generation: model::AgentGeneration) -> WireAgentGeneration {
+    WireAgentGeneration::from_bytes(generation.as_bytes())
+        .expect("durable agent generations are non-zero")
+}
+
+fn wire_agent_kind(agent: AgentKind) -> WireAgentKind {
+    match agent {
+        AgentKind::Pi => WireAgentKind::Pi,
+        AgentKind::ClaudeCode => WireAgentKind::ClaudeCode,
+    }
+}
+
+fn reconcile_agent_status(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    chat: model::ChatId,
+    agent: AgentKind,
+    generation: model::AgentGeneration,
+) -> bool {
+    let key = PtyKey::ChatAgent(chat);
+    let Some(identity) = pty_runtime.registered_session_identity(key) else {
+        return false;
+    };
+    let query = AgentStatusQuery {
+        schema_version: AGENT_STATUS_SCHEMA_VERSION,
+        identity,
+        chat_id: chat.0,
+        agent: wire_agent_kind(agent),
+        generation: wire_agent_generation(generation),
+    };
+    match pty_runtime.get_agent_status(query) {
+        Ok(Some(record)) if record.generation == query.generation => {
+            app.mark_chat_status_by_id(chat, chat_status_from_agent_status(record.status));
+            true
+        }
+        Ok(_) => false,
+        Err(error) => {
+            pty_runtime.append_terminal_system_line(
+                key,
+                format!("failed to reconcile daemon agent status: {error}"),
+            );
+            false
+        }
+    }
+}
+
+fn chat_status_from_agent_status(status: AgentStatus) -> ChatStatus {
+    match status {
+        AgentStatus::Idle => ChatStatus::Idle,
+        AgentStatus::Running => ChatStatus::Thinking,
+        AgentStatus::Waiting => ChatStatus::Waiting,
+        AgentStatus::Finished | AgentStatus::Exited => ChatStatus::Done,
+        AgentStatus::Failed => ChatStatus::Failed,
     }
 }
 
@@ -1391,32 +1699,78 @@ fn write_private_runtime_file(
     extension: &str,
     contents: &[u8],
 ) -> Option<PathBuf> {
-    for _ in 0..16 {
-        let path = dir.join(format!(
-            "{prefix}-{}-{:016x}.{extension}",
-            std::process::id(),
-            random_u64().ok()?
-        ));
-        match write_private_file(&path, contents) {
-            Ok(()) => return Some(path),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return None,
-        }
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    // Versioned fixed names bound generated artifacts to three files instead of
+    // leaking a PID/random file on every command construction.
+    let path = dir.join(format!("{prefix}-v2.{extension}"));
+    rotate_legacy_runtime_artifacts(dir, prefix, &path).ok()?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options.open(&path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != current_euid()
+        || metadata.nlink() != 1
+        || metadata.len() > 1024 * 1024
+    {
+        return None;
     }
-    None
+    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) } != 0 {
+        return None;
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .ok()?;
+    let mut existing = Vec::new();
+    file.read_to_end(&mut existing).ok()?;
+    if existing != contents {
+        file.set_len(0).ok()?;
+        file.seek(SeekFrom::Start(0)).ok()?;
+        file.write_all(contents).ok()?;
+        file.sync_all().ok()?;
+    }
+    Some(path)
 }
 
-fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+fn rotate_legacy_runtime_artifacts(
+    directory: &Path,
+    prefix: &str,
+    current: &Path,
+) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    const MAX_RETAINED_LEGACY_ARTIFACTS: usize = 16;
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(directory)?.take(4096) {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if path == current || !name.starts_with(prefix) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_file()
+            && metadata.uid() == current_euid()
+            && metadata.nlink() == 1
+        {
+            candidates.push((metadata.modified().ok(), path));
+        }
     }
-    let mut file = options.open(path)?;
-    file.write_all(contents)?;
-    file.sync_all()
+    candidates.sort_by_key(|(modified, _)| *modified);
+    let remove_count = candidates
+        .len()
+        .saturating_sub(MAX_RETAINED_LEGACY_ARTIFACTS);
+    for (_, path) in candidates.into_iter().take(remove_count) {
+        let _ = fs::remove_file(path);
+    }
+    Ok(())
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1529,6 +1883,27 @@ fn drain_pty_events(app: &mut App, pty_runtime: &mut PtyRuntime) -> bool {
         changed = true;
         match event {
             PtyEvent::Scrollback { .. } | PtyEvent::Output { .. } => {}
+            // Truncation is metadata, not terminal output. Injecting a notice
+            // into the parser here would place client text after replay/live
+            // bytes and corrupt the daemon's exact byte ordering.
+            PtyEvent::ReplayTruncated { .. } => {}
+            PtyEvent::TakenOver { terminal } => {
+                match terminal {
+                    PtyKey::ChatAgent(chat_id) => {
+                        app.mark_chat_status_by_id(chat_id, ChatStatus::Failed);
+                    }
+                    PtyKey::Terminal(terminal_id) => {
+                        app.mark_terminal_stopped(terminal_id);
+                    }
+                }
+                if app.pty_input_target() == Some(terminal) {
+                    app.end_pty_input();
+                }
+                pty_runtime.append_terminal_system_line(
+                    terminal,
+                    "PTY attachment was taken over by another client",
+                );
+            }
             PtyEvent::Exited { terminal, status } => match terminal {
                 PtyKey::ChatAgent(chat_id) => {
                     let chat_status = if status.code == 0 {
@@ -1538,6 +1913,13 @@ fn drain_pty_events(app: &mut App, pty_runtime: &mut PtyRuntime) -> bool {
                     };
                     let agent = chat_agent_kind(app, chat_id);
                     app.mark_chat_status_by_id(chat_id, chat_status);
+                    if let (Some(identity), Some(generation)) = (
+                        app.project.session_identity(terminal),
+                        app.project.active_agent_generation(chat_id),
+                    ) {
+                        app.clear_agent_generation(chat_id, generation);
+                        let _ = fs::remove_file(mult_agent_status_path(identity, generation));
+                    }
                     if app.pty_input_target() == Some(terminal) {
                         app.end_pty_input();
                     }
@@ -1737,61 +2119,186 @@ fn drain_agent_events(app: &mut App, backend: &mut impl AgentBackend) -> bool {
     changed
 }
 
-fn drain_mult_agent_status_events(app: &mut App) -> bool {
+fn drain_mult_agent_status_events(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    bridges: &mut AgentStatusBridgeState,
+) -> bool {
     let chats = app
         .project
         .workspaces
         .iter()
-        .flat_map(|workspace| workspace.chats.iter().map(|chat| chat.id))
+        .flat_map(|workspace| {
+            workspace.chats.iter().filter_map(|chat| {
+                let generation = app.project.active_agent_generation(chat.id)?;
+                let identity = app.project.session_identity(PtyKey::ChatAgent(chat.id))?;
+                Some((chat.id, chat.agent, identity, generation))
+            })
+        })
         .collect::<Vec<_>>();
 
     let mut changed = false;
-    for chat in chats {
-        if let Some(status) = read_mult_agent_status(&mult_agent_status_path(chat)) {
-            changed |= app.mark_chat_status_by_id(chat, status);
+    for (chat, agent, identity, generation) in chats {
+        let path = mult_agent_status_path(identity, generation);
+        let records = {
+            let cursor = bridges.cursors.entry(path.clone()).or_default();
+            match read_mult_agent_status_records(&path, cursor) {
+                Ok(records) => records,
+                Err(_) => continue,
+            }
+        };
+        for (record, consumed_offset) in records {
+            if !status_record_matches(&record, chat, agent, identity, generation) {
+                if let Some(cursor) = bridges.cursors.get_mut(&path) {
+                    cursor.offset = consumed_offset;
+                }
+                continue;
+            }
+            let Some(status) = mult_agent_status(&record.status) else {
+                if let Some(cursor) = bridges.cursors.get_mut(&path) {
+                    cursor.offset = consumed_offset;
+                }
+                continue;
+            };
+            let Some(wire_identity) =
+                pty_runtime.registered_session_identity(PtyKey::ChatAgent(chat))
+            else {
+                break;
+            };
+            let update = AgentStatusRecord {
+                schema_version: AGENT_STATUS_SCHEMA_VERSION,
+                identity: wire_identity,
+                chat_id: chat.0,
+                agent: wire_agent_kind(agent),
+                generation: wire_agent_generation(generation),
+                status,
+            };
+            match pty_runtime.update_agent_status(update) {
+                Ok(accepted) => {
+                    changed |= app.mark_chat_status_by_id(
+                        chat,
+                        chat_status_from_agent_status(accepted.status),
+                    );
+                    if let Some(cursor) = bridges.cursors.get_mut(&path) {
+                        cursor.offset = consumed_offset;
+                    }
+                }
+                Err(_) => {
+                    // The daemon is authoritative. Reconcile a final status or
+                    // stale generation instead of applying untrusted file data.
+                    reconcile_agent_status(app, pty_runtime, chat, agent, generation);
+                    if let Some(cursor) = bridges.cursors.get_mut(&path) {
+                        cursor.offset = consumed_offset;
+                    }
+                }
+            }
         }
     }
     changed
 }
 
-/// Upper bound on the agent status file. It is a tiny JSON object; anything
-/// larger is a bug or a hostile same-UID writer, and this read happens on the
-/// render thread once per frame per chat, so it must never read unboundedly.
-const MAX_STATUS_FILE_BYTES: u64 = 64 * 1024;
+const MAX_STATUS_RECORD_BYTES: usize = 4 * 1024;
+const MAX_STATUS_FILE_BYTES: u64 = 1024 * 1024;
 
-fn read_mult_agent_status(path: &Path) -> Option<ChatStatus> {
+fn read_mult_agent_status_records(
+    path: &Path,
+    cursor: &mut AgentStatusCursor,
+) -> io::Result<Vec<(MultAgentStatusRecord, u64)>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
     let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != current_euid()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o077 != 0
+        || metadata.len() > MAX_STATUS_FILE_BYTES
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        // O_NOFOLLOW: never follow a symlink swapped in for the status file.
-        // O_NONBLOCK: opening a FIFO or device must not stall the render thread.
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "agent status journal failed type, owner, link, mode, or size validation",
+        ));
     }
 
-    let file = options.open(path).ok()?;
-    // Read regular files only; a swapped-in FIFO/socket/device is ignored.
-    if !file.metadata().ok()?.file_type().is_file() {
-        return None;
+    if cursor.device != metadata.dev()
+        || cursor.inode != metadata.ino()
+        || cursor.offset > metadata.len()
+    {
+        cursor.device = metadata.dev();
+        cursor.inode = metadata.ino();
+        cursor.offset = 0;
+    }
+    file.seek(SeekFrom::Start(cursor.offset))?;
+    let remaining = MAX_STATUS_FILE_BYTES.saturating_sub(cursor.offset);
+    let mut bytes = Vec::new();
+    file.take(remaining + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > remaining {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "agent status journal exceeds its byte limit",
+        ));
     }
 
-    let mut contents = String::new();
-    file.take(MAX_STATUS_FILE_BYTES)
-        .read_to_string(&mut contents)
-        .ok()?;
-    let record = serde_json::from_str::<MultAgentStatusRecord>(&contents).ok()?;
-    mult_agent_status_to_chat_status(&record.status)
+    let complete_len = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |position| position + 1);
+    let mut records = Vec::new();
+    let mut relative_offset = 0_u64;
+    for line in bytes[..complete_len].split_inclusive(|byte| *byte == b'\n') {
+        relative_offset = relative_offset.saturating_add(line.len() as u64);
+        let encoded = line.strip_suffix(b"\n").unwrap_or(line);
+        if encoded.is_empty() || encoded.len() > MAX_STATUS_RECORD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "agent status journal contains an empty or oversized record",
+            ));
+        }
+        let record = serde_json::from_slice(encoded)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        records.push((record, cursor.offset + relative_offset));
+    }
+    Ok(records)
 }
 
-fn mult_agent_status_to_chat_status(status: &str) -> Option<ChatStatus> {
+fn status_record_matches(
+    record: &MultAgentStatusRecord,
+    chat: model::ChatId,
+    agent: AgentKind,
+    identity: model::SessionIdentity,
+    generation: model::AgentGeneration,
+) -> bool {
+    record.version == AGENT_STATUS_SCHEMA_VERSION
+        && record.namespace == identity.namespace.to_string()
+        && record.session_token == identity.token.to_string()
+        && record.chat_id == chat.0.to_string()
+        && record.agent_kind == agent_status_kind(agent)
+        && record.generation == generation.to_string()
+}
+
+fn mult_agent_status(status: &str) -> Option<AgentStatus> {
     match status {
-        "idle" => Some(ChatStatus::Idle),
-        "running" => Some(ChatStatus::Thinking),
-        "waiting" => Some(ChatStatus::Waiting),
-        "error" => Some(ChatStatus::Failed),
-        "finished" => Some(ChatStatus::Done),
+        "idle" => Some(AgentStatus::Idle),
+        "running" => Some(AgentStatus::Running),
+        "waiting" => Some(AgentStatus::Waiting),
+        "error" => Some(AgentStatus::Failed),
+        "finished" => Some(AgentStatus::Finished),
         _ => None,
+    }
+}
+
+fn agent_status_kind(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::Pi => "pi",
+        AgentKind::ClaudeCode => "claude_code",
     }
 }
 
@@ -1807,13 +2314,55 @@ fn chat_agent_kind(app: &App, chat_id: model::ChatId) -> AgentKind {
         .unwrap_or_default()
 }
 
-fn mult_agent_status_path(chat: model::ChatId) -> PathBuf {
-    let dir = ensure_mult_runtime_dir().unwrap_or_else(|_| mult_runtime_dir());
-    dir.join(format!(
-        "mult-agent-status-{}-{}.json",
-        std::process::id(),
-        chat.0
+fn mult_agent_status_path(
+    identity: model::SessionIdentity,
+    generation: model::AgentGeneration,
+) -> PathBuf {
+    mult_runtime_dir().join("status-v1").join(format!(
+        "{}-{}-{}.jsonl",
+        identity.namespace, identity.token, generation
     ))
+}
+
+fn prepare_mult_agent_status_file(path: &Path) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "status journal has no parent")
+    })?;
+    mult_protocol::ensure_private_dir(parent)?;
+    rotate_stale_status_files(parent, path)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
+    let file = options.open(path)?;
+    file.sync_all()
+}
+
+fn rotate_stale_status_files(directory: &Path, current: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    const MAX_RETAINED_STATUS_FILES: usize = 256;
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(directory)?.take(4096) {
+        let entry = entry?;
+        let path = entry.path();
+        if path == current || path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_file()
+            && metadata.uid() == current_euid()
+            && metadata.nlink() == 1
+        {
+            candidates.push((metadata.modified().ok(), path));
+        }
+    }
+    candidates.sort_by_key(|(modified, _)| *modified);
+    let remove_count = candidates.len().saturating_sub(MAX_RETAINED_STATUS_FILES);
+    for (_, path) in candidates.into_iter().take(remove_count) {
+        let _ = fs::remove_file(path);
+    }
+    Ok(())
 }
 
 fn ensure_mult_runtime_dir() -> io::Result<PathBuf> {
@@ -1831,12 +2380,6 @@ fn mult_runtime_dir() -> PathBuf {
 
 fn current_euid() -> u32 {
     unsafe { libc::geteuid() as u32 }
-}
-
-fn random_u64() -> io::Result<u64> {
-    let mut bytes = [0_u8; 8];
-    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(u64::from_ne_bytes(bytes))
 }
 
 fn save_if_dirty_with(
@@ -1868,7 +2411,8 @@ mod tests {
     use std::{cell::Cell, os::unix::net::UnixListener, sync::mpsc, thread};
 
     use mult_protocol::{
-        read_message, write_message, ClientMessage, ExitInfo, PaneId, ServerMessage, SessionId,
+        read_message, write_message, AttachError, AttachOutcome, AttachmentLease, ClientMessage,
+        ClientScopeId, OutputSequence, PaneId, ServerInstanceId, ServerMessage, SessionId,
         PROTOCOL_VERSION,
     };
 
@@ -1904,28 +2448,76 @@ mod tests {
                 &mut stream,
                 &ServerMessage::Hello {
                     protocol_version: PROTOCOL_VERSION,
+                    server_instance: ServerInstanceId::from_bytes([1; 16]),
+                    client_scope: ClientScopeId::from_bytes([2; 16]),
+                    resumed: false,
                 },
             )
             .expect("write server hello");
             let message: ClientMessage =
                 read_message(&mut stream).expect("read restoration request");
+            let ClientMessage::Attach { request_id, .. } = message.clone() else {
+                panic!("restoration must send Attach, got {message:?}");
+            };
             observed_tx
                 .send(message)
                 .expect("report restoration request");
-            let response = match reply {
-                RestorationReply::Attached => ServerMessage::Attached {
-                    session: SessionId(terminal.0),
-                    panes: Vec::new(),
-                },
-                RestorationReply::Missing => ServerMessage::PaneExited {
-                    pane: PaneId(terminal.0),
-                    exit: ExitInfo {
-                        code: 1,
-                        signal: Some("server session unavailable".to_string()),
-                    },
-                },
-            };
-            write_message(&mut stream, &response).expect("write restoration response");
+            match reply {
+                RestorationReply::Attached => {
+                    let lease = AttachmentLease::MIN;
+                    write_message(
+                        &mut stream,
+                        &ServerMessage::AttachResult {
+                            request_id,
+                            outcome: AttachOutcome::Attached {
+                                session: SessionId(terminal.0),
+                                pane: mult_protocol::PaneInfo {
+                                    id: PaneId(terminal.0),
+                                    title: "restored".to_string(),
+                                    rows: 40,
+                                    cols: 86,
+                                },
+                                lease,
+                            },
+                        },
+                    )
+                    .expect("write attach result");
+                    write_message(
+                        &mut stream,
+                        &ServerMessage::ReplayBegin {
+                            request_id,
+                            pane: PaneId(terminal.0),
+                            lease,
+                            first_sequence: OutputSequence::ZERO,
+                            watermark: OutputSequence::ZERO,
+                            omitted_prefix_bytes: 0,
+                        },
+                    )
+                    .expect("write replay begin");
+                    write_message(
+                        &mut stream,
+                        &ServerMessage::ReplayEnd {
+                            request_id,
+                            pane: PaneId(terminal.0),
+                            lease,
+                            watermark: OutputSequence::ZERO,
+                        },
+                    )
+                    .expect("write replay end");
+                }
+                RestorationReply::Missing => {
+                    write_message(
+                        &mut stream,
+                        &ServerMessage::AttachResult {
+                            request_id,
+                            outcome: AttachOutcome::Error(AttachError::SessionNotFound {
+                                session: SessionId(terminal.0),
+                            }),
+                        },
+                    )
+                    .expect("write missing attach result");
+                }
+            }
         });
         let runtime = PtyRuntime::connect_to_socket(socket_path.clone())
             .expect("connect restoration runtime");
@@ -2032,6 +2624,92 @@ mod tests {
 
         server.join().expect("restoration server exits");
         let _ = fs::remove_file(socket_path);
+    }
+
+    #[test]
+    fn migrated_v1_command_restoration_uses_generated_identity_and_only_attach() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let root = unique_status_path("v1-migration").with_extension("");
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let state_path = root.join("state.json");
+        let side_effect = root.join("must-not-run");
+        let command = format!(
+            "printf launched > {}",
+            shell_quote(&side_effect.display().to_string())
+        );
+        let v1 = serde_json::json!({
+            "version": 1,
+            "next_workspace_id": 2,
+            "next_chat_id": 1,
+            "next_terminal_id": 2,
+            "workspaces": [{
+                "id": 1,
+                "name": "migrated",
+                "cwd": null,
+                "environment": {},
+                "chats": [],
+                "terminals": [{
+                    "id": 1,
+                    "name": "command",
+                    "status": "Running",
+                    "launch": { "kind": "command", "command": command }
+                }]
+            }]
+        });
+        fs::write(&state_path, serde_json::to_vec_pretty(&v1).unwrap()).unwrap();
+        let store = storage::StateStore::acquire(
+            storage::StatePaths::from_explicit_path(state_path.clone()).unwrap(),
+        )
+        .unwrap();
+        let loaded = store.load_or_default().unwrap();
+        assert!(loaded.needs_save);
+        let terminal = loaded.state.workspaces[0].terminals[0].id;
+        let expected_identity = loaded
+            .state
+            .session_identity(PtyKey::Terminal(terminal))
+            .unwrap();
+        store.save(&loaded.state).unwrap();
+        let mut app = App::new(loaded.state);
+        let (mut runtime, observed, server, socket_path) =
+            connected_restoration_runtime(terminal, RestorationReply::Missing);
+
+        restore_persisted_sessions(
+            &mut app,
+            &mut runtime,
+            &Config::default(),
+            Rect::new(0, 0, 120, 40),
+        );
+
+        let request = observed
+            .recv_timeout(Duration::from_secs(2))
+            .expect("migration restoration sends one request");
+        let ClientMessage::Attach { identity, .. } = request else {
+            panic!("migration restoration must send Attach only");
+        };
+        assert_eq!(
+            identity.namespace.into_bytes(),
+            expected_identity.namespace.as_bytes()
+        );
+        assert_eq!(
+            identity.token.into_bytes(),
+            expected_identity.token.as_bytes()
+        );
+        assert!(!side_effect.exists());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(state_path).unwrap()).unwrap()
+                ["version"],
+            2
+        );
+
+        server.join().unwrap();
+        let _ = fs::remove_file(socket_path);
+        drop(store);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2190,25 +2868,39 @@ mod tests {
     }
 
     #[test]
-    fn read_mult_agent_status_parses_a_small_status_file() {
+    fn read_mult_agent_status_parses_complete_records_and_tolerates_a_torn_tail() {
         let path = unique_status_path("small");
-        fs::write(&path, r#"{"status":"running"}"#).expect("write status");
+        write_private_status(&path, b"{\"version\":1,\"namespace\":\"n\",\"sessionToken\":\"t\",\"chatId\":\"7\",\"agentKind\":\"pi\",\"generation\":\"g\",\"status\":\"running\"}\n{\"version\":1").unwrap();
+        let mut cursor = AgentStatusCursor::default();
 
-        assert_eq!(read_mult_agent_status(&path), Some(ChatStatus::Thinking));
+        let records = read_mult_agent_status_records(&path, &mut cursor).unwrap();
 
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0.status, "running");
+        assert!(records[0].1 < fs::metadata(&path).unwrap().len());
         let _ = fs::remove_file(&path);
     }
 
     #[test]
-    fn read_mult_agent_status_caps_the_read_and_rejects_oversized_files() {
+    fn read_mult_agent_status_rejects_oversized_files() {
         let path = unique_status_path("huge");
-        // Valid JSON as a whole, but far larger than the cap. Read in full it
-        // would parse; truncated at the cap it cannot, so a bounded read rejects
-        // it — proving the read never grows with the file.
-        let padding = " ".repeat(MAX_STATUS_FILE_BYTES as usize + 1024);
-        fs::write(&path, format!(r#"{{"status":"idle",{padding}"x":1}}"#)).expect("write status");
+        write_private_status(&path, &vec![b'x'; MAX_STATUS_FILE_BYTES as usize + 1]).unwrap();
 
-        assert_eq!(read_mult_agent_status(&path), None);
+        let error = read_mult_agent_status_records(&path, &mut AgentStatusCursor::default())
+            .expect_err("oversized journal must fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_mult_agent_status_rejects_group_readable_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = unique_status_path("mode");
+        write_private_status(&path, b"{}\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        assert!(read_mult_agent_status_records(&path, &mut AgentStatusCursor::default()).is_err());
 
         let _ = fs::remove_file(&path);
     }
@@ -2217,12 +2909,11 @@ mod tests {
     #[test]
     fn read_mult_agent_status_does_not_follow_symlinks() {
         let target = unique_status_path("symlink-target");
-        fs::write(&target, r#"{"status":"idle"}"#).expect("write status");
+        write_private_status(&target, b"{}\n").unwrap();
         let link = unique_status_path("symlink-link");
         std::os::unix::fs::symlink(&target, &link).expect("create symlink");
 
-        // O_NOFOLLOW means the symlink is not traversed, so nothing is read.
-        assert_eq!(read_mult_agent_status(&link), None);
+        assert!(read_mult_agent_status_records(&link, &mut AgentStatusCursor::default()).is_err());
 
         let _ = fs::remove_file(&link);
         let _ = fs::remove_file(&target);
@@ -2237,6 +2928,16 @@ mod tests {
             "mult-status-test-{label}-{}-{nanos}.json",
             std::process::id()
         ))
+    }
+
+    fn write_private_status(path: &Path, contents: &[u8]) -> io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(contents)
     }
 
     #[test]
@@ -2372,22 +3073,28 @@ mod tests {
         fs::write(&script, MULT_CLAUDE_STATUS_SCRIPT_SOURCE).expect("write script");
         let status_path = unique_status_path("cc-status");
         let _ = fs::remove_file(&status_path);
+        write_private_status(&status_path, b"").unwrap();
 
         let output = std::process::Command::new("sh")
             .arg(&script)
             .arg("running")
             .env(MULT_AGENT_STATUS_PATH_ENV, &status_path)
+            .env(MULT_AGENT_STATUS_VERSION_ENV, "1")
+            .env(MULT_AGENT_NAMESPACE_ENV, "namespace")
+            .env(MULT_AGENT_SESSION_TOKEN_ENV, "token")
             .env(MULT_AGENT_CHAT_ID_ENV, "7")
+            .env(MULT_AGENT_KIND_ENV, "pi")
+            .env(MULT_AGENT_GENERATION_ENV, "generation")
             .stdin(std::process::Stdio::null())
             .output()
             .expect("run status script");
         assert!(output.status.success());
 
-        // `running` round-trips through the file into mult's Thinking status.
-        assert_eq!(
-            read_mult_agent_status(&status_path),
-            Some(ChatStatus::Thinking)
-        );
+        let records =
+            read_mult_agent_status_records(&status_path, &mut AgentStatusCursor::default())
+                .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0.status, "running");
 
         let _ = fs::remove_file(&script);
         let _ = fs::remove_file(&status_path);
@@ -2401,31 +3108,44 @@ mod tests {
     }
 
     #[test]
-    fn mult_agent_status_file_updates_chat_status() {
-        // Startup no longer seeds agent chats, so add one explicitly for the
-        // status-file test (the lib's test-only seed helper is not visible to
-        // this bin-crate module).
+    fn status_record_validation_binds_every_identity_field_and_generation() {
         let mut state = model::ProjectState::default();
         let workspace = state.workspaces[0].id;
-        state
+        let chat = state
             .add_chat(
                 workspace,
                 model::DEFAULT_AGENT_CHAT_TITLE.to_string(),
                 ChatStatus::Idle,
                 AgentKind::Pi,
             )
-            .expect("chat ID is available");
-        let mut app = App::new(state);
-        app.project.workspaces[0].chats[0].id = model::ChatId(9_001);
-        let chat = app.project.workspaces[0].chats[0].id;
-        let path = mult_agent_status_path(chat);
-        let _ = fs::remove_file(&path);
-        fs::write(&path, r#"{"version":1,"status":"finished"}"#).expect("write status file");
+            .unwrap()
+            .unwrap();
+        let generation = state.begin_agent_generation(chat).unwrap().unwrap();
+        let identity = state.session_identity(PtyKey::ChatAgent(chat)).unwrap();
+        let encoded = format!(
+            "{{\"version\":1,\"namespace\":\"{}\",\"sessionToken\":\"{}\",\"chatId\":\"{}\",\"agentKind\":\"pi\",\"generation\":\"{}\",\"status\":\"finished\"}}",
+            identity.namespace, identity.token, chat.0, generation
+        );
+        let record: MultAgentStatusRecord = serde_json::from_str(&encoded).unwrap();
 
-        drain_mult_agent_status_events(&mut app);
-
-        assert_eq!(app.project.workspaces[0].chats[0].status, ChatStatus::Done);
-        let _ = fs::remove_file(&path);
+        assert!(status_record_matches(
+            &record,
+            chat,
+            AgentKind::Pi,
+            identity,
+            generation
+        ));
+        assert_eq!(
+            mult_agent_status(&record.status).map(chat_status_from_agent_status),
+            Some(ChatStatus::Done)
+        );
+        assert!(!status_record_matches(
+            &record,
+            model::ChatId(chat.0 + 1),
+            AgentKind::Pi,
+            identity,
+            generation
+        ));
     }
 
     #[test]

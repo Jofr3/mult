@@ -10,82 +10,168 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Condvar, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use mult_protocol::{
     bounded_screen_dimensions, default_socket_path, ensure_private_dir, read_message,
-    write_message, ClientMessage, ExitInfo, ForegroundProcessInfo, LaunchSpec, PaneId, PaneInfo,
-    ServerMessage, SessionId, SessionInfo, MAX_MESSAGE_BYTES, PROTOCOL_VERSION,
+    write_message, AgentSessionMetadata, AgentStatus, AgentStatusError, AgentStatusOutcome,
+    AgentStatusQuery, AgentStatusRecord, AttachError, AttachOutcome, AttachmentLease,
+    ClientMessage, ClientScopeId, CreateError, CreateOutcome, ExitInfo, ForegroundProcessInfo,
+    IdentityMismatch, LaunchSpec, LeaseOperation, LeaseRejectionReason, OutputSequence, PaneId,
+    PaneInfo, RequestId, ServerInstanceId, ServerMessage, SessionId, SessionIdentity, SessionInfo,
+    StateNamespace, StopError, StopOutcome, AGENT_STATUS_SCHEMA_VERSION,
+    MAX_CACHED_REQUEST_RESULTS_PER_SCOPE, MAX_MESSAGE_BYTES, MAX_PENDING_REQUESTS_PER_CLIENT,
+    PROTOCOL_VERSION,
 };
 use portable_pty::{native_pty_system, Child, CommandBuilder, ExitStatus, MasterPty, PtySize};
+use signal_hook::{
+    consts::signal::{SIGINT, SIGTERM},
+    flag,
+};
 
 type ClientId = u64;
 type SharedServer = Arc<Mutex<ServerState>>;
 type SharedPane = Arc<Mutex<PaneState>>;
 type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 type SharedMasterPty = Arc<Mutex<Box<dyn MasterPty + Send>>>;
-type ClientSender = mpsc::SyncSender<ServerMessage>;
+type ClientSender = mpsc::SyncSender<ClientDelivery>;
+
+#[derive(Debug)]
+enum ClientDelivery {
+    Message(ServerMessage),
+    Close,
+}
 
 const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 const RAW_HISTORY_MAX_BYTES: usize = MAX_MESSAGE_BYTES * 2;
 const RAW_HISTORY_CHUNK_BYTES: usize = 64 * 1024;
 const CLIENT_QUEUE_CAPACITY: usize = 1_024;
+const STOP_TERM_GRACE: Duration = Duration::from_millis(750);
+const STOP_FINALIZE_TIMEOUT: Duration = Duration::from_secs(3);
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const WAIT_RETRY_DELAY: Duration = Duration::from_millis(50);
+const SHUTDOWN_ERROR_MESSAGE: &str = "mult-server is shutting down";
 
 #[derive(Clone)]
 struct ClientHandle {
     id: ClientId,
     sender: ClientSender,
-    // A clone of the client socket kept solely so the server can proactively
-    // tear the connection down (`shutdown`) when the client falls too far
-    // behind or its writer dies. Shutting down any clone of the socket unblocks
-    // the reader/writer threads that hold the other clones.
     stream: Arc<UnixStream>,
+    active: Arc<AtomicBool>,
 }
 
 impl ClientHandle {
-    /// Hand a message to the client's writer queue without ever blocking the
-    /// caller. Returns `false` when the client should be dropped because its
-    /// queue is full (it cannot keep up) or its receiver is gone.
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
     fn try_deliver(&self, message: ServerMessage) -> bool {
-        match self.sender.try_send(message) {
+        if !self.is_active() {
+            return false;
+        }
+        match self.sender.try_send(ClientDelivery::Message(message)) {
             Ok(()) => true,
             Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => false,
         }
     }
 
+    fn finish_after_pending_deliveries(&self) {
+        self.active.store(false, Ordering::Release);
+        if self.sender.try_send(ClientDelivery::Close).is_err() {
+            let _ = self.stream.shutdown(Shutdown::Both);
+        }
+    }
+
     fn disconnect(&self) {
+        self.active.store(false, Ordering::Release);
         let _ = self.stream.shutdown(Shutdown::Both);
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RequestKey {
+    scope: ClientScopeId,
+    request_id: RequestId,
+}
+
+struct RequestRecord {
+    request: ClientMessage,
+    response: Option<ServerMessage>,
+    waiters: Vec<ClientHandle>,
+}
+
+struct RequestScopeState {
+    highest_request_id: Option<RequestId>,
+    records: BTreeMap<RequestId, RequestRecord>,
+}
+
+enum RequestDisposition {
+    New,
+    Pending,
+    Cached(ServerMessage),
+    Collision,
+    Expired,
+    TooManyPending,
+}
+
 struct ServerState {
     sessions: BTreeMap<SessionId, SharedPane>,
+    session_by_identity: BTreeMap<SessionIdentity, SessionId>,
     reserved_sessions: BTreeSet<SessionId>,
+    reserved_identities: BTreeSet<SessionIdentity>,
+    agent_states: BTreeMap<SessionIdentity, DaemonAgentState>,
     next_session_id: u64,
     next_client_id: ClientId,
+    next_lease: Option<AttachmentLease>,
+    server_instance: ServerInstanceId,
+    request_scopes: BTreeMap<ClientScopeId, RequestScopeState>,
+    shutting_down: bool,
+}
+
+#[derive(Clone)]
+struct AttachmentOwner {
+    scope: ClientScopeId,
+    lease: AttachmentLease,
+    client: ClientHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneLifecycle {
+    Running,
+    Stopping,
+    Exited,
+    Removed,
 }
 
 struct PaneState {
     session: SessionId,
+    identity: SessionIdentity,
+    agent: Option<AgentSessionMetadata>,
     pane: PaneId,
     name: String,
     title: String,
     rows: u16,
     cols: u16,
     raw_history: Vec<u8>,
+    history_start: OutputSequence,
+    next_output: OutputSequence,
     master: SharedMasterPty,
     writer: SharedPtyWriter,
-    child_pid: Option<u32>,
+    child_pid: u32,
+    process_group: libc::pid_t,
     foreground_process: ForegroundProcessInfo,
-    child: Option<Box<dyn Child + Send + Sync>>,
-    clients: Vec<ClientHandle>,
-    // Set while a foreground-process poll is already scheduled for this pane so
-    // a burst of input coalesces into a single in-flight poller thread instead
-    // of spawning one thread per keystroke.
+    owner: Option<AttachmentOwner>,
+    lifecycle: PaneLifecycle,
+    reader_done: bool,
+    child_exit: Option<ExitInfo>,
+    last_wait_error: Option<String>,
+    stop_driver_active: bool,
+    pending_stops: Vec<RequestKey>,
+    lifecycle_signal: Arc<(Mutex<u64>, Condvar)>,
     foreground_poll_scheduled: Arc<AtomicBool>,
 }
 
@@ -94,7 +180,15 @@ struct SessionCreateSpec {
     pane: PaneSpawnSpec,
 }
 
+#[derive(Debug, Clone)]
+struct DaemonAgentState {
+    metadata: AgentSessionMetadata,
+    status: Option<AgentStatusRecord>,
+}
+
 struct PaneSpawnSpec {
+    identity: SessionIdentity,
+    agent: Option<AgentSessionMetadata>,
     name: String,
     cwd: Option<PathBuf>,
     env: BTreeMap<String, String>,
@@ -106,20 +200,23 @@ struct PaneSpawnSpec {
 struct SpawnedPane {
     pane: SharedPane,
     reader: Box<dyn Read + Send>,
+    child: Box<dyn Child + Send + Sync>,
 }
 
 fn main() -> io::Result<()> {
     ignore_hangup_signal()?;
+    let shutdown = install_shutdown_signals()?;
     let socket_path = default_socket_path();
     bind_socket_path(&socket_path)?;
-    let server = Arc::new(Mutex::new(ServerState::default()));
+    let server = Arc::new(Mutex::new(ServerState::new()?));
     let listener = bind_unix_listener(&socket_path)?;
+    listener.set_nonblocking(true)?;
     restrict_socket_permissions(&socket_path)?;
     eprintln!("mult-server listening on {}", socket_path.display());
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    while !shutdown.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _)) => {
                 let server = Arc::clone(&server);
                 thread::spawn(move || {
                     if let Err(error) = handle_client(stream, server) {
@@ -127,106 +224,410 @@ fn main() -> io::Result<()> {
                     }
                 });
             }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(ACCEPT_POLL_INTERVAL);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => eprintln!("accept error: {error}"),
         }
     }
 
+    begin_daemon_shutdown(&server);
+    loop {
+        let empty = {
+            let state = server.lock().map_err(lock_error)?;
+            state.sessions.is_empty() && state.reserved_sessions.is_empty()
+        };
+        if empty {
+            break;
+        }
+        thread::sleep(ACCEPT_POLL_INTERVAL);
+    }
+    let _ = fs::remove_file(&socket_path);
     Ok(())
 }
 
-impl Default for ServerState {
-    fn default() -> Self {
-        Self {
+impl ServerState {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
             sessions: BTreeMap::new(),
+            session_by_identity: BTreeMap::new(),
             reserved_sessions: BTreeSet::new(),
+            reserved_identities: BTreeSet::new(),
+            agent_states: BTreeMap::new(),
             next_session_id: 1,
             next_client_id: 1,
-        }
+            next_lease: Some(AttachmentLease::MIN),
+            server_instance: ServerInstanceId::from_bytes(random_bytes()?),
+            request_scopes: BTreeMap::new(),
+            shutting_down: false,
+        })
     }
-}
 
-impl ServerState {
-    fn allocate_client_id(&mut self) -> ClientId {
+    fn allocate_client_id(&mut self) -> io::Result<ClientId> {
         let id = self.next_client_id;
-        self.next_client_id += 1;
-        id
+        self.next_client_id = self
+            .next_client_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("client ID space exhausted"))?;
+        Ok(id)
     }
 
-    fn allocate_session_id(&mut self) -> SessionId {
-        while self.sessions.contains_key(&SessionId(self.next_session_id))
-            || self
-                .reserved_sessions
-                .contains(&SessionId(self.next_session_id))
-        {
-            self.next_session_id += 1;
+    fn allocate_scope(&mut self) -> io::Result<ClientScopeId> {
+        for _ in 0..16 {
+            let scope = ClientScopeId::from_bytes(random_bytes()?);
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                self.request_scopes.entry(scope)
+            {
+                entry.insert(RequestScopeState::new());
+                return Ok(scope);
+            }
         }
-        let id = SessionId(self.next_session_id);
-        self.next_session_id += 1;
-        id
+        Err(io::Error::other("failed to allocate a unique client scope"))
     }
 
-    fn reserve_session_id(&mut self, requested_id: Option<SessionId>) -> io::Result<SessionId> {
-        let session = requested_id.unwrap_or_else(|| self.allocate_session_id());
+    fn resume_or_allocate_scope(
+        &mut self,
+        resume: Option<ClientScopeId>,
+    ) -> io::Result<(ClientScopeId, bool)> {
+        if let Some(scope) = resume.filter(|scope| self.request_scopes.contains_key(scope)) {
+            return Ok((scope, true));
+        }
+        self.allocate_scope().map(|scope| (scope, false))
+    }
+
+    fn allocate_lease(&mut self) -> io::Result<AttachmentLease> {
+        let lease = self
+            .next_lease
+            .ok_or_else(|| io::Error::other("attachment lease space exhausted"))?;
+        self.next_lease = lease.checked_next();
+        Ok(lease)
+    }
+
+    fn allocate_session_id(&mut self) -> io::Result<SessionId> {
+        loop {
+            let session = SessionId(self.next_session_id);
+            self.next_session_id = self
+                .next_session_id
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("session ID space exhausted"))?;
+            if !self.sessions.contains_key(&session) && !self.reserved_sessions.contains(&session) {
+                return Ok(session);
+            }
+        }
+    }
+
+    fn reserve_session(
+        &mut self,
+        requested_id: Option<SessionId>,
+        identity: SessionIdentity,
+    ) -> io::Result<SessionId> {
+        if self.shutting_down {
+            return Err(io::Error::other(SHUTDOWN_ERROR_MESSAGE));
+        }
+        if self.session_by_identity.contains_key(&identity)
+            || self.reserved_identities.contains(&identity)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "logical session identity already exists or is being created",
+            ));
+        }
+        let session = match requested_id {
+            Some(session) => session,
+            None => self.allocate_session_id()?,
+        };
         if self.sessions.contains_key(&session) || !self.reserved_sessions.insert(session) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("session {} already exists or is being created", session.0),
             ));
         }
+        self.reserved_identities.insert(identity);
         Ok(session)
     }
 
-    fn release_session_reservation(&mut self, session: SessionId) {
+    fn release_session_reservation(&mut self, session: SessionId, identity: SessionIdentity) {
         self.reserved_sessions.remove(&session);
+        self.reserved_identities.remove(&identity);
     }
 
-    fn session_infos(&self) -> Vec<SessionInfo> {
+    fn publish_reserved_session(&mut self, session: SessionId, pane: SharedPane) -> io::Result<()> {
+        if self.shutting_down {
+            return Err(io::Error::other(SHUTDOWN_ERROR_MESSAGE));
+        }
+        let (identity, agent) = {
+            let pane = pane.lock().map_err(lock_error)?;
+            (pane.identity, pane.agent)
+        };
+        if self.sessions.contains_key(&session)
+            || self.session_by_identity.contains_key(&identity)
+            || !self.reserved_sessions.contains(&session)
+            || !self.reserved_identities.contains(&identity)
+        {
+            return Err(io::Error::other("session was created concurrently"));
+        }
+        self.release_session_reservation(session, identity);
+        self.session_by_identity.insert(identity, session);
+        match agent {
+            Some(metadata) => {
+                self.agent_states.insert(
+                    identity,
+                    DaemonAgentState {
+                        metadata,
+                        status: None,
+                    },
+                );
+            }
+            None => {
+                self.agent_states.remove(&identity);
+            }
+        }
+        self.sessions.insert(session, pane);
+        Ok(())
+    }
+
+    fn session_infos(&self, namespace: StateNamespace) -> Vec<SessionInfo> {
         self.sessions
             .values()
-            .filter_map(|pane| pane.lock().ok().map(|pane| pane.session_info()))
+            .filter_map(|pane| {
+                pane.lock().ok().and_then(|pane| {
+                    (pane.identity.namespace == namespace).then(|| pane.session_info())
+                })
+            })
             .collect()
     }
 
     fn pane_by_id(&self, pane: PaneId) -> Option<SharedPane> {
         self.sessions.get(&SessionId(pane.0)).cloned().or_else(|| {
             self.sessions.values().find_map(|candidate| {
-                let matches = candidate
+                candidate
                     .lock()
                     .ok()
-                    .is_some_and(|candidate| candidate.pane == pane);
-                matches.then(|| Arc::clone(candidate))
+                    .is_some_and(|candidate| candidate.pane == pane)
+                    .then(|| Arc::clone(candidate))
             })
         })
     }
 
     fn remove_session_if_same(&mut self, session: SessionId, pane: &SharedPane) -> bool {
-        let matches = self
+        if self
             .sessions
             .get(&session)
-            .is_some_and(|existing| Arc::ptr_eq(existing, pane));
-        if matches {
+            .is_some_and(|existing| Arc::ptr_eq(existing, pane))
+        {
             self.sessions.remove(&session);
+            self.session_by_identity.retain(|_, id| *id != session);
+            true
+        } else {
+            false
         }
-        matches
+    }
+
+    fn session_for_identity(&self, identity: SessionIdentity) -> Option<SharedPane> {
+        let session = self.session_by_identity.get(&identity)?;
+        self.sessions.get(session).cloned()
+    }
+
+    fn record_agent_exit(
+        &mut self,
+        identity: SessionIdentity,
+        metadata: AgentSessionMetadata,
+        exit: &ExitInfo,
+    ) {
+        let Some(state) = self.agent_states.get_mut(&identity) else {
+            return;
+        };
+        if state.metadata != metadata || state.status.is_some_and(|status| status.status.is_final())
+        {
+            return;
+        }
+        state.status = Some(AgentStatusRecord {
+            schema_version: metadata.schema_version,
+            identity,
+            chat_id: metadata.chat_id,
+            agent: metadata.agent,
+            generation: metadata.generation,
+            status: if exit.code == 0 {
+                AgentStatus::Exited
+            } else {
+                AgentStatus::Failed
+            },
+        });
+    }
+
+    fn begin_request(
+        &mut self,
+        scope: ClientScopeId,
+        request: &ClientMessage,
+        client: &ClientHandle,
+    ) -> RequestDisposition {
+        let request_id = request_id(request).expect("stateful request has an ID");
+        let scope_state = self
+            .request_scopes
+            .entry(scope)
+            .or_insert_with(RequestScopeState::new);
+        scope_state.begin(request_id, request, client)
+    }
+
+    fn complete_request(&mut self, key: RequestKey, response: ServerMessage) -> Vec<ClientHandle> {
+        self.request_scopes
+            .get_mut(&key.scope)
+            .map(|scope| scope.complete(key.request_id, response))
+            .unwrap_or_default()
     }
 
     fn remove_client(&mut self, client_id: ClientId) {
-        for pane in self.sessions.values() {
-            if let Ok(mut pane) = pane.lock() {
-                pane.clients.retain(|client| client.id != client_id);
+        for scope in self.request_scopes.values_mut() {
+            for record in scope.records.values_mut() {
+                record.waiters.retain(|client| client.id != client_id);
             }
+        }
+        // Keep logical attachment ownership across transport loss. A resumed
+        // exact attach retry can transfer the lease to the replacement
+        // connection; explicit Detach, takeover, or finalization invalidates it.
+    }
+}
+
+impl Default for ServerState {
+    fn default() -> Self {
+        Self::new().expect("server identity randomness must be available")
+    }
+}
+
+impl RequestScopeState {
+    fn new() -> Self {
+        Self {
+            highest_request_id: None,
+            records: BTreeMap::new(),
+        }
+    }
+
+    fn begin(
+        &mut self,
+        request_id: RequestId,
+        request: &ClientMessage,
+        client: &ClientHandle,
+    ) -> RequestDisposition {
+        if let Some(record) = self.records.get_mut(&request_id) {
+            if record.request != *request {
+                return RequestDisposition::Collision;
+            }
+            if let Some(response) = &record.response {
+                return RequestDisposition::Cached(response.clone());
+            }
+            if !record.waiters.iter().any(|waiter| waiter.id == client.id) {
+                record.waiters.push(client.clone());
+            }
+            return RequestDisposition::Pending;
+        }
+
+        if self
+            .highest_request_id
+            .is_some_and(|highest| request_id <= highest)
+        {
+            return RequestDisposition::Expired;
+        }
+        let pending = self
+            .records
+            .values()
+            .filter(|record| record.response.is_none())
+            .count();
+        let overloaded = pending >= MAX_PENDING_REQUESTS_PER_CLIENT;
+        // Even an overload rejection consumes the request ID. Otherwise the
+        // same ID could be rejected now and mutate state later after capacity
+        // becomes available, violating scoped idempotence.
+        self.highest_request_id = Some(request_id);
+        self.records.insert(
+            request_id,
+            RequestRecord {
+                request: request.clone(),
+                response: None,
+                waiters: vec![client.clone()],
+            },
+        );
+        if overloaded {
+            RequestDisposition::TooManyPending
+        } else {
+            RequestDisposition::New
+        }
+    }
+
+    fn complete(&mut self, request_id: RequestId, response: ServerMessage) -> Vec<ClientHandle> {
+        let waiters = if let Some(record) = self.records.get_mut(&request_id) {
+            record.response = Some(response);
+            std::mem::take(&mut record.waiters)
+        } else {
+            Vec::new()
+        };
+        self.evict_old_results();
+        waiters
+    }
+
+    fn evict_old_results(&mut self) {
+        while self
+            .records
+            .values()
+            .filter(|record| record.response.is_some())
+            .count()
+            > MAX_CACHED_REQUEST_RESULTS_PER_SCOPE
+        {
+            let Some(oldest) = self
+                .records
+                .iter()
+                .find_map(|(id, record)| record.response.is_some().then_some(*id))
+            else {
+                break;
+            };
+            self.records.remove(&oldest);
         }
     }
 }
 
+fn request_id(message: &ClientMessage) -> Option<RequestId> {
+    match message {
+        ClientMessage::CreateSession { request_id, .. }
+        | ClientMessage::Attach { request_id, .. }
+        | ClientMessage::Stop { request_id, .. }
+        | ClientMessage::UpdateAgentStatus { request_id, .. }
+        | ClientMessage::GetAgentStatus { request_id, .. } => Some(*request_id),
+        _ => None,
+    }
+}
+
+fn random_bytes() -> io::Result<[u8; 16]> {
+    let mut bytes = [0; 16];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
 fn ignore_hangup_signal() -> io::Result<()> {
-    // The server owns long-lived PTYs. Ignore terminal hangups so a foreground
-    // development server, or an autospawned server that has not exec'd yet, does
-    // not terminate all panes when the launching terminal is closed.
     if unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) } == libc::SIG_ERR {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+fn install_shutdown_signals() -> io::Result<Arc<AtomicBool>> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    for signal in [SIGINT, SIGTERM] {
+        flag::register_conditional_shutdown(signal, 128 + signal, Arc::clone(&shutdown))?;
+        flag::register(signal, Arc::clone(&shutdown))?;
+    }
+    Ok(shutdown)
+}
+
+fn begin_daemon_shutdown(server: &SharedServer) {
+    let panes = match server.lock() {
+        Ok(mut state) => {
+            state.shutting_down = true;
+            state.sessions.values().cloned().collect::<Vec<_>>()
+        }
+        Err(_) => return,
+    };
+    for pane in panes {
+        start_stop_if_needed(Arc::clone(server), pane);
+    }
 }
 
 fn bind_socket_path(path: &PathBuf) -> io::Result<()> {
@@ -239,7 +640,6 @@ fn bind_socket_path(path: &PathBuf) -> io::Result<()> {
         }
         Err(error) => remove_stale_socket_file(path, error)?,
     }
-
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent)?;
     }
@@ -265,25 +665,20 @@ impl UmaskGuard {
 
 impl Drop for UmaskGuard {
     fn drop(&mut self) {
-        unsafe {
-            libc::umask(self.previous);
-        }
+        unsafe { libc::umask(self.previous) };
     }
 }
 
 fn remove_stale_socket_file(path: &PathBuf, connect_error: io::Error) -> io::Result<()> {
     use std::os::unix::fs::FileTypeExt;
-
     if connect_error.kind() == io::ErrorKind::NotFound {
         return Ok(());
     }
-
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-
     if metadata.file_type().is_socket() {
         fs::remove_file(path)
     } else {
@@ -299,7 +694,6 @@ fn remove_stale_socket_file(path: &PathBuf, connect_error: io::Error) -> io::Res
 
 fn restrict_socket_permissions(path: &PathBuf) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-
     let mut permissions = fs::metadata(path)?.permissions();
     permissions.set_mode(0o600);
     fs::set_permissions(path, permissions)
@@ -310,14 +704,14 @@ fn verify_peer_owner(stream: &UnixStream, peer_label: &str) -> io::Result<()> {
         return Ok(());
     };
     let current_uid = current_euid();
-    if uid_matches_peer(peer_uid, current_uid) {
-        return Ok(());
+    if peer_uid == current_uid {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("rejecting {peer_label} uid {peer_uid}; expected current uid {current_uid}"),
+        ))
     }
-
-    Err(io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        format!("rejecting {peer_label} uid {peer_uid}; expected current uid {current_uid}"),
-    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -354,14 +748,9 @@ fn current_euid() -> u32 {
     unsafe { libc::geteuid() as u32 }
 }
 
-fn uid_matches_peer(peer_uid: u32, current_uid: u32) -> bool {
-    peer_uid == current_uid
-}
-
 fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SpawnedPane> {
     let (rows, cols) = bounded_pty_dimensions(spec.rows, spec.cols);
-    let pty_system = native_pty_system();
-    let pair = pty_system
+    let pair = native_pty_system()
         .openpty(PtySize {
             rows,
             cols,
@@ -369,6 +758,12 @@ fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SpawnedPane
             pixel_height: 0,
         })
         .map_err(error_to_io)?;
+
+    // Complete every fallible master-side setup step before spawning. Once the
+    // child exists, either the waiter owns it or the unpublished cleanup path
+    // below kills and reaps it exactly once.
+    let reader = pair.master.try_clone_reader().map_err(error_to_io)?;
+    let writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(error_to_io)?));
 
     let shell = default_shell();
     let mut command = CommandBuilder::new(&shell);
@@ -378,85 +773,153 @@ fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SpawnedPane
     if let Some(cwd) = &spec.cwd {
         command.cwd(cwd.as_os_str());
     }
-    // A PTY child talks to mult's built-in vt100 emulator, not to the terminal
-    // hosting the `mult` client, so it must advertise *that* emulator's
-    // capabilities rather than inherit the host's $TERM. Leaking e.g. TERM=foot
-    // makes nvim drive truecolor through foot's terminfo as `\e[38:2::r:g:bm`
-    // (colon form with an empty colorspace field) — a shape the emulator does
-    // not decode, so every color is dropped and the screen renders monochrome.
-    // xterm-256color matches the emulator (xterm-style, 256-color, universally
-    // present); COLORTERM=truecolor opts programs into RGB, which they then emit
-    // in the semicolon form the emulator understands. Applied before spec.env so
-    // a workspace that sets TERM/COLORTERM explicitly still wins.
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     for (key, value) in spec.env {
         command.env(key, value);
     }
 
-    let child = pair.slave.spawn_command(command).map_err(error_to_io)?;
-    let child_pid = child.process_id();
-    let reader = pair.master.try_clone_reader().map_err(error_to_io)?;
-    let writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(error_to_io)?));
+    let mut child = pair.slave.spawn_command(command).map_err(error_to_io)?;
+    let child_pid = match child.process_id() {
+        Some(pid) if pid > 1 && pid <= libc::pid_t::MAX as u32 => pid,
+        _ => {
+            cleanup_unpublished_child(&mut child, None);
+            return Err(io::Error::other(
+                "PTY child did not report a safe process ID",
+            ));
+        }
+    };
+    let process_group = match validate_child_process_group(child_pid) {
+        Ok(group) => group,
+        Err(error) => {
+            cleanup_unpublished_child(&mut child, Some(child_pid as libc::pid_t));
+            return Err(error);
+        }
+    };
+
     let master = Arc::new(Mutex::new(pair.master));
     let title = pane_title(&shell, &spec.launch);
-
     let pane = Arc::new(Mutex::new(PaneState {
         session,
+        identity: spec.identity,
+        agent: spec.agent,
         pane: PaneId(session.0),
         name: spec.name,
         title,
         rows,
         cols,
         raw_history: Vec::new(),
+        history_start: OutputSequence::ZERO,
+        next_output: OutputSequence::ZERO,
         master,
         writer,
         child_pid,
+        process_group,
         foreground_process: ForegroundProcessInfo {
-            root_pid: child_pid,
+            root_pid: Some(child_pid),
             foreground_pid: None,
             command: None,
         },
-        child: Some(child),
-        clients: Vec::new(),
+        owner: None,
+        lifecycle: PaneLifecycle::Running,
+        reader_done: false,
+        child_exit: None,
+        last_wait_error: None,
+        stop_driver_active: false,
+        pending_stops: Vec::new(),
+        lifecycle_signal: Arc::new((Mutex::new(0), Condvar::new())),
         foreground_poll_scheduled: Arc::new(AtomicBool::new(false)),
     }));
 
-    Ok(SpawnedPane { pane, reader })
+    Ok(SpawnedPane {
+        pane,
+        reader,
+        child,
+    })
+}
+
+fn validate_child_process_group(child_pid: u32) -> io::Result<libc::pid_t> {
+    let pid = child_pid as libc::pid_t;
+    let group = unsafe { libc::getpgid(pid) };
+    if group == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let session = unsafe { libc::getsid(pid) };
+    if session == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let own_group = unsafe { libc::getpgrp() };
+    if group != pid || session != pid || group == own_group || group <= 1 {
+        return Err(io::Error::other(format!(
+            "PTY child {pid} is not an isolated session/process-group leader"
+        )));
+    }
+    Ok(group)
+}
+
+fn cleanup_unpublished_child(
+    child: &mut Box<dyn Child + Send + Sync>,
+    process_group: Option<libc::pid_t>,
+) {
+    if let Some(group) = process_group {
+        let _ = signal_process_group(group, libc::SIGKILL);
+    }
+    // Always target the direct child too. The caller may know only a candidate
+    // group (for example when group validation itself failed), and ESRCH for
+    // that candidate must not leave a live unpublished child blocking wait.
+    let _ = child.kill();
+    // This local path is the sole owner of an unpublished child. Never drop
+    // that handle unreaped merely because wait was interrupted or transiently
+    // failed.
+    loop {
+        match child.wait() {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                eprintln!("failed to reap unpublished PTY child; retrying: {error}");
+                thread::sleep(WAIT_RETRY_DELAY);
+            }
+        }
+    }
 }
 
 fn handle_client(stream: UnixStream, server: SharedServer) -> io::Result<()> {
     verify_peer_owner(&stream, "client")?;
     let (sender, receiver) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
-    let client_id = server.lock().map_err(lock_error)?.allocate_client_id();
+    let client_id = server.lock().map_err(lock_error)?.allocate_client_id()?;
     let shutdown_handle = Arc::new(stream.try_clone()?);
+    let active = Arc::new(AtomicBool::new(true));
     let client = ClientHandle {
         id: client_id,
         sender: sender.clone(),
         stream: Arc::clone(&shutdown_handle),
+        active: Arc::clone(&active),
     };
 
     let mut writer_stream = stream.try_clone()?;
     let writer_server = Arc::clone(&server);
-    // Detached: it exits on its own when its write fails or the channel closes.
-    let _writer = thread::spawn(move || {
-        for message in receiver {
-            if write_message(&mut writer_stream, &message).is_err() {
-                break;
+    thread::spawn(move || {
+        while let Ok(delivery) = receiver.recv() {
+            match delivery {
+                ClientDelivery::Message(message) => {
+                    if write_message(&mut writer_stream, &message).is_err() {
+                        break;
+                    }
+                }
+                ClientDelivery::Close => break,
             }
         }
-        // The writer is gone (socket error or the channel was dropped). Stop the
-        // server from broadcasting into a dead connection and unblock the reader
-        // half so this client is fully reaped instead of lingering in panes.
-        if let Ok(mut server) = writer_server.lock() {
-            server.remove_client(client_id);
+        active.store(false, Ordering::Release);
+        if let Ok(mut state) = writer_server.lock() {
+            state.remove_client(client_id);
         }
         let _ = shutdown_handle.shutdown(Shutdown::Both);
     });
 
-    let result = handle_client_messages(stream, &server, client);
-    if let Ok(mut server) = server.lock() {
-        server.remove_client(client_id);
+    let result = handle_client_messages(stream, &server, client.clone());
+    client.finish_after_pending_deliveries();
+    if let Ok(mut state) = server.lock() {
+        state.remove_client(client_id);
     }
     drop(sender);
     result
@@ -473,178 +936,1147 @@ fn handle_client_messages(
     };
     stream.set_read_timeout(None)?;
 
-    let ClientMessage::Hello { protocol_version } = message else {
-        let _ = client.sender.try_send(ServerMessage::Error {
+    let ClientMessage::Hello {
+        protocol_version,
+        resume,
+    } = message
+    else {
+        let _ = client.try_deliver(ServerMessage::Error {
             message: "expected protocol hello before other client messages".to_string(),
         });
         return Ok(());
     };
-
-    if !send_hello_response(&client, protocol_version) {
+    if protocol_version != PROTOCOL_VERSION {
+        let _ = client.try_deliver(ServerMessage::Error {
+            message: format!(
+                "client protocol version {protocol_version} is incompatible with server version {PROTOCOL_VERSION}; restart mult clients"
+            ),
+        });
+        return Ok(());
+    }
+    let (scope, resumed, server_instance) = {
+        let mut state = server.lock().map_err(lock_error)?;
+        let (scope, resumed) = state.resume_or_allocate_scope(resume)?;
+        (scope, resumed, state.server_instance)
+    };
+    if !client.try_deliver(ServerMessage::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        server_instance,
+        client_scope: scope,
+        resumed,
+    }) {
         return Ok(());
     }
 
     while let Some(message) = read_client_message(&mut stream)? {
         match message {
-            ClientMessage::Hello { protocol_version } => {
-                if !send_hello_response(&client, protocol_version) {
-                    break;
-                }
+            ClientMessage::Hello { .. } => {
+                let _ = client.try_deliver(ServerMessage::Error {
+                    message: "protocol hello may only be sent once per connection".to_string(),
+                });
+                break;
             }
-            ClientMessage::ListSessions => {
-                let sessions = server.lock().map_err(lock_error)?.session_infos();
-                let _ = client.sender.try_send(ServerMessage::Sessions(sessions));
+            ClientMessage::ListSessions { namespace } => {
+                let sessions = server.lock().map_err(lock_error)?.session_infos(namespace);
+                let _ = client.try_deliver(ServerMessage::Sessions {
+                    namespace,
+                    sessions,
+                });
             }
-            ClientMessage::CreateSession {
-                requested_id,
-                name,
-                cwd,
-                env,
-                launch,
-                rows,
-                cols,
-            } => {
-                let pane = create_session(
+            request @ ClientMessage::CreateSession { .. } => {
+                handle_create_request(server, scope, &client, request)?;
+            }
+            request @ ClientMessage::Attach { .. } => {
+                handle_attach_request(server, scope, resumed, &client, request)?;
+            }
+            ClientMessage::Input { pane, lease, bytes } => {
+                handle_leased_input(
                     server,
-                    SessionCreateSpec {
-                        requested_id,
-                        pane: PaneSpawnSpec {
-                            name,
-                            cwd,
-                            env,
-                            launch,
-                            rows,
-                            cols,
-                        },
-                    },
-                )?;
-                let info = pane.lock().map_err(lock_error)?.session_info();
-                let _ = client.sender.try_send(ServerMessage::Sessions(vec![info]));
+                    scope,
+                    &client,
+                    pane,
+                    lease,
+                    bytes,
+                    LeaseOperation::Input,
+                );
             }
-            ClientMessage::Attach {
-                session,
-                rows,
-                cols,
-            } => {
-                let pane = {
-                    let server = server.lock().map_err(lock_error)?;
-                    server.sessions.get(&session).cloned()
-                };
-                let Some(pane) = pane else {
-                    // The session is gone (e.g., the daemon was restarted or
-                    // autospawned fresh while this client was away). Report the
-                    // pane as exited so a reconnecting client stops treating it as
-                    // live and can recover, instead of silently freezing on a
-                    // session that no longer exists.
-                    let _ = client.sender.try_send(ServerMessage::PaneExited {
-                        pane: PaneId(session.0),
-                        exit: ExitInfo {
-                            code: 1,
-                            signal: Some("server session unavailable".to_string()),
-                        },
-                    });
-                    continue;
-                };
-
-                let (pane_info, pane_id, history, foreground_process) = {
-                    let mut pane = pane.lock().map_err(lock_error)?;
-                    pane.resize(rows, cols)?;
-                    pane.attach_client(client.clone());
-                    let foreground_process = pane.refresh_foreground_process();
-                    (
-                        pane.pane_info(),
-                        pane.pane,
-                        pane.raw_history.clone(),
-                        foreground_process,
-                    )
-                };
-
-                let _ = client.sender.try_send(ServerMessage::Attached {
-                    session,
-                    panes: vec![pane_info],
-                });
-                let _ = client.sender.try_send(ServerMessage::ForegroundProcess {
-                    pane: pane_id,
-                    process: foreground_process,
-                });
-                send_pty_scrollback(&client, pane_id, &history);
-            }
-            ClientMessage::Input { pane, bytes } => {
-                let pane = { server.lock().map_err(lock_error)?.pane_by_id(pane) };
-                if let Some(pane) = pane {
-                    let writer = { Arc::clone(&pane.lock().map_err(lock_error)?.writer) };
-                    write_pty_input(&writer, &bytes)?;
-                    if input_may_change_foreground(&bytes) {
-                        schedule_foreground_process_poll(pane);
-                    }
-                }
-            }
-            ClientMessage::Paste { pane, text } => {
-                let pane = { server.lock().map_err(lock_error)?.pane_by_id(pane) };
-                if let Some(pane) = pane {
-                    let writer = { Arc::clone(&pane.lock().map_err(lock_error)?.writer) };
-                    write_pty_input(&writer, text.as_bytes())?;
-                    if input_may_change_foreground(text.as_bytes()) {
-                        schedule_foreground_process_poll(pane);
-                    }
-                }
+            ClientMessage::Paste { pane, lease, bytes } => {
+                handle_leased_input(
+                    server,
+                    scope,
+                    &client,
+                    pane,
+                    lease,
+                    bytes,
+                    LeaseOperation::Paste,
+                );
             }
             ClientMessage::Scroll { .. }
             | ClientMessage::ScrollToTop { .. }
             | ClientMessage::ScrollToBottom { .. } => {}
-            ClientMessage::Resize { pane, rows, cols } => {
-                let pane = { server.lock().map_err(lock_error)?.pane_by_id(pane) };
-                if let Some(pane) = pane {
-                    pane.lock().map_err(lock_error)?.resize(rows, cols)?;
-                }
+            ClientMessage::Resize {
+                pane,
+                lease,
+                rows,
+                cols,
+            } => handle_leased_resize(server, scope, &client, pane, lease, rows, cols),
+            ClientMessage::Detach { pane, lease } => {
+                handle_leased_detach(server, scope, &client, pane, lease)
             }
-            ClientMessage::Detach => break,
-            ClientMessage::Stop { pane } => {
-                let target = { server.lock().map_err(lock_error)?.pane_by_id(pane) };
-                let Some(target) = target else {
-                    let _ = client.sender.try_send(ServerMessage::StopResult {
-                        pane,
-                        stopped: false,
-                        error: None,
-                    });
-                    continue;
-                };
-
-                // Take the child out under a brief lock, then kill+reap with the
-                // pane lock released so the blocking wait never stalls the reader
-                // thread. Remove the session by identity so a recycled id created
-                // in the meantime is never torn down by mistake. The correlated
-                // result lets clients retain durable state unless cleanup was
-                // confirmed successful (or the pane was already absent).
-                let (session, child) = {
-                    let mut target = target.lock().map_err(lock_error)?;
-                    (target.session, target.take_child())
-                };
-                match kill_and_reap(child) {
-                    Ok(()) => {
-                        server
-                            .lock()
-                            .map_err(lock_error)?
-                            .remove_session_if_same(session, &target);
-                        let _ = client.sender.try_send(ServerMessage::StopResult {
-                            pane,
-                            stopped: true,
-                            error: None,
-                        });
-                    }
-                    Err(error) => {
-                        let _ = client.sender.try_send(ServerMessage::StopResult {
-                            pane,
-                            stopped: false,
-                            error: Some(format!("failed to stop pane: {error}")),
-                        });
-                    }
-                }
+            request @ ClientMessage::Stop { .. } => {
+                handle_stop_request(server, scope, &client, request)?;
+            }
+            request @ (ClientMessage::UpdateAgentStatus { .. }
+            | ClientMessage::GetAgentStatus { .. }) => {
+                handle_agent_status_request(server, scope, &client, request)?;
             }
         }
     }
-
     Ok(())
+}
+
+fn handle_create_request(
+    server: &SharedServer,
+    scope: ClientScopeId,
+    client: &ClientHandle,
+    request: ClientMessage,
+) -> io::Result<()> {
+    let ClientMessage::CreateSession {
+        request_id,
+        identity,
+        requested_id,
+        agent,
+        name,
+        cwd,
+        env,
+        launch,
+        rows,
+        cols,
+    } = &request
+    else {
+        unreachable!();
+    };
+    match server
+        .lock()
+        .map_err(lock_error)?
+        .begin_request(scope, &request, client)
+    {
+        RequestDisposition::Cached(response) => {
+            let _ = client.try_deliver(response);
+            return Ok(());
+        }
+        RequestDisposition::Pending => return Ok(()),
+        RequestDisposition::Collision => {
+            return deliver_create_error(client, *request_id, CreateError::RequestCollision)
+        }
+        RequestDisposition::Expired => {
+            return deliver_create_error(client, *request_id, CreateError::RetryExpired)
+        }
+        RequestDisposition::TooManyPending => {
+            let response = ServerMessage::CreateResult {
+                request_id: *request_id,
+                outcome: CreateOutcome::Error(CreateError::Failed {
+                    message: "too many pending requests".to_string(),
+                }),
+            };
+            complete_and_deliver(
+                server,
+                RequestKey {
+                    scope,
+                    request_id: *request_id,
+                },
+                response,
+            );
+            return Ok(());
+        }
+        RequestDisposition::New => {}
+    }
+
+    let invalid_agent = agent.and_then(validate_agent_metadata);
+    let existing_numeric = requested_id.and_then(|id| {
+        server
+            .lock()
+            .ok()
+            .and_then(|state| state.sessions.get(&id).cloned())
+    });
+    let existing_identity = server
+        .lock()
+        .ok()
+        .and_then(|state| state.session_for_identity(*identity));
+    let outcome = if let Some(error) = invalid_agent {
+        CreateOutcome::Error(CreateError::InvalidAgentMetadata(error))
+    } else if let Some(pane) = existing_numeric {
+        let pane = pane.lock().map_err(lock_error)?;
+        if pane.identity == *identity {
+            CreateOutcome::Error(CreateError::SessionAlreadyExists {
+                session: pane.session_info(),
+            })
+        } else {
+            CreateOutcome::Error(CreateError::IdentityMismatch {
+                session: pane.session,
+                mismatch: identity_mismatch(pane.identity, *identity),
+            })
+        }
+    } else if let Some(pane) = existing_identity {
+        CreateOutcome::Error(CreateError::IdentityAlreadyExists {
+            session: pane.lock().map_err(lock_error)?.session_info(),
+        })
+    } else {
+        match create_session(
+            server,
+            SessionCreateSpec {
+                requested_id: *requested_id,
+                pane: PaneSpawnSpec {
+                    identity: *identity,
+                    agent: *agent,
+                    name: name.clone(),
+                    cwd: cwd.clone(),
+                    env: env.clone(),
+                    launch: launch.clone(),
+                    rows: *rows,
+                    cols: *cols,
+                },
+            },
+        ) {
+            Ok(pane) => CreateOutcome::Created {
+                session: pane.lock().map_err(lock_error)?.session_info(),
+            },
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let numeric = requested_id.and_then(|id| {
+                    server
+                        .lock()
+                        .ok()
+                        .and_then(|state| state.sessions.get(&id).cloned())
+                });
+                let logical = server
+                    .lock()
+                    .ok()
+                    .and_then(|state| state.session_for_identity(*identity));
+                if let Some(pane) = numeric {
+                    let pane = pane.lock().map_err(lock_error)?;
+                    if pane.identity == *identity {
+                        CreateOutcome::Error(CreateError::SessionAlreadyExists {
+                            session: pane.session_info(),
+                        })
+                    } else {
+                        CreateOutcome::Error(CreateError::IdentityMismatch {
+                            session: pane.session,
+                            mismatch: identity_mismatch(pane.identity, *identity),
+                        })
+                    }
+                } else if let Some(pane) = logical {
+                    CreateOutcome::Error(CreateError::IdentityAlreadyExists {
+                        session: pane.lock().map_err(lock_error)?.session_info(),
+                    })
+                } else {
+                    CreateOutcome::Error(CreateError::Failed {
+                        message: error.to_string(),
+                    })
+                }
+            }
+            Err(error) => CreateOutcome::Error(CreateError::Failed {
+                message: error.to_string(),
+            }),
+        }
+    };
+    let response = ServerMessage::CreateResult {
+        request_id: *request_id,
+        outcome,
+    };
+    complete_and_deliver(
+        server,
+        RequestKey {
+            scope,
+            request_id: *request_id,
+        },
+        response,
+    );
+    Ok(())
+}
+
+fn validate_agent_metadata(metadata: AgentSessionMetadata) -> Option<AgentStatusError> {
+    if metadata.schema_version != AGENT_STATUS_SCHEMA_VERSION {
+        return Some(AgentStatusError::WrongSchema {
+            expected: AGENT_STATUS_SCHEMA_VERSION,
+            received: metadata.schema_version,
+        });
+    }
+    if metadata.chat_id == 0 {
+        return Some(AgentStatusError::WrongChat {
+            expected: 1,
+            received: 0,
+        });
+    }
+    None
+}
+
+fn identity_mismatch(expected: SessionIdentity, received: SessionIdentity) -> IdentityMismatch {
+    if expected.namespace != received.namespace {
+        IdentityMismatch::Namespace
+    } else {
+        IdentityMismatch::SessionToken
+    }
+}
+
+fn deliver_create_error(
+    client: &ClientHandle,
+    request_id: RequestId,
+    error: CreateError,
+) -> io::Result<()> {
+    let _ = client.try_deliver(ServerMessage::CreateResult {
+        request_id,
+        outcome: CreateOutcome::Error(error),
+    });
+    Ok(())
+}
+
+fn handle_attach_request(
+    server: &SharedServer,
+    scope: ClientScopeId,
+    resumed: bool,
+    client: &ClientHandle,
+    request: ClientMessage,
+) -> io::Result<()> {
+    handle_attach_request_with_hook(server, scope, resumed, client, request, || {})
+}
+
+fn handle_attach_request_with_hook(
+    server: &SharedServer,
+    scope: ClientScopeId,
+    resumed: bool,
+    client: &ClientHandle,
+    request: ClientMessage,
+    before_commit: impl FnOnce(),
+) -> io::Result<()> {
+    let ClientMessage::Attach {
+        request_id,
+        identity,
+        session,
+        rows,
+        cols,
+    } = &request
+    else {
+        unreachable!();
+    };
+    let key = RequestKey {
+        scope,
+        request_id: *request_id,
+    };
+
+    let disposition = server
+        .lock()
+        .map_err(lock_error)?
+        .begin_request(scope, &request, client);
+    let cached = match disposition {
+        RequestDisposition::Cached(response) => Some(response),
+        RequestDisposition::Pending => return Ok(()),
+        RequestDisposition::Collision => {
+            return deliver_attach_error(client, *request_id, AttachError::RequestCollision)
+        }
+        RequestDisposition::Expired => {
+            return deliver_attach_error(client, *request_id, AttachError::RetryExpired)
+        }
+        RequestDisposition::TooManyPending => {
+            let response = ServerMessage::AttachResult {
+                request_id: *request_id,
+                outcome: AttachOutcome::Error(AttachError::Failed {
+                    message: "too many pending requests".to_string(),
+                }),
+            };
+            complete_and_deliver(server, key, response);
+            return Ok(());
+        }
+        RequestDisposition::New => None,
+    };
+
+    // A cached error is immutable and can be replayed without consulting the
+    // current session map. In particular, a later session with the same numeric
+    // ID must not change the original request's result.
+    if let Some(
+        response @ ServerMessage::AttachResult {
+            outcome: AttachOutcome::Error(_),
+            ..
+        },
+    ) = cached.clone()
+    {
+        let _ = client.try_deliver(response);
+        return Ok(());
+    }
+
+    // This is the attach/takeover linearization boundary. Shutdown sets its
+    // flag under the same server lock, so exactly one side can commit first.
+    before_commit();
+    let mut state = server.lock().map_err(lock_error)?;
+    if state.shutting_down {
+        let response = ServerMessage::AttachResult {
+            request_id: *request_id,
+            outcome: AttachOutcome::Error(AttachError::Failed {
+                message: SHUTDOWN_ERROR_MESSAGE.to_string(),
+            }),
+        };
+        if cached.is_some() {
+            // The original successful result remains the immutable cached
+            // result, but it cannot rebind while shutdown is in progress.
+            drop(state);
+            let _ = client.try_deliver(response);
+        } else {
+            let waiters = state.complete_request(key, response.clone());
+            drop(state);
+            deliver_to_waiters(waiters, response);
+        }
+        return Ok(());
+    }
+    let Some(pane) = state.sessions.get(session).cloned() else {
+        if cached.is_some() {
+            drop(state);
+            return deliver_attach_error(client, *request_id, AttachError::Superseded);
+        }
+        let response = ServerMessage::AttachResult {
+            request_id: *request_id,
+            outcome: AttachOutcome::Error(AttachError::SessionNotFound { session: *session }),
+        };
+        let waiters = state.complete_request(key, response.clone());
+        drop(state);
+        deliver_to_waiters(waiters, response);
+        return Ok(());
+    };
+    let mut pane_state = pane.lock().map_err(lock_error)?;
+    if pane_state.identity != *identity {
+        if cached.is_some() {
+            drop(pane_state);
+            drop(state);
+            return deliver_attach_error(client, *request_id, AttachError::Superseded);
+        }
+        let response = ServerMessage::AttachResult {
+            request_id: *request_id,
+            outcome: AttachOutcome::Error(AttachError::IdentityMismatch {
+                session: *session,
+                mismatch: identity_mismatch(pane_state.identity, *identity),
+            }),
+        };
+        let waiters = state.complete_request(key, response.clone());
+        drop(pane_state);
+        drop(state);
+        deliver_to_waiters(waiters, response);
+        return Ok(());
+    }
+    let recoverable_stopping =
+        pane_state.lifecycle == PaneLifecycle::Stopping && !pane_state.stop_driver_active;
+    if pane_state.lifecycle != PaneLifecycle::Running && !recoverable_stopping {
+        if cached.is_some() {
+            drop(pane_state);
+            drop(state);
+            return deliver_attach_error(client, *request_id, AttachError::Superseded);
+        }
+        let response = ServerMessage::AttachResult {
+            request_id: *request_id,
+            outcome: AttachOutcome::Error(AttachError::SessionNotFound { session: *session }),
+        };
+        let waiters = state.complete_request(key, response.clone());
+        drop(pane_state);
+        drop(state);
+        deliver_to_waiters(waiters, response);
+        return Ok(());
+    }
+
+    if let Some(response) = cached {
+        let lease = match response {
+            ServerMessage::AttachResult {
+                outcome: AttachOutcome::Attached { lease, .. },
+                ..
+            } => lease,
+            _ => unreachable!("cached attach response has attach shape"),
+        };
+        let usable = pane_state.owner.as_ref().is_some_and(|owner| {
+            owner.scope == scope
+                && owner.lease == lease
+                && client.is_active()
+                && (owner.client.id == client.id || resumed)
+        });
+        if !usable {
+            return deliver_attach_error(client, *request_id, AttachError::Superseded);
+        }
+        if pane_state.lifecycle == PaneLifecycle::Running {
+            if let Err(error) = pane_state.resize(*rows, *cols) {
+                drop(pane_state);
+                drop(state);
+                return deliver_attach_error(
+                    client,
+                    *request_id,
+                    AttachError::Failed {
+                        message: error.to_string(),
+                    },
+                );
+            }
+        }
+        if let Some(previous) = pane_state.owner.replace(AttachmentOwner {
+            scope,
+            lease,
+            client: client.clone(),
+        }) {
+            if previous.client.id != client.id
+                && !previous.client.try_deliver(ServerMessage::TakenOver {
+                    pane: pane_state.pane,
+                    lease: previous.lease,
+                })
+            {
+                previous.client.disconnect();
+            }
+        }
+        let response = ServerMessage::AttachResult {
+            request_id: *request_id,
+            outcome: AttachOutcome::Attached {
+                session: *session,
+                pane: pane_state.pane_info(),
+                lease,
+            },
+        };
+        let foreground = pane_state.refresh_foreground_process();
+        if !deliver_attach_transaction(
+            client,
+            &response,
+            *request_id,
+            lease,
+            &pane_state,
+            &foreground,
+        ) {
+            client.disconnect();
+        }
+        return Ok(());
+    }
+
+    if pane_state.lifecycle == PaneLifecycle::Running {
+        if let Err(error) = pane_state.resize(*rows, *cols) {
+            let response = ServerMessage::AttachResult {
+                request_id: *request_id,
+                outcome: AttachOutcome::Error(AttachError::Failed {
+                    message: error.to_string(),
+                }),
+            };
+            let waiters = state.complete_request(key, response.clone());
+            drop(pane_state);
+            drop(state);
+            deliver_to_waiters(waiters, response);
+            return Ok(());
+        }
+    }
+    let lease = match state.allocate_lease() {
+        Ok(lease) => lease,
+        Err(error) => {
+            let response = ServerMessage::AttachResult {
+                request_id: *request_id,
+                outcome: AttachOutcome::Error(AttachError::Failed {
+                    message: error.to_string(),
+                }),
+            };
+            let waiters = state.complete_request(key, response.clone());
+            drop(pane_state);
+            drop(state);
+            deliver_to_waiters(waiters, response);
+            return Ok(());
+        }
+    };
+
+    if let Some(previous) = pane_state.owner.take() {
+        if !previous.client.try_deliver(ServerMessage::TakenOver {
+            pane: pane_state.pane,
+            lease: previous.lease,
+        }) {
+            previous.client.disconnect();
+        }
+    }
+
+    let response = ServerMessage::AttachResult {
+        request_id: *request_id,
+        outcome: AttachOutcome::Attached {
+            session: *session,
+            pane: pane_state.pane_info(),
+            lease,
+        },
+    };
+    let mut waiters = state.complete_request(key, response.clone());
+    if waiters.is_empty() {
+        // The initiating transport may have disconnected while the operation
+        // was in flight. Preserve a logical owner so an exact resumed retry can
+        // reclaim this lease instead of being confused with explicit detach.
+        waiters.push(client.clone());
+    }
+    let selected_owner = waiters.last().cloned().expect("non-empty attach waiters");
+    pane_state.owner = Some(AttachmentOwner {
+        scope,
+        lease,
+        client: selected_owner.clone(),
+    });
+    let foreground = pane_state.refresh_foreground_process();
+    for waiter in waiters {
+        let accepted = deliver_attach_transaction(
+            &waiter,
+            &response,
+            *request_id,
+            lease,
+            &pane_state,
+            &foreground,
+        );
+        if !accepted {
+            waiter.disconnect();
+        } else if waiter.id != selected_owner.id {
+            let _ = waiter.try_deliver(ServerMessage::TakenOver {
+                pane: pane_state.pane,
+                lease,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn deliver_attach_transaction(
+    client: &ClientHandle,
+    response: &ServerMessage,
+    request_id: RequestId,
+    lease: AttachmentLease,
+    pane: &PaneState,
+    foreground: &ForegroundProcessInfo,
+) -> bool {
+    deliver_attach_transaction_with_hook(
+        client,
+        response,
+        request_id,
+        lease,
+        pane,
+        foreground,
+        || {},
+    )
+}
+
+fn deliver_attach_transaction_with_hook(
+    client: &ClientHandle,
+    response: &ServerMessage,
+    request_id: RequestId,
+    lease: AttachmentLease,
+    pane: &PaneState,
+    foreground: &ForegroundProcessInfo,
+    after_replay_begin: impl FnOnce(),
+) -> bool {
+    let mut accepted = client.try_deliver(response.clone())
+        && client.try_deliver(ServerMessage::ReplayBegin {
+            request_id,
+            pane: pane.pane,
+            lease,
+            first_sequence: pane.history_start,
+            watermark: pane.next_output,
+            omitted_prefix_bytes: pane.history_start.get(),
+        });
+    if accepted {
+        after_replay_begin();
+    }
+    let mut sequence = pane.history_start;
+    for chunk in pane.raw_history.chunks(RAW_HISTORY_CHUNK_BYTES) {
+        if !accepted {
+            break;
+        }
+        accepted = client.try_deliver(ServerMessage::ReplayChunk {
+            request_id,
+            pane: pane.pane,
+            lease,
+            sequence,
+            bytes: chunk.to_vec(),
+        });
+        let Some(next) = sequence.checked_add_bytes(chunk.len()) else {
+            return false;
+        };
+        sequence = next;
+    }
+    accepted
+        && sequence == pane.next_output
+        && client.try_deliver(ServerMessage::ReplayEnd {
+            request_id,
+            pane: pane.pane,
+            lease,
+            watermark: pane.next_output,
+        })
+        && client.try_deliver(ServerMessage::ForegroundProcess {
+            pane: pane.pane,
+            lease,
+            process: foreground.clone(),
+        })
+}
+
+fn deliver_to_waiters(waiters: Vec<ClientHandle>, response: ServerMessage) {
+    for waiter in waiters {
+        if !waiter.try_deliver(response.clone()) {
+            waiter.disconnect();
+        }
+    }
+}
+
+fn deliver_attach_error(
+    client: &ClientHandle,
+    request_id: RequestId,
+    error: AttachError,
+) -> io::Result<()> {
+    let _ = client.try_deliver(ServerMessage::AttachResult {
+        request_id,
+        outcome: AttachOutcome::Error(error),
+    });
+    Ok(())
+}
+
+fn handle_leased_input(
+    server: &SharedServer,
+    scope: ClientScopeId,
+    client: &ClientHandle,
+    pane_id: PaneId,
+    lease: AttachmentLease,
+    bytes: Vec<u8>,
+    operation: LeaseOperation,
+) {
+    let state = match server.lock() {
+        Ok(state) => state,
+        Err(_) => return,
+    };
+    let Some(pane) = state.pane_by_id(pane_id) else {
+        reject_lease(
+            client,
+            pane_id,
+            lease,
+            operation,
+            LeaseRejectionReason::PaneMissing,
+        );
+        return;
+    };
+    let pane_state = match pane.lock() {
+        Ok(pane) => pane,
+        Err(_) => return,
+    };
+    if let Err(reason) =
+        pane_state.validate_mutation_lease(state.shutting_down, scope, client.id, lease)
+    {
+        reject_lease(client, pane_id, lease, operation, reason);
+        return;
+    }
+    if let Err(error) = write_pty_input(&pane_state.writer, &bytes) {
+        eprintln!("failed to write PTY input for pane {}: {error}", pane_id.0);
+        return;
+    }
+    // Ordinary mutations never change the connection binding. Only a fresh
+    // attach or an exact cached attach on a resumed scope may do that.
+    let schedule = input_may_change_foreground(&bytes);
+    drop(pane_state);
+    drop(state);
+    if schedule {
+        schedule_foreground_process_poll(pane);
+    }
+}
+
+fn handle_leased_resize(
+    server: &SharedServer,
+    scope: ClientScopeId,
+    client: &ClientHandle,
+    pane_id: PaneId,
+    lease: AttachmentLease,
+    rows: u16,
+    cols: u16,
+) {
+    let state = match server.lock() {
+        Ok(state) => state,
+        Err(_) => return,
+    };
+    let Some(pane) = state.pane_by_id(pane_id) else {
+        reject_lease(
+            client,
+            pane_id,
+            lease,
+            LeaseOperation::Resize,
+            LeaseRejectionReason::PaneMissing,
+        );
+        return;
+    };
+    let mut pane_state = match pane.lock() {
+        Ok(pane) => pane,
+        Err(_) => return,
+    };
+    if let Err(reason) =
+        pane_state.validate_mutation_lease(state.shutting_down, scope, client.id, lease)
+    {
+        reject_lease(client, pane_id, lease, LeaseOperation::Resize, reason);
+        return;
+    }
+    if let Err(error) = pane_state.resize(rows, cols) {
+        eprintln!("failed to resize pane {}: {error}", pane_id.0);
+    }
+}
+
+fn handle_leased_detach(
+    server: &SharedServer,
+    scope: ClientScopeId,
+    client: &ClientHandle,
+    pane_id: PaneId,
+    lease: AttachmentLease,
+) {
+    let state = match server.lock() {
+        Ok(state) => state,
+        Err(_) => return,
+    };
+    let Some(pane) = state.pane_by_id(pane_id) else {
+        reject_lease(
+            client,
+            pane_id,
+            lease,
+            LeaseOperation::Detach,
+            LeaseRejectionReason::PaneMissing,
+        );
+        return;
+    };
+    let mut pane_state = match pane.lock() {
+        Ok(pane) => pane,
+        Err(_) => return,
+    };
+    if let Err(reason) =
+        pane_state.validate_mutation_lease(state.shutting_down, scope, client.id, lease)
+    {
+        reject_lease(client, pane_id, lease, LeaseOperation::Detach, reason);
+        return;
+    }
+    pane_state.owner = None;
+}
+
+fn reject_lease(
+    client: &ClientHandle,
+    pane: PaneId,
+    lease: AttachmentLease,
+    operation: LeaseOperation,
+    reason: LeaseRejectionReason,
+) {
+    let _ = client.try_deliver(ServerMessage::LeaseRejected {
+        pane,
+        lease,
+        operation,
+        reason,
+    });
+}
+
+fn handle_stop_request(
+    server: &SharedServer,
+    scope: ClientScopeId,
+    client: &ClientHandle,
+    request: ClientMessage,
+) -> io::Result<()> {
+    let ClientMessage::Stop {
+        request_id,
+        identity,
+        pane,
+        lease,
+    } = &request
+    else {
+        unreachable!();
+    };
+    match server
+        .lock()
+        .map_err(lock_error)?
+        .begin_request(scope, &request, client)
+    {
+        RequestDisposition::Cached(response) => {
+            let _ = client.try_deliver(response);
+            return Ok(());
+        }
+        RequestDisposition::Pending => return Ok(()),
+        RequestDisposition::Collision => {
+            return deliver_stop_error(client, *request_id, StopError::RequestCollision)
+        }
+        RequestDisposition::Expired => {
+            return deliver_stop_error(client, *request_id, StopError::RetryExpired)
+        }
+        RequestDisposition::TooManyPending => {
+            let response = ServerMessage::StopResult {
+                request_id: *request_id,
+                outcome: StopOutcome::Error(StopError::Failed {
+                    message: "too many pending requests".to_string(),
+                }),
+            };
+            complete_and_deliver(
+                server,
+                RequestKey {
+                    scope,
+                    request_id: *request_id,
+                },
+                response,
+            );
+            return Ok(());
+        }
+        RequestDisposition::New => {}
+    }
+
+    let key = RequestKey {
+        scope,
+        request_id: *request_id,
+    };
+    let target = server.lock().map_err(lock_error)?.pane_by_id(*pane);
+    let Some(target) = target else {
+        complete_and_deliver(
+            server,
+            key,
+            ServerMessage::StopResult {
+                request_id: *request_id,
+                outcome: StopOutcome::AlreadyAbsent,
+            },
+        );
+        return Ok(());
+    };
+    {
+        let mut pane_state = target.lock().map_err(lock_error)?;
+        if pane_state.identity != *identity {
+            let mismatch = identity_mismatch(pane_state.identity, *identity);
+            drop(pane_state);
+            complete_and_deliver(
+                server,
+                key,
+                ServerMessage::StopResult {
+                    request_id: *request_id,
+                    outcome: StopOutcome::Error(StopError::IdentityMismatch {
+                        pane: *pane,
+                        mismatch,
+                    }),
+                },
+            );
+            return Ok(());
+        }
+        if matches!(
+            pane_state.lifecycle,
+            PaneLifecycle::Exited | PaneLifecycle::Removed
+        ) {
+            drop(pane_state);
+            complete_and_deliver(
+                server,
+                key,
+                ServerMessage::StopResult {
+                    request_id: *request_id,
+                    outcome: StopOutcome::AlreadyAbsent,
+                },
+            );
+            return Ok(());
+        }
+        if let Err(reason) = pane_state.validate_stop_lease(scope, client.id, *lease) {
+            drop(pane_state);
+            complete_and_deliver(
+                server,
+                key,
+                ServerMessage::StopResult {
+                    request_id: *request_id,
+                    outcome: StopOutcome::Error(StopError::LeaseRejected(reason)),
+                },
+            );
+            return Ok(());
+        }
+        pane_state.pending_stops.push(key);
+        if pane_state.lifecycle == PaneLifecycle::Running {
+            pane_state.lifecycle = PaneLifecycle::Stopping;
+        }
+    }
+    start_stop_if_needed(Arc::clone(server), target);
+    Ok(())
+}
+
+fn handle_agent_status_request(
+    server: &SharedServer,
+    scope: ClientScopeId,
+    client: &ClientHandle,
+    request: ClientMessage,
+) -> io::Result<()> {
+    let request_id = request_id(&request).expect("agent status request is correlated");
+    match server
+        .lock()
+        .map_err(lock_error)?
+        .begin_request(scope, &request, client)
+    {
+        RequestDisposition::Cached(response) => {
+            let _ = client.try_deliver(response);
+            return Ok(());
+        }
+        RequestDisposition::Pending => return Ok(()),
+        RequestDisposition::Collision => {
+            return deliver_agent_status_error(
+                client,
+                request_id,
+                AgentStatusError::RequestCollision,
+            );
+        }
+        RequestDisposition::Expired => {
+            return deliver_agent_status_error(client, request_id, AgentStatusError::RetryExpired);
+        }
+        RequestDisposition::TooManyPending => {
+            complete_and_deliver(
+                server,
+                RequestKey { scope, request_id },
+                ServerMessage::AgentStatusResult {
+                    request_id,
+                    outcome: AgentStatusOutcome::Error(AgentStatusError::Failed {
+                        message: "too many pending requests".to_string(),
+                    }),
+                },
+            );
+            return Ok(());
+        }
+        RequestDisposition::New => {}
+    }
+
+    let outcome = {
+        let mut state = server.lock().map_err(lock_error)?;
+        match request {
+            ClientMessage::UpdateAgentStatus { record, .. } => {
+                update_agent_status(&mut state, record)
+            }
+            ClientMessage::GetAgentStatus { query, .. } => query_agent_status(&state, query),
+            _ => unreachable!("agent status handler received another request"),
+        }
+    };
+    complete_and_deliver(
+        server,
+        RequestKey { scope, request_id },
+        ServerMessage::AgentStatusResult {
+            request_id,
+            outcome,
+        },
+    );
+    Ok(())
+}
+
+fn update_agent_status(state: &mut ServerState, record: AgentStatusRecord) -> AgentStatusOutcome {
+    if record.schema_version != AGENT_STATUS_SCHEMA_VERSION {
+        return AgentStatusOutcome::Error(AgentStatusError::WrongSchema {
+            expected: AGENT_STATUS_SCHEMA_VERSION,
+            received: record.schema_version,
+        });
+    }
+    let missing = missing_agent_identity_error(state, record.identity, record.chat_id);
+    let Some(agent_state) = state.agent_states.get_mut(&record.identity) else {
+        return AgentStatusOutcome::Error(missing);
+    };
+    if record.chat_id != agent_state.metadata.chat_id {
+        return AgentStatusOutcome::Error(AgentStatusError::WrongChat {
+            expected: agent_state.metadata.chat_id,
+            received: record.chat_id,
+        });
+    }
+    if record.agent != agent_state.metadata.agent {
+        return AgentStatusOutcome::Error(AgentStatusError::WrongAgent {
+            expected: agent_state.metadata.agent,
+            received: record.agent,
+        });
+    }
+    if record.generation != agent_state.metadata.generation {
+        return AgentStatusOutcome::Error(AgentStatusError::StaleGeneration {
+            current: agent_state.metadata.generation,
+            received: record.generation,
+        });
+    }
+    if let Some(current) = agent_state
+        .status
+        .filter(|current| current.status.is_final())
+    {
+        if current.status != record.status {
+            return AgentStatusOutcome::Error(AgentStatusError::FinalStatusConflict {
+                current: current.status,
+                attempted: record.status,
+            });
+        }
+        return AgentStatusOutcome::Updated(current);
+    }
+    agent_state.status = Some(record);
+    AgentStatusOutcome::Updated(record)
+}
+
+fn query_agent_status(state: &ServerState, query: AgentStatusQuery) -> AgentStatusOutcome {
+    if query.schema_version != AGENT_STATUS_SCHEMA_VERSION {
+        return AgentStatusOutcome::Error(AgentStatusError::WrongSchema {
+            expected: AGENT_STATUS_SCHEMA_VERSION,
+            received: query.schema_version,
+        });
+    }
+    let Some(agent_state) = state.agent_states.get(&query.identity) else {
+        return AgentStatusOutcome::Error(missing_agent_identity_error(
+            state,
+            query.identity,
+            query.chat_id,
+        ));
+    };
+    if query.chat_id != agent_state.metadata.chat_id {
+        return AgentStatusOutcome::Error(AgentStatusError::WrongChat {
+            expected: agent_state.metadata.chat_id,
+            received: query.chat_id,
+        });
+    }
+    if query.agent != agent_state.metadata.agent {
+        return AgentStatusOutcome::Error(AgentStatusError::WrongAgent {
+            expected: agent_state.metadata.agent,
+            received: query.agent,
+        });
+    }
+    if query.generation != agent_state.metadata.generation {
+        return AgentStatusOutcome::Error(AgentStatusError::StaleGeneration {
+            current: agent_state.metadata.generation,
+            received: query.generation,
+        });
+    }
+    AgentStatusOutcome::Current(agent_state.status)
+}
+
+fn missing_agent_identity_error(
+    state: &ServerState,
+    identity: SessionIdentity,
+    chat_id: u64,
+) -> AgentStatusError {
+    if state.session_by_identity.contains_key(&identity) {
+        return AgentStatusError::NotAgentSession { identity };
+    }
+    if state
+        .agent_states
+        .keys()
+        .any(|candidate| candidate.token == identity.token)
+    {
+        return AgentStatusError::IdentityMismatch(IdentityMismatch::Namespace);
+    }
+    if state.agent_states.iter().any(|(candidate, agent)| {
+        candidate.namespace == identity.namespace && agent.metadata.chat_id == chat_id
+    }) {
+        return AgentStatusError::IdentityMismatch(IdentityMismatch::SessionToken);
+    }
+    AgentStatusError::SessionNotFound { identity }
+}
+
+fn deliver_agent_status_error(
+    client: &ClientHandle,
+    request_id: RequestId,
+    error: AgentStatusError,
+) -> io::Result<()> {
+    let _ = client.try_deliver(ServerMessage::AgentStatusResult {
+        request_id,
+        outcome: AgentStatusOutcome::Error(error),
+    });
+    Ok(())
+}
+
+fn deliver_stop_error(
+    client: &ClientHandle,
+    request_id: RequestId,
+    error: StopError,
+) -> io::Result<()> {
+    let _ = client.try_deliver(ServerMessage::StopResult {
+        request_id,
+        outcome: StopOutcome::Error(error),
+    });
+    Ok(())
+}
+
+fn complete_and_deliver(server: &SharedServer, key: RequestKey, response: ServerMessage) {
+    let waiters = server
+        .lock()
+        .map(|mut state| state.complete_request(key, response.clone()))
+        .unwrap_or_default();
+    for waiter in waiters {
+        if !waiter.try_deliver(response.clone()) {
+            waiter.disconnect();
+        }
+    }
 }
 
 fn read_client_message(stream: &mut UnixStream) -> io::Result<Option<ClientMessage>> {
@@ -662,22 +2094,6 @@ fn is_client_disconnect(error: &io::Error) -> bool {
     )
 }
 
-fn send_hello_response(client: &ClientHandle, protocol_version: u16) -> bool {
-    if protocol_version != PROTOCOL_VERSION {
-        let _ = client.sender.try_send(ServerMessage::Error {
-            message: format!(
-                "client protocol version {protocol_version} is incompatible with server version {PROTOCOL_VERSION}; restart mult clients"
-            ),
-        });
-        return false;
-    }
-
-    let _ = client.sender.try_send(ServerMessage::Hello {
-        protocol_version: PROTOCOL_VERSION,
-    });
-    true
-}
-
 fn create_session(server: &SharedServer, spec: SessionCreateSpec) -> io::Result<SharedPane> {
     create_session_with_spawner(server, spec, spawn_pane)
 }
@@ -687,49 +2103,43 @@ fn create_session_with_spawner(
     spec: SessionCreateSpec,
     spawn: impl FnOnce(SessionId, PaneSpawnSpec) -> io::Result<SpawnedPane>,
 ) -> io::Result<SharedPane> {
+    let identity = spec.pane.identity;
     let session = {
-        let mut server = server.lock().map_err(lock_error)?;
-        if let Some(requested_id) = spec.requested_id {
-            if let Some(existing) = server.sessions.get(&requested_id).cloned() {
-                return Ok(existing);
-            }
-        }
-        server.reserve_session_id(spec.requested_id)?
+        let mut state = server.lock().map_err(lock_error)?;
+        state.reserve_session(spec.requested_id, identity)?
     };
-
-    let spawned = match spawn(session, spec.pane) {
+    let mut spawned = match spawn(session, spec.pane) {
         Ok(spawned) => spawned,
         Err(error) => {
-            if let Ok(mut server) = server.lock() {
-                server.release_session_reservation(session);
+            if let Ok(mut state) = server.lock() {
+                state.release_session_reservation(session, identity);
             }
             return Err(error);
         }
     };
 
     {
-        let mut server = server.lock().map_err(lock_error)?;
-        server.release_session_reservation(session);
-        if server.sessions.contains_key(&session) {
-            let child = spawned
-                .pane
-                .lock()
-                .ok()
-                .and_then(|mut pane| pane.take_child());
-            drop(server);
-            let _ = kill_and_reap(child);
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("session {} was created concurrently", session.0),
-            ));
+        let publish = server
+            .lock()
+            .map_err(lock_error)?
+            .publish_reserved_session(session, Arc::clone(&spawned.pane));
+        if let Err(error) = publish {
+            cleanup_unpublished_child(
+                &mut spawned.child,
+                spawned.pane.lock().ok().map(|pane| pane.process_group),
+            );
+            if let Ok(mut state) = server.lock() {
+                state.release_session_reservation(session, identity);
+            }
+            return Err(error);
         }
-        server.sessions.insert(session, Arc::clone(&spawned.pane));
     }
     spawn_reader(
         spawned.reader,
         Arc::clone(&spawned.pane),
         Arc::clone(server),
     );
+    spawn_waiter(spawned.child, Arc::clone(&spawned.pane), Arc::clone(server));
     Ok(spawned.pane)
 }
 
@@ -741,15 +2151,10 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, pane: SharedPane, server: Shar
                 Ok(0) => break,
                 Ok(n) => {
                     let bytes = buffer[..n].to_vec();
-                    let (pane_id, clients) = match pane.lock() {
-                        Ok(mut pane) => {
-                            pane.append_raw_history(&bytes);
-                            (pane.pane, pane.clients.clone())
-                        }
-                        Err(_) => break,
-                    };
-                    let dropped = broadcast_pty_output(pane_id, bytes, &clients);
-                    remove_pane_clients(&pane, &dropped);
+                    if let Err(error) = publish_pty_output(&pane, bytes) {
+                        eprintln!("failed to sequence PTY output: {error}");
+                        break;
+                    }
                     broadcast_foreground_process_if_changed(&pane);
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -759,46 +2164,342 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, pane: SharedPane, server: Shar
                 }
             }
         }
-
-        let Some((session, pane_id, clients, exit)) = pane_exit(&pane) else {
-            return;
-        };
-        if let Ok(mut server) = server.lock() {
-            server.remove_session_if_same(session, &pane);
+        if let Ok(mut pane_state) = pane.lock() {
+            pane_state.reader_done = true;
+            pane_state.notify_lifecycle();
         }
-        let _ = broadcast_exit(pane_id, exit, &clients);
+        maybe_finalize(&server, &pane);
     });
 }
 
-fn pane_exit(pane: &SharedPane) -> Option<(SessionId, PaneId, Vec<ClientHandle>, ExitInfo)> {
-    let (session, pane_id, clients, mut child) = {
-        let mut pane = pane.lock().ok()?;
-        let child = pane.child.take()?;
-        (pane.session, pane.pane, pane.clients.clone(), child)
-    };
+fn publish_pty_output(pane: &SharedPane, bytes: Vec<u8>) -> io::Result<()> {
+    publish_pty_output_with_hook(pane, bytes, || {})
+}
 
-    let exit = match child.try_wait() {
-        Ok(Some(status)) => exit_info(status),
-        Ok(None) => match child.wait() {
-            Ok(status) => exit_info(status),
+fn publish_pty_output_with_hook(
+    pane: &SharedPane,
+    bytes: Vec<u8>,
+    before_pane_lock: impl FnOnce(),
+) -> io::Result<()> {
+    // The test hook makes contention against the same pane barrier observable
+    // without changing production synchronization or relying on a sleep.
+    before_pane_lock();
+    let mut pane_state = pane.lock().map_err(lock_error)?;
+    let sequence = pane_state.append_raw_history(&bytes)?;
+    if let Some(owner) = pane_state.owner.clone() {
+        if !owner.client.try_deliver(ServerMessage::PtyOutput {
+            pane: pane_state.pane,
+            lease: owner.lease,
+            sequence,
+            bytes,
+        }) {
+            // Delivery failure invalidates only this transport. Keep the
+            // logical (scope, lease) owner dormant for an exact resumed retry.
+            owner.client.disconnect();
+        }
+    }
+    Ok(())
+}
+
+fn spawn_waiter(mut child: Box<dyn Child + Send + Sync>, pane: SharedPane, server: SharedServer) {
+    thread::spawn(move || loop {
+        match child.wait() {
+            Ok(status) => {
+                if let Ok(mut pane_state) = pane.lock() {
+                    pane_state.child_exit = Some(exit_info(status));
+                    pane_state.last_wait_error = None;
+                    pane_state.notify_lifecycle();
+                }
+                maybe_finalize(&server, &pane);
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => {
-                eprintln!("failed to wait for PTY child: {error}");
-                ExitInfo {
-                    code: 1,
-                    signal: None,
+                let message = error.to_string();
+                record_wait_failure(&pane, &message);
+                fail_pending_stops(
+                    &server,
+                    &pane,
+                    format!("failed to wait for PTY child: {message}"),
+                );
+                let signal = pane
+                    .lock()
+                    .ok()
+                    .map(|pane| Arc::clone(&pane.lifecycle_signal));
+                if let Some(signal) = signal {
+                    let (lock, ready) = &*signal;
+                    if let Ok(generation) = lock.lock() {
+                        let _ = ready.wait_timeout(generation, WAIT_RETRY_DELAY);
+                    }
                 }
             }
-        },
-        Err(error) => {
-            eprintln!("failed to poll PTY child exit: {error}");
-            ExitInfo {
-                code: 1,
-                signal: None,
-            }
         }
+    });
+}
+
+fn record_wait_failure(pane: &SharedPane, message: &str) {
+    if let Ok(mut pane_state) = pane.lock() {
+        pane_state.last_wait_error = Some(message.to_string());
+        // The termination thread exclusively owns stop_driver_active. Clearing
+        // it here could launch a duplicate TERM/KILL driver while that thread
+        // still waits.
+        pane_state.notify_lifecycle();
+    }
+}
+
+fn maybe_finalize(server: &SharedServer, pane: &SharedPane) {
+    let (owner, exit, pending, deliveries) = {
+        let mut state = match server.lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        let mut pane_state = match pane.lock() {
+            Ok(pane) => pane,
+            Err(_) => return,
+        };
+        if pane_state.lifecycle == PaneLifecycle::Removed
+            || !pane_state.reader_done
+            || pane_state.child_exit.is_none()
+        {
+            return;
+        }
+        pane_state.lifecycle = PaneLifecycle::Exited;
+        let exit = pane_state.child_exit.clone().expect("checked exit");
+        let session = pane_state.session;
+        if let Some(metadata) = pane_state.agent {
+            state.record_agent_exit(pane_state.identity, metadata, &exit);
+        }
+        state.remove_session_if_same(session, pane);
+        pane_state.lifecycle = PaneLifecycle::Removed;
+        pane_state.stop_driver_active = false;
+        let owner = pane_state.owner.take();
+        let pending = std::mem::take(&mut pane_state.pending_stops);
+        pane_state.notify_lifecycle();
+        let mut deliveries = Vec::new();
+        for key in &pending {
+            let response = ServerMessage::StopResult {
+                request_id: key.request_id,
+                outcome: StopOutcome::Stopped { exit: exit.clone() },
+            };
+            let waiters = state.complete_request(*key, response.clone());
+            deliveries.push((waiters, response));
+        }
+        (owner, exit, pending, deliveries)
     };
 
-    Some((session, pane_id, clients, exit))
+    if let Some(owner) = owner {
+        if !owner.client.try_deliver(ServerMessage::PaneExited {
+            pane: pane.lock().ok().map(|pane| pane.pane).unwrap_or(PaneId(0)),
+            lease: owner.lease,
+            exit: exit.clone(),
+        }) {
+            owner.client.disconnect();
+        }
+    }
+    for (waiters, response) in deliveries {
+        for waiter in waiters {
+            if !waiter.try_deliver(response.clone()) {
+                waiter.disconnect();
+            }
+        }
+    }
+    let _ = pending;
+}
+
+fn start_stop_if_needed(server: SharedServer, pane: SharedPane) {
+    let groups = {
+        let mut pane_state = match pane.lock() {
+            Ok(pane) => pane,
+            Err(_) => return,
+        };
+        if matches!(
+            pane_state.lifecycle,
+            PaneLifecycle::Exited | PaneLifecycle::Removed
+        ) || pane_state.stop_driver_active
+        {
+            return;
+        }
+        pane_state.lifecycle = PaneLifecycle::Stopping;
+        pane_state.stop_driver_active = true;
+        let foreground = pane_state
+            .master
+            .lock()
+            .ok()
+            .and_then(|master| master.process_group_leader())
+            .filter(|group| *group > 1 && *group != pane_state.process_group);
+        (pane_state.process_group, foreground)
+    };
+
+    thread::spawn(move || {
+        let result = drive_termination(
+            |signal| signal_process_groups(groups, signal),
+            |timeout| wait_for_finalization(&pane, timeout),
+        );
+        let (restore_running, message) = match result {
+            TerminationResult::Finalized => return,
+            TerminationResult::TermFailed(error) => {
+                (true, format!("failed to signal PTY group: {error}"))
+            }
+            TerminationResult::KillFailed(error) => {
+                (false, format!("failed to kill PTY group: {error}"))
+            }
+            TerminationResult::TimedOut => (
+                false,
+                "timed out waiting for PTY child reap and output drain".to_string(),
+            ),
+        };
+        if let Ok(mut pane_state) = pane.lock() {
+            pane_state.stop_driver_active = false;
+            if restore_running && pane_state.lifecycle == PaneLifecycle::Stopping {
+                pane_state.lifecycle = PaneLifecycle::Running;
+            }
+            pane_state.notify_lifecycle();
+        }
+        fail_pending_stops(&server, &pane, message);
+    });
+}
+
+#[derive(Debug)]
+enum TerminationResult {
+    Finalized,
+    TermFailed(io::Error),
+    KillFailed(io::Error),
+    TimedOut,
+}
+
+fn drive_termination(
+    mut signal: impl FnMut(libc::c_int) -> io::Result<()>,
+    mut wait: impl FnMut(Duration) -> bool,
+) -> TerminationResult {
+    if let Err(error) = signal(libc::SIGTERM) {
+        return TerminationResult::TermFailed(error);
+    }
+    if wait(STOP_TERM_GRACE) {
+        return TerminationResult::Finalized;
+    }
+    if let Err(error) = signal(libc::SIGKILL) {
+        return TerminationResult::KillFailed(error);
+    }
+    if wait(STOP_FINALIZE_TIMEOUT) {
+        TerminationResult::Finalized
+    } else {
+        TerminationResult::TimedOut
+    }
+}
+
+fn wait_for_finalization(pane: &SharedPane, timeout: Duration) -> bool {
+    let signal = match pane.lock() {
+        Ok(pane_state) => {
+            if pane_state.lifecycle == PaneLifecycle::Removed {
+                return true;
+            }
+            Arc::clone(&pane_state.lifecycle_signal)
+        }
+        Err(_) => return false,
+    };
+    let deadline = Instant::now() + timeout;
+    let (lock, ready) = &*signal;
+    let mut observed = match lock.lock() {
+        Ok(generation) => *generation,
+        Err(_) => return false,
+    };
+    loop {
+        // Never hold the condition-variable mutex while taking the pane mutex:
+        // lifecycle writers notify while holding the pane mutex.
+        if pane
+            .lock()
+            .ok()
+            .is_some_and(|pane_state| pane_state.lifecycle == PaneLifecycle::Removed)
+        {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let generation = match lock.lock() {
+            Ok(generation) => generation,
+            Err(_) => return false,
+        };
+        if *generation != observed {
+            observed = *generation;
+            continue;
+        }
+        let Ok((generation, timed)) = ready.wait_timeout(generation, remaining) else {
+            return false;
+        };
+        let changed = *generation != observed;
+        observed = *generation;
+        if timed.timed_out() && !changed {
+            return false;
+        }
+    }
+}
+
+fn fail_pending_stops(server: &SharedServer, pane: &SharedPane, message: String) {
+    let deliveries = {
+        let mut state = match server.lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        let mut pane_state = match pane.lock() {
+            Ok(pane) => pane,
+            Err(_) => return,
+        };
+        let pending = std::mem::take(&mut pane_state.pending_stops);
+        pending
+            .into_iter()
+            .map(|key| {
+                let response = ServerMessage::StopResult {
+                    request_id: key.request_id,
+                    outcome: StopOutcome::Error(StopError::Failed {
+                        message: message.clone(),
+                    }),
+                };
+                let waiters = state.complete_request(key, response.clone());
+                (waiters, response)
+            })
+            .collect::<Vec<_>>()
+    };
+    for (waiters, response) in deliveries {
+        for waiter in waiters {
+            let _ = waiter.try_deliver(response.clone());
+        }
+    }
+}
+
+fn signal_process_groups(
+    (root, foreground): (libc::pid_t, Option<libc::pid_t>),
+    signal: libc::c_int,
+) -> io::Result<()> {
+    signal_process_group(root, signal)?;
+    if let Some(foreground) = foreground {
+        // The stable child group is authoritative. The foreground group is a
+        // best-effort supplement for interactive job control; failure there
+        // must not turn an already-delivered root signal into a false
+        // "nothing was signalled" rollback.
+        let _ = signal_process_group(foreground, signal);
+    }
+    Ok(())
+}
+
+fn signal_process_group(group: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
+    let own_group = unsafe { libc::getpgrp() };
+    if group <= 1 || group == own_group {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to signal unsafe process group {group}"),
+        ));
+    }
+    if unsafe { libc::kill(-group, signal) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 fn exit_info(status: ExitStatus) -> ExitInfo {
@@ -808,48 +2509,30 @@ fn exit_info(status: ExitStatus) -> ExitInfo {
     }
 }
 
-fn send_pty_scrollback(client: &ClientHandle, pane: PaneId, bytes: &[u8]) {
-    if bytes.is_empty() {
-        if !client.try_deliver(ServerMessage::PtyScrollback {
-            pane,
-            bytes: Vec::new(),
-        }) {
-            client.disconnect();
-        }
-        return;
-    }
-
-    for chunk in bytes.chunks(RAW_HISTORY_CHUNK_BYTES) {
-        if !client.try_deliver(ServerMessage::PtyScrollback {
-            pane,
-            bytes: chunk.to_vec(),
-        }) {
-            client.disconnect();
-            break;
-        }
-    }
-}
-
 fn broadcast_foreground_process_if_changed(pane: &SharedPane) {
-    let Some((pane_id, process, clients)) = foreground_process_update(pane) else {
+    let mut pane_state = match pane.lock() {
+        Ok(pane) => pane,
+        Err(_) => return,
+    };
+    let Some(process) = pane_state.refresh_foreground_process_if_changed() else {
         return;
     };
-
-    let dropped = deliver_to_clients(&clients, |client| {
-        client.try_deliver(ServerMessage::ForegroundProcess {
-            pane: pane_id,
-            process: process.clone(),
-        })
-    });
-    remove_pane_clients(pane, &dropped);
+    deliver_foreground_process(&pane_state, process);
 }
 
-fn foreground_process_update(
-    pane: &SharedPane,
-) -> Option<(PaneId, ForegroundProcessInfo, Vec<ClientHandle>)> {
-    let mut pane = pane.lock().ok()?;
-    let process = pane.refresh_foreground_process_if_changed()?;
-    Some((pane.pane, process, pane.clients.clone()))
+fn deliver_foreground_process(pane: &PaneState, process: ForegroundProcessInfo) {
+    let Some(owner) = pane.owner.clone() else {
+        return;
+    };
+    if !owner.client.try_deliver(ServerMessage::ForegroundProcess {
+        pane: pane.pane,
+        lease: owner.lease,
+        process,
+    }) {
+        // As with output delivery, retain logical ownership while making the
+        // failed connection immediately unusable for mutations.
+        owner.client.disconnect();
+    }
 }
 
 fn schedule_foreground_process_poll(pane: SharedPane) {
@@ -857,14 +2540,9 @@ fn schedule_foreground_process_poll(pane: SharedPane) {
         Ok(pane) => Arc::clone(&pane.foreground_poll_scheduled),
         Err(_) => return,
     };
-    // Coalesce bursts of input into a single in-flight poller. When a poll is
-    // already scheduled it will observe the latest state at its staged
-    // intervals, so a paste of many newlines no longer spawns one thread per
-    // byte (and one stuck /proc read can no longer multiply across threads).
     if scheduled.swap(true, Ordering::AcqRel) {
         return;
     }
-
     thread::spawn(move || {
         for delay in [
             Duration::from_millis(25),
@@ -884,59 +2562,14 @@ fn input_may_change_foreground(bytes: &[u8]) -> bool {
         .any(|byte| matches!(*byte, b'\r' | b'\n' | 0x03 | 0x1a))
 }
 
-/// Deliver a per-client message without ever blocking the caller, returning the
-/// ids of clients that must be dropped because they could not keep up or are
-/// gone. Each dropped client is disconnected so its reader/writer threads exit
-/// and the connection is reclaimed; the caller is responsible for removing the
-/// returned ids from the pane's client list.
-fn deliver_to_clients(
-    clients: &[ClientHandle],
-    mut deliver: impl FnMut(&ClientHandle) -> bool,
-) -> Vec<ClientId> {
-    let mut dropped = Vec::new();
-    for client in clients {
-        if !deliver(client) {
-            client.disconnect();
-            dropped.push(client.id);
-        }
-    }
-    dropped
-}
-
-fn remove_pane_clients(pane: &SharedPane, dropped: &[ClientId]) {
-    if dropped.is_empty() {
-        return;
-    }
-    if let Ok(mut pane) = pane.lock() {
-        pane.clients.retain(|client| !dropped.contains(&client.id));
-    }
-}
-
-fn broadcast_exit(pane: PaneId, exit: ExitInfo, clients: &[ClientHandle]) -> Vec<ClientId> {
-    deliver_to_clients(clients, |client| {
-        client.try_deliver(ServerMessage::PaneExited {
-            pane,
-            exit: exit.clone(),
-        })
-    })
-}
-
-fn broadcast_pty_output(pane: PaneId, bytes: Vec<u8>, clients: &[ClientHandle]) -> Vec<ClientId> {
-    deliver_to_clients(clients, |client| {
-        client.try_deliver(ServerMessage::PtyOutput {
-            pane,
-            bytes: bytes.clone(),
-        })
-    })
-}
-
 impl PaneState {
     fn session_info(&self) -> SessionInfo {
         SessionInfo {
             id: self.session,
+            identity: self.identity,
             name: self.name.clone(),
             pane: self.pane,
-            attached: !self.clients.is_empty(),
+            attached: self.owner.is_some(),
         }
     }
 
@@ -947,6 +2580,48 @@ impl PaneState {
             rows: self.rows,
             cols: self.cols,
         }
+    }
+
+    fn validate_lease(
+        &self,
+        scope: ClientScopeId,
+        client_id: ClientId,
+        lease: AttachmentLease,
+    ) -> Result<(), LeaseRejectionReason> {
+        let Some(owner) = &self.owner else {
+            return Err(LeaseRejectionReason::NotOwner);
+        };
+        if owner.lease != lease {
+            return Err(LeaseRejectionReason::StaleLease);
+        }
+        if owner.scope != scope || owner.client.id != client_id || !owner.client.is_active() {
+            return Err(LeaseRejectionReason::NotOwner);
+        }
+        Ok(())
+    }
+
+    fn validate_mutation_lease(
+        &self,
+        shutting_down: bool,
+        scope: ClientScopeId,
+        client_id: ClientId,
+        lease: AttachmentLease,
+    ) -> Result<(), LeaseRejectionReason> {
+        if shutting_down || self.lifecycle != PaneLifecycle::Running {
+            return Err(LeaseRejectionReason::NotOwner);
+        }
+        self.validate_lease(scope, client_id, lease)
+    }
+
+    fn validate_stop_lease(
+        &self,
+        scope: ClientScopeId,
+        client_id: ClientId,
+        lease: AttachmentLease,
+    ) -> Result<(), LeaseRejectionReason> {
+        // Exact pending/cached retries return before this validation. Every new
+        // stop request must come from the active owning connection.
+        self.validate_lease(scope, client_id, lease)
     }
 
     fn refresh_foreground_process(&mut self) -> ForegroundProcessInfo {
@@ -972,18 +2647,15 @@ impl PaneState {
             .ok()
             .and_then(|master| master.process_group_leader())
             .and_then(|pid| u32::try_from(pid).ok());
-        let command = foreground_pid.and_then(command_line_for_pid);
         ForegroundProcessInfo {
-            root_pid: self.child_pid,
+            root_pid: Some(self.child_pid),
             foreground_pid,
-            command,
+            command: foreground_pid.and_then(command_line_for_pid),
         }
     }
 
     fn resize(&mut self, rows: u16, cols: u16) -> io::Result<()> {
         let (rows, cols) = bounded_pty_dimensions(rows, cols);
-        self.rows = rows;
-        self.cols = cols;
         self.master
             .lock()
             .map_err(|_| io::Error::other("PTY master lock poisoned"))?
@@ -993,42 +2665,45 @@ impl PaneState {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(error_to_io)
+            .map_err(error_to_io)?;
+        self.rows = rows;
+        self.cols = cols;
+        Ok(())
     }
 
-    fn take_child(&mut self) -> Option<Box<dyn Child + Send + Sync>> {
-        self.child.take()
+    fn append_raw_history(&mut self, bytes: &[u8]) -> io::Result<OutputSequence> {
+        self.append_raw_history_with_limit(bytes, RAW_HISTORY_MAX_BYTES)
     }
 
-    /// Attach `client`, taking over from any other client (single-attach with
-    /// takeover). This lets a reconnecting client re-attach even when its
-    /// previous, now-dead connection is still listed here and has not been
-    /// reaped yet, instead of being rejected as already attached.
-    fn attach_client(&mut self, client: ClientHandle) {
-        self.clients.retain(|existing| existing.id == client.id);
-        if !self.clients.iter().any(|existing| existing.id == client.id) {
-            self.clients.push(client);
-        }
-    }
-
-    fn append_raw_history(&mut self, bytes: &[u8]) {
+    fn append_raw_history_with_limit(
+        &mut self,
+        bytes: &[u8],
+        limit: usize,
+    ) -> io::Result<OutputSequence> {
+        let sequence = self.next_output;
+        self.next_output = self
+            .next_output
+            .checked_add_bytes(bytes.len())
+            .ok_or_else(|| io::Error::other("PTY output sequence exhausted"))?;
         self.raw_history.extend_from_slice(bytes);
-        let overflow = self.raw_history.len().saturating_sub(RAW_HISTORY_MAX_BYTES);
+        let overflow = self.raw_history.len().saturating_sub(limit);
         if overflow > 0 {
             self.raw_history.drain(..overflow);
+            self.history_start = self
+                .history_start
+                .checked_add_bytes(overflow)
+                .ok_or_else(|| io::Error::other("PTY history sequence exhausted"))?;
+        }
+        Ok(sequence)
+    }
+
+    fn notify_lifecycle(&self) {
+        let (lock, ready) = &*self.lifecycle_signal;
+        if let Ok(mut generation) = lock.lock() {
+            *generation = generation.wrapping_add(1);
+            ready.notify_all();
         }
     }
-}
-
-/// Kill and reap a PTY child. `wait` can block, so this must run with the
-/// `PaneState` mutex released — the per-pane reader thread needs that lock to
-/// keep draining output and would otherwise stall behind us.
-fn kill_and_reap(child: Option<Box<dyn Child + Send + Sync>>) -> io::Result<()> {
-    let Some(mut child) = child else {
-        return Ok(());
-    };
-    child.kill()?;
-    child.wait().map(|_| ())
 }
 
 fn bounded_pty_dimensions(rows: u16, cols: u16) -> (u16, u16) {
@@ -1049,14 +2724,12 @@ fn command_line_from_cmdline_bytes(bytes: &[u8]) -> Option<String> {
     if args.is_empty() {
         return None;
     }
-
     if let Some(program) = Path::new(&args[0])
         .file_name()
         .and_then(|name| name.to_str())
     {
         args[0] = program.to_string();
     }
-
     Some(
         args.into_iter()
             .map(shell_display_arg)
@@ -1085,6 +2758,9 @@ fn write_pty_input(writer: &SharedPtyWriter, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn shell_command_args(command: String) -> Vec<String> {
+    // TerminalLaunch::Command and both chat-agent commands are intentionally
+    // evaluated by the login shell. Keep this distinct from MULT_AGENT_CMD's
+    // client-side argv parser.
     vec!["-lc".to_string(), command]
 }
 
@@ -1111,375 +2787,1585 @@ fn error_to_io(error: anyhow::Error) -> io::Error {
 mod tests {
     use std::{
         os::unix::fs::PermissionsExt,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::*;
 
     const TEST_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
-    #[test]
-    fn exit_info_preserves_child_exit_code() {
-        let info = exit_info(ExitStatus::with_exit_code(7));
-
-        assert_eq!(info.code, 7);
-        assert_eq!(info.signal, None);
+    fn request_id(value: u64) -> RequestId {
+        RequestId::new(value).expect("non-zero request ID")
     }
 
-    #[test]
-    fn exit_info_preserves_child_signal() {
-        let info = exit_info(ExitStatus::with_signal("SIGTERM"));
+    struct TestClientReceiver(mpsc::Receiver<ClientDelivery>);
 
-        assert_eq!(info.code, 1);
-        assert_eq!(info.signal.as_deref(), Some("SIGTERM"));
+    struct RecordingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
-    #[test]
-    fn restrict_socket_permissions_sets_user_only_mode() {
-        let path = unique_socket_path();
-        let _listener = UnixListener::bind(&path).expect("bind test socket");
+    impl TestClientReceiver {
+        fn recv_timeout(&self, timeout: Duration) -> Result<ServerMessage, mpsc::RecvTimeoutError> {
+            match self.0.recv_timeout(timeout)? {
+                ClientDelivery::Message(message) => Ok(message),
+                ClientDelivery::Close => Err(mpsc::RecvTimeoutError::Disconnected),
+            }
+        }
 
-        restrict_socket_permissions(&path).expect("restrict socket permissions");
+        fn try_recv(&self) -> Result<ServerMessage, mpsc::TryRecvError> {
+            match self.0.try_recv()? {
+                ClientDelivery::Message(message) => Ok(message),
+                ClientDelivery::Close => Err(mpsc::TryRecvError::Disconnected),
+            }
+        }
+    }
 
-        let mode = fs::metadata(&path)
-            .expect("socket metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
-        fs::remove_file(&path).expect("remove test socket");
+    fn test_client(id: ClientId) -> (ClientHandle, TestClientReceiver) {
+        test_client_with_capacity(id, 32)
+    }
+
+    fn test_client_with_capacity(
+        id: ClientId,
+        capacity: usize,
+    ) -> (ClientHandle, TestClientReceiver) {
+        let (sender, receiver) = mpsc::sync_channel(capacity);
+        let (stream, _peer) = UnixStream::pair().expect("socket pair");
+        (
+            ClientHandle {
+                id,
+                sender,
+                stream: Arc::new(stream),
+                active: Arc::new(AtomicBool::new(true)),
+            },
+            TestClientReceiver(receiver),
+        )
+    }
+
+    fn test_identity() -> SessionIdentity {
+        test_identity_bytes(0x41, 0x42)
+    }
+
+    fn test_identity_bytes(namespace: u8, token: u8) -> SessionIdentity {
+        SessionIdentity {
+            namespace: StateNamespace::from_bytes([namespace; 16]).unwrap(),
+            token: mult_protocol::SessionToken::from_bytes([token; 16]).unwrap(),
+        }
+    }
+
+    fn test_agent_metadata() -> AgentSessionMetadata {
+        AgentSessionMetadata {
+            schema_version: AGENT_STATUS_SCHEMA_VERSION,
+            chat_id: 7,
+            agent: mult_protocol::AgentKind::Pi,
+            generation: mult_protocol::AgentGeneration::from_bytes([0x43; 16]).unwrap(),
+        }
+    }
+
+    fn create_request(id: RequestId, name: &str) -> ClientMessage {
+        ClientMessage::CreateSession {
+            request_id: id,
+            identity: test_identity(),
+            requested_id: Some(SessionId(7)),
+            agent: None,
+            name: name.to_string(),
+            cwd: None,
+            env: BTreeMap::new(),
+            launch: LaunchSpec::Shell,
+            rows: 24,
+            cols: 80,
+        }
+    }
+
+    fn attach_request(id: RequestId, rows: u16, cols: u16) -> ClientMessage {
+        ClientMessage::Attach {
+            request_id: id,
+            identity: test_identity(),
+            session: SessionId(1),
+            rows,
+            cols,
+        }
+    }
+
+    fn receive_empty_attach_transaction(
+        receiver: &TestClientReceiver,
+        expected_request: RequestId,
+    ) -> AttachmentLease {
+        let lease = match receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap() {
+            ServerMessage::AttachResult {
+                request_id,
+                outcome:
+                    AttachOutcome::Attached {
+                        session: SessionId(1),
+                        pane,
+                        lease,
+                    },
+            } if request_id == expected_request && pane.id == PaneId(1) => lease,
+            message => panic!("unexpected attach acknowledgement: {message:?}"),
+        };
+        assert!(matches!(
+            receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::ReplayBegin {
+                request_id,
+                pane: PaneId(1),
+                lease: replay_lease,
+                first_sequence: OutputSequence::ZERO,
+                watermark: OutputSequence::ZERO,
+                omitted_prefix_bytes: 0,
+            } if request_id == expected_request && replay_lease == lease
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::ReplayEnd {
+                request_id,
+                pane: PaneId(1),
+                lease: replay_lease,
+                watermark: OutputSequence::ZERO,
+            } if request_id == expected_request && replay_lease == lease
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::ForegroundProcess {
+                pane: PaneId(1),
+                lease: foreground_lease,
+                ..
+            } if foreground_lease == lease
+        ));
+        lease
+    }
+
+    fn fill_client_queue(client: &ClientHandle, capacity: usize) {
+        for _ in 0..capacity {
+            assert!(client.try_deliver(ServerMessage::Sessions {
+                namespace: test_identity().namespace,
+                sessions: Vec::new(),
+            }));
+        }
     }
 
     #[test]
     fn peer_owner_check_accepts_same_user_socket_pair() {
-        let (client, _server) = UnixStream::pair().expect("create socket pair");
-
-        verify_peer_owner(&client, "test client").expect("same uid peer is accepted");
-        assert!(uid_matches_peer(current_euid(), current_euid()));
-        assert!(!uid_matches_peer(
-            current_euid().saturating_add(1),
-            current_euid()
-        ));
+        let (client, _server) = UnixStream::pair().expect("socket pair");
+        verify_peer_owner(&client, "test client").expect("same uid peer");
     }
 
     #[test]
-    fn bind_socket_path_creates_missing_parent_with_user_only_mode() {
-        let dir = unique_socket_dir();
+    fn bind_socket_path_creates_private_parent_and_handles_collisions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_socket_path().with_extension("dir");
         let path = dir.join("mult.sock");
+        bind_socket_path(&path).expect("create socket parent");
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        fs::remove_dir_all(&dir).unwrap();
 
-        bind_socket_path(&path).expect("prepare socket path");
+        let regular = unique_socket_path();
+        fs::write(&regular, "keep").unwrap();
+        assert_eq!(
+            bind_socket_path(&regular).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read_to_string(&regular).unwrap(), "keep");
+        fs::remove_file(&regular).unwrap();
 
-        let mode = fs::metadata(&dir)
-            .expect("socket parent metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o700);
-        fs::remove_dir_all(&dir).expect("remove socket dir");
+        let stale = unique_socket_path();
+        drop(UnixListener::bind(&stale).unwrap());
+        bind_socket_path(&stale).expect("remove stale socket");
+        assert!(!stale.exists());
     }
 
     #[test]
-    fn server_rejects_incompatible_client_protocol_version() {
-        let (mut client_stream, server_stream) = UnixStream::pair().expect("create socket pair");
-        client_stream
-            .set_read_timeout(Some(TEST_IO_TIMEOUT))
-            .expect("set read timeout");
-        let server = Arc::new(Mutex::new(ServerState::default()));
-        let (server_thread, completion) = spawn_client_handler(server_stream, server);
-
-        write_message(
-            &mut client_stream,
-            &ClientMessage::Hello {
+    fn handshake_rejects_wrong_version_and_non_hello_first_message() {
+        for first in [
+            ClientMessage::Hello {
                 protocol_version: PROTOCOL_VERSION + 1,
+                resume: None,
             },
-        )
-        .expect("write incompatible hello");
-
-        let message: ServerMessage = read_message(&mut client_stream).expect("read error");
-        assert!(
-            matches!(message, ServerMessage::Error { message } if message.contains("incompatible"))
-        );
-        await_client_handler(
-            server_thread,
-            completion,
-            "server handling an incompatible protocol hello",
-        );
-    }
-
-    #[test]
-    fn server_rejects_non_hello_first_message() {
-        let (mut client_stream, server_stream) = UnixStream::pair().expect("create socket pair");
-        client_stream
-            .set_read_timeout(Some(TEST_IO_TIMEOUT))
-            .expect("set read timeout");
-        let server = Arc::new(Mutex::new(ServerState::default()));
-        let (server_thread, completion) = spawn_client_handler(server_stream, server);
-
-        write_message(&mut client_stream, &ClientMessage::ListSessions)
-            .expect("write non-hello message");
-
-        let message: ServerMessage = read_message(&mut client_stream).expect("read error");
-        assert!(
-            matches!(message, ServerMessage::Error { message } if message.contains("expected protocol hello"))
-        );
-        await_client_handler(
-            server_thread,
-            completion,
-            "server rejecting a non-hello first message",
-        );
-    }
-
-    fn spawn_client_handler(
-        stream: UnixStream,
-        server: SharedServer,
-    ) -> (thread::JoinHandle<()>, mpsc::Receiver<io::Result<()>>) {
-        let (completion_sender, completion) = mpsc::channel();
-        let server_thread = thread::spawn(move || {
-            let _ = completion_sender.send(handle_client(stream, server));
-        });
-        (server_thread, completion)
-    }
-
-    fn await_client_handler(
-        server_thread: thread::JoinHandle<()>,
-        completion: mpsc::Receiver<io::Result<()>>,
-        operation: &str,
-    ) {
-        let result = completion
-            .recv_timeout(TEST_IO_TIMEOUT)
-            .unwrap_or_else(|error| {
-                panic!("timed out after {TEST_IO_TIMEOUT:?} waiting for {operation}: {error}")
+            ClientMessage::ListSessions {
+                namespace: test_identity().namespace,
+            },
+        ] {
+            let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
+            client_stream
+                .set_read_timeout(Some(TEST_IO_TIMEOUT))
+                .unwrap();
+            let server = Arc::new(Mutex::new(ServerState::default()));
+            let (done_tx, done_rx) = mpsc::channel();
+            let handle = thread::spawn(move || {
+                let _ = done_tx.send(handle_client(server_stream, server));
             });
-        server_thread
-            .join()
-            .expect("completed server thread should not panic");
-        result.unwrap_or_else(|error| panic!("failed while {operation}: {error}"));
+            write_message(&mut client_stream, &first).unwrap();
+            assert!(matches!(
+                read_message::<ServerMessage>(&mut client_stream).unwrap(),
+                ServerMessage::Error { .. }
+            ));
+            done_rx
+                .recv_timeout(TEST_IO_TIMEOUT)
+                .expect("handler completion")
+                .expect("handler result");
+            handle.join().unwrap();
+        }
     }
 
     #[test]
-    fn pty_dimensions_are_bounded_for_server_allocations() {
+    fn dimensions_reservations_and_client_queue_remain_bounded() {
         let (rows, cols) = bounded_pty_dimensions(u16::MAX, u16::MAX);
-
         assert!(usize::from(rows) * usize::from(cols) <= mult_protocol::MAX_SCREEN_CELLS);
-        assert!(rows > 0);
-        assert!(cols > 0);
-    }
+        assert!(rows > 0 && cols > 0);
 
-    #[test]
-    fn raw_history_is_capped() {
-        let mut pane = test_pane_state();
-        pane.append_raw_history(&vec![b'a'; RAW_HISTORY_MAX_BYTES + 10]);
-
-        assert_eq!(pane.raw_history.len(), RAW_HISTORY_MAX_BYTES);
-    }
-
-    #[test]
-    fn session_allocation_skips_reserved_ids() {
         let mut server = ServerState::default();
         server
-            .reserve_session_id(Some(SessionId(1)))
-            .expect("reserve first session");
-
-        assert_eq!(server.allocate_session_id(), SessionId(2));
-    }
-
-    #[test]
-    fn duplicate_requested_session_reservation_is_rejected() {
-        let mut server = ServerState::default();
-        server
-            .reserve_session_id(Some(SessionId(7)))
-            .expect("reserve requested session");
-
-        let error = server
-            .reserve_session_id(Some(SessionId(7)))
-            .expect_err("duplicate reservation should fail");
-
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-    }
-
-    #[test]
-    fn reservation_is_released_when_spawn_fails() {
-        let server = Arc::new(Mutex::new(ServerState::default()));
-        let error = match create_session_with_spawner(
-            &server,
-            SessionCreateSpec {
-                requested_id: Some(SessionId(11)),
-                pane: PaneSpawnSpec {
-                    name: "broken".to_string(),
-                    cwd: None,
-                    env: BTreeMap::new(),
-                    launch: LaunchSpec::Shell,
-                    rows: 24,
-                    cols: 80,
-                },
-            },
-            |_session, _spec| Err(io::Error::other("injected spawn failure")),
-        ) {
-            Ok(_) => panic!("injected spawn failure should fail"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error.kind(), io::ErrorKind::Other);
-        assert!(server
-            .lock()
-            .expect("server lock")
-            .reserved_sessions
-            .is_empty());
-    }
-
-    #[test]
-    fn bind_socket_path_refuses_to_remove_existing_non_socket_path() {
-        let path = unique_socket_path();
-        fs::write(&path, "do not remove").expect("write collision file");
-
-        let error = bind_socket_path(&path).expect_err("refuse non-socket collision");
-
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            .reserve_session(Some(SessionId(1)), test_identity())
+            .unwrap();
+        assert_eq!(server.allocate_session_id().unwrap(), SessionId(2));
         assert_eq!(
-            fs::read_to_string(&path).expect("collision file remains"),
-            "do not remove"
+            server
+                .reserve_session(Some(SessionId(1)), test_identity())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
         );
-        fs::remove_file(&path).expect("remove collision file");
-    }
+        server.release_session_reservation(SessionId(1), test_identity());
+        assert!(server.reserved_sessions.is_empty());
 
-    #[test]
-    fn bind_socket_path_removes_stale_socket_file() {
-        let path = unique_socket_path();
-        let listener = UnixListener::bind(&path).expect("bind stale socket");
-        drop(listener);
-
-        bind_socket_path(&path).expect("remove stale socket");
-
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn command_line_from_cmdline_bytes_formats_process_args() {
-        assert_eq!(
-            command_line_from_cmdline_bytes(b"/usr/bin/cargo\0test\0--\0space value\0"),
-            Some("cargo test -- 'space value'".to_string())
-        );
-        assert_eq!(command_line_from_cmdline_bytes(b""), None);
-    }
-
-    #[test]
-    fn broadcast_drops_full_client_without_blocking_the_reader() {
-        // Keep the receiver alive so the channel reports Full (a slow client),
-        // not Disconnected (a gone client).
         let (sender, _receiver) = mpsc::sync_channel(1);
-        let (stream, _peer) = UnixStream::pair().expect("create socket pair");
+        let (stream, _peer) = UnixStream::pair().unwrap();
         let client = ClientHandle {
             id: 1,
             sender,
             stream: Arc::new(stream),
+            active: Arc::new(AtomicBool::new(true)),
         };
-        // Fill the one-slot queue; a blocking send would now wedge the reader.
-        client
-            .sender
-            .try_send(ServerMessage::PtyOutput {
-                pane: PaneId(1),
-                bytes: Vec::new(),
-            })
-            .expect("prime the client queue");
-
-        // Returns promptly (the test would hang on a blocking send) and reports
-        // the slow client for eviction.
-        let dropped =
-            broadcast_pty_output(PaneId(1), b"more".to_vec(), std::slice::from_ref(&client));
-
-        assert_eq!(dropped, vec![1]);
+        let sessions = || ServerMessage::Sessions {
+            namespace: test_identity().namespace,
+            sessions: Vec::new(),
+        };
+        assert!(client.try_deliver(sessions()));
+        assert!(!client.try_deliver(sessions()));
     }
 
     #[test]
-    fn broadcast_keeps_client_that_drains_its_queue() {
-        let (sender, receiver) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
-        let (stream, _peer) = UnixStream::pair().expect("create socket pair");
-        let client = ClientHandle {
-            id: 7,
-            sender,
-            stream: Arc::new(stream),
-        };
+    fn shutdown_racing_reserved_create_never_publishes_the_child() {
+        let mut server = ServerState::default();
+        let session = server
+            .reserve_session(Some(SessionId(77)), test_identity())
+            .unwrap();
+        let pane = Arc::new(Mutex::new(test_pane_state(None)));
 
-        let dropped =
-            broadcast_pty_output(PaneId(3), b"data".to_vec(), std::slice::from_ref(&client));
+        // This is the publication boundary reached after an in-flight spawn.
+        // Shutdown wins before the reserved child attempts to commit.
+        server.shutting_down = true;
+        let error = server
+            .publish_reserved_session(session, pane)
+            .expect_err("shutdown must reject reserved child publication");
 
-        assert!(dropped.is_empty());
-        let message = receiver
-            .recv_timeout(TEST_IO_TIMEOUT)
-            .unwrap_or_else(|error| {
-                panic!(
-                    "timed out after {TEST_IO_TIMEOUT:?} waiting for PTY output for pane 3: {error}"
-                )
-            });
-        assert!(
-            matches!(
-                &message,
-                ServerMessage::PtyOutput { pane, bytes }
-                    if *pane == PaneId(3) && bytes.as_slice() == b"data"
-            ),
-            "expected PTY output for pane 3, got {message:?}"
+        assert!(error.to_string().contains("shutting down"));
+        assert!(server.sessions.is_empty());
+        server.release_session_reservation(session, test_identity());
+        assert!(server.reserved_sessions.is_empty());
+        assert!(server.reserved_identities.is_empty());
+    }
+
+    #[test]
+    fn shutdown_wins_at_the_attach_commit_boundary_and_caches_the_rejection() {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let scope = server.lock().unwrap().allocate_scope().unwrap();
+        let pane = Arc::new(Mutex::new(test_pane_state(None)));
+        server
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(SessionId(1), Arc::clone(&pane));
+        let initial_lease = server.lock().unwrap().next_lease;
+        let request_id = request_id(1);
+        let request = attach_request(request_id, 5, 7);
+        let (client, receiver) = test_client(1);
+        let shutdown_server = Arc::clone(&server);
+
+        handle_attach_request_with_hook(
+            &server,
+            scope,
+            false,
+            &client,
+            request.clone(),
+            move || shutdown_server.lock().unwrap().shutting_down = true,
+        )
+        .unwrap();
+        let first = receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap();
+        assert!(matches!(
+            &first,
+            ServerMessage::AttachResult {
+                request_id: received,
+                outcome: AttachOutcome::Error(AttachError::Failed { message }),
+            } if *received == request_id && message == SHUTDOWN_ERROR_MESSAGE
+        ));
+        {
+            let pane_state = pane.lock().unwrap();
+            assert!(pane_state.owner.is_none());
+            assert_eq!((pane_state.rows, pane_state.cols), (1, 1));
+        }
+        assert_eq!(server.lock().unwrap().next_lease, initial_lease);
+
+        handle_attach_request(&server, scope, false, &client, request).unwrap();
+        assert_eq!(
+            receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            first,
+            "a new request rejected by shutdown is cached"
         );
     }
 
     #[test]
-    fn attaching_a_new_client_takes_over_from_the_previous_one() {
-        let mut pane = test_pane_state();
+    fn shutdown_wins_against_takeover_without_mutating_the_old_owner() {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let old_scope = server.lock().unwrap().allocate_scope().unwrap();
+        let new_scope = server.lock().unwrap().allocate_scope().unwrap();
+        let (old_client, old_receiver) = test_client(1);
+        let old_lease = AttachmentLease::MIN;
+        let pane = Arc::new(Mutex::new(test_pane_state(Some(AttachmentOwner {
+            scope: old_scope,
+            lease: old_lease,
+            client: old_client.clone(),
+        }))));
+        {
+            let mut state = server.lock().unwrap();
+            state.next_lease = old_lease.checked_next();
+            state.sessions.insert(SessionId(1), Arc::clone(&pane));
+        }
+        let initial_next_lease = server.lock().unwrap().next_lease;
+        let request_id = request_id(1);
+        let (new_client, new_receiver) = test_client(2);
+        let shutdown_server = Arc::clone(&server);
 
-        pane.attach_client(test_client(1));
-        assert_eq!(pane.clients.len(), 1);
-        assert_eq!(pane.clients[0].id, 1);
+        handle_attach_request_with_hook(
+            &server,
+            new_scope,
+            false,
+            &new_client,
+            attach_request(request_id, 9, 11),
+            move || shutdown_server.lock().unwrap().shutting_down = true,
+        )
+        .unwrap();
 
-        // A second client takes over: the previous one is evicted.
-        pane.attach_client(test_client(2));
-        assert_eq!(pane.clients.len(), 1);
-        assert_eq!(pane.clients[0].id, 2);
-
-        // Re-attaching the same id is idempotent (no duplicate entry).
-        pane.attach_client(test_client(2));
-        assert_eq!(pane.clients.len(), 1);
-        assert_eq!(pane.clients[0].id, 2);
+        assert!(matches!(
+            new_receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::AttachResult {
+                request_id: received,
+                outcome: AttachOutcome::Error(AttachError::Failed { ref message }),
+            } if received == request_id && message == SHUTDOWN_ERROR_MESSAGE
+        ));
+        let pane_state = pane.lock().unwrap();
+        assert_eq!((pane_state.rows, pane_state.cols), (1, 1));
+        assert!(pane_state.owner.as_ref().is_some_and(|owner| {
+            owner.scope == old_scope && owner.lease == old_lease && owner.client.id == old_client.id
+        }));
+        drop(pane_state);
+        assert_eq!(server.lock().unwrap().next_lease, initial_next_lease);
+        assert!(old_receiver.try_recv().is_err(), "no TakenOver was emitted");
     }
 
-    fn test_client(id: ClientId) -> ClientHandle {
-        // The receiver and peer socket are dropped immediately; this test only
-        // inspects pane.clients membership and never sends to the client.
-        let (sender, _) = mpsc::sync_channel(1);
-        let (stream, _) = UnixStream::pair().expect("create socket pair");
-        ClientHandle {
-            id,
-            sender,
-            stream: Arc::new(stream),
+    #[test]
+    fn cached_success_cannot_rebind_after_shutdown_begins() {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let scope = server.lock().unwrap().allocate_scope().unwrap();
+        let pane = Arc::new(Mutex::new(test_pane_state(None)));
+        server
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(SessionId(1), Arc::clone(&pane));
+        let request_id = request_id(1);
+        let request = attach_request(request_id, 1, 1);
+        let (first, first_receiver) = test_client(1);
+        handle_attach_request(&server, scope, false, &first, request.clone()).unwrap();
+        let lease = receive_empty_attach_transaction(&first_receiver, request_id);
+        server.lock().unwrap().shutting_down = true;
+        let (replacement, replacement_receiver) = test_client(2);
+
+        handle_attach_request(&server, scope, true, &replacement, request).unwrap();
+
+        assert!(matches!(
+            replacement_receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::AttachResult {
+                request_id: received,
+                outcome: AttachOutcome::Error(AttachError::Failed { ref message }),
+            } if received == request_id && message == SHUTDOWN_ERROR_MESSAGE
+        ));
+        assert!(pane.lock().unwrap().owner.as_ref().is_some_and(|owner| {
+            owner.scope == scope && owner.lease == lease && owner.client.id == first.id
+        }));
+        assert!(
+            first_receiver.try_recv().is_err(),
+            "no TakenOver was emitted"
+        );
+    }
+
+    #[test]
+    fn request_cache_replays_exact_results_and_rejects_collisions() {
+        let mut server = ServerState::default();
+        let scope = server.allocate_scope().expect("scope");
+        let (client, _receiver) = test_client(1);
+        let id = request_id(1);
+        let request = create_request(id, "first");
+        assert!(matches!(
+            server.begin_request(scope, &request, &client),
+            RequestDisposition::New
+        ));
+        let response = ServerMessage::CreateResult {
+            request_id: id,
+            outcome: CreateOutcome::Error(CreateError::Failed {
+                message: "injected".to_string(),
+            }),
+        };
+        server.complete_request(
+            RequestKey {
+                scope,
+                request_id: id,
+            },
+            response.clone(),
+        );
+        assert!(matches!(
+            server.begin_request(scope, &request, &client),
+            RequestDisposition::Cached(cached) if cached == response
+        ));
+        assert!(matches!(
+            server.begin_request(scope, &create_request(id, "different"), &client),
+            RequestDisposition::Collision
+        ));
+        let mut different_identity = request.clone();
+        let ClientMessage::CreateSession { identity, .. } = &mut different_identity else {
+            unreachable!()
+        };
+        *identity = test_identity_bytes(0x41, 0x55);
+        assert!(matches!(
+            server.begin_request(scope, &different_identity, &client),
+            RequestDisposition::Collision
+        ));
+    }
+
+    #[test]
+    fn agent_status_validates_schema_chat_generation_and_final_transitions() {
+        let identity = test_identity();
+        let metadata = test_agent_metadata();
+        let mut server = ServerState::default();
+        server.agent_states.insert(
+            identity,
+            DaemonAgentState {
+                metadata,
+                status: None,
+            },
+        );
+        let record = |status| AgentStatusRecord {
+            schema_version: AGENT_STATUS_SCHEMA_VERSION,
+            identity,
+            chat_id: metadata.chat_id,
+            agent: metadata.agent,
+            generation: metadata.generation,
+            status,
+        };
+
+        let mut wrong_schema = record(AgentStatus::Running);
+        wrong_schema.schema_version += 1;
+        assert!(matches!(
+            update_agent_status(&mut server, wrong_schema),
+            AgentStatusOutcome::Error(AgentStatusError::WrongSchema { .. })
+        ));
+
+        let mut wrong_chat = record(AgentStatus::Running);
+        wrong_chat.chat_id += 1;
+        assert!(matches!(
+            update_agent_status(&mut server, wrong_chat),
+            AgentStatusOutcome::Error(AgentStatusError::WrongChat { .. })
+        ));
+
+        let mut stale = record(AgentStatus::Running);
+        stale.generation = mult_protocol::AgentGeneration::from_bytes([0x66; 16]).unwrap();
+        assert!(matches!(
+            update_agent_status(&mut server, stale),
+            AgentStatusOutcome::Error(AgentStatusError::StaleGeneration { .. })
+        ));
+
+        assert!(matches!(
+            update_agent_status(&mut server, record(AgentStatus::Finished)),
+            AgentStatusOutcome::Updated(AgentStatusRecord {
+                status: AgentStatus::Finished,
+                ..
+            })
+        ));
+        assert!(matches!(
+            update_agent_status(&mut server, record(AgentStatus::Running)),
+            AgentStatusOutcome::Updated(AgentStatusRecord {
+                status: AgentStatus::Running,
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            update_agent_status(&mut server, record(AgentStatus::Failed)),
+            AgentStatusOutcome::Updated(AgentStatusRecord {
+                status: AgentStatus::Failed,
+                ..
+            })
+        ));
+        assert!(matches!(
+            update_agent_status(&mut server, record(AgentStatus::Running)),
+            AgentStatusOutcome::Error(AgentStatusError::FinalStatusConflict {
+                current: AgentStatus::Failed,
+                attempted: AgentStatus::Running,
+            })
+        ));
+        assert!(matches!(
+            query_agent_status(
+                &server,
+                AgentStatusQuery {
+                    schema_version: AGENT_STATUS_SCHEMA_VERSION,
+                    identity,
+                    chat_id: metadata.chat_id,
+                    agent: metadata.agent,
+                    generation: metadata.generation,
+                }
+            ),
+            AgentStatusOutcome::Current(Some(AgentStatusRecord {
+                status: AgentStatus::Failed,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn concurrent_exact_request_waiters_receive_one_cached_completion() {
+        let mut scope = RequestScopeState::new();
+        let (first, _first_rx) = test_client(1);
+        let (second, _second_rx) = test_client(2);
+        let id = request_id(1);
+        let request = create_request(id, "same");
+        assert!(matches!(
+            scope.begin(id, &request, &first),
+            RequestDisposition::New
+        ));
+        assert!(matches!(
+            scope.begin(id, &request, &second),
+            RequestDisposition::Pending
+        ));
+        let response = ServerMessage::CreateResult {
+            request_id: id,
+            outcome: CreateOutcome::Error(CreateError::RetryExpired),
+        };
+        let waiters = scope.complete(id, response.clone());
+        assert_eq!(
+            waiters.iter().map(|waiter| waiter.id).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(matches!(
+            scope.begin(id, &request, &second),
+            RequestDisposition::Cached(cached) if cached == response
+        ));
+    }
+
+    #[test]
+    fn overload_rejection_consumes_and_caches_the_request_id() {
+        let mut scope = RequestScopeState::new();
+        let (client, _receiver) = test_client(1);
+        for value in 1..=MAX_PENDING_REQUESTS_PER_CLIENT as u64 {
+            let id = request_id(value);
+            assert!(matches!(
+                scope.begin(id, &create_request(id, "pending"), &client),
+                RequestDisposition::New
+            ));
+        }
+        let rejected_id = request_id(MAX_PENDING_REQUESTS_PER_CLIENT as u64 + 1);
+        let rejected = create_request(rejected_id, "overloaded");
+        assert!(matches!(
+            scope.begin(rejected_id, &rejected, &client),
+            RequestDisposition::TooManyPending
+        ));
+        let response = ServerMessage::CreateResult {
+            request_id: rejected_id,
+            outcome: CreateOutcome::Error(CreateError::Failed {
+                message: "too many pending requests".to_string(),
+            }),
+        };
+        scope.complete(rejected_id, response.clone());
+        assert!(matches!(
+            scope.begin(rejected_id, &rejected, &client),
+            RequestDisposition::Cached(cached) if cached == response
+        ));
+    }
+
+    #[test]
+    fn evicted_request_ids_expire_instead_of_mutating_again() {
+        let mut scope = RequestScopeState::new();
+        let (client, _receiver) = test_client(1);
+        for value in 1..=(MAX_CACHED_REQUEST_RESULTS_PER_SCOPE as u64 + 1) {
+            let id = request_id(value);
+            let request = create_request(id, "same");
+            assert!(matches!(
+                scope.begin(id, &request, &client),
+                RequestDisposition::New
+            ));
+            scope.complete(
+                id,
+                ServerMessage::CreateResult {
+                    request_id: id,
+                    outcome: CreateOutcome::Error(CreateError::RetryExpired),
+                },
+            );
+        }
+        let first = create_request(request_id(1), "same");
+        assert!(matches!(
+            scope.begin(request_id(1), &first, &client),
+            RequestDisposition::Expired
+        ));
+    }
+
+    #[test]
+    fn history_offsets_report_the_exact_retained_suffix() {
+        let mut pane = test_pane_state(None);
+        assert_eq!(
+            pane.append_raw_history_with_limit(b"012345", 10).unwrap(),
+            OutputSequence::ZERO
+        );
+        assert_eq!(
+            pane.append_raw_history_with_limit(b"6789ABCD", 10).unwrap(),
+            OutputSequence::new(6)
+        );
+        assert_eq!(pane.raw_history, b"456789ABCD");
+        assert_eq!(pane.history_start, OutputSequence::new(4));
+        assert_eq!(pane.next_output, OutputSequence::new(14));
+    }
+
+    #[test]
+    fn termination_driver_orders_term_grace_kill_and_final_wait() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let signal_calls = Arc::clone(&calls);
+        let wait_calls = Arc::clone(&calls);
+        let mut waits = 0;
+
+        let result = drive_termination(
+            move |signal| {
+                signal_calls
+                    .lock()
+                    .unwrap()
+                    .push(if signal == libc::SIGTERM {
+                        "term"
+                    } else {
+                        "kill"
+                    });
+                Ok(())
+            },
+            move |timeout| {
+                waits += 1;
+                wait_calls
+                    .lock()
+                    .unwrap()
+                    .push(if timeout == STOP_TERM_GRACE {
+                        "grace"
+                    } else {
+                        "final"
+                    });
+                waits == 2
+            },
+        );
+
+        assert!(matches!(result, TerminationResult::Finalized));
+        assert_eq!(*calls.lock().unwrap(), ["term", "grace", "kill", "final"]);
+    }
+
+    #[test]
+    fn termination_failures_are_ordered_and_remain_recoverable() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let result = drive_termination(
+            move |signal| {
+                recorded.lock().unwrap().push(signal);
+                if signal == libc::SIGTERM {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("injected KILL failure"))
+                }
+            },
+            |_| false,
+        );
+        assert!(matches!(result, TerminationResult::KillFailed(_)));
+        assert_eq!(*calls.lock().unwrap(), [libc::SIGTERM, libc::SIGKILL]);
+
+        let pane = Arc::new(Mutex::new(test_pane_state(None)));
+        {
+            let mut pane_state = pane.lock().unwrap();
+            pane_state.lifecycle = PaneLifecycle::Stopping;
+            pane_state.stop_driver_active = true;
+        }
+        record_wait_failure(&pane, "injected wait failure");
+        let pane_state = pane.lock().unwrap();
+        assert!(
+            pane_state.stop_driver_active,
+            "waiter cannot start a second driver"
+        );
+        assert_eq!(
+            pane_state.last_wait_error.as_deref(),
+            Some("injected wait failure")
+        );
+    }
+
+    #[test]
+    fn lease_exhaustion_completes_and_caches_attach_failure() {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let scope = server.lock().unwrap().allocate_scope().unwrap();
+        server.lock().unwrap().next_lease = None;
+        let pane = Arc::new(Mutex::new(test_pane_state(None)));
+        server.lock().unwrap().sessions.insert(SessionId(1), pane);
+        let (client, receiver) = test_client(1);
+        let request = ClientMessage::Attach {
+            request_id: request_id(1),
+            identity: test_identity(),
+            session: SessionId(1),
+            rows: 1,
+            cols: 1,
+        };
+
+        handle_attach_request(&server, scope, false, &client, request.clone()).unwrap();
+        handle_attach_request(&server, scope, false, &client, request).unwrap();
+
+        for _ in 0..2 {
+            assert!(matches!(
+                receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+                ServerMessage::AttachResult {
+                    outcome: AttachOutcome::Error(AttachError::Failed { ref message }),
+                    ..
+                } if message.contains("lease space exhausted")
+            ));
         }
     }
 
-    fn test_pane_state() -> PaneState {
-        let pty_system = native_pty_system();
-        let pair = pty_system
+    #[test]
+    fn failed_output_delivery_keeps_a_dormant_lease_for_exact_resumed_attach() {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let scope = server.lock().unwrap().allocate_scope().unwrap();
+        let pane = Arc::new(Mutex::new(test_pane_state(None)));
+        let written = Arc::new(Mutex::new(Vec::new()));
+        pane.lock().unwrap().writer =
+            Arc::new(Mutex::new(Box::new(RecordingWriter(Arc::clone(&written)))));
+        server
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(SessionId(1), Arc::clone(&pane));
+        let request_id = request_id(1);
+        let request = attach_request(request_id, 1, 1);
+        let (first, first_receiver) = test_client_with_capacity(1, 8);
+
+        handle_attach_request(&server, scope, false, &first, request.clone()).unwrap();
+        let lease = receive_empty_attach_transaction(&first_receiver, request_id);
+        fill_client_queue(&first, 8);
+
+        publish_pty_output(&pane, b"delivery-failed-but-retained".to_vec()).unwrap();
+
+        assert!(!first.is_active());
+        {
+            let pane_state = pane.lock().unwrap();
+            assert!(pane_state.owner.as_ref().is_some_and(|owner| {
+                owner.scope == scope && owner.lease == lease && owner.client.id == first.id
+            }));
+            assert_eq!(
+                pane_state.validate_lease(scope, first.id, lease),
+                Err(LeaseRejectionReason::NotOwner),
+                "an inactive transport cannot mutate with its dormant lease"
+            );
+            assert_eq!(
+                pane_state.validate_stop_lease(scope, first.id, lease),
+                Err(LeaseRejectionReason::NotOwner)
+            );
+        }
+
+        let (resumed_client, resumed_receiver) = test_client_with_capacity(2, 8);
+        handle_attach_request(
+            &server,
+            scope,
+            true,
+            &resumed_client,
+            attach_request(request_id, 1, 2),
+        )
+        .unwrap();
+        assert!(matches!(
+            resumed_receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::AttachResult {
+                request_id: received,
+                outcome: AttachOutcome::Error(AttachError::RequestCollision),
+            } if received == request_id
+        ));
+        handle_attach_request(&server, scope, false, &resumed_client, request.clone()).unwrap();
+        assert!(matches!(
+            resumed_receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::AttachResult {
+                request_id: received,
+                outcome: AttachOutcome::Error(AttachError::Superseded),
+            } if received == request_id
+        ));
+        assert_eq!(
+            pane.lock().unwrap().owner.as_ref().unwrap().client.id,
+            first.id
+        );
+
+        handle_attach_request(&server, scope, true, &resumed_client, request).unwrap();
+        assert!(matches!(
+            resumed_receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::AttachResult {
+                request_id: received,
+                outcome: AttachOutcome::Attached { lease: received_lease, .. },
+            } if received == request_id && received_lease == lease
+        ));
+        assert!(matches!(
+            resumed_receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::ReplayBegin {
+                request_id: received,
+                lease: received_lease,
+                first_sequence: OutputSequence::ZERO,
+                watermark,
+                ..
+            } if received == request_id
+                && received_lease == lease
+                && watermark == OutputSequence::new(28)
+        ));
+        assert!(matches!(
+            resumed_receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::ReplayChunk {
+                request_id: received,
+                lease: received_lease,
+                sequence: OutputSequence::ZERO,
+                ref bytes,
+                ..
+            } if received == request_id
+                && received_lease == lease
+                && bytes == b"delivery-failed-but-retained"
+        ));
+        assert!(matches!(
+            resumed_receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::ReplayEnd {
+                request_id: received,
+                lease: received_lease,
+                watermark,
+                ..
+            } if received == request_id
+                && received_lease == lease
+                && watermark == OutputSequence::new(28)
+        ));
+        assert!(matches!(
+            resumed_receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::ForegroundProcess { lease: received_lease, .. }
+                if received_lease == lease
+        ));
+        let pane_state = pane.lock().unwrap();
+        assert!(pane_state.owner.as_ref().is_some_and(|owner| {
+            owner.scope == scope
+                && owner.lease == lease
+                && owner.client.id == resumed_client.id
+                && owner.client.is_active()
+        }));
+        assert_eq!(
+            pane_state.validate_lease(scope, first.id, lease),
+            Err(LeaseRejectionReason::NotOwner)
+        );
+        assert_eq!(
+            pane_state.validate_lease(scope, resumed_client.id, lease),
+            Ok(())
+        );
+        drop(pane_state);
+
+        handle_leased_input(
+            &server,
+            scope,
+            &first,
+            PaneId(1),
+            lease,
+            b"stale-input".to_vec(),
+            LeaseOperation::Input,
+        );
+        handle_leased_input(
+            &server,
+            scope,
+            &first,
+            PaneId(1),
+            lease,
+            b"stale-paste".to_vec(),
+            LeaseOperation::Paste,
+        );
+        handle_leased_resize(&server, scope, &first, PaneId(1), lease, 77, 99);
+        handle_leased_detach(&server, scope, &first, PaneId(1), lease);
+        let stale_stop_request_id = RequestId::new(2).unwrap();
+        let stale_stop = ClientMessage::Stop {
+            request_id: stale_stop_request_id,
+            identity: test_identity(),
+            pane: PaneId(1),
+            lease,
+        };
+        handle_stop_request(&server, scope, &first, stale_stop.clone()).unwrap();
+        handle_stop_request(&server, scope, &resumed_client, stale_stop).unwrap();
+        assert!(matches!(
+            resumed_receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::StopResult {
+                request_id: received,
+                outcome: StopOutcome::Error(StopError::LeaseRejected(
+                    LeaseRejectionReason::NotOwner
+                )),
+            } if received == stale_stop_request_id
+        ));
+        let pane_state = pane.lock().unwrap();
+        assert!(written.lock().unwrap().is_empty());
+        assert_eq!((pane_state.rows, pane_state.cols), (1, 1));
+        assert_eq!(pane_state.lifecycle, PaneLifecycle::Running);
+        assert!(pane_state.pending_stops.is_empty());
+        assert!(pane_state.owner.as_ref().is_some_and(|owner| {
+            owner.scope == scope
+                && owner.lease == lease
+                && owner.client.id == resumed_client.id
+                && owner.client.is_active()
+        }));
+    }
+
+    #[test]
+    fn failed_foreground_delivery_keeps_a_dormant_lease_for_resumption() {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let scope = server.lock().unwrap().allocate_scope().unwrap();
+        let pane = Arc::new(Mutex::new(test_pane_state(None)));
+        server
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(SessionId(1), Arc::clone(&pane));
+        let request_id = request_id(1);
+        let request = attach_request(request_id, 1, 1);
+        let (first, first_receiver) = test_client_with_capacity(1, 8);
+        handle_attach_request(&server, scope, false, &first, request.clone()).unwrap();
+        let lease = receive_empty_attach_transaction(&first_receiver, request_id);
+        fill_client_queue(&first, 8);
+
+        let process = pane.lock().unwrap().foreground_process.clone();
+        deliver_foreground_process(&pane.lock().unwrap(), process);
+
+        assert!(!first.is_active());
+        assert!(pane.lock().unwrap().owner.as_ref().is_some_and(|owner| {
+            owner.scope == scope && owner.lease == lease && owner.client.id == first.id
+        }));
+
+        let (resumed_client, resumed_receiver) = test_client_with_capacity(2, 8);
+        handle_attach_request(&server, scope, true, &resumed_client, request).unwrap();
+        assert_eq!(
+            receive_empty_attach_transaction(&resumed_receiver, request_id),
+            lease
+        );
+        assert_eq!(
+            pane.lock().unwrap().owner.as_ref().unwrap().client.id,
+            resumed_client.id
+        );
+    }
+
+    #[test]
+    fn failed_initial_attach_foreground_delivery_preserves_the_resumable_lease() {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let scope = server.lock().unwrap().allocate_scope().unwrap();
+        let pane = Arc::new(Mutex::new(test_pane_state(None)));
+        server
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(SessionId(1), Arc::clone(&pane));
+        let request_id = request_id(1);
+        let request = attach_request(request_id, 1, 1);
+        let (first, first_receiver) = test_client_with_capacity(1, 3);
+
+        handle_attach_request(&server, scope, false, &first, request.clone()).unwrap();
+
+        let lease = match first_receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap() {
+            ServerMessage::AttachResult {
+                request_id: received,
+                outcome: AttachOutcome::Attached { lease, .. },
+            } if received == request_id => lease,
+            message => panic!("unexpected attach acknowledgement: {message:?}"),
+        };
+        assert!(matches!(
+            first_receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::ReplayBegin {
+                request_id: received,
+                lease: received_lease,
+                ..
+            } if received == request_id && received_lease == lease
+        ));
+        assert!(matches!(
+            first_receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::ReplayEnd {
+                request_id: received,
+                lease: received_lease,
+                ..
+            } if received == request_id && received_lease == lease
+        ));
+        assert!(first_receiver.try_recv().is_err());
+        assert!(!first.is_active());
+        assert!(pane.lock().unwrap().owner.as_ref().is_some_and(|owner| {
+            owner.scope == scope && owner.lease == lease && owner.client.id == first.id
+        }));
+
+        let (resumed, resumed_receiver) = test_client_with_capacity(2, 4);
+        handle_attach_request(&server, scope, true, &resumed, request).unwrap();
+
+        assert_eq!(
+            receive_empty_attach_transaction(&resumed_receiver, request_id),
+            lease
+        );
+        assert!(pane.lock().unwrap().owner.as_ref().is_some_and(|owner| {
+            owner.scope == scope
+                && owner.lease == lease
+                && owner.client.id == resumed.id
+                && owner.client.is_active()
+        }));
+    }
+
+    #[test]
+    fn fresh_takeover_of_a_dormant_owner_allocates_a_new_lease() {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let old_scope = server.lock().unwrap().allocate_scope().unwrap();
+        let new_scope = server.lock().unwrap().allocate_scope().unwrap();
+        let pane = Arc::new(Mutex::new(test_pane_state(None)));
+        server
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(SessionId(1), Arc::clone(&pane));
+        let old_request_id = request_id(1);
+        let old_request = attach_request(old_request_id, 1, 1);
+        let (old, old_receiver) = test_client_with_capacity(1, 8);
+        handle_attach_request(&server, old_scope, false, &old, old_request.clone()).unwrap();
+        let old_lease = receive_empty_attach_transaction(&old_receiver, old_request_id);
+        fill_client_queue(&old, 8);
+        let process = pane.lock().unwrap().foreground_process.clone();
+        deliver_foreground_process(&pane.lock().unwrap(), process);
+        assert!(!old.is_active());
+
+        let (new, new_receiver) = test_client_with_capacity(2, 8);
+        handle_attach_request(
+            &server,
+            new_scope,
+            false,
+            &new,
+            attach_request(request_id(1), 1, 1),
+        )
+        .unwrap();
+        let new_lease = receive_empty_attach_transaction(&new_receiver, request_id(1));
+        assert_ne!(new_lease, old_lease);
+        assert!(pane.lock().unwrap().owner.as_ref().is_some_and(|owner| {
+            owner.scope == new_scope && owner.lease == new_lease && owner.client.id == new.id
+        }));
+
+        let (old_resumed, old_resumed_receiver) = test_client(3);
+        handle_attach_request(&server, old_scope, true, &old_resumed, old_request).unwrap();
+        assert!(matches!(
+            old_resumed_receiver
+                .recv_timeout(TEST_IO_TIMEOUT)
+                .unwrap(),
+            ServerMessage::AttachResult {
+                request_id: received,
+                outcome: AttachOutcome::Error(AttachError::Superseded),
+            } if received == old_request_id
+        ));
+    }
+
+    #[test]
+    fn numbered_output_contending_with_attach_replay_is_strictly_contiguous() {
+        let scope = ClientScopeId::from_bytes([11; 16]);
+        let request_id = request_id(7);
+        let lease = AttachmentLease::MIN;
+        let (client, receiver) = test_client_with_capacity(1, 128);
+        let pane = Arc::new(Mutex::new(test_pane_state(Some(AttachmentOwner {
+            scope,
+            lease,
+            client: client.clone(),
+        }))));
+        let record = |number: usize| format!("SEQ:{number:08}\n").into_bytes();
+        let replay_bytes = (0..32).flat_map(&record).collect::<Vec<_>>();
+        let expected_bytes = (0..64).flat_map(&record).collect::<Vec<_>>();
+        pane.lock()
+            .unwrap()
+            .append_raw_history(&replay_bytes)
+            .unwrap();
+        let response = ServerMessage::AttachResult {
+            request_id,
+            outcome: AttachOutcome::Attached {
+                session: SessionId(1),
+                pane: pane.lock().unwrap().pane_info(),
+                lease,
+            },
+        };
+        let (start_sender, start_receiver) = mpsc::channel();
+        let (contended_sender, contended_receiver) = mpsc::channel();
+        let producer_pane = Arc::clone(&pane);
+        let barrier_probe = Arc::clone(&pane);
+        let producer = thread::spawn(move || {
+            start_receiver.recv().unwrap();
+            publish_pty_output_with_hook(&producer_pane, record(32), || {
+                assert!(matches!(
+                    barrier_probe.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                contended_sender.send(()).unwrap();
+            })
+            .unwrap();
+            for number in 33..64 {
+                publish_pty_output(&producer_pane, record(number)).unwrap();
+            }
+        });
+
+        let pane_state = pane.lock().unwrap();
+        let replay_watermark = pane_state.next_output;
+        let foreground = pane_state.foreground_process.clone();
+        assert!(deliver_attach_transaction_with_hook(
+            &client,
+            &response,
+            request_id,
+            lease,
+            &pane_state,
+            &foreground,
+            || {
+                start_sender.send(()).unwrap();
+                contended_receiver
+                    .recv_timeout(TEST_IO_TIMEOUT)
+                    .expect("producer reached the held pane replay barrier");
+            },
+        ));
+        drop(pane_state);
+        producer.join().unwrap();
+
+        assert_eq!(
+            receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            response,
+            "the correlated acknowledgement is first"
+        );
+        assert!(matches!(
+            receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::ReplayBegin {
+                request_id: received,
+                pane: PaneId(1),
+                lease: received_lease,
+                first_sequence: OutputSequence::ZERO,
+                watermark,
+                omitted_prefix_bytes: 0,
+            } if received == request_id && received_lease == lease && watermark == replay_watermark
+        ));
+        let replay = match receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap() {
+            ServerMessage::ReplayChunk {
+                request_id: received,
+                pane: PaneId(1),
+                lease: received_lease,
+                sequence: OutputSequence::ZERO,
+                bytes,
+            } if received == request_id && received_lease == lease => bytes,
+            message => panic!("unexpected replay message: {message:?}"),
+        };
+        assert_eq!(replay, replay_bytes);
+        assert!(matches!(
+            receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::ReplayEnd {
+                request_id: received,
+                pane: PaneId(1),
+                lease: received_lease,
+                watermark,
+            } if received == request_id && received_lease == lease && watermark == replay_watermark
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::ForegroundProcess {
+                pane: PaneId(1),
+                lease: received_lease,
+                ..
+            } if received_lease == lease
+        ));
+
+        let mut combined = replay;
+        let mut expected_sequence = replay_watermark;
+        for number in 32..64 {
+            match receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap() {
+                ServerMessage::PtyOutput {
+                    pane: PaneId(1),
+                    lease: received_lease,
+                    sequence,
+                    bytes,
+                } if received_lease == lease && sequence == expected_sequence => {
+                    assert_eq!(bytes, record(number));
+                    expected_sequence = expected_sequence.checked_add_bytes(bytes.len()).unwrap();
+                    combined.extend_from_slice(&bytes);
+                }
+                message => panic!("live output overtook or broke replay ordering: {message:?}"),
+            }
+        }
+        assert_eq!(
+            combined, expected_bytes,
+            "no numbered record is lost or duplicated"
+        );
+        assert_eq!(
+            expected_sequence,
+            pane.lock().unwrap().next_output,
+            "live sequence reaches the exact publication watermark"
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn termination_driver_does_not_kill_after_graceful_completion() {
+        let signals = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&signals);
+        let result = drive_termination(
+            move |signal| {
+                recorded.lock().unwrap().push(signal);
+                Ok(())
+            },
+            |timeout| timeout == STOP_TERM_GRACE,
+        );
+
+        assert!(matches!(result, TerminationResult::Finalized));
+        assert_eq!(*signals.lock().unwrap(), [libc::SIGTERM]);
+    }
+
+    #[test]
+    fn signal_process_group_rejects_the_daemon_group() {
+        let own = unsafe { libc::getpgrp() };
+        let error = signal_process_group(own, libc::SIGTERM).expect_err("reject own group");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn exit_info_preserves_child_status() {
+        assert_eq!(exit_info(ExitStatus::with_exit_code(7)).code, 7);
+        assert_eq!(
+            exit_info(ExitStatus::with_signal("SIGTERM"))
+                .signal
+                .as_deref(),
+            Some("SIGTERM")
+        );
+    }
+
+    #[test]
+    fn socket_permissions_are_user_only() {
+        let path = unique_socket_path();
+        let _listener = UnixListener::bind(&path).expect("bind socket");
+        restrict_socket_permissions(&path).expect("restrict socket");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn command_line_formatting_is_shell_safe_for_display() {
+        assert_eq!(
+            command_line_from_cmdline_bytes(b"/usr/bin/cargo\0test\0space value\0"),
+            Some("cargo test 'space value'".to_string())
+        );
+    }
+
+    #[test]
+    fn leases_are_connection_specific_and_stale_tokens_are_rejected() {
+        let scope = ClientScopeId::from_bytes([7; 16]);
+        let other_scope = ClientScopeId::from_bytes([8; 16]);
+        let (owner, _owner_rx) = test_client(1);
+        let lease = AttachmentLease::MIN;
+        let pane = test_pane_state(Some(AttachmentOwner {
+            scope,
+            lease,
+            client: owner.clone(),
+        }));
+
+        assert_eq!(pane.validate_lease(scope, 1, lease), Ok(()));
+        assert_eq!(
+            pane.validate_lease(scope, 2, lease),
+            Err(LeaseRejectionReason::NotOwner)
+        );
+        assert_eq!(
+            pane.validate_lease(other_scope, 1, lease),
+            Err(LeaseRejectionReason::NotOwner)
+        );
+        assert_eq!(
+            pane.validate_lease(scope, 1, lease.checked_next().expect("second lease")),
+            Err(LeaseRejectionReason::StaleLease)
+        );
+        assert_eq!(pane.validate_stop_lease(scope, 1, lease), Ok(()));
+        assert_eq!(
+            pane.validate_stop_lease(scope, 2, lease),
+            Err(LeaseRejectionReason::NotOwner)
+        );
+        owner.disconnect();
+        assert_eq!(
+            pane.validate_lease(scope, 1, lease),
+            Err(LeaseRejectionReason::NotOwner)
+        );
+        assert_eq!(
+            pane.validate_stop_lease(scope, 1, lease),
+            Err(LeaseRejectionReason::NotOwner)
+        );
+    }
+
+    #[test]
+    fn stopping_and_shutdown_reject_all_non_stop_mutations() {
+        let scope = ClientScopeId::from_bytes([9; 16]);
+        let (owner, _receiver) = test_client(1);
+        let lease = AttachmentLease::MIN;
+        let mut pane = test_pane_state(Some(AttachmentOwner {
+            scope,
+            lease,
+            client: owner,
+        }));
+        assert_eq!(pane.validate_mutation_lease(false, scope, 1, lease), Ok(()));
+        pane.lifecycle = PaneLifecycle::Stopping;
+        assert_eq!(
+            pane.validate_mutation_lease(false, scope, 1, lease),
+            Err(LeaseRejectionReason::NotOwner)
+        );
+        pane.lifecycle = PaneLifecycle::Running;
+        assert_eq!(
+            pane.validate_mutation_lease(true, scope, 1, lease),
+            Err(LeaseRejectionReason::NotOwner)
+        );
+    }
+
+    #[test]
+    fn disconnect_keeps_logical_owner_for_scope_resumption() {
+        let mut server = ServerState::default();
+        let scope = server.allocate_scope().unwrap();
+        let (owner, _receiver) = test_client(41);
+        let pane = Arc::new(Mutex::new(test_pane_state(Some(AttachmentOwner {
+            scope,
+            lease: AttachmentLease::MIN,
+            client: owner.clone(),
+        }))));
+        server.sessions.insert(SessionId(1), Arc::clone(&pane));
+
+        owner.disconnect();
+        server.remove_client(41);
+
+        let pane = pane.lock().unwrap();
+        assert!(pane
+            .owner
+            .as_ref()
+            .is_some_and(|owner| { owner.scope == scope && owner.lease == AttachmentLease::MIN }));
+        assert_eq!(
+            pane.validate_lease(scope, 41, AttachmentLease::MIN),
+            Err(LeaseRejectionReason::NotOwner)
+        );
+    }
+
+    #[test]
+    fn centralized_finalizer_handles_stop_before_natural_exit_exactly_once() {
+        assert_finalization_order(true);
+    }
+
+    #[test]
+    fn centralized_finalizer_handles_natural_exit_before_stop_exactly_once() {
+        assert_finalization_order(false);
+    }
+
+    fn assert_finalization_order(stop_first: bool) {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let scope = server.lock().unwrap().allocate_scope().unwrap();
+        let (client, receiver) = test_client(1);
+        let lease = AttachmentLease::MIN;
+        let request_id = request_id(1);
+        let request = ClientMessage::Stop {
+            request_id,
+            identity: test_identity(),
+            pane: PaneId(1),
+            lease,
+        };
+        assert!(matches!(
+            server
+                .lock()
+                .unwrap()
+                .begin_request(scope, &request, &client),
+            RequestDisposition::New
+        ));
+        let pane = Arc::new(Mutex::new(test_pane_state(Some(AttachmentOwner {
+            scope,
+            lease,
+            client: client.clone(),
+        }))));
+        server
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(SessionId(1), Arc::clone(&pane));
+        let exit = ExitInfo {
+            code: 23,
+            signal: None,
+        };
+
+        if stop_first {
+            {
+                let mut pane_state = pane.lock().unwrap();
+                pane_state.lifecycle = PaneLifecycle::Stopping;
+                pane_state
+                    .pending_stops
+                    .push(RequestKey { scope, request_id });
+                pane_state.reader_done = true;
+            }
+            maybe_finalize(&server, &pane);
+            assert!(server.lock().unwrap().sessions.contains_key(&SessionId(1)));
+            assert!(receiver.try_recv().is_err());
+            pane.lock().unwrap().child_exit = Some(exit.clone());
+        } else {
+            pane.lock().unwrap().child_exit = Some(exit.clone());
+            maybe_finalize(&server, &pane);
+            assert!(server.lock().unwrap().sessions.contains_key(&SessionId(1)));
+            assert!(receiver.try_recv().is_err());
+            {
+                let mut pane_state = pane.lock().unwrap();
+                pane_state.lifecycle = PaneLifecycle::Stopping;
+                pane_state
+                    .pending_stops
+                    .push(RequestKey { scope, request_id });
+            }
+            maybe_finalize(&server, &pane);
+            assert!(server.lock().unwrap().sessions.contains_key(&SessionId(1)));
+            assert!(receiver.try_recv().is_err());
+            pane.lock().unwrap().reader_done = true;
+        }
+
+        maybe_finalize(&server, &pane);
+        maybe_finalize(&server, &pane);
+
+        assert!(server.lock().unwrap().sessions.is_empty());
+        assert_eq!(pane.lock().unwrap().lifecycle, PaneLifecycle::Removed);
+        assert!(matches!(
+            receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::PaneExited {
+                pane: PaneId(1),
+                lease: received_lease,
+                exit: ref received_exit,
+            } if received_lease == lease && received_exit == &exit
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::StopResult {
+                request_id: received,
+                outcome: StopOutcome::Stopped { exit: ref received_exit },
+            } if received == request_id && received_exit == &exit
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "finalization was emitted twice"
+        );
+    }
+
+    #[test]
+    fn centralized_finalizer_removes_and_emits_each_result_once() {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let scope = server.lock().unwrap().allocate_scope().unwrap();
+        let (client, receiver) = test_client(1);
+        let lease = AttachmentLease::MIN;
+        let request_id = request_id(1);
+        let request = ClientMessage::Stop {
+            request_id,
+            identity: test_identity(),
+            pane: PaneId(1),
+            lease,
+        };
+        assert!(matches!(
+            server
+                .lock()
+                .unwrap()
+                .begin_request(scope, &request, &client),
+            RequestDisposition::New
+        ));
+
+        let mut pane_state = test_pane_state(Some(AttachmentOwner {
+            scope,
+            lease,
+            client,
+        }));
+        pane_state.lifecycle = PaneLifecycle::Stopping;
+        pane_state.reader_done = true;
+        pane_state.child_exit = Some(ExitInfo {
+            code: 0,
+            signal: None,
+        });
+        pane_state
+            .pending_stops
+            .push(RequestKey { scope, request_id });
+        let pane = Arc::new(Mutex::new(pane_state));
+        server
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(SessionId(1), Arc::clone(&pane));
+
+        maybe_finalize(&server, &pane);
+        maybe_finalize(&server, &pane);
+
+        assert!(server.lock().unwrap().sessions.is_empty());
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ServerMessage::PaneExited {
+                pane: PaneId(1),
+                ..
+            }
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ServerMessage::StopResult {
+                request_id: received,
+                outcome: StopOutcome::Stopped { .. },
+            } if received == request_id
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "finalizer emitted a duplicate"
+        );
+    }
+
+    fn test_pane_state(owner: Option<AttachmentOwner>) -> PaneState {
+        let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 1,
                 cols: 1,
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .expect("open test pty");
+            .expect("open test PTY");
         PaneState {
             session: SessionId(1),
+            identity: test_identity(),
+            agent: None,
             pane: PaneId(1),
             name: "test".to_string(),
             title: "test".to_string(),
             rows: 1,
             cols: 1,
             raw_history: Vec::new(),
+            history_start: OutputSequence::ZERO,
+            next_output: OutputSequence::ZERO,
             master: Arc::new(Mutex::new(pair.master)),
             writer: Arc::new(Mutex::new(Box::new(io::sink()))),
-            child_pid: None,
+            child_pid: std::process::id(),
+            process_group: unsafe { libc::getpgrp() },
             foreground_process: ForegroundProcessInfo {
-                root_pid: None,
+                root_pid: Some(std::process::id()),
                 foreground_pid: None,
                 command: None,
             },
-            child: None,
-            clients: Vec::new(),
+            owner,
+            lifecycle: PaneLifecycle::Running,
+            reader_done: false,
+            child_exit: None,
+            last_wait_error: None,
+            stop_driver_active: false,
+            pending_stops: Vec::new(),
+            lifecycle_signal: Arc::new((Mutex::new(0), Condvar::new())),
             foreground_poll_scheduled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -1487,16 +4373,8 @@ mod tests {
     fn unique_socket_path() -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after Unix epoch")
+            .expect("clock")
             .as_nanos();
         env::temp_dir().join(format!("mult-server-test-{unique}.sock"))
-    }
-
-    fn unique_socket_dir() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after Unix epoch")
-            .as_nanos();
-        env::temp_dir().join(format!("mult-server-test-{unique}"))
     }
 }

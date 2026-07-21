@@ -2,18 +2,24 @@ use std::{
     collections::BTreeMap,
     env, fs,
     io::{self, Read, Write},
+    num::NonZeroU64,
     path::{Path, PathBuf},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 10;
+pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 1;
 pub const DEFAULT_SOCKET_NAME: &str = "mult.sock";
 pub const SOCKET_PATH_ENV: &str = "MULT_SOCKET_PATH";
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SCREEN_ROWS: u16 = 1_000;
 pub const MAX_SCREEN_COLS: u16 = 1_000;
 pub const MAX_SCREEN_CELLS: usize = 200_000;
+/// Maximum number of correlated requests a client may have awaiting results.
+pub const MAX_PENDING_REQUESTS_PER_CLIENT: usize = 1_024;
+/// Maximum number of completed request results retained for one resumable scope.
+pub const MAX_CACHED_REQUEST_RESULTS_PER_SCOPE: usize = 4_096;
 
 pub fn default_socket_path() -> PathBuf {
     if let Some(path) = env::var_os(SOCKET_PATH_ENV) {
@@ -149,15 +155,239 @@ pub struct SessionId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PaneId(pub u64);
 
+macro_rules! nonzero_opaque_identity {
+    ($name:ident, $description:literal) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name([u8; 16]);
+
+        impl $name {
+            pub fn from_bytes(bytes: [u8; 16]) -> Option<Self> {
+                if bytes == [0; 16] {
+                    None
+                } else {
+                    Some(Self(bytes))
+                }
+            }
+
+            pub const fn into_bytes(self) -> [u8; 16] {
+                self.0
+            }
+
+            pub const fn as_bytes(&self) -> &[u8; 16] {
+                &self.0
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                self.0.serialize(serializer)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let bytes = <[u8; 16]>::deserialize(deserializer)?;
+                Self::from_bytes(bytes)
+                    .ok_or_else(|| de::Error::custom(concat!($description, " cannot be all zero")))
+            }
+        }
+    };
+}
+
+nonzero_opaque_identity!(StateNamespace, "state namespace");
+nonzero_opaque_identity!(SessionToken, "session token");
+nonzero_opaque_identity!(AgentGeneration, "agent generation");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SessionIdentity {
+    pub namespace: StateNamespace,
+    pub token: SessionToken,
+}
+
+/// Opaque server-issued identity for a resumable client request scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ClientScopeId([u8; 16]);
+
+impl ClientScopeId {
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn into_bytes(self) -> [u8; 16] {
+        self.0
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+/// Opaque identity generated once for each daemon process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ServerInstanceId([u8; 16]);
+
+impl ServerInstanceId {
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn into_bytes(self) -> [u8; 16] {
+        self.0
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+/// A non-zero request number scoped to one [`ClientScopeId`].
+///
+/// Clients allocate these monotonically with [`RequestId::checked_next`] and
+/// never wrap or reuse them. Retrying an idempotent request uses the exact same
+/// ID and request body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RequestId(NonZeroU64);
+
+impl RequestId {
+    pub const MIN: Self = Self(NonZeroU64::MIN);
+    pub const MAX: Self = Self(NonZeroU64::MAX);
+
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.get().checked_add(1) {
+            Some(value) => Self::new(value),
+            None => None,
+        }
+    }
+}
+
+/// An opaque, non-zero capability for mutating one attached pane.
+///
+/// The daemon allocates leases monotonically without reuse and invalidates the
+/// previous lease before completing a takeover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct AttachmentLease(NonZeroU64);
+
+impl AttachmentLease {
+    pub const MIN: Self = Self(NonZeroU64::MIN);
+    pub const MAX: Self = Self(NonZeroU64::MAX);
+
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.get().checked_add(1) {
+            Some(value) => Self::new(value),
+            None => None,
+        }
+    }
+}
+
+/// Absolute byte offset in a pane's output stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct OutputSequence(u64);
+
+impl OutputSequence {
+    pub const ZERO: Self = Self(0);
+
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub fn checked_add_bytes(self, byte_count: usize) -> Option<Self> {
+        let byte_count = u64::try_from(byte_count).ok()?;
+        self.0.checked_add(byte_count).map(Self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LaunchSpec {
     Shell,
     Command(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentKind {
+    Pi,
+    ClaudeCode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSessionMetadata {
+    pub schema_version: u16,
+    pub chat_id: u64,
+    pub agent: AgentKind,
+    pub generation: AgentGeneration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentStatus {
+    Idle,
+    Running,
+    Waiting,
+    /// One agent turn completed; the long-lived PTY may accept another turn.
+    Finished,
+    Failed,
+    Exited,
+}
+
+impl AgentStatus {
+    pub const fn is_final(self) -> bool {
+        matches!(self, Self::Failed | Self::Exited)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStatusRecord {
+    pub schema_version: u16,
+    pub identity: SessionIdentity,
+    pub chat_id: u64,
+    pub agent: AgentKind,
+    pub generation: AgentGeneration,
+    pub status: AgentStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStatusQuery {
+    pub schema_version: u16,
+    pub identity: SessionIdentity,
+    pub chat_id: u64,
+    pub agent: AgentKind,
+    pub generation: AgentGeneration,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: SessionId,
+    pub identity: SessionIdentity,
     pub name: String,
     pub pane: PaneId,
     pub attached: bool,
@@ -188,10 +418,18 @@ pub struct ExitInfo {
 pub enum ClientMessage {
     Hello {
         protocol_version: u16,
+        /// A previous scope to resume. Stateful requests may be retried only
+        /// when the server confirms this scope and daemon instance.
+        resume: Option<ClientScopeId>,
     },
-    ListSessions,
+    ListSessions {
+        namespace: StateNamespace,
+    },
     CreateSession {
+        request_id: RequestId,
+        identity: SessionIdentity,
         requested_id: Option<SessionId>,
+        agent: Option<AgentSessionMetadata>,
         name: String,
         cwd: Option<PathBuf>,
         env: BTreeMap<String, String>,
@@ -200,17 +438,25 @@ pub enum ClientMessage {
         cols: u16,
     },
     Attach {
+        request_id: RequestId,
+        identity: SessionIdentity,
         session: SessionId,
         rows: u16,
         cols: u16,
     },
+    /// Raw terminal input has no request ID and must never be replayed after
+    /// uncertain delivery.
     Input {
         pane: PaneId,
+        lease: AttachmentLease,
         bytes: Vec<u8>,
     },
+    /// Prepared terminal paste bytes have no request ID and must never be
+    /// replayed after uncertain delivery.
     Paste {
         pane: PaneId,
-        text: String,
+        lease: AttachmentLease,
+        bytes: Vec<u8>,
     },
     Scroll {
         pane: PaneId,
@@ -224,12 +470,173 @@ pub enum ClientMessage {
     },
     Resize {
         pane: PaneId,
+        lease: AttachmentLease,
         rows: u16,
         cols: u16,
     },
-    Detach,
-    Stop {
+    Detach {
         pane: PaneId,
+        lease: AttachmentLease,
+    },
+    Stop {
+        request_id: RequestId,
+        identity: SessionIdentity,
+        pane: PaneId,
+        lease: AttachmentLease,
+    },
+    UpdateAgentStatus {
+        request_id: RequestId,
+        record: AgentStatusRecord,
+    },
+    GetAgentStatus {
+        request_id: RequestId,
+        query: AgentStatusQuery,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IdentityMismatch {
+    Namespace,
+    SessionToken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CreateOutcome {
+    Created { session: SessionInfo },
+    Error(CreateError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CreateError {
+    /// The request ID was previously used with a different operation or body.
+    RequestCollision,
+    /// The request ID predates the bounded retained-result window.
+    RetryExpired,
+    /// A different create request already owns the requested session ID.
+    SessionAlreadyExists {
+        session: SessionInfo,
+    },
+    IdentityAlreadyExists {
+        session: SessionInfo,
+    },
+    IdentityMismatch {
+        session: SessionId,
+        mismatch: IdentityMismatch,
+    },
+    InvalidAgentMetadata(AgentStatusError),
+    Failed {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttachOutcome {
+    Attached {
+        session: SessionId,
+        pane: PaneInfo,
+        lease: AttachmentLease,
+    },
+    Error(AttachError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttachError {
+    RequestCollision,
+    RetryExpired,
+    SessionNotFound {
+        session: SessionId,
+    },
+    IdentityMismatch {
+        session: SessionId,
+        mismatch: IdentityMismatch,
+    },
+    /// The cached attachment result's lease was invalidated by a takeover.
+    Superseded,
+    Failed {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LeaseOperation {
+    Input,
+    Paste,
+    Resize,
+    Detach,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LeaseRejectionReason {
+    PaneMissing,
+    NotOwner,
+    StaleLease,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StopOutcome {
+    Stopped {
+        exit: ExitInfo,
+    },
+    /// A new stop request for an absent pane is confirmed success. An exact
+    /// retry instead replays the original cached outcome.
+    AlreadyAbsent,
+    Error(StopError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StopError {
+    RequestCollision,
+    RetryExpired,
+    IdentityMismatch {
+        pane: PaneId,
+        mismatch: IdentityMismatch,
+    },
+    LeaseRejected(LeaseRejectionReason),
+    Failed {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentStatusOutcome {
+    Updated(AgentStatusRecord),
+    Current(Option<AgentStatusRecord>),
+    Error(AgentStatusError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentStatusError {
+    RequestCollision,
+    RetryExpired,
+    WrongSchema {
+        expected: u16,
+        received: u16,
+    },
+    SessionNotFound {
+        identity: SessionIdentity,
+    },
+    IdentityMismatch(IdentityMismatch),
+    NotAgentSession {
+        identity: SessionIdentity,
+    },
+    WrongChat {
+        expected: u64,
+        received: u64,
+    },
+    WrongAgent {
+        expected: AgentKind,
+        received: AgentKind,
+    },
+    StaleGeneration {
+        current: AgentGeneration,
+        received: AgentGeneration,
+    },
+    FinalStatusConflict {
+        current: AgentStatus,
+        attempted: AgentStatus,
+    },
+    Failed {
+        message: String,
     },
 }
 
@@ -237,36 +644,84 @@ pub enum ClientMessage {
 pub enum ServerMessage {
     Hello {
         protocol_version: u16,
+        server_instance: ServerInstanceId,
+        client_scope: ClientScopeId,
+        resumed: bool,
     },
-    Sessions(Vec<SessionInfo>),
-    Attached {
-        session: SessionId,
-        panes: Vec<PaneInfo>,
+    Sessions {
+        namespace: StateNamespace,
+        sessions: Vec<SessionInfo>,
     },
-    PtyScrollback {
+    CreateResult {
+        request_id: RequestId,
+        outcome: CreateOutcome,
+    },
+    /// A successful result is followed by ReplayBegin, zero or more
+    /// ReplayChunk messages, then ReplayEnd for the same request and lease.
+    AttachResult {
+        request_id: RequestId,
+        outcome: AttachOutcome,
+    },
+    /// Begins replay of `[first_sequence, watermark)`. A non-zero
+    /// `omitted_prefix_bytes` reports suffix truncation explicitly.
+    ReplayBegin {
+        request_id: RequestId,
         pane: PaneId,
+        lease: AttachmentLease,
+        first_sequence: OutputSequence,
+        watermark: OutputSequence,
+        omitted_prefix_bytes: u64,
+    },
+    ReplayChunk {
+        request_id: RequestId,
+        pane: PaneId,
+        lease: AttachmentLease,
+        sequence: OutputSequence,
         bytes: Vec<u8>,
+    },
+    ReplayEnd {
+        request_id: RequestId,
+        pane: PaneId,
+        lease: AttachmentLease,
+        watermark: OutputSequence,
     },
     PtyOutput {
         pane: PaneId,
+        lease: AttachmentLease,
+        sequence: OutputSequence,
         bytes: Vec<u8>,
     },
     ForegroundProcess {
         pane: PaneId,
+        lease: AttachmentLease,
         process: ForegroundProcessInfo,
     },
     PaneExited {
         pane: PaneId,
+        lease: AttachmentLease,
         exit: ExitInfo,
     },
     StopResult {
+        request_id: RequestId,
+        outcome: StopOutcome,
+    },
+    AgentStatusResult {
+        request_id: RequestId,
+        outcome: AgentStatusOutcome,
+    },
+    TakenOver {
         pane: PaneId,
-        stopped: bool,
-        error: Option<String>,
+        /// The lease which was displaced, not the replacement lease.
+        lease: AttachmentLease,
     },
-    Error {
-        message: String,
+    LeaseRejected {
+        pane: PaneId,
+        lease: AttachmentLease,
+        operation: LeaseOperation,
+        reason: LeaseRejectionReason,
     },
+    /// Reserved for handshake, framing, and connection-wide protocol errors.
+    Error { message: String },
 }
 
 pub fn read_message<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> io::Result<T> {
@@ -331,45 +786,565 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
 mod tests {
     use super::*;
 
-    #[test]
-    fn round_trips_messages_with_length_prefix() {
-        let message = ClientMessage::Attach {
-            session: SessionId(1),
+    fn request_id(value: u64) -> RequestId {
+        RequestId::new(value).expect("non-zero request ID")
+    }
+
+    fn lease(value: u64) -> AttachmentLease {
+        AttachmentLease::new(value).expect("non-zero attachment lease")
+    }
+
+    fn namespace(byte: u8) -> StateNamespace {
+        StateNamespace::from_bytes([byte; 16]).expect("non-zero namespace")
+    }
+
+    fn token(byte: u8) -> SessionToken {
+        SessionToken::from_bytes([byte; 16]).expect("non-zero token")
+    }
+
+    fn generation(byte: u8) -> AgentGeneration {
+        AgentGeneration::from_bytes([byte; 16]).expect("non-zero generation")
+    }
+
+    fn identity() -> SessionIdentity {
+        SessionIdentity {
+            namespace: namespace(0x44),
+            token: token(0x55),
+        }
+    }
+
+    fn agent_metadata() -> AgentSessionMetadata {
+        AgentSessionMetadata {
+            schema_version: AGENT_STATUS_SCHEMA_VERSION,
+            chat_id: 12,
+            agent: AgentKind::Pi,
+            generation: generation(0x66),
+        }
+    }
+
+    fn agent_record(status: AgentStatus) -> AgentStatusRecord {
+        let metadata = agent_metadata();
+        AgentStatusRecord {
+            schema_version: metadata.schema_version,
+            identity: identity(),
+            chat_id: metadata.chat_id,
+            agent: metadata.agent,
+            generation: metadata.generation,
+            status,
+        }
+    }
+
+    fn session_info() -> SessionInfo {
+        SessionInfo {
+            id: SessionId(7),
+            identity: identity(),
+            name: "fixture session".to_string(),
+            pane: PaneId(17),
+            attached: true,
+        }
+    }
+
+    fn pane_info() -> PaneInfo {
+        PaneInfo {
+            id: PaneId(17),
+            title: "fixture pane".to_string(),
             rows: 24,
             cols: 80,
-        };
-        let mut bytes = Vec::new();
-        write_message(&mut bytes, &message).expect("write message");
-        let decoded: ClientMessage = read_message(&mut bytes.as_slice()).expect("read message");
+        }
+    }
 
-        assert_eq!(decoded, message);
+    fn assert_framed_round_trip<T>(message: &T)
+    where
+        T: std::fmt::Debug + PartialEq + Serialize + for<'de> Deserialize<'de>,
+    {
+        let mut frame = Vec::new();
+        write_message(&mut frame, message).expect("write framed fixture");
+
+        let decoded: T = read_message(&mut frame.as_slice()).expect("read framed fixture");
+        assert_eq!(&decoded, message);
+
+        let mut reencoded = Vec::new();
+        write_message(&mut reencoded, &decoded).expect("re-encode framed fixture");
+        assert_eq!(reencoded, frame);
     }
 
     #[test]
-    fn round_trips_correlated_stop_result() {
-        let message = ServerMessage::StopResult {
-            pane: PaneId(7),
-            stopped: false,
-            error: Some("kill failed".to_string()),
-        };
-        let mut bytes = Vec::new();
-        write_message(&mut bytes, &message).expect("write message");
-        let decoded: ServerMessage = read_message(&mut bytes.as_slice()).expect("read message");
+    fn request_and_lease_values_are_non_zero_and_do_not_wrap() {
+        assert_eq!(RequestId::new(0), None);
+        assert_eq!(RequestId::MIN.get(), 1);
+        assert_eq!(RequestId::MIN.checked_next(), RequestId::new(2));
+        assert_eq!(RequestId::MAX.get(), u64::MAX);
+        assert_eq!(RequestId::MAX.checked_next(), None);
 
-        assert_eq!(decoded, message);
+        assert_eq!(AttachmentLease::new(0), None);
+        assert_eq!(AttachmentLease::MIN.get(), 1);
+        assert_eq!(AttachmentLease::MIN.checked_next(), AttachmentLease::new(2));
+        assert_eq!(AttachmentLease::MAX.get(), u64::MAX);
+        assert_eq!(AttachmentLease::MAX.checked_next(), None);
     }
 
     #[test]
-    fn round_trips_raw_pty_output() {
-        let message = ServerMessage::PtyOutput {
-            pane: PaneId(7),
-            bytes: b"hello\x1b[31m".to_vec(),
-        };
-        let mut bytes = Vec::new();
-        write_message(&mut bytes, &message).expect("write message");
-        let decoded: ServerMessage = read_message(&mut bytes.as_slice()).expect("read message");
+    fn wire_decode_rejects_zero_request_and_lease_values() {
+        let payload = postcard::to_allocvec(&0_u64).expect("encode zero");
+        let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&payload);
+        assert!(read_message::<RequestId>(&mut frame.as_slice()).is_err());
+        assert!(read_message::<AttachmentLease>(&mut frame.as_slice()).is_err());
 
-        assert_eq!(decoded, message);
+        for description in ["namespace", "session token", "agent generation"] {
+            let payload = postcard::to_allocvec(&[0_u8; 16]).expect("encode zero identity");
+            let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+            frame.extend_from_slice(&payload);
+            let rejected = match description {
+                "namespace" => read_message::<StateNamespace>(&mut frame.as_slice()).is_err(),
+                "session token" => read_message::<SessionToken>(&mut frame.as_slice()).is_err(),
+                _ => read_message::<AgentGeneration>(&mut frame.as_slice()).is_err(),
+            };
+            assert!(rejected, "zero {description} must be rejected");
+        }
+    }
+
+    #[test]
+    fn output_sequences_advance_by_exact_byte_count_without_wrapping() {
+        assert_eq!(
+            OutputSequence::new(40).checked_add_bytes(2),
+            Some(OutputSequence::new(42))
+        );
+        assert_eq!(OutputSequence::new(u64::MAX).checked_add_bytes(1), None);
+    }
+
+    #[test]
+    fn round_trips_every_protocol_v10_client_message_fixture() {
+        let scope = ClientScopeId::from_bytes([0x11; 16]);
+        let mut env = BTreeMap::new();
+        env.insert("FIXTURE_KEY".to_string(), "fixture value".to_string());
+
+        let fixtures = vec![
+            ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                resume: None,
+            },
+            ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                resume: Some(scope),
+            },
+            ClientMessage::ListSessions {
+                namespace: namespace(0x44),
+            },
+            ClientMessage::CreateSession {
+                request_id: request_id(1),
+                identity: identity(),
+                requested_id: Some(SessionId(7)),
+                agent: Some(agent_metadata()),
+                name: "shell fixture".to_string(),
+                cwd: Some(PathBuf::from("/fixture/cwd")),
+                env: env.clone(),
+                launch: LaunchSpec::Shell,
+                rows: 24,
+                cols: 80,
+            },
+            ClientMessage::CreateSession {
+                request_id: RequestId::MAX,
+                identity: SessionIdentity {
+                    namespace: namespace(0x44),
+                    token: token(0x77),
+                },
+                requested_id: None,
+                agent: None,
+                name: "command fixture".to_string(),
+                cwd: None,
+                env,
+                launch: LaunchSpec::Command("printf '%s\\n' fixture".to_string()),
+                rows: MAX_SCREEN_ROWS,
+                cols: MAX_SCREEN_COLS,
+            },
+            ClientMessage::Attach {
+                request_id: request_id(2),
+                identity: identity(),
+                session: SessionId(7),
+                rows: 25,
+                cols: 81,
+            },
+            ClientMessage::Input {
+                pane: PaneId(17),
+                lease: lease(101),
+                bytes: vec![0, 0xff, b'\n'],
+            },
+            ClientMessage::Paste {
+                pane: PaneId(17),
+                lease: lease(101),
+                bytes: "\u{1b}[200~λ\ntext\u{1b}[201~".as_bytes().to_vec(),
+            },
+            ClientMessage::Resize {
+                pane: PaneId(17),
+                lease: lease(101),
+                rows: MAX_SCREEN_ROWS,
+                cols: MAX_SCREEN_COLS,
+            },
+            ClientMessage::Detach {
+                pane: PaneId(17),
+                lease: lease(101),
+            },
+            ClientMessage::Stop {
+                request_id: request_id(3),
+                identity: identity(),
+                pane: PaneId(17),
+                lease: lease(101),
+            },
+            ClientMessage::UpdateAgentStatus {
+                request_id: request_id(4),
+                record: agent_record(AgentStatus::Running),
+            },
+            ClientMessage::UpdateAgentStatus {
+                request_id: request_id(40),
+                record: agent_record(AgentStatus::Idle),
+            },
+            ClientMessage::UpdateAgentStatus {
+                request_id: request_id(41),
+                record: agent_record(AgentStatus::Waiting),
+            },
+            ClientMessage::UpdateAgentStatus {
+                request_id: request_id(42),
+                record: agent_record(AgentStatus::Finished),
+            },
+            ClientMessage::UpdateAgentStatus {
+                request_id: request_id(44),
+                record: agent_record(AgentStatus::Failed),
+            },
+            ClientMessage::UpdateAgentStatus {
+                request_id: request_id(43),
+                record: agent_record(AgentStatus::Exited),
+            },
+            ClientMessage::GetAgentStatus {
+                request_id: request_id(5),
+                query: AgentStatusQuery {
+                    schema_version: AGENT_STATUS_SCHEMA_VERSION,
+                    identity: identity(),
+                    chat_id: 12,
+                    agent: AgentKind::Pi,
+                    generation: generation(0x66),
+                },
+            },
+        ];
+
+        for fixture in &fixtures {
+            assert_framed_round_trip(fixture);
+        }
+    }
+
+    #[test]
+    fn round_trips_every_protocol_v10_server_message_fixture() {
+        let scope = ClientScopeId::from_bytes([0x22; 16]);
+        let server_instance = ServerInstanceId::from_bytes([0x33; 16]);
+        let session = session_info();
+        let pane = pane_info();
+        let mut fixtures = vec![
+            ServerMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                server_instance,
+                client_scope: scope,
+                resumed: false,
+            },
+            ServerMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                server_instance,
+                client_scope: scope,
+                resumed: true,
+            },
+            ServerMessage::Sessions {
+                namespace: namespace(0x44),
+                sessions: vec![session.clone()],
+            },
+            ServerMessage::CreateResult {
+                request_id: request_id(1),
+                outcome: CreateOutcome::Created {
+                    session: session.clone(),
+                },
+            },
+            ServerMessage::CreateResult {
+                request_id: request_id(2),
+                outcome: CreateOutcome::Error(CreateError::RequestCollision),
+            },
+            ServerMessage::CreateResult {
+                request_id: request_id(3),
+                outcome: CreateOutcome::Error(CreateError::RetryExpired),
+            },
+            ServerMessage::CreateResult {
+                request_id: request_id(4),
+                outcome: CreateOutcome::Error(CreateError::SessionAlreadyExists {
+                    session: session.clone(),
+                }),
+            },
+            ServerMessage::CreateResult {
+                request_id: request_id(5),
+                outcome: CreateOutcome::Error(CreateError::Failed {
+                    message: "spawn failed".to_string(),
+                }),
+            },
+            ServerMessage::CreateResult {
+                request_id: request_id(21),
+                outcome: CreateOutcome::Error(CreateError::IdentityAlreadyExists {
+                    session: session.clone(),
+                }),
+            },
+            ServerMessage::CreateResult {
+                request_id: request_id(22),
+                outcome: CreateOutcome::Error(CreateError::IdentityMismatch {
+                    session: SessionId(7),
+                    mismatch: IdentityMismatch::Namespace,
+                }),
+            },
+            ServerMessage::CreateResult {
+                request_id: request_id(23),
+                outcome: CreateOutcome::Error(CreateError::InvalidAgentMetadata(
+                    AgentStatusError::WrongSchema {
+                        expected: AGENT_STATUS_SCHEMA_VERSION,
+                        received: 99,
+                    },
+                )),
+            },
+            ServerMessage::AttachResult {
+                request_id: request_id(6),
+                outcome: AttachOutcome::Attached {
+                    session: SessionId(7),
+                    pane: pane.clone(),
+                    lease: lease(101),
+                },
+            },
+            ServerMessage::AttachResult {
+                request_id: request_id(7),
+                outcome: AttachOutcome::Error(AttachError::RequestCollision),
+            },
+            ServerMessage::AttachResult {
+                request_id: request_id(8),
+                outcome: AttachOutcome::Error(AttachError::RetryExpired),
+            },
+            ServerMessage::AttachResult {
+                request_id: request_id(9),
+                outcome: AttachOutcome::Error(AttachError::SessionNotFound {
+                    session: SessionId(404),
+                }),
+            },
+            ServerMessage::AttachResult {
+                request_id: request_id(10),
+                outcome: AttachOutcome::Error(AttachError::Superseded),
+            },
+            ServerMessage::AttachResult {
+                request_id: request_id(11),
+                outcome: AttachOutcome::Error(AttachError::Failed {
+                    message: "attach failed".to_string(),
+                }),
+            },
+            ServerMessage::AttachResult {
+                request_id: request_id(24),
+                outcome: AttachOutcome::Error(AttachError::IdentityMismatch {
+                    session: SessionId(7),
+                    mismatch: IdentityMismatch::SessionToken,
+                }),
+            },
+            ServerMessage::ReplayBegin {
+                request_id: request_id(6),
+                pane: PaneId(17),
+                lease: lease(101),
+                first_sequence: OutputSequence::ZERO,
+                watermark: OutputSequence::new(12),
+                omitted_prefix_bytes: 0,
+            },
+            ServerMessage::ReplayBegin {
+                request_id: request_id(12),
+                pane: PaneId(17),
+                lease: lease(102),
+                first_sequence: OutputSequence::new(4_096),
+                watermark: OutputSequence::new(8_192),
+                omitted_prefix_bytes: 4_096,
+            },
+            ServerMessage::ReplayChunk {
+                request_id: request_id(6),
+                pane: PaneId(17),
+                lease: lease(101),
+                sequence: OutputSequence::new(3),
+                bytes: vec![0, 0xff, b'x'],
+            },
+            ServerMessage::ReplayEnd {
+                request_id: request_id(6),
+                pane: PaneId(17),
+                lease: lease(101),
+                watermark: OutputSequence::new(12),
+            },
+            ServerMessage::PtyOutput {
+                pane: PaneId(17),
+                lease: lease(101),
+                sequence: OutputSequence::new(12),
+                bytes: Vec::new(),
+            },
+            ServerMessage::PtyOutput {
+                pane: PaneId(17),
+                lease: lease(101),
+                sequence: OutputSequence::new(12),
+                bytes: vec![0, 0x1b, 0xff],
+            },
+            ServerMessage::ForegroundProcess {
+                pane: PaneId(17),
+                lease: lease(101),
+                process: ForegroundProcessInfo {
+                    root_pid: Some(1_000),
+                    foreground_pid: Some(1_001),
+                    command: Some("fixture command".to_string()),
+                },
+            },
+            ServerMessage::PaneExited {
+                pane: PaneId(17),
+                lease: lease(101),
+                exit: ExitInfo {
+                    code: 0,
+                    signal: None,
+                },
+            },
+            ServerMessage::PaneExited {
+                pane: PaneId(17),
+                lease: lease(101),
+                exit: ExitInfo {
+                    code: 137,
+                    signal: Some("SIGKILL".to_string()),
+                },
+            },
+            ServerMessage::StopResult {
+                request_id: request_id(13),
+                outcome: StopOutcome::Stopped {
+                    exit: ExitInfo {
+                        code: 0,
+                        signal: None,
+                    },
+                },
+            },
+            ServerMessage::StopResult {
+                request_id: request_id(14),
+                outcome: StopOutcome::AlreadyAbsent,
+            },
+            ServerMessage::StopResult {
+                request_id: request_id(15),
+                outcome: StopOutcome::Error(StopError::RequestCollision),
+            },
+            ServerMessage::StopResult {
+                request_id: request_id(16),
+                outcome: StopOutcome::Error(StopError::RetryExpired),
+            },
+            ServerMessage::StopResult {
+                request_id: request_id(17),
+                outcome: StopOutcome::Error(StopError::LeaseRejected(
+                    LeaseRejectionReason::PaneMissing,
+                )),
+            },
+            ServerMessage::StopResult {
+                request_id: request_id(18),
+                outcome: StopOutcome::Error(StopError::LeaseRejected(
+                    LeaseRejectionReason::NotOwner,
+                )),
+            },
+            ServerMessage::StopResult {
+                request_id: request_id(19),
+                outcome: StopOutcome::Error(StopError::LeaseRejected(
+                    LeaseRejectionReason::StaleLease,
+                )),
+            },
+            ServerMessage::StopResult {
+                request_id: request_id(20),
+                outcome: StopOutcome::Error(StopError::Failed {
+                    message: "kill or wait failed".to_string(),
+                }),
+            },
+            ServerMessage::StopResult {
+                request_id: request_id(25),
+                outcome: StopOutcome::Error(StopError::IdentityMismatch {
+                    pane: PaneId(17),
+                    mismatch: IdentityMismatch::SessionToken,
+                }),
+            },
+            ServerMessage::AgentStatusResult {
+                request_id: request_id(26),
+                outcome: AgentStatusOutcome::Updated(agent_record(AgentStatus::Running)),
+            },
+            ServerMessage::AgentStatusResult {
+                request_id: request_id(27),
+                outcome: AgentStatusOutcome::Current(Some(agent_record(AgentStatus::Waiting))),
+            },
+            ServerMessage::AgentStatusResult {
+                request_id: request_id(28),
+                outcome: AgentStatusOutcome::Current(None),
+            },
+            ServerMessage::TakenOver {
+                pane: PaneId(17),
+                lease: lease(101),
+            },
+        ];
+
+        for (index, error) in [
+            AgentStatusError::RequestCollision,
+            AgentStatusError::RetryExpired,
+            AgentStatusError::WrongSchema {
+                expected: AGENT_STATUS_SCHEMA_VERSION,
+                received: 99,
+            },
+            AgentStatusError::SessionNotFound {
+                identity: identity(),
+            },
+            AgentStatusError::IdentityMismatch(IdentityMismatch::Namespace),
+            AgentStatusError::IdentityMismatch(IdentityMismatch::SessionToken),
+            AgentStatusError::NotAgentSession {
+                identity: identity(),
+            },
+            AgentStatusError::WrongChat {
+                expected: 12,
+                received: 13,
+            },
+            AgentStatusError::WrongAgent {
+                expected: AgentKind::Pi,
+                received: AgentKind::ClaudeCode,
+            },
+            AgentStatusError::StaleGeneration {
+                current: generation(0x66),
+                received: generation(0x77),
+            },
+            AgentStatusError::FinalStatusConflict {
+                current: AgentStatus::Failed,
+                attempted: AgentStatus::Running,
+            },
+            AgentStatusError::Failed {
+                message: "status state failed".to_string(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            fixtures.push(ServerMessage::AgentStatusResult {
+                request_id: request_id(100 + index as u64),
+                outcome: AgentStatusOutcome::Error(error),
+            });
+        }
+
+        for operation in [
+            LeaseOperation::Input,
+            LeaseOperation::Paste,
+            LeaseOperation::Resize,
+            LeaseOperation::Detach,
+        ] {
+            for reason in [
+                LeaseRejectionReason::PaneMissing,
+                LeaseRejectionReason::NotOwner,
+                LeaseRejectionReason::StaleLease,
+            ] {
+                fixtures.push(ServerMessage::LeaseRejected {
+                    pane: PaneId(17),
+                    lease: lease(101),
+                    operation,
+                    reason,
+                });
+            }
+        }
+
+        for fixture in &fixtures {
+            assert_framed_round_trip(fixture);
+        }
     }
 
     #[cfg(not(unix))]
@@ -479,6 +1454,8 @@ mod tests {
     #[test]
     fn read_message_rejects_trailing_bytes_inside_frame() {
         let message = ClientMessage::Attach {
+            request_id: request_id(1),
+            identity: identity(),
             session: SessionId(1),
             rows: 24,
             cols: 80,

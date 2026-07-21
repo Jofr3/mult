@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "next_workspace_id": 2,
+  "next_chat_id": 3,
+  "next_terminal_id": 3,
+  "workspaces": [
+    {
+      "id": 1,
+      "name": "complete",
+      "cwd": "/work/project",
+      "environment": {
+        "RUST_LOG": "debug"
+      },
+      "chats": [
+        {
+          "id": 1,
+          "name": "agent",
+          "status": "Done",
+          "agent": "Pi",
+          "messages": [
+            {
+              "role": "User",
+              "text": "question"
+            },
+            {
+              "role": "Assistant",
+              "text": "answer"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "name": "agent",
+          "status": "Waiting",
+          "agent": "ClaudeCode",
+          "messages": []
+        }
+      ],
+      "terminals": [
+        {
+          "id": 1,
+          "name": "shell",
+          "status": "Stopped",
+          "launch": {
+            "kind": "shell"
+          }
+        },
+        {
+          "id": 2,
+          "name": "command",
+          "status": "Running",
+          "launch": {
+            "kind": "command",
+            "command": "printf migrated-only"
+          }
+        }
+      ]
+    }
+  ]
+}

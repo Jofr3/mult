@@ -7,7 +7,7 @@ The current implementation is a Ratatui/Crossterm client plus a small `mult-serv
 ## Current capabilities
 
 - Multiple workspaces, each with a working directory, agent chats, and terminals.
-- Persistent JSON project state for workspace/chat/terminal metadata and chat transcripts.
+- Persistent JSON project state for workspace/chat/terminal metadata and structured messages emitted by the experimental process-agent backend.
 - Runtime PTY sessions managed by `mult-server` over a Unix socket.
 - Shell terminals and command terminals.
 - Auto-start for the selected terminal or selected agent chat.
@@ -110,7 +110,7 @@ Config path:
 
 - `$MULT_CONFIG_PATH`, if set
 - otherwise `$XDG_CONFIG_HOME/mult/config.json`
-- otherwise `~/.config/mult/config.json`
+- otherwise the effective user's passwd home at `~/.config/mult/config.json`; startup fails clearly if no durable home can be resolved
 
 Example:
 
@@ -152,15 +152,17 @@ State path:
 
 - `$MULT_STATE_PATH`, if set
 - otherwise `$XDG_DATA_HOME/mult/state.json`
-- otherwise `~/.local/share/mult/state.json`
+- otherwise the effective user's passwd home at `~/.local/share/mult/state.json`; startup fails clearly if no durable home can be resolved
 
-The state file is written atomically through an owner-only temporary file and final state files are set to `0600`. Newly-created state directories use owner-only permissions. Invalid JSON is moved aside with a `.corrupt-*` suffix before resetting to defaults; state files with a newer schema version are rejected without rewriting them.
+The state file is owned by one TUI at a time through a nonblocking process-lifetime lock acquired before loading. A second TUI using the same state path fails clearly instead of overwriting a stale snapshot. Writes are atomic through an owner-only temporary file; state and lock files are `0600`, and newly-created state directories are `0700`. Invalid JSON is moved aside with a `.corrupt-*` suffix before resetting to defaults; state files with a newer schema version are rejected without rewriting them. Version-1 state is explicitly migrated to version 2 and saved before any daemon restoration or command launch.
 
-Durable state contains the workspace tree, chat messages, terminal metadata, terminal launch commands, and statuses. PTY processes, raw terminal buffers, and scrollback are runtime/server-owned and are not stored in the JSON state file.
+Durable state contains the workspace tree, terminal metadata and launch commands, immutable session identities, statuses, and messages received through the structured experimental process-agent API. Normal Pi and Claude Code chats run in PTYs: their raw terminal output can survive a TUI reconnect while the same daemon session lives, but it is not treated as an authoritative structured transcript and does not survive daemon loss. Raw terminal buffers and scrollback are not stored in the JSON state file. The separate bounded transcript-journal codec is reserved for backends that provide real role/message boundaries; `mult` never invents those boundaries by scraping PTY bytes.
 
 On startup, a command terminal persisted as running is attached only if its existing daemon session is available. `mult` never relaunches that command during restoration; an unavailable session is marked stopped and requires deliberate typing or **Start selected PTY** before it runs again. Persisted stopped command terminals are likewise not auto-started after a client restart.
 
 If saving state fails, the TUI remains open, keeps the state dirty, and shows the error until a later user action retries successfully. A quit request that cannot save is cancelled rather than discarding unsaved state.
+
+Pi and Claude Code lifecycle bridges write generation-scoped, append-only status journals under the private runtime directory. Records include the durable namespace/token, chat, backend, schema, and random process generation. The TUI validates and forwards them to the daemon; daemon state is authoritative across reconnects and rejects stale identities/generations or late updates after final failure/exit.
 
 ## Project layout
 

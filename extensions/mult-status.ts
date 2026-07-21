@@ -1,70 +1,92 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { mkdirSync, renameSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { appendFileSync, statSync } from "node:fs";
 
 type MultAgentStatus = "idle" | "running" | "waiting" | "error" | "finished";
 
+const MAX_STATUS_FILE_BYTES = 1024 * 1024;
 const statusPath = process.env.MULT_AGENT_STATUS_PATH;
+const version = process.env.MULT_AGENT_STATUS_VERSION;
+const namespace = process.env.MULT_AGENT_NAMESPACE;
+const sessionToken = process.env.MULT_AGENT_SESSION_TOKEN;
 const chatId = process.env.MULT_AGENT_CHAT_ID;
+const agentKind = process.env.MULT_AGENT_KIND;
+const generation = process.env.MULT_AGENT_GENERATION;
 
-function emitStatus(status: MultAgentStatus, detail?: string) {
-  if (!statusPath) return;
+function emitStatus(status: MultAgentStatus) {
+  if (
+    !statusPath ||
+    !version ||
+    !namespace ||
+    !sessionToken ||
+    !chatId ||
+    !agentKind ||
+    !generation
+  ) {
+    return;
+  }
 
   try {
-    mkdirSync(dirname(statusPath), { recursive: true });
+    // mult creates and validates this generation-specific owner-private file.
+    // Never create parent directories here: a stale hook must not resurrect a
+    // generation that mult has cleaned up.
+    if (statSync(statusPath).size >= MAX_STATUS_FILE_BYTES) return;
     const payload = `${JSON.stringify({
-      version: 1,
-      status,
+      version: Number(version),
+      namespace,
+      sessionToken,
       chatId,
-      detail,
-      timestamp: Date.now(),
+      agentKind,
+      generation,
+      status,
     })}\n`;
-    const tempPath = `${statusPath}.${process.pid}.tmp`;
-    writeFileSync(tempPath, payload, "utf8");
-    renameSync(tempPath, statusPath);
+    appendFileSync(statusPath, payload, {
+      encoding: "utf8",
+      flag: "a",
+      mode: 0o600,
+    });
   } catch {
-    // Keep the extension silent: status reporting should never disturb pi.
+    // Status reporting must never disturb pi.
   }
 }
 
 export default function (pi: ExtensionAPI) {
-  emitStatus("idle", "extension loaded");
+  emitStatus("idle");
 
   pi.on("session_start", () => {
-    emitStatus("idle", "session started");
+    emitStatus("idle");
   });
 
   pi.on("input", () => {
-    emitStatus("running", "input received");
+    emitStatus("running");
   });
 
   pi.on("before_agent_start", () => {
-    emitStatus("running", "agent starting");
+    emitStatus("running");
   });
 
   pi.on("agent_start", () => {
-    emitStatus("running", "agent running");
+    emitStatus("running");
   });
 
   pi.on("turn_start", () => {
-    emitStatus("running", "turn running");
+    emitStatus("running");
   });
 
-  pi.on("tool_execution_start", (event) => {
-    emitStatus("running", `tool: ${event.toolName}`);
+  pi.on("tool_execution_start", () => {
+    emitStatus("running");
   });
 
   pi.on("tool_execution_end", (event) => {
-    emitStatus(event.isError ? "error" : "running", `tool: ${event.toolName}`);
+    emitStatus(event.isError ? "error" : "running");
   });
 
   pi.on("after_provider_response", (event) => {
     if (event.status >= 400) {
-      emitStatus("error", `provider response: ${event.status}`);
+      emitStatus("error");
     }
   });
 
   pi.on("agent_end", () => {
-    emitStatus("finished", "agent finished");
+    emitStatus("finished");
   });
 }

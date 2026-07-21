@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     fs,
     io::Read,
-    os::unix::net::UnixStream,
+    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, net::UnixStream},
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
@@ -16,10 +16,20 @@ use std::{
 };
 
 use mult::{
-    model::{ChatId, PtyKey, TerminalId},
+    model::{
+        ChatId, PtyKey, SessionIdentity as ModelSessionIdentity, SessionToken as ModelSessionToken,
+        StateNamespace as ModelStateNamespace, TerminalId,
+    },
     pty::{PtyDimensions, PtyEvent, PtyExit, PtyRuntime, PtySpawn},
 };
-use mult_protocol::SOCKET_PATH_ENV;
+use mult_protocol::{
+    read_message, write_message, AgentGeneration, AgentKind, AgentSessionMetadata, AgentStatus,
+    AgentStatusError, AgentStatusOutcome, AgentStatusQuery, AgentStatusRecord, AttachError,
+    AttachOutcome, AttachmentLease, ClientMessage, CreateError, CreateOutcome, IdentityMismatch,
+    LaunchSpec, LeaseOperation, LeaseRejectionReason, OutputSequence, PaneId, RequestId,
+    ServerMessage, SessionId, SessionIdentity, SessionToken, StateNamespace, StopError,
+    StopOutcome, AGENT_STATUS_SCHEMA_VERSION, PROTOCOL_VERSION, SOCKET_PATH_ENV,
+};
 
 const INTEGRATION_TIMEOUT: Duration = Duration::from_secs(5);
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -157,7 +167,13 @@ fn reconnect_replays_raw_scrollback_into_fresh_parser() {
 
     let mut reconnected = PtyRuntime::connect_to_socket(server.socket_path.clone())
         .expect("reconnect to isolated mult-server");
-    start_short_lived_command(&mut reconnected, terminal, "printf should-not-run");
+    register_test_identity(&mut reconnected, terminal);
+    assert_eq!(
+        reconnected
+            .attach_existing(terminal, PtyDimensions { rows: 6, cols: 40 })
+            .expect("attach existing replay session"),
+        mult::pty::AttachExistingResult::Attached
+    );
     wait_for_output(&mut reconnected, terminal, "replayed")
         .expect("reattach should replay buffered raw PTY output");
     assert!(reconnected.stop(terminal).expect("stop replayed terminal"));
@@ -181,22 +197,17 @@ fn second_client_takes_over_session_from_a_still_attached_client() {
     );
     wait_for_output(&mut client_a, terminal, "takeover").expect("client A should see output");
 
-    // Client B attaches to the same session while A is *still attached*. Without
-    // takeover the server rejects this as "already attached"; with it, B takes
-    // over and receives the replayed scrollback. `start` reuses the existing
-    // server session (CreateSession is idempotent for a known id).
+    // Client B uses attach-only takeover. A second CreateSession with a
+    // different command is correctly a correlated SessionAlreadyExists error.
     let mut client_b =
         PtyRuntime::connect_to_socket(server.socket_path.clone()).expect("connect client B");
-    let mut spawn = PtySpawn::command_line(
-        terminal,
-        "ignored-existing-session".to_string(),
-        None,
-        BTreeMap::new(),
+    register_test_identity(&mut client_b, terminal);
+    assert_eq!(
+        client_b
+            .attach_existing(terminal, PtyDimensions { rows: 6, cols: 40 })
+            .expect("client B should take over the existing session"),
+        mult::pty::AttachExistingResult::Attached
     );
-    spawn.size = PtyDimensions { rows: 6, cols: 40 };
-    client_b
-        .start(spawn)
-        .expect("client B should take over the existing session");
     wait_for_output(&mut client_b, terminal, "takeover")
         .expect("takeover should replay buffered output to client B");
 
@@ -237,7 +248,7 @@ fn reattach_after_server_restart_reports_vanished_session_as_exited() {
 }
 
 #[test]
-fn terminal_is_retired_when_the_daemon_is_gone_and_not_autospawned() {
+fn terminal_is_retained_when_daemon_delivery_is_uncertain() {
     if integration_tests_are_skipped() {
         return;
     }
@@ -261,13 +272,23 @@ fn terminal_is_retired_when_the_daemon_is_gone_and_not_autospawned() {
         .terminate()
         .expect("terminate isolated mult-server within deadline");
 
-    let status = wait_for_terminal_exit_after_reconnect(&mut runtime, terminal)
-        .expect("client should retire the terminal once the daemon is unreachable");
-    assert_eq!(
-        status.signal.as_deref(),
-        Some("mult-server connection lost")
+    let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    let mut observed_uncertain = false;
+    while Instant::now() < deadline && !observed_uncertain {
+        let _ = runtime.resize(terminal, PtyDimensions { rows: 6, cols: 40 });
+        observed_uncertain = runtime.drain_events().into_iter().any(|event| {
+            matches!(event, PtyEvent::Error { message, .. } if message.contains("retained pending reconciliation") || message.contains("uncertain"))
+        });
+        thread::yield_now();
+    }
+    assert!(
+        observed_uncertain,
+        "daemon loss must be reported as uncertain"
     );
-    assert!(!runtime.is_running(terminal));
+    assert!(
+        runtime.is_running(terminal),
+        "transport loss alone is not proof that the pane disappeared"
+    );
 }
 
 #[test]
@@ -328,6 +349,1710 @@ fn rapid_stop_restart_and_chat_runtime_ids_keep_client_registry_consistent() {
     assert!(!runtime.is_running(chat_terminal));
 }
 
+#[test]
+fn state_namespace_collision_is_rejected_without_relaunching() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let server = start_isolated_server().expect("start server");
+    let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    let session = SessionId(7091);
+    let identity = identity_for_session(session);
+    let wrong_namespace = SessionIdentity {
+        namespace: StateNamespace::from_bytes([0x52; 16]).unwrap(),
+        token: identity.token,
+    };
+    let mut client = RawClient::connect(&server.socket_path).unwrap();
+
+    client.send(create_message(1, session, "cat")).unwrap();
+    assert!(matches!(
+        client
+            .recv_matching(deadline, |message| matches!(
+                message,
+                ServerMessage::CreateResult { request_id: received, .. }
+                    if *received == request_id(1)
+            ))
+            .unwrap(),
+        ServerMessage::CreateResult {
+            outcome: CreateOutcome::Created { .. },
+            ..
+        }
+    ));
+
+    client
+        .send(create_message_with_identity(
+            2,
+            session,
+            wrong_namespace,
+            None,
+            "printf must-not-launch",
+        ))
+        .unwrap();
+    assert!(matches!(
+        client
+            .recv_matching(deadline, |message| matches!(
+                message,
+                ServerMessage::CreateResult { request_id: received, .. }
+                    if *received == request_id(2)
+            ))
+            .unwrap(),
+        ServerMessage::CreateResult {
+            outcome: CreateOutcome::Error(CreateError::IdentityMismatch {
+                mismatch: IdentityMismatch::Namespace,
+                ..
+            }),
+            ..
+        }
+    ));
+
+    client
+        .send(ClientMessage::ListSessions {
+            namespace: wrong_namespace.namespace,
+        })
+        .unwrap();
+    assert!(matches!(
+        client.recv_next(deadline).unwrap(),
+        ServerMessage::Sessions { namespace, sessions }
+            if namespace == wrong_namespace.namespace && sessions.is_empty()
+    ));
+    client
+        .send(ClientMessage::ListSessions {
+            namespace: identity.namespace,
+        })
+        .unwrap();
+    assert!(matches!(
+        client.recv_next(deadline).unwrap(),
+        ServerMessage::Sessions { namespace, sessions }
+            if namespace == identity.namespace
+                && matches!(sessions.as_slice(), [info] if info.identity == identity)
+    ));
+
+    client.send(attach_message(3, session)).unwrap();
+    let attached = client.receive_attach(deadline, request_id(3)).unwrap();
+    client.send(stop_message(4, &attached)).unwrap();
+    client
+        .recv_matching(deadline, |message| {
+            matches!(
+                message,
+                ServerMessage::StopResult { request_id: received, .. }
+                    if *received == request_id(4)
+            )
+        })
+        .unwrap();
+}
+
+#[test]
+fn wrong_session_token_cannot_stop_the_numeric_pane() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let server = start_isolated_server().expect("start server");
+    let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    let session = SessionId(7092);
+    let mut client = RawClient::connect(&server.socket_path).unwrap();
+    client.send(create_message(1, session, "cat")).unwrap();
+    client
+        .recv_matching(deadline, |message| {
+            matches!(
+                message,
+                ServerMessage::CreateResult { request_id: received, .. }
+                    if *received == request_id(1)
+            )
+        })
+        .unwrap();
+    client.send(attach_message(2, session)).unwrap();
+    let attached = client.receive_attach(deadline, request_id(2)).unwrap();
+    let wrong_token = SessionIdentity {
+        namespace: test_namespace(),
+        token: SessionToken::from_bytes([0xee; 16]).unwrap(),
+    };
+
+    client
+        .send(stop_message_with_identity(3, &attached, wrong_token))
+        .unwrap();
+    assert!(matches!(
+        client
+            .recv_matching(deadline, |message| matches!(
+                message,
+                ServerMessage::StopResult { request_id: received, .. }
+                    if *received == request_id(3)
+            ))
+            .unwrap(),
+        ServerMessage::StopResult {
+            outcome: StopOutcome::Error(StopError::IdentityMismatch {
+                mismatch: IdentityMismatch::SessionToken,
+                ..
+            }),
+            ..
+        }
+    ));
+
+    client
+        .send(ClientMessage::Input {
+            pane: attached.pane,
+            lease: attached.lease,
+            bytes: b"still-running\n".to_vec(),
+        })
+        .unwrap();
+    client
+        .receive_output_until(deadline, attached.pane, attached.lease, b"still-running")
+        .expect("wrong token did not mutate the pane");
+    client.send(stop_message(4, &attached)).unwrap();
+    client
+        .recv_matching(deadline, |message| {
+            matches!(
+                message,
+                ServerMessage::StopResult { request_id: received, .. }
+                    if *received == request_id(4)
+            )
+        })
+        .unwrap();
+}
+
+#[test]
+fn wrong_session_token_attach_cannot_take_over_or_resize_the_numeric_pane() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let server = start_isolated_server().expect("start server");
+    let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    let session = SessionId(7098);
+    let identity = identity_for_session(session);
+    let mut owner = RawClient::connect(&server.socket_path).unwrap();
+    owner.send(create_message(1, session, "cat")).unwrap();
+    owner
+        .recv_matching(deadline, |message| {
+            matches!(
+                message,
+                ServerMessage::CreateResult { request_id: received, .. }
+                    if *received == request_id(1)
+            )
+        })
+        .unwrap();
+    owner.send(attach_message(2, session)).unwrap();
+    let attached = owner.receive_attach(deadline, request_id(2)).unwrap();
+
+    let mut attacker = RawClient::connect(&server.socket_path).unwrap();
+    let wrong_identity = SessionIdentity {
+        namespace: identity.namespace,
+        token: SessionToken::from_bytes([0xed; 16]).unwrap(),
+    };
+    attacker
+        .send(attach_message_with_identity(1, session, wrong_identity))
+        .unwrap();
+    assert!(matches!(
+        attacker
+            .recv_matching(deadline, |message| matches!(
+                message,
+                ServerMessage::AttachResult { request_id: received, .. }
+                    if *received == request_id(1)
+            ))
+            .unwrap(),
+        ServerMessage::AttachResult {
+            outcome: AttachOutcome::Error(AttachError::IdentityMismatch {
+                mismatch: IdentityMismatch::SessionToken,
+                ..
+            }),
+            ..
+        }
+    ));
+
+    owner
+        .send(ClientMessage::Input {
+            pane: attached.pane,
+            lease: attached.lease,
+            bytes: b"owner-retained\n".to_vec(),
+        })
+        .unwrap();
+    owner
+        .receive_output_until(deadline, attached.pane, attached.lease, b"owner-retained")
+        .expect("wrong identity attach did not take over the owner");
+    owner.send(stop_message(3, &attached)).unwrap();
+    owner
+        .recv_matching(deadline, |message| {
+            matches!(
+                message,
+                ServerMessage::StopResult { request_id: received, .. }
+                    if *received == request_id(3)
+            )
+        })
+        .unwrap();
+}
+
+#[test]
+fn wrong_agent_status_schema_is_rejected() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let server = start_isolated_server().expect("start server");
+    let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    let session = SessionId(7093);
+    let identity = identity_for_session(session);
+    let mut client = RawClient::connect(&server.socket_path).unwrap();
+    create_agent_session(&mut client, deadline, session, identity);
+    let mut record = test_agent_record(identity, AgentStatus::Running);
+    record.schema_version += 1;
+    client
+        .send(ClientMessage::UpdateAgentStatus {
+            request_id: request_id(2),
+            record,
+        })
+        .unwrap();
+    assert!(matches!(
+        receive_status_result(&mut client, deadline, 2),
+        AgentStatusOutcome::Error(AgentStatusError::WrongSchema { .. })
+    ));
+    stop_unattached_session(&mut client, deadline, session, 3, 4);
+}
+
+#[test]
+fn wrong_chat_agent_and_token_status_updates_are_rejected() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let server = start_isolated_server().expect("start server");
+    let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    let session = SessionId(7094);
+    let identity = identity_for_session(session);
+    let mut client = RawClient::connect(&server.socket_path).unwrap();
+    create_agent_session(&mut client, deadline, session, identity);
+
+    let mut wrong_chat = test_agent_record(identity, AgentStatus::Running);
+    wrong_chat.chat_id += 1;
+    client
+        .send(ClientMessage::UpdateAgentStatus {
+            request_id: request_id(2),
+            record: wrong_chat,
+        })
+        .unwrap();
+    assert!(matches!(
+        receive_status_result(&mut client, deadline, 2),
+        AgentStatusOutcome::Error(AgentStatusError::WrongChat { .. })
+    ));
+
+    let mut wrong_agent = test_agent_record(identity, AgentStatus::Running);
+    wrong_agent.agent = AgentKind::ClaudeCode;
+    client
+        .send(ClientMessage::UpdateAgentStatus {
+            request_id: request_id(3),
+            record: wrong_agent,
+        })
+        .unwrap();
+    assert!(matches!(
+        receive_status_result(&mut client, deadline, 3),
+        AgentStatusOutcome::Error(AgentStatusError::WrongAgent { .. })
+    ));
+
+    let mut wrong_token = test_agent_record(identity, AgentStatus::Running);
+    wrong_token.identity.token = SessionToken::from_bytes([0xef; 16]).unwrap();
+    client
+        .send(ClientMessage::UpdateAgentStatus {
+            request_id: request_id(4),
+            record: wrong_token,
+        })
+        .unwrap();
+    assert!(matches!(
+        receive_status_result(&mut client, deadline, 4),
+        AgentStatusOutcome::Error(AgentStatusError::IdentityMismatch(
+            IdentityMismatch::SessionToken
+        ))
+    ));
+    stop_unattached_session(&mut client, deadline, session, 5, 6);
+}
+
+#[test]
+fn stale_agent_generation_is_rejected() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let server = start_isolated_server().expect("start server");
+    let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    let session = SessionId(7095);
+    let identity = identity_for_session(session);
+    let mut client = RawClient::connect(&server.socket_path).unwrap();
+    create_agent_session(&mut client, deadline, session, identity);
+    let mut record = test_agent_record(identity, AgentStatus::Running);
+    record.generation = AgentGeneration::from_bytes([0x62; 16]).unwrap();
+    client
+        .send(ClientMessage::UpdateAgentStatus {
+            request_id: request_id(2),
+            record,
+        })
+        .unwrap();
+    assert!(matches!(
+        receive_status_result(&mut client, deadline, 2),
+        AgentStatusOutcome::Error(AgentStatusError::StaleGeneration { .. })
+    ));
+
+    let metadata = test_agent_metadata();
+    client
+        .send(ClientMessage::GetAgentStatus {
+            request_id: request_id(3),
+            query: AgentStatusQuery {
+                schema_version: AGENT_STATUS_SCHEMA_VERSION,
+                identity,
+                chat_id: metadata.chat_id,
+                agent: metadata.agent,
+                generation: AgentGeneration::from_bytes([0x62; 16]).unwrap(),
+            },
+        })
+        .unwrap();
+    assert!(matches!(
+        receive_status_result(&mut client, deadline, 3),
+        AgentStatusOutcome::Error(AgentStatusError::StaleGeneration { .. })
+    ));
+    stop_unattached_session(&mut client, deadline, session, 4, 5);
+}
+
+#[test]
+fn late_running_status_cannot_overwrite_a_final_failure() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let server = start_isolated_server().expect("start server");
+    let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    let session = SessionId(7096);
+    let identity = identity_for_session(session);
+    let mut client = RawClient::connect(&server.socket_path).unwrap();
+    create_agent_session(&mut client, deadline, session, identity);
+    for (request, status) in [(2, AgentStatus::Failed), (3, AgentStatus::Running)] {
+        client
+            .send(ClientMessage::UpdateAgentStatus {
+                request_id: request_id(request),
+                record: test_agent_record(identity, status),
+            })
+            .unwrap();
+    }
+    assert!(matches!(
+        receive_status_result(&mut client, deadline, 2),
+        AgentStatusOutcome::Updated(AgentStatusRecord {
+            status: AgentStatus::Failed,
+            ..
+        })
+    ));
+    assert!(matches!(
+        receive_status_result(&mut client, deadline, 3),
+        AgentStatusOutcome::Error(AgentStatusError::FinalStatusConflict {
+            current: AgentStatus::Failed,
+            attempted: AgentStatus::Running,
+        })
+    ));
+    stop_unattached_session(&mut client, deadline, session, 4, 5);
+}
+
+#[test]
+fn final_agent_status_remains_visible_after_client_crash_and_reconnect() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let server = start_isolated_server().expect("start server");
+    let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    let session = SessionId(7097);
+    let identity = identity_for_session(session);
+    let mut first = RawClient::connect(&server.socket_path).unwrap();
+    create_agent_session(&mut first, deadline, session, identity);
+    first
+        .send(ClientMessage::UpdateAgentStatus {
+            request_id: request_id(2),
+            record: test_agent_record(identity, AgentStatus::Failed),
+        })
+        .unwrap();
+    assert!(matches!(
+        receive_status_result(&mut first, deadline, 2),
+        AgentStatusOutcome::Updated(_)
+    ));
+    drop(first);
+
+    let mut reconnected = RawClient::connect(&server.socket_path).unwrap();
+    let metadata = test_agent_metadata();
+    reconnected
+        .send(ClientMessage::GetAgentStatus {
+            request_id: request_id(1),
+            query: AgentStatusQuery {
+                schema_version: AGENT_STATUS_SCHEMA_VERSION,
+                identity,
+                chat_id: metadata.chat_id,
+                agent: metadata.agent,
+                generation: metadata.generation,
+            },
+        })
+        .unwrap();
+    assert!(matches!(
+        receive_status_result(&mut reconnected, deadline, 1),
+        AgentStatusOutcome::Current(Some(AgentStatusRecord {
+            status: AgentStatus::Failed,
+            ..
+        }))
+    ));
+    stop_unattached_session(&mut reconnected, deadline, session, 2, 3);
+    reconnected
+        .send(ClientMessage::GetAgentStatus {
+            request_id: request_id(4),
+            query: AgentStatusQuery {
+                schema_version: AGENT_STATUS_SCHEMA_VERSION,
+                identity,
+                chat_id: metadata.chat_id,
+                agent: metadata.agent,
+                generation: metadata.generation,
+            },
+        })
+        .unwrap();
+    assert!(matches!(
+        receive_status_result(&mut reconnected, deadline, 4),
+        AgentStatusOutcome::Current(Some(AgentStatusRecord {
+            status: AgentStatus::Failed,
+            ..
+        }))
+    ));
+}
+
+#[test]
+fn raw_stateful_requests_remain_correlated_across_two_panes() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let server = start_isolated_server().expect("start server");
+    let mut client = RawClient::connect(&server.socket_path).expect("connect raw client");
+    let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    let session_a = SessionId(7101);
+    let session_b = SessionId(7102);
+
+    client
+        .send(create_message(1, session_a, "cat"))
+        .expect("pipeline create A");
+    client
+        .send(create_message(2, session_b, "cat"))
+        .expect("pipeline create B");
+    for (request, session) in [(1, session_a), (2, session_b)] {
+        assert!(matches!(
+            client
+                .recv_matching(deadline, |message| {
+                    matches!(message, ServerMessage::CreateResult { request_id: received, .. } if *received == request_id(request))
+                })
+                .expect("correlated create result"),
+            ServerMessage::CreateResult {
+                request_id: received,
+                outcome: CreateOutcome::Created { session: ref info },
+            } if received == request_id(request) && info.id == session
+        ));
+    }
+
+    client
+        .send(attach_message(3, session_a))
+        .expect("pipeline attach A");
+    client
+        .send(attach_message(4, session_b))
+        .expect("pipeline attach B");
+    let attach_a = client
+        .receive_attach(deadline, request_id(3))
+        .expect("attach A");
+    let attach_b = client
+        .receive_attach(deadline, request_id(4))
+        .expect("attach B");
+    assert_eq!(attach_a.pane, PaneId(session_a.0));
+    assert_eq!(attach_b.pane, PaneId(session_b.0));
+
+    client
+        .send(ClientMessage::Input {
+            pane: attach_b.pane,
+            lease: attach_b.lease,
+            bytes: b"pane-b-marker\n".to_vec(),
+        })
+        .expect("input B");
+    client
+        .receive_output_until(deadline, attach_b.pane, attach_b.lease, b"pane-b-marker")
+        .expect("unrelated pane B output");
+
+    client
+        .send(stop_message(5, &attach_a))
+        .expect("pipeline stop A");
+    client
+        .send(stop_message(6, &attach_b))
+        .expect("pipeline stop B");
+    for request in [5, 6] {
+        assert!(matches!(
+            client
+                .recv_matching(deadline, |message| matches!(
+                    message,
+                    ServerMessage::StopResult { request_id: received, .. }
+                        if *received == request_id(request)
+                ))
+                .expect("correlated stop result"),
+            ServerMessage::StopResult { request_id: received, outcome: StopOutcome::Stopped { .. } }
+                if received == request_id(request)
+        ));
+    }
+}
+
+#[test]
+fn pane_a_attach_error_does_not_abort_pane_b() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let server = start_isolated_server().expect("start server");
+    let mut client = RawClient::connect(&server.socket_path).expect("connect raw client");
+    let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    let session_b = SessionId(7112);
+    client
+        .send(create_message(1, session_b, "printf pane-b-ready; cat"))
+        .unwrap();
+    client
+        .recv_matching(deadline, |message| {
+            matches!(message, ServerMessage::CreateResult { request_id: received, .. } if *received == request_id(1))
+        })
+        .expect("create B");
+
+    client.send(attach_message(2, SessionId(7999))).unwrap();
+    client.send(attach_message(3, session_b)).unwrap();
+    assert!(matches!(
+        client
+            .recv_matching(deadline, |message| matches!(
+                message,
+                ServerMessage::AttachResult { request_id: received, .. }
+                    if *received == request_id(2)
+            ))
+            .expect("pane A scoped failure"),
+        ServerMessage::AttachResult {
+            outcome: AttachOutcome::Error(AttachError::SessionNotFound { .. }),
+            ..
+        }
+    ));
+    let attached = client
+        .receive_attach(deadline, request_id(3))
+        .expect("pane B attach succeeds");
+    assert_eq!(attached.pane, PaneId(session_b.0));
+    client.send(stop_message(4, &attached)).expect("stop B");
+    client
+        .recv_matching(deadline, |message| {
+            matches!(message, ServerMessage::StopResult { request_id: received, .. } if *received == request_id(4))
+        })
+        .expect("stop B result");
+}
+
+#[test]
+fn takeover_rejects_every_old_lease_mutation() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let server = start_isolated_server().expect("start server");
+    let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    let session = SessionId(7121);
+    let mut old = RawClient::connect(&server.socket_path).expect("connect old owner");
+    old.send(create_message(1, session, "cat")).unwrap();
+    old.recv_matching(deadline, |message| {
+        matches!(message, ServerMessage::CreateResult { request_id: received, .. } if *received == request_id(1))
+    })
+    .unwrap();
+    old.send(attach_message(2, session)).unwrap();
+    let displaced = old.receive_attach(deadline, request_id(2)).unwrap();
+    old.send(attach_message(2, session)).unwrap();
+    let exact_retry = old.receive_attach(deadline, request_id(2)).unwrap();
+    assert_eq!(
+        (exact_retry.pane, exact_retry.lease),
+        (displaced.pane, displaced.lease),
+        "exact attach retry replays a complete transaction with the same lease"
+    );
+
+    let mut current = RawClient::connect(&server.socket_path).expect("connect new owner");
+    current.send(attach_message(1, session)).unwrap();
+    let replacement = current.receive_attach(deadline, request_id(1)).unwrap();
+    assert_ne!(displaced.lease, replacement.lease);
+    assert!(matches!(
+        old.recv_matching(deadline, |message| matches!(
+            message,
+            ServerMessage::TakenOver { pane, lease }
+                if *pane == displaced.pane && *lease == displaced.lease
+        ))
+        .expect("old owner receives TakenOver"),
+        ServerMessage::TakenOver { .. }
+    ));
+
+    for message in [
+        ClientMessage::Input {
+            pane: displaced.pane,
+            lease: displaced.lease,
+            bytes: b"stale-input\n".to_vec(),
+        },
+        ClientMessage::Paste {
+            pane: displaced.pane,
+            lease: displaced.lease,
+            bytes: b"stale-paste\n".to_vec(),
+        },
+        ClientMessage::Resize {
+            pane: displaced.pane,
+            lease: displaced.lease,
+            rows: 77,
+            cols: 99,
+        },
+        ClientMessage::Detach {
+            pane: displaced.pane,
+            lease: displaced.lease,
+        },
+    ] {
+        old.send(message).unwrap();
+    }
+    old.send(stop_message(3, &displaced)).unwrap();
+
+    let mut rejected = Vec::new();
+    while rejected.len() < 4 {
+        let message = old
+            .recv_matching(deadline, |message| {
+                matches!(
+                    message,
+                    ServerMessage::LeaseRejected { pane, lease, .. }
+                        if *pane == displaced.pane && *lease == displaced.lease
+                )
+            })
+            .expect("stale mutation rejection");
+        if let ServerMessage::LeaseRejected { operation, .. } = message {
+            rejected.push(operation);
+        }
+    }
+    rejected.sort_by_key(|operation| *operation as u8);
+    assert_eq!(
+        rejected,
+        [
+            LeaseOperation::Input,
+            LeaseOperation::Paste,
+            LeaseOperation::Resize,
+            LeaseOperation::Detach,
+        ]
+    );
+    assert!(matches!(
+        old.recv_matching(deadline, |message| matches!(
+            message,
+            ServerMessage::StopResult { request_id: received, .. }
+                if *received == request_id(3)
+        ))
+        .expect("stale stop rejection"),
+        ServerMessage::StopResult {
+            outcome: StopOutcome::Error(StopError::LeaseRejected(
+                LeaseRejectionReason::NotOwner | LeaseRejectionReason::StaleLease
+            )),
+            ..
+        }
+    ));
+    old.send(attach_message(2, session)).unwrap();
+    assert!(matches!(
+        old.recv_matching(deadline, |message| matches!(
+            message,
+            ServerMessage::AttachResult { request_id: received, .. }
+                if *received == request_id(2)
+        ))
+        .expect("taken-over cached attach is superseded"),
+        ServerMessage::AttachResult {
+            outcome: AttachOutcome::Error(AttachError::Superseded),
+            ..
+        }
+    ));
+
+    current
+        .send(ClientMessage::Input {
+            pane: replacement.pane,
+            lease: replacement.lease,
+            bytes: b"current-owner-marker\n".to_vec(),
+        })
+        .unwrap();
+    current
+        .receive_output_until(
+            deadline,
+            replacement.pane,
+            replacement.lease,
+            b"current-owner-marker",
+        )
+        .expect("current owner still controls pane");
+    current.send(stop_message(2, &replacement)).unwrap();
+    current
+        .recv_matching(deadline, |message| {
+            matches!(message, ServerMessage::StopResult { request_id: received, .. } if *received == request_id(2))
+        })
+        .unwrap();
+}
+
+#[test]
+fn explicit_detach_invalidates_cached_attach_lease() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let server = start_isolated_server().expect("start server");
+    let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    let session = SessionId(7125);
+    let mut client = RawClient::connect(&server.socket_path).unwrap();
+    client.send(create_message(1, session, "cat")).unwrap();
+    client
+        .recv_matching(deadline, |message| {
+            matches!(message, ServerMessage::CreateResult { request_id: received, .. } if *received == request_id(1))
+        })
+        .unwrap();
+    client.send(attach_message(2, session)).unwrap();
+    let detached = client.receive_attach(deadline, request_id(2)).unwrap();
+    client
+        .send(ClientMessage::Detach {
+            pane: detached.pane,
+            lease: detached.lease,
+        })
+        .unwrap();
+    client
+        .send(ClientMessage::ListSessions {
+            namespace: test_namespace(),
+        })
+        .unwrap();
+    client
+        .recv_matching(deadline, |message| {
+            matches!(message, ServerMessage::Sessions { namespace, .. } if *namespace == test_namespace())
+        })
+        .expect("detach processing barrier");
+    client.send(attach_message(2, session)).unwrap();
+    assert!(matches!(
+        client
+            .recv_matching(deadline, |message| matches!(
+                message,
+                ServerMessage::AttachResult { request_id: received, .. }
+                    if *received == request_id(2)
+            ))
+            .unwrap(),
+        ServerMessage::AttachResult {
+            outcome: AttachOutcome::Error(AttachError::Superseded),
+            ..
+        }
+    ));
+    client.send(attach_message(3, session)).unwrap();
+    let replacement = client.receive_attach(deadline, request_id(3)).unwrap();
+    assert_ne!(replacement.lease, detached.lease);
+    client.send(stop_message(4, &replacement)).unwrap();
+    client
+        .recv_matching(deadline, |message| {
+            matches!(message, ServerMessage::StopResult { request_id: received, .. } if *received == request_id(4))
+        })
+        .unwrap();
+}
+
+#[test]
+fn numbered_attach_replay_and_live_output_are_exactly_contiguous() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let server = start_isolated_server().expect("start server");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let session = SessionId(7131);
+    let command = "i=0; while IFS= read -r n; do while [ \"$i\" -lt \"$n\" ]; do printf 'SEQ:%08d\\n' \"$i\"; i=$((i+1)); done; done";
+    let mut first = RawClient::connect(&server.socket_path).unwrap();
+    first.send(create_message(1, session, command)).unwrap();
+    first
+        .recv_matching(deadline, |message| {
+            matches!(message, ServerMessage::CreateResult { request_id: received, .. } if *received == request_id(1))
+        })
+        .unwrap();
+    first.send(attach_message(2, session)).unwrap();
+    let first_attachment = first.receive_attach(deadline, request_id(2)).unwrap();
+    first
+        .send(ClientMessage::Input {
+            pane: first_attachment.pane,
+            lease: first_attachment.lease,
+            bytes: b"20\n".to_vec(),
+        })
+        .unwrap();
+    first
+        .receive_output_until(
+            deadline,
+            first_attachment.pane,
+            first_attachment.lease,
+            b"SEQ:00000019",
+        )
+        .expect("initial numbered history");
+
+    let mut second = RawClient::connect(&server.socket_path).unwrap();
+    second.send(attach_message(1, session)).unwrap();
+    let replayed = second.receive_attach(deadline, request_id(1)).unwrap();
+    assert_replay_is_contiguous(&replayed);
+    second
+        .send(ClientMessage::Input {
+            pane: replayed.pane,
+            lease: replayed.lease,
+            bytes: b"40\n".to_vec(),
+        })
+        .unwrap();
+    let mut combined = replayed.replay_bytes.clone();
+    let mut expected = replayed.watermark;
+    while !combined
+        .windows(b"SEQ:00000039".len())
+        .any(|window| window == b"SEQ:00000039")
+    {
+        let message = second
+            .recv_matching(deadline, |message| {
+                matches!(
+                    message,
+                    ServerMessage::PtyOutput { pane, lease, .. }
+                        if *pane == replayed.pane && *lease == replayed.lease
+                )
+            })
+            .expect("numbered live output");
+        let ServerMessage::PtyOutput {
+            sequence, bytes, ..
+        } = message
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            sequence, expected,
+            "live output must begin at the watermark"
+        );
+        expected = sequence.checked_add_bytes(bytes.len()).unwrap();
+        combined.extend(bytes);
+    }
+    assert_eq!(
+        extract_numbered_records(&combined),
+        (0_u32..40).collect::<Vec<_>>()
+    );
+    second.send(stop_message(2, &replayed)).unwrap();
+    second
+        .recv_matching(deadline, |message| {
+            matches!(message, ServerMessage::StopResult { request_id: received, .. } if *received == request_id(2))
+        })
+        .unwrap();
+}
+
+#[test]
+fn stop_before_child_exit_finalizes_once_without_a_stale_session() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let server = start_isolated_server().expect("start server");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let session = SessionId(7140);
+    let mut client = RawClient::connect(&server.socket_path).unwrap();
+    client
+        .send(create_message(
+            1,
+            session,
+            "trap 'echo STOP-FIRST; exit 23' TERM; echo READY; while :; do read line; done",
+        ))
+        .unwrap();
+    assert!(matches!(
+        client
+            .recv_matching(deadline, |message| matches!(
+                message,
+                ServerMessage::CreateResult { request_id: received, .. }
+                    if *received == request_id(1)
+            ))
+            .unwrap(),
+        ServerMessage::CreateResult {
+            outcome: CreateOutcome::Created { .. },
+            ..
+        }
+    ));
+    client.send(attach_message(2, session)).unwrap();
+    let attached = client.receive_attach(deadline, request_id(2)).unwrap();
+    let (mut output, mut expected_sequence) =
+        receive_attachment_marker(&mut client, &attached, b"READY", deadline);
+
+    client.send(stop_message(3, &attached)).unwrap();
+    let mut pane_exit = None;
+    let mut exit_count = 0;
+    loop {
+        match client.recv_next(deadline).expect("stop-first finalization") {
+            ServerMessage::PtyOutput {
+                pane,
+                lease,
+                sequence,
+                bytes,
+            } if pane == attached.pane && lease == attached.lease => {
+                assert_eq!(sequence, expected_sequence, "live output sequence gap");
+                expected_sequence = sequence.checked_add_bytes(bytes.len()).unwrap();
+                output.extend(bytes);
+            }
+            ServerMessage::ForegroundProcess { pane, lease, .. }
+                if pane == attached.pane && lease == attached.lease => {}
+            ServerMessage::PaneExited { pane, lease, exit }
+                if pane == attached.pane && lease == attached.lease =>
+            {
+                exit_count += 1;
+                assert_eq!(exit_count, 1, "duplicate PaneExited");
+                assert!(
+                    output
+                        .windows(b"STOP-FIRST".len())
+                        .any(|window| window == b"STOP-FIRST"),
+                    "the stop marker must be drained before finalization: {output:?}"
+                );
+                pane_exit = Some(exit);
+            }
+            ServerMessage::StopResult {
+                request_id: received,
+                outcome: StopOutcome::Stopped { exit },
+            } if received == request_id(3) => {
+                assert_eq!(Some(exit), pane_exit, "PaneExited must precede StopResult");
+                break;
+            }
+            message => panic!("unexpected stop-first message: {message:?}"),
+        }
+    }
+
+    assert_session_finalized_once(&mut client, deadline, session, &attached, request_id(2));
+}
+
+#[test]
+fn natural_exit_before_stop_returns_already_absent_without_a_stale_session() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let server = start_isolated_server().expect("start server");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let session = SessionId(7141);
+    let mut client = RawClient::connect(&server.socket_path).unwrap();
+    client
+        .send(create_message(
+            1,
+            session,
+            "echo READY; read line; echo NATURAL-FIRST; exit 0",
+        ))
+        .unwrap();
+    assert!(matches!(
+        client
+            .recv_matching(deadline, |message| matches!(
+                message,
+                ServerMessage::CreateResult { request_id: received, .. }
+                    if *received == request_id(1)
+            ))
+            .unwrap(),
+        ServerMessage::CreateResult {
+            outcome: CreateOutcome::Created { .. },
+            ..
+        }
+    ));
+    client.send(attach_message(2, session)).unwrap();
+    let attached = client.receive_attach(deadline, request_id(2)).unwrap();
+    let (mut output, mut expected_sequence) =
+        receive_attachment_marker(&mut client, &attached, b"READY", deadline);
+    client
+        .send(ClientMessage::Input {
+            pane: attached.pane,
+            lease: attached.lease,
+            bytes: b"release\n".to_vec(),
+        })
+        .unwrap();
+
+    loop {
+        match client
+            .recv_next(deadline)
+            .expect("natural-first finalization")
+        {
+            ServerMessage::PtyOutput {
+                pane,
+                lease,
+                sequence,
+                bytes,
+            } if pane == attached.pane && lease == attached.lease => {
+                assert_eq!(sequence, expected_sequence, "live output sequence gap");
+                expected_sequence = sequence.checked_add_bytes(bytes.len()).unwrap();
+                output.extend(bytes);
+            }
+            ServerMessage::ForegroundProcess { pane, lease, .. }
+                if pane == attached.pane && lease == attached.lease => {}
+            ServerMessage::PaneExited { pane, lease, .. }
+                if pane == attached.pane && lease == attached.lease =>
+            {
+                assert!(
+                    output
+                        .windows(b"NATURAL-FIRST".len())
+                        .any(|window| window == b"NATURAL-FIRST"),
+                    "natural output must be drained before finalization: {output:?}"
+                );
+                break;
+            }
+            message => panic!("unexpected natural-first message: {message:?}"),
+        }
+    }
+
+    client.send(stop_message(3, &attached)).unwrap();
+    assert!(matches!(
+        client.recv_next(deadline).expect("already-absent stop result"),
+        ServerMessage::StopResult {
+            request_id: received,
+            outcome: StopOutcome::AlreadyAbsent,
+        } if received == request_id(3)
+    ));
+    assert_session_finalized_once(&mut client, deadline, session, &attached, request_id(2));
+}
+
+#[test]
+fn stop_kills_pipeline_and_sigterm_ignoring_descendant() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let server = start_isolated_server().expect("start server");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let dir = unique_private_dir("process-group");
+    let fifo = dir.join("liveness.fifo");
+    let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0, "mkfifo");
+    let mut liveness = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .expect("open liveness reader");
+    let quoted_fifo = shell_quote_test(&fifo.to_string_lossy());
+    let command = format!(
+        "exec 9>{quoted_fifo}; (trap '' HUP TERM; printf READY >&9; while :; do sleep 60; done) | cat"
+    );
+    let session = SessionId(7151);
+    let mut client = RawClient::connect(&server.socket_path).unwrap();
+    client.send(create_message(1, session, &command)).unwrap();
+    client
+        .recv_matching(deadline, |message| {
+            matches!(message, ServerMessage::CreateResult { request_id: received, .. } if *received == request_id(1))
+        })
+        .unwrap();
+    client.send(attach_message(2, session)).unwrap();
+    let attached = client.receive_attach(deadline, request_id(2)).unwrap();
+    wait_for_fifo_token(&mut liveness, b"READY", deadline).expect("descendant ready");
+
+    client.send(stop_message(3, &attached)).unwrap();
+    assert!(matches!(
+        client
+            .recv_matching(deadline, |message| matches!(
+                message,
+                ServerMessage::StopResult { request_id: received, .. }
+                    if *received == request_id(3)
+            ))
+            .expect("group stop finalized"),
+        ServerMessage::StopResult {
+            outcome: StopOutcome::Stopped { .. },
+            ..
+        }
+    ));
+    wait_for_fifo_eof(&mut liveness, deadline)
+        .expect("all pipeline and descendant liveness descriptors closed");
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn daemon_shutdown_uses_group_finalization_and_reaps_sessions() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let mut server = start_isolated_server().expect("start server");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let dir = unique_private_dir("daemon-shutdown");
+    let fifo = dir.join("liveness.fifo");
+    let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0, "mkfifo");
+    let mut liveness = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .unwrap();
+    let command = format!(
+        "exec 9>{}; trap '' HUP TERM; printf READY >&9; while :; do sleep 60; done",
+        shell_quote_test(&fifo.to_string_lossy())
+    );
+    let mut client = RawClient::connect(&server.socket_path).unwrap();
+    client
+        .send(create_message(1, SessionId(7161), &command))
+        .unwrap();
+    client
+        .recv_matching(deadline, |message| {
+            matches!(message, ServerMessage::CreateResult { request_id: received, .. } if *received == request_id(1))
+        })
+        .unwrap();
+    client.send(attach_message(2, SessionId(7161))).unwrap();
+    client.receive_attach(deadline, request_id(2)).unwrap();
+    wait_for_fifo_token(&mut liveness, b"READY", deadline).unwrap();
+
+    assert_eq!(
+        unsafe { libc::kill(server.child.id() as libc::pid_t, libc::SIGTERM) },
+        0,
+        "signal daemon shutdown"
+    );
+    let status = loop {
+        match server.child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::yield_now(),
+            Ok(None) => panic!("daemon did not finish graceful shutdown"),
+            Err(error) => panic!("poll daemon shutdown: {error}"),
+        }
+    };
+    assert!(status.success(), "graceful daemon status: {status}");
+    wait_for_fifo_eof(&mut liveness, deadline).expect("daemon shutdown closed descendant FIFO");
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[derive(Debug, Clone)]
+struct RawAttachment {
+    pane: PaneId,
+    lease: AttachmentLease,
+    first_sequence: OutputSequence,
+    watermark: OutputSequence,
+    replay_ranges: Vec<(OutputSequence, usize)>,
+    replay_bytes: Vec<u8>,
+}
+
+struct RawClient {
+    stream: UnixStream,
+    backlog: VecDeque<ServerMessage>,
+}
+
+impl RawClient {
+    fn connect(socket_path: &PathBuf) -> Result<Self, String> {
+        let mut stream = UnixStream::connect(socket_path)
+            .map_err(|error| format!("connect {}: {error}", socket_path.display()))?;
+        write_message(
+            &mut stream,
+            &ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                resume: None,
+            },
+        )
+        .map_err(|error| format!("send hello: {error}"))?;
+        stream
+            .set_read_timeout(Some(INTEGRATION_TIMEOUT))
+            .map_err(|error| error.to_string())?;
+        let hello = read_message::<ServerMessage>(&mut stream)
+            .map_err(|error| format!("read hello: {error}"))?;
+        stream
+            .set_read_timeout(None)
+            .map_err(|error| error.to_string())?;
+        if !matches!(
+            hello,
+            ServerMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                ..
+            }
+        ) {
+            return Err(format!("unexpected hello: {hello:?}"));
+        }
+        Ok(Self {
+            stream,
+            backlog: VecDeque::new(),
+        })
+    }
+
+    fn send(&mut self, message: ClientMessage) -> Result<(), String> {
+        write_message(&mut self.stream, &message)
+            .map_err(|error| format!("send {message:?}: {error}"))
+    }
+
+    fn recv_next(&mut self, deadline: Instant) -> Result<ServerMessage, String> {
+        if let Some(message) = self.backlog.pop_front() {
+            return Ok(message);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("deadline expired".to_string());
+        }
+        self.stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|error| error.to_string())?;
+        read_message::<ServerMessage>(&mut self.stream)
+            .map_err(|error| format!("read next server message before {deadline:?}: {error}"))
+    }
+
+    fn recv_matching(
+        &mut self,
+        deadline: Instant,
+        predicate: impl Fn(&ServerMessage) -> bool,
+    ) -> Result<ServerMessage, String> {
+        if let Some(index) = self.backlog.iter().position(&predicate) {
+            return Ok(self.backlog.remove(index).expect("backlog index exists"));
+        }
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "deadline expired; unmatched messages: {:?}",
+                    self.backlog
+                ));
+            }
+            self.stream
+                .set_read_timeout(Some(remaining))
+                .map_err(|error| error.to_string())?;
+            let message = read_message::<ServerMessage>(&mut self.stream).map_err(|error| {
+                format!(
+                    "read server message before {deadline:?}: {error}; backlog={:?}",
+                    self.backlog
+                )
+            })?;
+            if predicate(&message) {
+                return Ok(message);
+            }
+            self.backlog.push_back(message);
+        }
+    }
+
+    fn receive_output_until(
+        &mut self,
+        deadline: Instant,
+        pane: PaneId,
+        lease: AttachmentLease,
+        needle: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        while !bytes.windows(needle.len()).any(|window| window == needle) {
+            let message = self.recv_matching(deadline, |message| {
+                matches!(
+                    message,
+                    ServerMessage::PtyOutput {
+                        pane: output_pane,
+                        lease: output_lease,
+                        ..
+                    } if *output_pane == pane && *output_lease == lease
+                )
+            })?;
+            let ServerMessage::PtyOutput { bytes: output, .. } = message else {
+                unreachable!()
+            };
+            bytes.extend(output);
+        }
+        Ok(bytes)
+    }
+
+    fn receive_attach(
+        &mut self,
+        deadline: Instant,
+        request: RequestId,
+    ) -> Result<RawAttachment, String> {
+        let result = self.recv_matching(deadline, |message| {
+            matches!(message, ServerMessage::AttachResult { request_id, .. } if *request_id == request)
+        })?;
+        let (pane, lease) = match result {
+            ServerMessage::AttachResult {
+                outcome: AttachOutcome::Attached { pane, lease, .. },
+                ..
+            } => (pane.id, lease),
+            other => return Err(format!("attach failed: {other:?}")),
+        };
+        let begin = self.recv_matching(deadline, |message| {
+            matches!(message, ServerMessage::ReplayBegin { request_id, .. } if *request_id == request)
+        })?;
+        let ServerMessage::ReplayBegin {
+            first_sequence,
+            watermark,
+            omitted_prefix_bytes,
+            ..
+        } = begin
+        else {
+            unreachable!()
+        };
+        if omitted_prefix_bytes != first_sequence.get() {
+            return Err("replay truncation metadata did not match first sequence".to_string());
+        }
+        let mut replay_ranges = Vec::new();
+        let mut replay_bytes = Vec::new();
+        loop {
+            let message = self.recv_matching(deadline, |message| {
+                matches!(
+                    message,
+                    ServerMessage::ReplayChunk { request_id, .. }
+                        | ServerMessage::ReplayEnd { request_id, .. }
+                        if *request_id == request
+                )
+            })?;
+            match message {
+                ServerMessage::ReplayChunk {
+                    pane: chunk_pane,
+                    lease: chunk_lease,
+                    sequence,
+                    bytes,
+                    ..
+                } => {
+                    if chunk_pane != pane || chunk_lease != lease {
+                        return Err("replay chunk identified wrong attachment".to_string());
+                    }
+                    replay_ranges.push((sequence, bytes.len()));
+                    replay_bytes.extend(bytes);
+                }
+                ServerMessage::ReplayEnd {
+                    pane: end_pane,
+                    lease: end_lease,
+                    watermark: end_watermark,
+                    ..
+                } => {
+                    if end_pane != pane || end_lease != lease || end_watermark != watermark {
+                        return Err("replay end mismatch".to_string());
+                    }
+                    break;
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(RawAttachment {
+            pane,
+            lease,
+            first_sequence,
+            watermark,
+            replay_ranges,
+            replay_bytes,
+        })
+    }
+}
+
+fn request_id(value: u64) -> RequestId {
+    RequestId::new(value).expect("non-zero request ID")
+}
+
+fn test_namespace() -> StateNamespace {
+    StateNamespace::from_bytes([0x51; 16]).unwrap()
+}
+
+fn identity_for_session(session: SessionId) -> SessionIdentity {
+    let mut bytes = [0_u8; 16];
+    bytes[8..].copy_from_slice(&session.0.to_be_bytes());
+    if bytes == [0; 16] {
+        bytes[15] = 1;
+    }
+    SessionIdentity {
+        namespace: test_namespace(),
+        token: SessionToken::from_bytes(bytes).unwrap(),
+    }
+}
+
+fn model_identity_for_key(key: PtyKey) -> ModelSessionIdentity {
+    let wire_id = match key {
+        PtyKey::Terminal(id) => id.0,
+        PtyKey::ChatAgent(id) => id.0 | (1_u64 << 63),
+    };
+    let mut bytes = [0_u8; 16];
+    bytes[8..].copy_from_slice(&wire_id.to_be_bytes());
+    if bytes == [0; 16] {
+        bytes[15] = 1;
+    }
+    ModelSessionIdentity {
+        namespace: ModelStateNamespace::from_bytes([0x51; 16]).unwrap(),
+        token: ModelSessionToken::from_bytes(bytes).unwrap(),
+    }
+}
+
+fn register_test_identity(runtime: &mut PtyRuntime, terminal: PtyKey) {
+    runtime
+        .register_session_identity(terminal, model_identity_for_key(terminal))
+        .expect("register deterministic durable test identity");
+}
+
+fn create_message(request: u64, session: SessionId, command: &str) -> ClientMessage {
+    create_message_with_identity(
+        request,
+        session,
+        identity_for_session(session),
+        None,
+        command,
+    )
+}
+
+fn create_message_with_identity(
+    request: u64,
+    session: SessionId,
+    identity: SessionIdentity,
+    agent: Option<AgentSessionMetadata>,
+    command: &str,
+) -> ClientMessage {
+    ClientMessage::CreateSession {
+        request_id: request_id(request),
+        identity,
+        requested_id: Some(session),
+        agent,
+        name: format!("integration-{}", session.0),
+        cwd: None,
+        env: BTreeMap::new(),
+        launch: LaunchSpec::Command(command.to_string()),
+        rows: 8,
+        cols: 80,
+    }
+}
+
+fn attach_message(request: u64, session: SessionId) -> ClientMessage {
+    attach_message_with_identity(request, session, identity_for_session(session))
+}
+
+fn attach_message_with_identity(
+    request: u64,
+    session: SessionId,
+    identity: SessionIdentity,
+) -> ClientMessage {
+    ClientMessage::Attach {
+        request_id: request_id(request),
+        identity,
+        session,
+        rows: 8,
+        cols: 80,
+    }
+}
+
+fn stop_message(request: u64, attachment: &RawAttachment) -> ClientMessage {
+    stop_message_with_identity(
+        request,
+        attachment,
+        identity_for_session(SessionId(attachment.pane.0)),
+    )
+}
+
+fn stop_message_with_identity(
+    request: u64,
+    attachment: &RawAttachment,
+    identity: SessionIdentity,
+) -> ClientMessage {
+    ClientMessage::Stop {
+        request_id: request_id(request),
+        identity,
+        pane: attachment.pane,
+        lease: attachment.lease,
+    }
+}
+
+fn test_agent_metadata() -> AgentSessionMetadata {
+    AgentSessionMetadata {
+        schema_version: AGENT_STATUS_SCHEMA_VERSION,
+        chat_id: 77,
+        agent: AgentKind::Pi,
+        generation: AgentGeneration::from_bytes([0x61; 16]).unwrap(),
+    }
+}
+
+fn test_agent_record(identity: SessionIdentity, status: AgentStatus) -> AgentStatusRecord {
+    let metadata = test_agent_metadata();
+    AgentStatusRecord {
+        schema_version: metadata.schema_version,
+        identity,
+        chat_id: metadata.chat_id,
+        agent: metadata.agent,
+        generation: metadata.generation,
+        status,
+    }
+}
+
+fn create_agent_session(
+    client: &mut RawClient,
+    deadline: Instant,
+    session: SessionId,
+    identity: SessionIdentity,
+) {
+    client
+        .send(create_message_with_identity(
+            1,
+            session,
+            identity,
+            Some(test_agent_metadata()),
+            "cat",
+        ))
+        .unwrap();
+    assert!(matches!(
+        client
+            .recv_matching(deadline, |message| matches!(
+                message,
+                ServerMessage::CreateResult { request_id: received, .. }
+                    if *received == request_id(1)
+            ))
+            .unwrap(),
+        ServerMessage::CreateResult {
+            outcome: CreateOutcome::Created { .. },
+            ..
+        }
+    ));
+}
+
+fn receive_status_result(
+    client: &mut RawClient,
+    deadline: Instant,
+    request: u64,
+) -> AgentStatusOutcome {
+    match client
+        .recv_matching(deadline, |message| {
+            matches!(
+                message,
+                ServerMessage::AgentStatusResult { request_id: received, .. }
+                    if *received == request_id(request)
+            )
+        })
+        .unwrap()
+    {
+        ServerMessage::AgentStatusResult { outcome, .. } => outcome,
+        _ => unreachable!(),
+    }
+}
+
+fn stop_unattached_session(
+    client: &mut RawClient,
+    deadline: Instant,
+    session: SessionId,
+    attach_request: u64,
+    stop_request: u64,
+) {
+    client
+        .send(attach_message(attach_request, session))
+        .unwrap();
+    let attached = client
+        .receive_attach(deadline, request_id(attach_request))
+        .unwrap();
+    client.send(stop_message(stop_request, &attached)).unwrap();
+    client
+        .recv_matching(deadline, |message| {
+            matches!(
+                message,
+                ServerMessage::StopResult { request_id: received, .. }
+                    if *received == request_id(stop_request)
+            )
+        })
+        .unwrap();
+}
+
+fn assert_replay_is_contiguous(attachment: &RawAttachment) {
+    let mut expected = attachment.first_sequence;
+    for (sequence, len) in &attachment.replay_ranges {
+        assert_eq!(*sequence, expected, "replay gap or duplicate");
+        expected = sequence.checked_add_bytes(*len).unwrap();
+    }
+    assert_eq!(expected, attachment.watermark);
+    assert_eq!(
+        attachment.replay_bytes.len() as u64,
+        attachment.watermark.get() - attachment.first_sequence.get()
+    );
+}
+
+fn receive_attachment_marker(
+    client: &mut RawClient,
+    attachment: &RawAttachment,
+    marker: &[u8],
+    deadline: Instant,
+) -> (Vec<u8>, OutputSequence) {
+    let mut output = attachment.replay_bytes.clone();
+    let mut expected_sequence = attachment.watermark;
+    while !output.windows(marker.len()).any(|window| window == marker) {
+        match client.recv_next(deadline).expect("attachment marker") {
+            ServerMessage::PtyOutput {
+                pane,
+                lease,
+                sequence,
+                bytes,
+            } if pane == attachment.pane && lease == attachment.lease => {
+                assert_eq!(sequence, expected_sequence, "live output sequence gap");
+                expected_sequence = sequence.checked_add_bytes(bytes.len()).unwrap();
+                output.extend(bytes);
+            }
+            ServerMessage::ForegroundProcess { pane, lease, .. }
+                if pane == attachment.pane && lease == attachment.lease => {}
+            message => panic!("unexpected message while waiting for marker: {message:?}"),
+        }
+    }
+    (output, expected_sequence)
+}
+
+fn assert_session_finalized_once(
+    client: &mut RawClient,
+    deadline: Instant,
+    session: SessionId,
+    attachment: &RawAttachment,
+    cached_attach_request: RequestId,
+) {
+    client
+        .send(ClientMessage::ListSessions {
+            namespace: test_namespace(),
+        })
+        .unwrap();
+    loop {
+        match client.recv_next(deadline).expect("session-list barrier") {
+            ServerMessage::Sessions {
+                namespace,
+                sessions,
+            } if namespace == test_namespace() => {
+                assert!(
+                    sessions.iter().all(|info| info.id != session),
+                    "finalized session remained listed"
+                );
+                break;
+            }
+            ServerMessage::PaneExited { pane, lease, .. }
+                if pane == attachment.pane && lease == attachment.lease =>
+            {
+                panic!("duplicate PaneExited before the session-list barrier")
+            }
+            ServerMessage::ForegroundProcess { pane, lease, .. }
+                if pane == attachment.pane && lease == attachment.lease => {}
+            message => panic!("unexpected post-finalization message: {message:?}"),
+        }
+    }
+
+    client
+        .send(attach_message(cached_attach_request.get(), session))
+        .unwrap();
+    assert!(matches!(
+        client.recv_next(deadline).expect("superseded cached attach"),
+        ServerMessage::AttachResult {
+            request_id,
+            outcome: AttachOutcome::Error(AttachError::Superseded),
+        } if request_id == cached_attach_request
+    ));
+}
+
+fn extract_numbered_records(bytes: &[u8]) -> Vec<u32> {
+    const PREFIX: &[u8] = b"SEQ:";
+    let mut records = Vec::new();
+    let mut index = 0;
+    while index + PREFIX.len() + 8 <= bytes.len() {
+        if &bytes[index..index + PREFIX.len()] == PREFIX {
+            let digits = &bytes[index + PREFIX.len()..index + PREFIX.len() + 8];
+            if digits.iter().all(u8::is_ascii_digit) {
+                records.push(std::str::from_utf8(digits).unwrap().parse().unwrap());
+                index += PREFIX.len() + 8;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    records
+}
+
+fn unique_private_dir(label: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let path =
+        std::env::temp_dir().join(format!("mult-pty-{label}-{}-{unique}", std::process::id()));
+    fs::create_dir(&path).expect("create private test directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    path
+}
+
+fn shell_quote_test(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn wait_for_fifo_token(file: &mut fs::File, token: &[u8], deadline: Instant) -> Result<(), String> {
+    let mut observed = Vec::new();
+    let mut buffer = [0_u8; 64];
+    while Instant::now() < deadline {
+        match file.read(&mut buffer) {
+            Ok(0) => thread::yield_now(),
+            Ok(read) => {
+                observed.extend_from_slice(&buffer[..read]);
+                if observed.windows(token.len()).any(|window| window == token) {
+                    return Ok(());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => thread::yield_now(),
+            Err(error) => return Err(format!("read liveness FIFO: {error}")),
+        }
+    }
+    Err(format!(
+        "timed out waiting for FIFO token; observed={observed:?}"
+    ))
+}
+
+fn wait_for_fifo_eof(file: &mut fs::File, deadline: Instant) -> Result<(), String> {
+    let mut buffer = [0_u8; 64];
+    while Instant::now() < deadline {
+        match file.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => thread::yield_now(),
+            Err(error) => return Err(format!("read liveness FIFO: {error}")),
+        }
+    }
+    Err("timed out waiting for all liveness FIFO writers to close".to_string())
+}
+
 struct ObservedTerminal {
     saw_scrollback: bool,
     saw_output: bool,
@@ -336,6 +2061,7 @@ struct ObservedTerminal {
 }
 
 fn start_short_lived_command(runtime: &mut PtyRuntime, terminal: PtyKey, command: &str) {
+    register_test_identity(runtime, terminal);
     let mut spawn = PtySpawn::command_line(terminal, command.to_string(), None, BTreeMap::new());
     spawn.size = PtyDimensions { rows: 6, cols: 40 };
     runtime.start(spawn).expect("start PTY command");

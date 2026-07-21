@@ -3,6 +3,8 @@ pub mod app;
 pub mod config;
 pub mod git;
 pub mod model;
+pub mod paths;
 pub mod pty;
 pub mod storage;
+pub mod transcript;
 pub mod ui;
