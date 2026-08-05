@@ -1,0 +1,27 @@
+---
+source: src/ui.rs
+expression: "draw_grid(&app, &pty_runtime, frame_area.width, frame_area.height)"
+---
+symbols:
+| ▣ orbit                    main line 4                                                            |
+|   · agent: pi                    line 5                                                            |
+|   $ terminal                     line 6                                                            |
+|                                  line 7                                                            |
+|                                  line 8                                                            |
+|                                  line 9                                                            |
+|                                  line 10                                                           |
+|                                  line 11                                                           |
+|                                  line 12                                                           |
+|                                  line 13                                                           |
+
+backgrounds (. nc  : base  # highlight  * selection  @ cursor  r reset):
+|..................................rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr|
+|..................................******rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr|
+|##################################****rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr|
+|..................................rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr|
+|..................................rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr|
+|..................................rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr|
+|..................................rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr|
+|..................................rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr|
+|..................................rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr|
+|..................................rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr|

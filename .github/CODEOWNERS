@@ -1,0 +1,19 @@
+# Every path has an owner, so no PR sits without a review request.
+# See https://docs.github.com/articles/about-code-owners
+*                       @Jofr3
+
+# Security-sensitive surfaces, called out so they are never reviewed casually:
+# the wire protocol and peer checks, the daemon, process spawning, and the two
+# files that are execution boundaries (state and config). See SECURITY.md.
+/crates/protocol/       @Jofr3
+/src/bin/mult-server.rs @Jofr3
+/src/pty.rs             @Jofr3
+/src/storage.rs         @Jofr3
+/src/config.rs          @Jofr3
+/SECURITY.md            @Jofr3
+
+# Anything that decides what ships or what runs in CI.
+/.github/               @Jofr3
+/fuzz/                  @Jofr3
+/flake.nix              @Jofr3
+/deny.toml              @Jofr3

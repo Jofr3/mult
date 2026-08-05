@@ -1,0 +1,60 @@
+name: Feature request
+description: Suggest a change to what mult does.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        `mult` deliberately keeps a small dependency tree and a narrow surface —
+        see [AGENTS.md](https://github.com/Jofr3/mult/blob/main/AGENTS.md). A
+        request that needs no new dependency is much more likely to land.
+
+        Planned work is tracked in
+        [docs/BACKLOG.md](https://github.com/Jofr3/mult/blob/main/docs/BACKLOG.md);
+        it is worth checking whether this is already there.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >
+        What are you trying to do, and what makes it awkward today? Describe the
+        situation rather than the solution — it often has more than one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like instead
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - "TUI / interaction"
+        - "Agent chats (pi or Claude Code)"
+        - "Terminals and the PTY daemon"
+        - "Configuration"
+        - "CLI"
+        - "Packaging and distribution"
+        - "Documentation"
+        - "Other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Including whether existing config or keybindings get close.
+
+  - type: checkboxes
+    id: deps
+    attributes:
+      label: Dependencies
+      options:
+        - label: This would need a new runtime dependency (best-guess is fine)

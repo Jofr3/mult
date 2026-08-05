@@ -1,0 +1,42 @@
+[package]
+name = "mult-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Deliberately its own workspace, detached from the one at the repository root.
+# `libfuzzer-sys` needs a nightly compiler and pulls a sanitizer runtime in, so
+# folding it into the main workspace would put it in `cargo build --workspace`,
+# in `cargo deny`'s dependency graph, and in the lockfile every normal build
+# resolves. Nothing here is a dependency of `mult` or `mult-protocol`.
+[workspace]
+members = ["."]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mult = { path = ".." }
+mult-protocol = { path = "../crates/protocol" }
+
+[profile.release]
+debug = 1
+
+# `cargo fuzz` adds the `--cfg fuzzing` and sanitizer flags itself; the targets
+# below are declared with `test = false`/`doc = false` because they are `main`
+# functions for libFuzzer, not test binaries.
+
+[[bin]]
+name = "protocol_read_message"
+path = "fuzz_targets/protocol_read_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vt_response_detector"
+path = "fuzz_targets/vt_response_detector.rs"
+test = false
+doc = false
+bench = false

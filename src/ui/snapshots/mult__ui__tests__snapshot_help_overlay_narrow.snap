@@ -1,0 +1,27 @@
+---
+source: src/ui.rs
+expression: "draw_grid(&app, &PtyRuntime::new_offline(), 44, 10)"
+---
+symbols:
+|┌ Keybindings ─────────────────────────────┐|
+|│Navigation                                │|
+|│(palette)             Focus sidebar — ret…│|
+|│(palette)             Focus selected pane…│|
+|│any key               Start selected PTY …│|
+|│? / F1                Show keybindings — …│|
+|│Ctrl+Esc              Quit mult — save st…│|
+|│Ctrl+j / Ctrl+Enter   Select next item — …│|
+|│Ctrl+k                Select previous ite…│|
+|└ esc closes • ↑/↓ scrolls ────────────────┘|
+
+backgrounds (. nc  : base  # highlight  * selection  @ cursor  r reset):
+|::::::::::::::::::::::::::::::::::::::::::::|
+|::::::::::::::::::::::::::::::::::::::::::::|
+|::::::::::::::::::::::::::::::::::::::::::::|
+|::::::::::::::::::::::::::::::::::::::::::::|
+|::::::::::::::::::::::::::::::::::::::::::::|
+|::::::::::::::::::::::::::::::::::::::::::::|
+|::::::::::::::::::::::::::::::::::::::::::::|
+|::::::::::::::::::::::::::::::::::::::::::::|
+|::::::::::::::::::::::::::::::::::::::::::::|
+|::::::::::::::::::::::::::::::::::::::::::::|

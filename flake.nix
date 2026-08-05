@@ -25,8 +25,12 @@
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
             MULT_TEST_SHELL = "${pkgs.runtimeShell}";
-            # buildRustPackage runs inside a Nix sandbox where PTY-backed
-            # integration tests cannot reliably create interactive devices.
+            # The Nix sandbox has a `/dev/ptmx` symlink but no `devpts` mounted
+            # behind it, so `openpty` fails with ENOENT before any of mult's own
+            # code runs. This opts out of every PTY-backed test — the integration
+            # suite *and* the daemon's own dispatch tests, which spawn real panes
+            # (G15). It is the only thing that sets this variable; everywhere a
+            # PTY can be allocated, those tests run and must pass.
             MULT_SKIP_PTY_INTEGRATION = "1";
           };
         });
@@ -60,12 +64,27 @@
               rustfmt
 
               cargo-watch
-              cargo-audit
+              # cargo-deny covers advisories, licenses, bans and sources.
+              # cargo-audit used to sit alongside it and only re-checked a
+              # subset of the advisories section, so it was dropped (H10).
+              cargo-deny
+              cargo-llvm-cov
+              # `just fuzz-build` / `cargo fuzz run`; both need a nightly rustc,
+              # which is not in this shell — see CONTRIBUTING.md.
+              cargo-fuzz
               just
             ];
 
             RUST_BACKTRACE = "1";
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+
+            # `just coverage` needs llvm-cov/llvm-profdata. The rustup
+            # `llvm-tools-preview` component does not exist in this shell, so
+            # point cargo-llvm-cov at nixpkgs' LLVM instead — it is the same
+            # version this shell's rustc is built against, which is the thing
+            # that has to match for the profile data to be readable.
+            LLVM_COV = "${pkgs.llvmPackages.llvm}/bin/llvm-cov";
+            LLVM_PROFDATA = "${pkgs.llvmPackages.llvm}/bin/llvm-profdata";
 
             shellHook = ''
               export PATH="$HOME/.cargo/bin:$PATH"

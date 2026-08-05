@@ -1,5 +1,15 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import {
+  closeSync,
+  constants,
+  mkdirSync,
+  openSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
 import { dirname } from "node:path";
 
 type MultAgentStatus = "idle" | "running" | "waiting" | "error" | "finished";
@@ -7,11 +17,37 @@ type MultAgentStatus = "idle" | "running" | "waiting" | "error" | "finished";
 const statusPath = process.env.MULT_AGENT_STATUS_PATH;
 const chatId = process.env.MULT_AGENT_CHAT_ID;
 
+/**
+ * Refuse to write into a directory anyone but the owner can modify.
+ *
+ * mult creates this directory 0700 and verifies it, but the extension can win
+ * the race and create it first — and `mkdirSync` used to do so with the default
+ * 0755, leaving the directory that holds the executed hook script readable (and,
+ * with a loose umask, writable) by others. Creating it 0700 is half the fix;
+ * this is the other half, for the case where it already exists.
+ */
+function parentDirIsPrivate(dir: string): boolean {
+  try {
+    const stats = statSync(dir);
+    if (!stats.isDirectory()) return false;
+    if (typeof process.getuid === "function" && stats.uid !== process.getuid()) {
+      return false;
+    }
+    return (stats.mode & 0o077) === 0;
+  } catch {
+    return false;
+  }
+}
+
 function emitStatus(status: MultAgentStatus, detail?: string) {
   if (!statusPath) return;
 
+  const dir = dirname(statusPath);
+  let tempPath: string | undefined;
   try {
-    mkdirSync(dirname(statusPath), { recursive: true });
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    if (!parentDirIsPrivate(dir)) return;
+
     const payload = `${JSON.stringify({
       version: 1,
       status,
@@ -19,11 +55,33 @@ function emitStatus(status: MultAgentStatus, detail?: string) {
       detail,
       timestamp: Date.now(),
     })}\n`;
-    const tempPath = `${statusPath}.${process.pid}.tmp`;
-    writeFileSync(tempPath, payload, "utf8");
+    // A random name plus O_EXCL|O_NOFOLLOW: the old `<path>.<pid>.tmp` was
+    // predictable and opened with a plain truncating create, so a symlink
+    // planted at that name redirected — and truncated — whatever it pointed at.
+    tempPath = `${statusPath}.${randomBytes(8).toString("hex")}.tmp`;
+    const flags =
+      constants.O_CREAT |
+      constants.O_EXCL |
+      constants.O_WRONLY |
+      constants.O_NOFOLLOW;
+    const fd = openSync(tempPath, flags, 0o600);
+    try {
+      writeSync(fd, payload, null, "utf8");
+    } finally {
+      closeSync(fd);
+    }
     renameSync(tempPath, statusPath);
+    tempPath = undefined;
   } catch {
     // Keep the extension silent: status reporting should never disturb pi.
+  } finally {
+    if (tempPath !== undefined) {
+      try {
+        unlinkSync(tempPath);
+      } catch {
+        // Nothing more to do; the leftover is a 0600 file in a private dir.
+      }
+    }
   }
 }
 

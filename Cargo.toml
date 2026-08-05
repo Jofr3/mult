@@ -1,15 +1,33 @@
 [package]
 name = "mult"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.88"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# `cargo run` (and `just run`) means the client; the daemon is asked for by
+# name. Without this the package's two binaries make a bare `cargo run` an
+# error, which the README and the justfile both assumed was not the case.
+default-run = "mult"
 description = "A terminal UI prototype for multiplexing AI agent workspaces, chats, and terminals."
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/Jofr3/mult"
+license.workspace = true
+repository.workspace = true
 
 [workspace]
 members = ["crates/protocol"]
 default-members = [".", "crates/protocol"]
+
+# The one place the release version is written inside Cargo (H17). The protocol
+# crate inherits it, so the two can no longer drift; the remaining copies live
+# in `flake.nix` and `extensions/package.json` and are checked by
+# `just version-check`, which `just ci` runs.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# The MSRV is tested: `.github/workflows/ci.yml` runs `cargo check` against this
+# exact version. It is pinned in `rust-toolchain.toml` (the *development*
+# toolchain, deliberately newer) and in that job; bump all three together.
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Jofr3/mult"
 
 [profile.release]
 # Smaller, faster shipped binaries. `panic = "unwind"` (the default) is kept on
@@ -32,3 +50,9 @@ tui-term = { version = "0.3.4", default-features = false }
 # Fork of vt100 0.15 with deep visible scrollback support; keep tui-term's
 # vt100 feature disabled and render through the local adapter in src/ui.rs.
 vt100 = { package = "fnug-vt100", version = "0.15.2" }
+
+[dev-dependencies]
+# Snapshot assertions for whole rendered frames (`src/snapshots/`), so layout
+# regressions fail loudly instead of slipping past the per-row substring checks.
+# Test-only, default features off.
+insta = { version = "1.48.0", default-features = false }

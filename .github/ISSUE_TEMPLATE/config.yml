@@ -1,0 +1,13 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Jofr3/mult/security/advisories/new
+    about: >
+      Do not open a public issue. Report privately — see SECURITY.md. The state
+      file and the runtime socket are execution boundaries.
+  - name: Troubleshooting guide
+    url: https://github.com/Jofr3/mult/blob/main/docs/TROUBLESHOOTING.md
+    about: Every message mult produces, mapped to its cause and fix.
+  - name: Configuration reference
+    url: https://github.com/Jofr3/mult/blob/main/docs/CONFIG.md
+    about: Every config key, its type, default and effect.

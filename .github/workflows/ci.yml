@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, so a new RustSec advisory filed against a dependency that is already
+  # in `Cargo.lock` is caught by the `deny` job within a week instead of waiting
+  # for somebody to open a PR (H10). `workflow_dispatch` is there so the same
+  # check can be run on demand without pushing a commit.
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
 
 jobs:
   cargo:
@@ -22,9 +29,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: just,cargo-audit
+          tool: just,cargo-deny
       - name: Run local CI gate
         run: just ci
+
+  msrv:
+    # `Cargo.toml` declares `rust-version = "1.88"` while the development
+    # toolchain is 1.94, so without this job the MSRV is an untested claim (H1).
+    # `cargo +1.88` is explicit because `rust-toolchain.toml` pins 1.94 and would
+    # otherwise override the toolchain this step just installed.
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - name: Check against the declared MSRV
+        run: cargo +1.88 check --workspace --locked --all-targets --all-features
 
   deny:
     name: cargo-deny
@@ -38,6 +61,58 @@ jobs:
         with:
           tool: cargo-deny
       - run: cargo deny check
+
+  coverage:
+    # Reports the number and guards against a sharp drop; the floor is set below
+    # the measured value on purpose, so unrelated work is never blocked on
+    # raising coverage (H9).
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Measure coverage
+        run: cargo llvm-cov --locked --workspace --all-features --summary-only --fail-under-lines 85
+      - name: Write lcov report
+        if: always()
+        run: cargo llvm-cov --locked --workspace --all-features --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-lcov
+          path: lcov.info
+
+  fuzz:
+    # Builds the fuzz targets so a refactor cannot silently break them (G3). The
+    # 60s-per-target run below is a smoke test, not a campaign: fuzzing is
+    # unbounded and does not belong on every push. Real campaigns are run by
+    # hand — see CONTRIBUTING.md.
+    name: Fuzz targets build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Build fuzz targets
+        working-directory: fuzz
+        run: cargo +nightly fuzz build
+      - name: Time-boxed smoke run
+        working-directory: fuzz
+        run: |
+          for target in protocol_read_message vt_response_detector; do
+            cargo +nightly fuzz run "$target" -- -max_total_time=60 -rss_limit_mb=4096
+          done
 
   extension:
     name: Status extension typecheck

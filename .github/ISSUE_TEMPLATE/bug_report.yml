@@ -1,0 +1,118 @@
+name: Bug report
+description: Something in mult does not behave as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. `mult` is a terminal UI, so how it behaves depends
+        heavily on **which terminal it is running in** — the fields below are not
+        boilerplate, they are usually what makes a report reproducible.
+
+        Before filing, it is worth a look at
+        [docs/TROUBLESHOOTING.md](https://github.com/Jofr3/mult/blob/main/docs/TROUBLESHOOTING.md),
+        which maps the messages `mult` produces to their causes.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+      placeholder: |
+        1. Opened a workspace with Ctrl+f
+        2. Pressed Ctrl+t to add a terminal
+        3. Expected a shell; got …
+    validations:
+      required: true
+
+  - type: textarea
+    id: message
+    attributes:
+      label: Exact message text
+      description: >
+        Anything on the status line (marked `x`, `!` or `·`) or written into a
+        pane with a `[mult]` prefix. Copy it verbatim — the wording identifies
+        the code path.
+      render: text
+
+  - type: input
+    id: version
+    attributes:
+      label: mult version
+      description: Output of `mult --version`.
+      placeholder: "mult 0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal emulator and version
+      description: >
+        For example: kitty 0.42.2, WezTerm 20240203, Ghostty 1.1.0, iTerm2 3.5,
+        GNOME Terminal 3.52, tmux 3.5a inside Alacritty 0.15.
+      placeholder: "kitty 0.42.2"
+    validations:
+      required: true
+
+  - type: input
+    id: term
+    attributes:
+      label: $TERM
+      description: Output of `echo $TERM`.
+      placeholder: "xterm-kitty"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kitty-keyboard
+    attributes:
+      label: Kitty keyboard protocol
+      description: >
+        Is the kitty keyboard protocol active? If you are unsure, run
+        `printf '\eP+q6b6579626f617264\e\\'` — or just pick "Not sure" and say
+        which terminal you use. This matters because modified keys
+        (`Alt+Shift+<letter>`, cursor keys under an application-mode program) are
+        encoded differently depending on it, and several recent fixes are in that
+        code.
+      options:
+        - "Yes — kitty, Ghostty, WezTerm, foot or similar with it enabled"
+        - "No — legacy xterm encoding"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS and version
+      placeholder: "Ubuntu 24.04 / macOS 15.3 / NixOS unstable"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: multiplexer
+    attributes:
+      label: Running inside another multiplexer?
+      options:
+        - "No"
+        - "tmux"
+        - "screen"
+        - "zellij"
+        - "Other"
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant config
+      description: >
+        Your `config.json`, if it is not the default. Redact anything private —
+        note that `pi_agent_command` and `claude_code_command` are shell command
+        lines and may contain arguments you would rather not publish.
+      render: json
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Screenshots, terminal size, whether it reproduces every time.

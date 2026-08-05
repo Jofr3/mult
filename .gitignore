@@ -3,3 +3,45 @@
 /.direnv
 *.log
 extensions/node_modules
+
+# Rejected insta snapshots (accepted ones are committed under src/snapshots/)
+*.snap.new
+
+# cargo-llvm-cov output (`just coverage`, `just coverage-html`)
+/lcov.info
+/target/llvm-cov
+
+# cargo-fuzz working state. The targets and fuzz/Cargo.toml are committed; the
+# corpus, the crash artifacts and the separate lockfile are not.
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
+/fuzz/Cargo.lock
+
+# State files moved aside at startup: `.corrupt-*` when state.json could not be
+# decoded, `.pre-11a-*` when the Slice 11a migration kept a copy. They are
+# written next to the state file, which is normally outside the repo — but
+# $MULT_STATE_PATH and `--state` are routinely pointed here while testing.
+*.corrupt-*
+*.pre-11a-*
+
+# Local agent/editor scratch. `.claude/settings.json` is shared and committed;
+# `settings.local.json` is per-contributor and was previously only ignored by
+# the repository owner's *global* gitignore, so everyone else saw it untracked.
+.claude/settings.local.json
+
+# Editors and IDEs
+/.vscode
+/.idea
+/.zed
+/.helix
+*.swp
+*.swo
+*~
+.nvim.lua
+.envrc.local
+
+# macOS / Linux desktop litter
+.DS_Store
+.directory

@@ -1,0 +1,130 @@
+name: Release
+
+# Tag-triggered (H5). Pushing `vX.Y.Z` builds the archives and publishes a
+# GitHub Release; `workflow_dispatch` builds the same archives without
+# publishing, so the matrix can be exercised before a tag is cut.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            # The only build that needs a C toolchain switch; nothing in the
+            # dependency graph compiles C, but the musl target needs its linker.
+            packages: musl-tools
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install target toolchain packages
+        if: matrix.packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.packages }}
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build both binaries
+        # `--locked` so a release is built from the committed lockfile, matching
+        # what CI validated. Both binaries are built from the same invocation
+        # because they ship together (see the packaging step).
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin mult --bin mult-server
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            version="$(git rev-parse --short HEAD)"
+          fi
+          name="mult-${version}-${{ matrix.target }}"
+          staging="dist/$name"
+          mkdir -p "$staging"
+
+          # The client autospawns the daemon from the directory it is running
+          # from, and since Slice 5 it refuses a `mult-server` that is not owned
+          # by this user or is writable by anyone else. An archive with only one
+          # of the two binaries would leave that path permanently broken, so
+          # both go in every archive, side by side at the archive root.
+          bin="target/${{ matrix.target }}/release"
+          cp "$bin/mult" "$bin/mult-server" "$staging/"
+          cp README.md LICENSE-MIT LICENSE-APACHE CHANGELOG.md "$staging/"
+
+          tar -C dist -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            ${{ steps.package.outputs.name }}.tar.gz
+            ${{ steps.package.outputs.name }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Collect checksums
+        run: |
+          set -euo pipefail
+          ls -l dist
+          cat dist/*.sha256 | sed 's#dist/##' > dist/SHA256SUMS
+          cat dist/SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md).
+
+          Each archive contains **both** \`mult\` and \`mult-server\`. Keep them in the
+          same directory: the client autospawns the daemon from a path next to its
+          own binary and verifies its ownership and mode before doing so.
+
+          Verify a download against \`SHA256SUMS\`." \
+            --verify-tag \
+            dist/*.tar.gz dist/SHA256SUMS

@@ -1,11 +1,13 @@
 [package]
 name = "mult-protocol"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.88"
+# Inherited from `[workspace.package]` in the root `Cargo.toml` (H17): this used
+# to be a fourth hand-maintained copy of the release version.
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "Wire protocol (postcard-framed messages) shared by the mult client and mult-server."
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/Jofr3/mult"
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
