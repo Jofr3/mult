@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "namespace": "000102030405060708090a0b0c0d0e0f",
   "session_identities": {
     "chats": {
@@ -51,7 +51,7 @@
         {
           "id": 1,
           "name": "shell",
-          "status": "Stopped",
+          "restore_on_launch": false,
           "launch": {
             "kind": "shell"
           }
@@ -59,7 +59,7 @@
         {
           "id": 2,
           "name": "command",
-          "status": "Running",
+          "restore_on_launch": true,
           "launch": {
             "kind": "command",
             "command": "printf migrated-only"

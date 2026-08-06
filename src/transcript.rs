@@ -1,14 +1,45 @@
+//! Append-only journal of authoritative chat messages.
+//!
+//! # Status: shipped but unwired (S1)
+//!
+//! [`TranscriptJournal`] has **no call site outside this file's own tests**.
+//! It is compiled into both binaries and exercised only by `cargo test`; no
+//! chat, pane, or save path opens a journal today. This is intentional — the
+//! owner's Phase 3.4 wires it — so do not read the absence of callers as dead
+//! code to delete, and do not read the presence of the type as evidence that
+//! transcripts are being persisted. They are not.
+//!
+//! Before it is wired up, all of the following must hold:
+//!
+//! - **The path is chosen by `mult`, never by a user string.** `open` takes a
+//!   caller-supplied [`PathBuf`] and validates the parent through
+//!   [`SecureDirectory`], but the caller still decides *which* directory; it
+//!   must be the app-owned state directory, alongside `state.json`.
+//! - **Recovery stays opt-in.** [`TranscriptRecovery::Refuse`] is the default
+//!   precisely because `open` must not truncate a file it was merely pointed
+//!   at (R4/S2). Only a caller that knows the path names its own journal may
+//!   pass [`TranscriptRecovery::TruncatePartialTail`].
+//! - **Only structured messages are appended.** Raw PTY bytes have no role and
+//!   no message boundary; feeding them here would produce a journal that
+//!   cannot be replayed.
+//! - **Writes stay off the render thread.** Every append is a `write_all` plus
+//!   a flush to a real file, and the client's UI loop is synchronous.
+//! - **The caps are the retention policy.** [`MAX_TRANSCRIPT_FILE_BYTES`] is a
+//!   refusal, not a rotation: whoever wires this up owns deciding what happens
+//!   to a chat that reaches it.
+
 use std::{
     fs::File,
     io::{self, Read, Write},
     path::PathBuf,
 };
 
+use mult_protocol::invalid_data;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     model::{ChatMessageRole, SessionIdentity},
-    storage::{set_file_mode, validate_private_regular_file, SecureDirectory},
+    storage::{secure_private_regular_file, SecureDirectory},
 };
 
 pub const TRANSCRIPT_RECORD_VERSION: u32 = 1;
@@ -33,12 +64,46 @@ pub struct TranscriptJournal {
     bytes: usize,
 }
 
+/// What [`TranscriptJournal::open_with_recovery`] may do to a file whose final
+/// record is incomplete (a crash between `write_all` and the trailing newline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TranscriptRecovery {
+    /// Refuse to open, leaving every byte in place.
+    ///
+    /// The default, because `open` takes a caller-supplied path: a mistyped or
+    /// misconfigured one must not be silently truncated as a side effect of
+    /// merely opening it.
+    #[default]
+    Refuse,
+    /// Discard the incomplete final record by truncating to the last complete
+    /// one. Only a caller that knows the path names *its own* journal may ask
+    /// for this.
+    TruncatePartialTail,
+}
+
 impl TranscriptJournal {
     /// Opens an append-only journal for authoritative structured messages.
     /// Arbitrary PTY output must not be passed to this API because byte chunks
     /// do not establish message roles or boundaries.
+    ///
+    /// Non-destructive: an incomplete final record is reported, not removed.
+    /// See [`Self::open_with_recovery`].
     pub fn open(path: PathBuf, identity: SessionIdentity) -> io::Result<Self> {
-        let directory = SecureDirectory::open_parent(&path, true, true)?;
+        Self::open_with_recovery(path, identity, TranscriptRecovery::Refuse)
+    }
+
+    /// As [`Self::open`], with an explicit choice of what to do about an
+    /// incomplete final record.
+    pub fn open_with_recovery(
+        path: PathBuf,
+        identity: SessionIdentity,
+        recovery: TranscriptRecovery,
+    ) -> io::Result<Self> {
+        // `normalize_parent: false`: missing parents are still created 0700,
+        // but an *existing* directory keeps the mode its owner gave it.
+        // Opening a journal is not consent to re-permission a directory the
+        // caller may have only named by accident.
+        let directory = SecureDirectory::open_parent(&path, true, false)?;
         let name = path.file_name().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -50,10 +115,9 @@ impl TranscriptJournal {
             libc::O_RDWR | libc::O_APPEND | libc::O_CREAT | libc::O_NONBLOCK,
             0o600,
         )?;
-        validate_private_regular_file(&file, &format!("transcript file {}", path.display()))?;
-        set_file_mode(&file, 0o600)?;
+        secure_private_regular_file(&file, &format!("transcript file {}", path.display()))?;
 
-        let (records, bytes) = read_and_recover(&mut file, identity)?;
+        let (records, bytes) = read_and_recover(&mut file, identity, recovery)?;
         let next_sequence = records.last().map_or(Ok(1), |record| {
             record.sequence.checked_add(1).ok_or_else(|| {
                 io::Error::new(
@@ -127,6 +191,7 @@ impl TranscriptJournal {
 fn read_and_recover(
     file: &mut File,
     identity: SessionIdentity,
+    recovery: TranscriptRecovery,
 ) -> io::Result<(Vec<TranscriptRecord>, usize)> {
     let mut bytes = Vec::new();
     file.take((MAX_TRANSCRIPT_FILE_BYTES + 1) as u64)
@@ -188,14 +253,24 @@ fn read_and_recover(
     }
 
     if last_complete != bytes.len() {
-        file.set_len(last_complete as u64)?;
-        file.sync_data()?;
+        // Appending after a partial record would splice two records into one,
+        // so the file cannot be used as-is; the only question is whether the
+        // caller authorised destroying the partial tail.
+        match recovery {
+            TranscriptRecovery::Refuse => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "transcript has an incomplete final record; reopen with \
+                     TranscriptRecovery::TruncatePartialTail to discard it",
+                ));
+            }
+            TranscriptRecovery::TruncatePartialTail => {
+                file.set_len(last_complete as u64)?;
+                file.sync_data()?;
+            }
+        }
     }
     Ok((records, last_complete))
-}
-
-fn invalid_data(error: serde_json::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
 #[cfg(test)]
@@ -213,7 +288,7 @@ mod tests {
     static NEXT_TEST_PATH: AtomicU64 = AtomicU64::new(1);
 
     #[test]
-    fn truncated_final_record_is_removed_without_losing_prior_records() {
+    fn truncated_final_record_is_removed_only_when_recovery_is_requested() {
         let path = unique_test_path();
         let identity = identity();
         let mut journal = TranscriptJournal::open(path.clone(), identity).unwrap();
@@ -230,13 +305,43 @@ mod tests {
         raw.write_all(br#"{"version":1,"identity":"#).unwrap();
         raw.sync_data().unwrap();
         drop(raw);
+        let partial_len = fs::metadata(&path).unwrap().len();
 
-        let journal = TranscriptJournal::open(path.clone(), identity).unwrap();
+        // The default never touches the file: opening a path is not consent to
+        // truncate whatever happens to be there.
+        let error = TranscriptJournal::open(path.clone(), identity)
+            .err()
+            .expect("an incomplete tail must not be truncated by default");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("incomplete final record"));
+        assert_eq!(fs::metadata(&path).unwrap().len(), partial_len);
+
+        let journal = TranscriptJournal::open_with_recovery(
+            path.clone(),
+            identity,
+            TranscriptRecovery::TruncatePartialTail,
+        )
+        .unwrap();
 
         assert_eq!(journal.records().len(), 2);
         assert_eq!(journal.records()[0].text, "hello");
         assert_eq!(journal.records()[1].text, "hi");
         assert_eq!(fs::metadata(path).unwrap().len(), complete_len);
+    }
+
+    #[test]
+    fn opening_a_journal_does_not_change_its_parent_directory_mode() {
+        let path = unique_test_path();
+        let parent = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o750)).unwrap();
+
+        TranscriptJournal::open(path, identity()).unwrap();
+
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
     }
 
     #[test]
@@ -259,7 +364,7 @@ mod tests {
         let path = unique_test_path();
         let identity = identity();
         let other = {
-            let state = ProjectState::try_default().unwrap();
+            let state = ProjectState::try_first_run().unwrap();
             let terminal = state.workspaces[1].terminals[0].id;
             state.session_identity(PtyKey::Terminal(terminal)).unwrap()
         };
@@ -327,7 +432,7 @@ mod tests {
     }
 
     fn identity() -> SessionIdentity {
-        let state = ProjectState::try_default().unwrap();
+        let state = ProjectState::try_first_run().unwrap();
         let terminal = state.workspaces[0].terminals[0].id;
         state.session_identity(PtyKey::Terminal(terminal)).unwrap()
     }

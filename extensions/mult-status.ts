@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { appendFileSync, statSync } from "node:fs";
+import { closeSync, constants, lstatSync, openSync, writeSync } from "node:fs";
 
 type MultAgentStatus = "idle" | "running" | "waiting" | "error" | "finished";
 
@@ -27,9 +27,12 @@ function emitStatus(status: MultAgentStatus) {
 
   try {
     // mult creates and validates this generation-specific owner-private file.
-    // Never create parent directories here: a stale hook must not resurrect a
-    // generation that mult has cleaned up.
-    if (statSync(statusPath).size >= MAX_STATUS_FILE_BYTES) return;
+    // Never create the file or its parents here: a stale hook must not
+    // resurrect a generation that mult has cleaned up. `lstat` + O_NOFOLLOW
+    // keep the append inside that file — a symlink at this path is refused
+    // rather than written through.
+    const stats = lstatSync(statusPath);
+    if (!stats.isFile() || stats.size >= MAX_STATUS_FILE_BYTES) return;
     const payload = `${JSON.stringify({
       version: Number(version),
       namespace,
@@ -39,11 +42,15 @@ function emitStatus(status: MultAgentStatus) {
       generation,
       status,
     })}\n`;
-    appendFileSync(statusPath, payload, {
-      encoding: "utf8",
-      flag: "a",
-      mode: 0o600,
-    });
+    const fd = openSync(
+      statusPath,
+      constants.O_WRONLY | constants.O_APPEND | (constants.O_NOFOLLOW ?? 0),
+    );
+    try {
+      writeSync(fd, payload, null, "utf8");
+    } finally {
+      closeSync(fd);
+    }
   } catch {
     // Status reporting must never disturb pi.
   }

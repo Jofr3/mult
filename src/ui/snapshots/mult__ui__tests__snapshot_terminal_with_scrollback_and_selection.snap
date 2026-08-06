@@ -1,0 +1,43 @@
+---
+source: src/ui.rs
+expression: "buffer_snapshot(&render_buffer(&app, &pty_runtime, &config::Config::default(),\nframe_area.width, frame_area.height,))"
+---
+size: 60x12
+
+symbols:
+| ▣ mult             one                                     |
+|   $ terminal       two                                     |
+|                    three                                   |
+| ▣ website          four                                    |
+|   $ terminal       five                                    |
+|                    six                                     |
+|                    seven                                   |
+|                    eight                                   |
+|                    nine                                    |
+|                    ten                                     |
+|                    eleven                                  |
+|                    twelve                                  |
+
+styles:
+|abbccccaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddd|
+|eeeffeeeeeeeeeeeeeeegggddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaggggdddddddddddddddddddddddddddddddddddd|
+|abbcccccccaaaaaaaaaadddddddddddddddddddddddddddddddddddddddd|
+|aaahhaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddd|
+
+legend:
+  a = Style::new().fg(Color::Rgb(224, 222, 244)).bg(Color::Rgb(31, 29, 48)).underline_color(Color::Reset)
+  b = Style::new().fg(Color::Rgb(156, 207, 216)).bg(Color::Rgb(31, 29, 48)).underline_color(Color::Reset)
+  c = Style::new().fg(Color::Rgb(156, 207, 216)).bg(Color::Rgb(31, 29, 48)).underline_color(Color::Reset).bold()
+  d = Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+  e = Style::new().fg(Color::Rgb(224, 222, 244)).bg(Color::Rgb(68, 65, 90)).underline_color(Color::Reset).bold()
+  f = Style::new().fg(Color::Rgb(110, 106, 134)).bg(Color::Rgb(68, 65, 90)).underline_color(Color::Reset).bold()
+  g = Style::new().fg(Color::Rgb(31, 29, 48)).bg(Color::Rgb(156, 207, 216)).underline_color(Color::Reset)
+  h = Style::new().fg(Color::Rgb(110, 106, 134)).bg(Color::Rgb(31, 29, 48)).underline_color(Color::Reset)

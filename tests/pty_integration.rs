@@ -3,9 +3,9 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     fs,
-    io::Read,
+    io::{Read, Write},
     os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, net::UnixStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -31,9 +31,21 @@ use mult_protocol::{
     StopOutcome, AGENT_STATUS_SCHEMA_VERSION, PROTOCOL_VERSION, SOCKET_PATH_ENV,
 };
 
-const INTEGRATION_TIMEOUT: Duration = Duration::from_secs(5);
-const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+/// G11: a deadline is a failure detector, not a schedule. Every wait here polls
+/// for an *observable* condition and returns the moment it holds, so a generous
+/// cap costs the happy path nothing and buys the suite immunity to a loaded CI
+/// runner. The old 5 s cap, combined with `sleep 1`/`2`/`3` embedded in the
+/// shell commands, made several tests race their own fixtures.
+const INTEGRATION_TIMEOUT: Duration = Duration::from_secs(30);
+const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(15);
 const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+/// Printed by [`pty_integration_harness_runs_a_real_pty`] when the suite is not
+/// skipped. CI greps for it, so a job that silently skipped every test cannot
+/// report success (S9). Keep in step with `.github/workflows/ci.yml`.
+const EXECUTION_SENTINEL: &str = "MULT_PTY_INTEGRATION_RAN";
+/// Set by the CI job that is supposed to exercise real PTYs. With it set,
+/// asking to skip is a hard failure rather than a silent no-op.
+const REQUIRE_INTEGRATION_ENV: &str = "MULT_REQUIRE_PTY_INTEGRATION";
 
 struct CapturedStderr {
     bytes: Arc<Mutex<Vec<u8>>>,
@@ -120,6 +132,49 @@ impl Drop for ServerGuard {
     }
 }
 
+/// S9: proof that this file actually ran.
+///
+/// `MULT_SKIP_PTY_INTEGRATION` turns every test here into a no-op that still
+/// reports `ok`, so "24 passed" is not evidence that a single PTY was opened.
+/// This test spawns a real PTY through a real daemon and prints
+/// [`EXECUTION_SENTINEL`] only after that worked; CI runs the suite with
+/// `--nocapture` and greps for the sentinel, so the line cannot appear unless
+/// the harness genuinely exercised a PTY.
+#[test]
+fn pty_integration_harness_runs_a_real_pty() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let server = start_isolated_server().expect("start isolated mult-server fixture");
+    let mut runtime = PtyRuntime::connect_to_socket(server.socket_path.clone())
+        .expect("connect to isolated mult-server");
+    let terminal = PtyKey::Terminal(TerminalId(7000));
+
+    start_short_lived_command(&mut runtime, terminal, "printf 'pty is alive\\n'; exit 0");
+    let observed = wait_for_terminal_exit(&mut runtime, terminal)
+        .expect("the harness must be able to run a command on a real PTY");
+
+    assert_eq!(observed.exit.code, 0);
+    assert!(
+        observed.output.contains("pty is alive"),
+        "real PTY output: {:?}",
+        observed.output
+    );
+    println!("{EXECUTION_SENTINEL}");
+}
+
+/// G11: this test used to race its own fixture. It needs a *live* `PtyOutput`
+/// after the replay, but `printf …; exit 7` can finish before the client's
+/// `Attach` lands, in which case the daemon correctly delivers every byte as
+/// replay and no live output is ever produced. Widening the timeout could not
+/// fix that: the awaited event does not exist in the losing interleaving.
+///
+/// The command now blocks on a FIFO after its first write, and the test only
+/// releases it once `start` has returned — that is, once both `CreateSession`
+/// and `Attach` have completed. Everything printed after the release is live
+/// output by construction, and the attach's replay transaction (which always
+/// ends in a `Scrollback` event, whether or not it carried bytes) has already
+/// been delivered.
 #[test]
 fn client_receives_scrollback_output_and_real_exit_from_server_pty() {
     if integration_tests_are_skipped() {
@@ -129,16 +184,33 @@ fn client_receives_scrollback_output_and_real_exit_from_server_pty() {
     let mut runtime = PtyRuntime::connect_to_socket(server.socket_path.clone())
         .expect("connect to isolated mult-server");
     let terminal = PtyKey::Terminal(TerminalId(7001));
+    let dir = unique_private_dir("live-output");
+    let release = make_fifo(&dir.join("release.fifo"));
 
-    start_short_lived_command(&mut runtime, terminal, "printf 'hello from pty\\n'; exit 7");
+    start_short_lived_command(
+        &mut runtime,
+        terminal,
+        &format!(
+            "printf 'hello from pty\\n'; read -r line < {}; printf 'live after attach\\n'; exit 7",
+            shell_quote_test(&release.to_string_lossy())
+        ),
+    );
+
+    // Opening the write end blocks until the child opens the read end, which it
+    // reaches only after its first `printf`.
+    release_fifo_waiter(&release).expect("child should reach its FIFO read");
+
     let observed = wait_for_terminal_exit(&mut runtime, terminal)
-        .expect("short-lived command should produce output and exit");
+        .expect("released command should produce live output and exit");
 
     assert!(
         observed.saw_scrollback,
-        "server should send an initial raw scrollback replay"
+        "attach must complete its raw scrollback replay transaction"
     );
-    assert!(observed.saw_output, "server should send raw PTY output");
+    assert!(
+        observed.saw_output,
+        "output written after the attach must arrive as live PTY output"
+    );
     assert_eq!(observed.exit.code, 7);
     assert_eq!(observed.exit.signal, None);
     assert!(
@@ -146,7 +218,13 @@ fn client_receives_scrollback_output_and_real_exit_from_server_pty() {
         "terminal output should include command stdout: {:?}",
         observed.output
     );
+    assert!(
+        observed.output.contains("live after attach"),
+        "terminal output should include what was written after the attach: {:?}",
+        observed.output
+    );
     assert!(!runtime.is_running(terminal));
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -160,7 +238,14 @@ fn reconnect_replays_raw_scrollback_into_fresh_parser() {
     {
         let mut runtime = PtyRuntime::connect_to_socket(server.socket_path.clone())
             .expect("connect to isolated mult-server");
-        start_short_lived_command(&mut runtime, terminal, "printf replayed; sleep 2");
+        // A keep-alive loop, not `sleep 2`: the session must outlive the
+        // detach/reconnect below however long that takes, and the test stops it
+        // explicitly at the end.
+        start_short_lived_command(
+            &mut runtime,
+            terminal,
+            "printf replayed; while :; do sleep 1; done",
+        );
         wait_for_output(&mut runtime, terminal, "replayed")
             .expect("first client should receive output before detach");
     }
@@ -300,11 +385,20 @@ fn server_ignores_sighup_and_keeps_sessions_running() {
     let mut runtime = PtyRuntime::connect_to_socket(server.socket_path.clone())
         .expect("connect to isolated mult-server");
     let terminal = PtyKey::Terminal(TerminalId(7004));
+    let dir = unique_private_dir("sighup");
+    let release = make_fifo(&dir.join("release.fifo"));
 
+    // G11: the old fixture was `printf before; sleep 1; printf after; sleep 3`,
+    // which quietly assumed the SIGHUP would be delivered within one second and
+    // the whole test would finish within four. The FIFO makes "after" happen
+    // strictly *because* the test released it, and strictly after the hangup.
     start_short_lived_command(
         &mut runtime,
         terminal,
-        "printf before; sleep 1; printf after; sleep 3",
+        &format!(
+            "printf before; read -r line < {}; printf after; while :; do sleep 1; done",
+            shell_quote_test(&release.to_string_lossy())
+        ),
     );
     wait_for_output(&mut runtime, terminal, "before")
         .expect("command should produce output before hangup");
@@ -312,10 +406,13 @@ fn server_ignores_sighup_and_keeps_sessions_running() {
     let rc = unsafe { libc::kill(server.child.id() as i32, libc::SIGHUP) };
     assert_eq!(rc, 0, "send SIGHUP to mult-server");
     assert_server_still_running(&mut server);
+
+    release_fifo_waiter(&release).expect("child should still be waiting after the hangup");
     wait_for_output(&mut runtime, terminal, "after")
         .expect("server should keep PTY command running after SIGHUP");
 
     assert!(runtime.stop(terminal).expect("stop terminal after SIGHUP"));
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -1198,7 +1295,7 @@ fn numbered_attach_replay_and_live_output_are_exactly_contiguous() {
             "live output must begin at the watermark"
         );
         expected = sequence.checked_add_bytes(bytes.len()).unwrap();
-        combined.extend(bytes);
+        combined.extend_from_slice(&bytes);
     }
     assert_eq!(
         extract_numbered_records(&combined),
@@ -1259,7 +1356,7 @@ fn stop_before_child_exit_finalizes_once_without_a_stale_session() {
             } if pane == attached.pane && lease == attached.lease => {
                 assert_eq!(sequence, expected_sequence, "live output sequence gap");
                 expected_sequence = sequence.checked_add_bytes(bytes.len()).unwrap();
-                output.extend(bytes);
+                output.extend_from_slice(&bytes);
             }
             ServerMessage::ForegroundProcess { pane, lease, .. }
                 if pane == attached.pane && lease == attached.lease => {}
@@ -1344,7 +1441,7 @@ fn natural_exit_before_stop_returns_already_absent_without_a_stale_session() {
             } if pane == attached.pane && lease == attached.lease => {
                 assert_eq!(sequence, expected_sequence, "live output sequence gap");
                 expected_sequence = sequence.checked_add_bytes(bytes.len()).unwrap();
-                output.extend(bytes);
+                output.extend_from_slice(&bytes);
             }
             ServerMessage::ForegroundProcess { pane, lease, .. }
                 if pane == attached.pane && lease == attached.lease => {}
@@ -1600,7 +1697,7 @@ impl RawClient {
             let ServerMessage::PtyOutput { bytes: output, .. } = message else {
                 unreachable!()
             };
-            bytes.extend(output);
+            bytes.extend_from_slice(&output);
         }
         Ok(bytes)
     }
@@ -1658,7 +1755,7 @@ impl RawClient {
                         return Err("replay chunk identified wrong attachment".to_string());
                     }
                     replay_ranges.push((sequence, bytes.len()));
-                    replay_bytes.extend(bytes);
+                    replay_bytes.extend_from_slice(&bytes);
                 }
                 ServerMessage::ReplayEnd {
                     pane: end_pane,
@@ -1924,7 +2021,7 @@ fn receive_attachment_marker(
             } if pane == attachment.pane && lease == attachment.lease => {
                 assert_eq!(sequence, expected_sequence, "live output sequence gap");
                 expected_sequence = sequence.checked_add_bytes(bytes.len()).unwrap();
-                output.extend(bytes);
+                output.extend_from_slice(&bytes);
             }
             ServerMessage::ForegroundProcess { pane, lease, .. }
                 if pane == attachment.pane && lease == attachment.lease => {}
@@ -2017,6 +2114,53 @@ fn unique_private_dir(label: &str) -> PathBuf {
 
 fn shell_quote_test(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn make_fifo(path: &Path) -> PathBuf {
+    let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("FIFO path");
+    assert_eq!(
+        unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) },
+        0,
+        "mkfifo {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+    path.to_path_buf()
+}
+
+/// Unblocks a child parked in `read -r line < fifo`.
+///
+/// The open is the handshake: a FIFO write-open only succeeds once a reader has
+/// opened the other end, so returning proves the child reached its `read` — and
+/// therefore ran everything before it. `O_NONBLOCK` keeps a child that never
+/// got that far from hanging the suite; a blocking open would wait forever.
+fn release_fifo_waiter(path: &Path) -> Result<(), String> {
+    let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(mut writer) => {
+                return writer
+                    .write_all(b"go\n")
+                    .map_err(|error| format!("write release FIFO {}: {error}", path.display()));
+            }
+            Err(error) if error.raw_os_error() != Some(libc::ENXIO) => {
+                return Err(format!("open release FIFO {}: {error}", path.display()));
+            }
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "timed out after {INTEGRATION_TIMEOUT:?} waiting for a reader on {}: {error}",
+                        path.display()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
 }
 
 fn wait_for_fifo_token(file: &mut fs::File, token: &[u8], deadline: Instant) -> Result<(), String> {
@@ -2223,6 +2367,15 @@ fn assert_server_still_running(server: &mut ServerGuard) {
 
 fn integration_tests_are_skipped() -> bool {
     if std::env::var_os("MULT_SKIP_PTY_INTEGRATION").is_some() {
+        // S9: the Nix sandbox cannot allocate PTYs, so it sets the skip and the
+        // job goes green having tested nothing. That is fine as long as some
+        // *other* job proves the tests ran — and the only way to prove it is to
+        // make skipping fatal where it is not allowed.
+        assert!(
+            std::env::var_os(REQUIRE_INTEGRATION_ENV).is_none(),
+            "{REQUIRE_INTEGRATION_ENV} is set, so MULT_SKIP_PTY_INTEGRATION must not be: this job \
+             exists to run the PTY integration tests, not to skip them"
+        );
         eprintln!("skipping PTY integration tests because MULT_SKIP_PTY_INTEGRATION is set");
         true
     } else {

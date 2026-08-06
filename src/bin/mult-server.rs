@@ -1,13 +1,39 @@
+//! `mult-server`, the PTY daemon.
+//!
+//! # Lock discipline
+//!
+//! Three mutex families exist and are always acquired in this order:
+//!
+//! 1. the single [`ServerState`] mutex,
+//! 2. one [`PaneState`] mutex per pane,
+//! 3. leaves: [`PtyWriteQueue`], the PTY master, and `PaneState::lifecycle_signal`.
+//!
+//! The rules that keep one wedged pane from freezing the whole daemon:
+//!
+//! - **L1** Never take the server lock while holding a pane lock. Every handler
+//!   acquires server first, then the one pane it routes to.
+//! - **L2** Never hold two pane locks at once. `ServerState::pane_by_id` is a
+//!   map lookup, not a scan, precisely so a routing decision cannot need a
+//!   second pane's mutex.
+//! - **L3** Never perform blocking I/O under (1) or (2). PTY writes are handed
+//!   to the pane's [`PtyWriteQueue`], whose writer thread holds no mutex while
+//!   it writes; client writes go through a `SyncSender`, whose `try_send` never
+//!   blocks. The only syscalls left under a lock are non-blocking ioctls
+//!   (`TIOCSWINSZ`, `tcgetpgrp`) on the master, which is a leaf.
+//! - **L4** Attach replay keeps the pane lock — that barrier is the ordering
+//!   guarantee documented in `docs/DAEMON.md` — but releases the server lock
+//!   first, so an attach serializes only the pane it attaches to. Replay is
+//!   bounded by `RAW_HISTORY_MAX_BYTES` and sends refcounted chunks, so it
+//!   neither runs long nor duplicates the retained history.
+
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    env, fs,
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    env, fmt, fs,
     io::{self, Read, Write},
     net::Shutdown,
-    os::unix::{
-        io::AsRawFd,
-        net::{UnixListener, UnixStream},
-    },
+    os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
+    process::ExitCode,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Condvar, Mutex,
@@ -16,14 +42,19 @@ use std::{
     time::{Duration, Instant},
 };
 
+use mult::cli::{self, Binary, Invocation};
+
 use mult_protocol::{
-    bounded_screen_dimensions, default_socket_path, ensure_private_dir, read_message,
+    bounded_screen_dimensions, default_socket_path, ensure_private_dir,
+    peer::verify_peer_is_self,
+    read_message,
+    shell::{default_shell, quote_display_argument, shell_command_args},
     write_message, AgentSessionMetadata, AgentStatus, AgentStatusError, AgentStatusOutcome,
     AgentStatusQuery, AgentStatusRecord, AttachError, AttachOutcome, AttachmentLease,
     ClientMessage, ClientScopeId, CreateError, CreateOutcome, ExitInfo, ForegroundProcessInfo,
     IdentityMismatch, LaunchSpec, LeaseOperation, LeaseRejectionReason, OutputSequence, PaneId,
-    PaneInfo, RequestId, ServerInstanceId, ServerMessage, SessionId, SessionIdentity, SessionInfo,
-    StateNamespace, StopError, StopOutcome, AGENT_STATUS_SCHEMA_VERSION,
+    PaneInfo, RejectCode, RequestId, ServerInstanceId, ServerMessage, SessionId, SessionIdentity,
+    SessionInfo, StateNamespace, StopError, StopOutcome, AGENT_STATUS_SCHEMA_VERSION,
     MAX_CACHED_REQUEST_RESULTS_PER_SCOPE, MAX_MESSAGE_BYTES, MAX_PENDING_REQUESTS_PER_CLIENT,
     PROTOCOL_VERSION,
 };
@@ -36,25 +67,137 @@ use signal_hook::{
 type ClientId = u64;
 type SharedServer = Arc<Mutex<ServerState>>;
 type SharedPane = Arc<Mutex<PaneState>>;
-type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 type SharedMasterPty = Arc<Mutex<Box<dyn MasterPty + Send>>>;
 type ClientSender = mpsc::SyncSender<ClientDelivery>;
 
+/// One queued item for a client's socket-writer thread.
+///
+/// Payload-carrying variants keep the pane's refcounted history chunk rather
+/// than a private `Vec` copy: an attach used to make the whole retained history
+/// resident a second time (once in the pane, once spread over the queued
+/// `ReplayChunk` messages). The wire message is built in the writer thread,
+/// immediately before it is serialized, so at most one copy exists at a time.
 #[derive(Debug)]
 enum ClientDelivery {
     Message(ServerMessage),
+    Output {
+        pane: PaneId,
+        lease: AttachmentLease,
+        sequence: OutputSequence,
+        bytes: Arc<[u8]>,
+    },
+    Replay {
+        request_id: RequestId,
+        pane: PaneId,
+        lease: AttachmentLease,
+        sequence: OutputSequence,
+        bytes: Arc<[u8]>,
+    },
     Close,
 }
 
 const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
-const RAW_HISTORY_MAX_BYTES: usize = MAX_MESSAGE_BYTES * 2;
+/// Lines of scrollback the `mult` client's terminal parser retains
+/// (`pty.rs::TERMINAL_SCROLLBACK_LINES`). Replay exists to refill that buffer,
+/// so it is what bounds retained history.
+const RAW_HISTORY_SCROLLBACK_LINES: usize = 5_000;
+/// Raw bytes budgeted per retained scrollback line. A line is at most `cols`
+/// printable cells plus its wrap/newline and a handful of SGR sequences; 512
+/// covers a 200-column line whose every run changes colour, and the cap is a
+/// ceiling on a rolling buffer rather than a per-line allocation.
+const RAW_HISTORY_BYTES_PER_LINE: usize = 512;
+/// Raw PTY output retained per pane for attach replay (~2.4 MiB).
+///
+/// This used to be `MAX_MESSAGE_BYTES * 2` (32 MiB), which is a wire-frame
+/// limit and has nothing to do with what a client can display. Sizing it from
+/// the client's actual scrollback need cuts resident daemon memory ~13x per
+/// pane while still refilling the deepest scrollback the client keeps.
+const RAW_HISTORY_MAX_BYTES: usize = RAW_HISTORY_SCROLLBACK_LINES * RAW_HISTORY_BYTES_PER_LINE;
+/// Largest retained-history chunk, and therefore the largest replay message.
 const RAW_HISTORY_CHUNK_BYTES: usize = 64 * 1024;
+// A replay chunk becomes one wire frame, and the retained history must be worth
+// less than a frame's worth of allocation to a client that asks for all of it.
+const _: () = assert!(RAW_HISTORY_CHUNK_BYTES < MAX_MESSAGE_BYTES);
+const _: () = assert!(RAW_HISTORY_MAX_BYTES < MAX_MESSAGE_BYTES);
+/// Bytes of client-supplied input a pane's writer thread may have outstanding.
+///
+/// A child that stops reading its stdin cannot be made to read it, so the queue
+/// has to refuse rather than grow or block. One screenful of paste is a few
+/// tens of kilobytes, so a megabyte only fills when the child is genuinely
+/// wedged.
+const PTY_WRITE_QUEUE_MAX_BYTES: usize = 1024 * 1024;
 const CLIENT_QUEUE_CAPACITY: usize = 1_024;
 const STOP_TERM_GRACE: Duration = Duration::from_millis(750);
 const STOP_FINALIZE_TIMEOUT: Duration = Duration::from_secs(3);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const WAIT_RETRY_DELAY: Duration = Duration::from_millis(50);
+/// Longest the daemon waits for every pane to finalize before exiting anyway.
+///
+/// It must exceed `STOP_TERM_GRACE + STOP_FINALIZE_TIMEOUT` so an ordinary
+/// SIGTERM/SIGKILL cycle always completes first, but it must exist: a pane
+/// whose stop driver reports `TimedOut` never reaches `Removed`, and an
+/// unbounded wait left the daemon alive forever holding its bound socket.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_ERROR_MESSAGE: &str = "mult-server is shutting down";
+
+/// A daemon-side failure on its way to a client.
+///
+/// It carries the machine-readable [`RejectCode`] the wire will hand over next
+/// to the diagnostic text. Before protocol 11 these were bare `io::Error`s
+/// whose *message* was the only thing distinguishing one rejection from
+/// another, and control flow keyed off that in both directions: the create
+/// handler branched on `kind() == AlreadyExists`, and the client and the tests
+/// matched substrings such as `"lease space exhausted"`. Rewording a message
+/// silently changed behaviour. The code is the contract now; `message` exists
+/// to be shown to a human and is never parsed.
+#[derive(Debug)]
+struct Rejection {
+    code: RejectCode,
+    message: String,
+}
+
+impl Rejection {
+    fn new(code: RejectCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// A failure inside the daemon with no more specific classification: a
+    /// poisoned lock, a failed `ioctl`, an unexpected OS error.
+    fn internal(message: impl fmt::Display) -> Self {
+        Self::new(RejectCode::DaemonInternal, message.to_string())
+    }
+
+    fn into_create_error(self) -> CreateError {
+        CreateError::Failed {
+            code: self.code,
+            message: self.message,
+        }
+    }
+
+    fn into_attach_error(self) -> AttachError {
+        AttachError::Failed {
+            code: self.code,
+            message: self.message,
+        }
+    }
+}
+
+impl fmt::Display for Rejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Rejection {}
+
+impl From<io::Error> for Rejection {
+    fn from(error: io::Error) -> Self {
+        Self::internal(error)
+    }
+}
 
 #[derive(Clone)]
 struct ClientHandle {
@@ -70,10 +213,18 @@ impl ClientHandle {
     }
 
     fn try_deliver(&self, message: ServerMessage) -> bool {
+        self.try_enqueue(ClientDelivery::Message(message))
+    }
+
+    /// Queues one delivery without ever blocking.
+    ///
+    /// Lock rule L3 depends on this: handlers call it while holding the server
+    /// and/or pane mutex, so it must be a `try_send` and nothing else.
+    fn try_enqueue(&self, delivery: ClientDelivery) -> bool {
         if !self.is_active() {
             return false;
         }
-        match self.sender.try_send(ClientDelivery::Message(message)) {
+        match self.sender.try_send(delivery) {
             Ok(()) => true,
             Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => false,
         }
@@ -89,6 +240,266 @@ impl ClientHandle {
     fn disconnect(&self) {
         self.active.store(false, Ordering::Release);
         let _ = self.stream.shutdown(Shutdown::Both);
+    }
+}
+
+/// Builds the wire message for one queued delivery, or `None` for `Close`.
+///
+/// Called from the client's writer thread. Since protocol 11 the payload
+/// messages carry `Arc<[u8]>`, so this is a refcount bump: the pane's retained
+/// chunk is serialized straight out of the allocation the PTY reader produced,
+/// with no copy of PTY bytes anywhere on the broadcast path (A9).
+fn delivery_message(delivery: ClientDelivery) -> Option<ServerMessage> {
+    match delivery {
+        ClientDelivery::Message(message) => Some(message),
+        ClientDelivery::Output {
+            pane,
+            lease,
+            sequence,
+            bytes,
+        } => Some(ServerMessage::PtyOutput {
+            pane,
+            lease,
+            sequence,
+            bytes,
+        }),
+        ClientDelivery::Replay {
+            request_id,
+            pane,
+            lease,
+            sequence,
+            bytes,
+        } => Some(ServerMessage::ReplayChunk {
+            request_id,
+            pane,
+            lease,
+            sequence,
+            bytes,
+        }),
+        ClientDelivery::Close => None,
+    }
+}
+
+/// Why a PTY write was refused instead of queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PtyWriteRefusal {
+    /// The child is not draining its stdin fast enough (or at all).
+    QueueFull,
+    /// The pane finalized, or the master rejected a write.
+    Closed,
+}
+
+/// A pane's bounded, non-blocking inbox for client-supplied PTY input.
+///
+/// `write_all` + `flush` on a PTY master blocks as soon as the child stops
+/// reading, and it used to be called straight from the socket-reader thread
+/// while both the server and the pane mutex were held — so one wedged child
+/// froze every pane and every client. All writes now go through here: producers
+/// only ever push under this leaf mutex (never blocking, never while doing I/O),
+/// and one writer thread per pane performs the blocking write holding no mutex
+/// at all.
+///
+/// The queue is bounded and **refuses** rather than drops: silently discarding
+/// keystrokes is indistinguishable from a hung terminal. A refusal is reported
+/// to the client as `LeaseRejected`, which is conclusive — the client clears the
+/// attachment and re-attaches instead of assuming the bytes landed.
+struct PtyWriteQueue {
+    state: Mutex<PtyWriteQueueState>,
+    ready: Condvar,
+    capacity: usize,
+}
+
+struct PtyWriteQueueState {
+    pending: VecDeque<Vec<u8>>,
+    queued_bytes: usize,
+    closed: bool,
+}
+
+impl PtyWriteQueue {
+    /// A queue with no writer thread. Production always uses [`Self::spawn`];
+    /// this exists so tests can observe exactly what was accepted.
+    fn with_capacity(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(PtyWriteQueueState {
+                pending: VecDeque::new(),
+                queued_bytes: 0,
+                closed: false,
+            }),
+            ready: Condvar::new(),
+            capacity,
+        })
+    }
+
+    fn spawn(writer: Box<dyn Write + Send>) -> Arc<Self> {
+        let queue = Self::with_capacity(PTY_WRITE_QUEUE_MAX_BYTES);
+        let writer_queue = Arc::clone(&queue);
+        thread::spawn(move || run_pty_writer(&writer_queue, writer));
+        queue
+    }
+
+    /// Accepts `bytes` for the PTY, or refuses them. Never blocks.
+    fn enqueue(&self, bytes: Vec<u8>) -> Result<(), PtyWriteRefusal> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let mut state = self.state.lock().map_err(|_| PtyWriteRefusal::Closed)?;
+        if state.closed {
+            return Err(PtyWriteRefusal::Closed);
+        }
+        // Reject the whole write rather than a prefix of it: a partially
+        // accepted keystroke sequence is worse than a reported refusal.
+        if state.queued_bytes.saturating_add(bytes.len()) > self.capacity {
+            return Err(PtyWriteRefusal::QueueFull);
+        }
+        state.queued_bytes += bytes.len();
+        state.pending.push_back(bytes);
+        drop(state);
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    /// Blocks until there is something to write, or the queue closes.
+    ///
+    /// Returns `None` once closed: a finalized pane has no child left to
+    /// receive the remainder.
+    ///
+    /// The whole backlog is taken at once and the accounting is reset with it,
+    /// so the bound is "queued plus one in-flight batch", not a hard `capacity`
+    /// ceiling. That is deliberate: charging the in-flight batch would mean a
+    /// wedged child's queue could never refill even after the write completes.
+    fn wait_for_writes(&self) -> Option<Vec<Vec<u8>>> {
+        let mut state = self.state.lock().ok()?;
+        loop {
+            if state.closed {
+                return None;
+            }
+            if !state.pending.is_empty() {
+                state.queued_bytes = 0;
+                return Some(std::mem::take(&mut state.pending).into());
+            }
+            state = self.ready.wait(state).ok()?;
+        }
+    }
+
+    fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+            state.pending.clear();
+            state.queued_bytes = 0;
+        }
+        self.ready.notify_all();
+    }
+
+    #[cfg(test)]
+    fn queued_bytes(&self) -> usize {
+        self.state
+            .lock()
+            .map(|state| state.queued_bytes)
+            .unwrap_or(0)
+    }
+}
+
+/// Drains one pane's write queue. Holds no mutex across the blocking write.
+fn run_pty_writer(queue: &Arc<PtyWriteQueue>, mut writer: Box<dyn Write + Send>) {
+    while let Some(batch) = queue.wait_for_writes() {
+        for bytes in batch {
+            if let Err(error) = writer.write_all(&bytes).and_then(|()| writer.flush()) {
+                eprintln!("failed to write PTY input: {error}");
+                // Further writes cannot succeed either. Closing makes the next
+                // client write a reported LeaseRejected instead of a silent
+                // discard.
+                queue.close();
+                return;
+            }
+        }
+    }
+}
+
+/// Raw PTY output retained per pane for attach replay.
+///
+/// A flat `Vec<u8>` made trimming O(retained history): once the cap was
+/// reached, every 8 KiB read `drain(..overflow)`d — a memmove of the whole
+/// buffer — under the pane lock. This keeps the history as a deque of immutable
+/// refcounted chunks plus an offset into the oldest one, so a trim drops whole
+/// chunks in O(bytes dropped) and never touches a retained byte. The chunks are
+/// also exactly what replay sends, so a queued replay shares them with the pane
+/// instead of making the history resident twice.
+#[derive(Default)]
+struct RawHistory {
+    chunks: VecDeque<Arc<[u8]>>,
+    /// Bytes of `chunks.front()` already trimmed away. Always strictly less
+    /// than that chunk's length while any chunk remains.
+    front_offset: usize,
+    len: usize,
+}
+
+impl RawHistory {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Appends `bytes` (splitting it into replay-sized chunks) and trims the
+    /// oldest bytes beyond `limit`. Returns the number of bytes dropped.
+    fn append(&mut self, bytes: &Arc<[u8]>, limit: usize) -> usize {
+        if bytes.len() <= RAW_HISTORY_CHUNK_BYTES {
+            // The reader's 8 KiB buffer always lands here, so a live read costs
+            // one allocation and no copy beyond the one that made the `Arc`.
+            if !bytes.is_empty() {
+                self.len += bytes.len();
+                self.chunks.push_back(Arc::clone(bytes));
+            }
+        } else {
+            for piece in bytes.chunks(RAW_HISTORY_CHUNK_BYTES) {
+                self.len += piece.len();
+                self.chunks.push_back(Arc::from(piece));
+            }
+        }
+        self.trim_to(limit)
+    }
+
+    fn trim_to(&mut self, limit: usize) -> usize {
+        let mut remaining = self.len.saturating_sub(limit);
+        let mut dropped = 0;
+        while remaining > 0 {
+            let Some(front) = self.chunks.front() else {
+                break;
+            };
+            let available = front.len() - self.front_offset;
+            if remaining < available {
+                self.front_offset += remaining;
+                self.len -= remaining;
+                dropped += remaining;
+                break;
+            }
+            self.chunks.pop_front();
+            self.front_offset = 0;
+            self.len -= available;
+            dropped += available;
+            remaining -= available;
+        }
+        dropped
+    }
+
+    /// The retained history as replay-sized chunks, oldest first.
+    ///
+    /// Every chunk but the oldest is shared with the pane at zero cost. Only
+    /// the oldest needs a copy, and only when a trim landed inside it.
+    fn replay_chunks(&self) -> Vec<Arc<[u8]>> {
+        let mut chunks = Vec::with_capacity(self.chunks.len());
+        for (index, chunk) in self.chunks.iter().enumerate() {
+            if index == 0 && self.front_offset > 0 {
+                chunks.push(Arc::from(&chunk[self.front_offset..]));
+            } else {
+                chunks.push(Arc::clone(chunk));
+            }
+        }
+        chunks
+    }
+
+    #[cfg(test)]
+    fn to_vec(&self) -> Vec<u8> {
+        self.replay_chunks().concat()
     }
 }
 
@@ -147,20 +558,31 @@ enum PaneLifecycle {
     Removed,
 }
 
+/// One pane's mutable state.
+///
+/// Lock rules (see the module header): this mutex is taken **after** the server
+/// mutex and never with another pane's mutex held. Nothing under it blocks —
+/// PTY writes go to `writes`, client writes go through `ClientHandle::try_*`.
+/// The one long-running section is attach replay, which is bounded by
+/// `RAW_HISTORY_MAX_BYTES` and deliberately holds this mutex so replay cannot
+/// interleave with live output (`docs/DAEMON.md`, "Attach replay ordering").
 struct PaneState {
     session: SessionId,
     identity: SessionIdentity,
     agent: Option<AgentSessionMetadata>,
+    /// Always `PaneId(session.0)`. The daemon allocates one pane per session
+    /// and the two numeric coordinates are the same number by construction;
+    /// `ServerState::pane_by_id` relies on it.
     pane: PaneId,
     name: String,
     title: String,
     rows: u16,
     cols: u16,
-    raw_history: Vec<u8>,
+    raw_history: RawHistory,
     history_start: OutputSequence,
     next_output: OutputSequence,
     master: SharedMasterPty,
-    writer: SharedPtyWriter,
+    writes: Arc<PtyWriteQueue>,
     child_pid: u32,
     process_group: libc::pid_t,
     foreground_process: ForegroundProcessInfo,
@@ -203,13 +625,46 @@ struct SpawnedPane {
     child: Box<dyn Child + Send + Sync>,
 }
 
-fn main() -> io::Result<()> {
+/// Exit status for a command line that could not be run, distinct from a
+/// failure while running.
+const USAGE_EXIT_CODE: u8 = 2;
+
+fn main() -> ExitCode {
+    let options = match cli::parse(Binary::Server, env::args_os().skip(1)) {
+        Ok(Invocation::Run(options)) => options,
+        Ok(Invocation::Print(text)) => {
+            println!("{text}");
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(USAGE_EXIT_CODE);
+        }
+    };
+
+    match run(options) {
+        Ok(()) => ExitCode::SUCCESS,
+        // `Display`, never `Debug`: a daemon that fails to bind should say so
+        // in a sentence, not as a struct dump.
+        Err(error) => {
+            eprintln!("mult-server: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(options: cli::Options) -> io::Result<()> {
     ignore_hangup_signal()?;
     let shutdown = install_shutdown_signals()?;
-    let socket_path = default_socket_path();
+    // `--socket` outranks `$MULT_SOCKET_PATH`, which outranks the default.
+    let socket_path = options.socket.unwrap_or_else(default_socket_path);
     bind_socket_path(&socket_path)?;
     let server = Arc::new(Mutex::new(ServerState::new()?));
     let listener = bind_unix_listener(&socket_path)?;
+    // From here on every exit path — `?`, a shutdown deadline, or a panic —
+    // unlinks the socket. Leaving it bound made the next client autospawn
+    // connect to nothing.
+    let _socket = SocketGuard::new(socket_path.clone());
     listener.set_nonblocking(true)?;
     restrict_socket_permissions(&socket_path)?;
     eprintln!("mult-server listening on {}", socket_path.display());
@@ -233,18 +688,57 @@ fn main() -> io::Result<()> {
     }
 
     begin_daemon_shutdown(&server);
-    loop {
-        let empty = {
-            let state = server.lock().map_err(lock_error)?;
-            state.sessions.is_empty() && state.reserved_sessions.is_empty()
-        };
-        if empty {
-            break;
-        }
-        thread::sleep(ACCEPT_POLL_INTERVAL);
+    if !wait_for_sessions_drained(&server, SHUTDOWN_DRAIN_TIMEOUT) {
+        eprintln!(
+            "mult-server shutdown deadline reached with sessions still live; exiting and unlinking {}",
+            socket_path.display()
+        );
     }
-    let _ = fs::remove_file(&socket_path);
     Ok(())
+}
+
+/// Removes the listening socket when the daemon leaves `main`, however it
+/// leaves.
+struct SocketGuard {
+    path: PathBuf,
+}
+
+impl SocketGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Waits for every session and reservation to finalize, bounded by `timeout`.
+///
+/// Returns whether the daemon drained. The deadline is the point: a pane whose
+/// stop driver reports `TerminationResult::TimedOut` is never removed, and the
+/// old unbounded `sessions.is_empty()` spin meant such a pane kept `mult-server`
+/// alive — and its socket bound — forever.
+fn wait_for_sessions_drained(server: &SharedServer, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let drained = match server.lock() {
+            Ok(state) => state.sessions.is_empty() && state.reserved_sessions.is_empty(),
+            // A poisoned lock will never report an empty map. Exiting is the
+            // only remaining way to release the socket.
+            Err(_) => return false,
+        };
+        if drained {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        thread::sleep(ACCEPT_POLL_INTERVAL.min(remaining));
+    }
 }
 
 impl ServerState {
@@ -296,21 +790,23 @@ impl ServerState {
         self.allocate_scope().map(|scope| (scope, false))
     }
 
-    fn allocate_lease(&mut self) -> io::Result<AttachmentLease> {
-        let lease = self
-            .next_lease
-            .ok_or_else(|| io::Error::other("attachment lease space exhausted"))?;
+    fn allocate_lease(&mut self) -> Result<AttachmentLease, Rejection> {
+        let lease = self.next_lease.ok_or_else(|| {
+            Rejection::new(
+                RejectCode::ResourceExhausted,
+                "attachment lease space exhausted",
+            )
+        })?;
         self.next_lease = lease.checked_next();
         Ok(lease)
     }
 
-    fn allocate_session_id(&mut self) -> io::Result<SessionId> {
+    fn allocate_session_id(&mut self) -> Result<SessionId, Rejection> {
         loop {
             let session = SessionId(self.next_session_id);
-            self.next_session_id = self
-                .next_session_id
-                .checked_add(1)
-                .ok_or_else(|| io::Error::other("session ID space exhausted"))?;
+            self.next_session_id = self.next_session_id.checked_add(1).ok_or_else(|| {
+                Rejection::new(RejectCode::ResourceExhausted, "session ID space exhausted")
+            })?;
             if !self.sessions.contains_key(&session) && !self.reserved_sessions.contains(&session) {
                 return Ok(session);
             }
@@ -321,15 +817,18 @@ impl ServerState {
         &mut self,
         requested_id: Option<SessionId>,
         identity: SessionIdentity,
-    ) -> io::Result<SessionId> {
+    ) -> Result<SessionId, Rejection> {
         if self.shutting_down {
-            return Err(io::Error::other(SHUTDOWN_ERROR_MESSAGE));
+            return Err(Rejection::new(
+                RejectCode::ShuttingDown,
+                SHUTDOWN_ERROR_MESSAGE,
+            ));
         }
         if self.session_by_identity.contains_key(&identity)
             || self.reserved_identities.contains(&identity)
         {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
+            return Err(Rejection::new(
+                RejectCode::SessionAlreadyExists,
                 "logical session identity already exists or is being created",
             ));
         }
@@ -338,8 +837,8 @@ impl ServerState {
             None => self.allocate_session_id()?,
         };
         if self.sessions.contains_key(&session) || !self.reserved_sessions.insert(session) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
+            return Err(Rejection::new(
+                RejectCode::SessionAlreadyExists,
                 format!("session {} already exists or is being created", session.0),
             ));
         }
@@ -352,9 +851,16 @@ impl ServerState {
         self.reserved_identities.remove(&identity);
     }
 
-    fn publish_reserved_session(&mut self, session: SessionId, pane: SharedPane) -> io::Result<()> {
+    fn publish_reserved_session(
+        &mut self,
+        session: SessionId,
+        pane: SharedPane,
+    ) -> Result<(), Rejection> {
         if self.shutting_down {
-            return Err(io::Error::other(SHUTDOWN_ERROR_MESSAGE));
+            return Err(Rejection::new(
+                RejectCode::ShuttingDown,
+                SHUTDOWN_ERROR_MESSAGE,
+            ));
         }
         let (identity, agent) = {
             let pane = pane.lock().map_err(lock_error)?;
@@ -365,7 +871,10 @@ impl ServerState {
             || !self.reserved_sessions.contains(&session)
             || !self.reserved_identities.contains(&identity)
         {
-            return Err(io::Error::other("session was created concurrently"));
+            return Err(Rejection::new(
+                RejectCode::SessionAlreadyExists,
+                "session was created concurrently",
+            ));
         }
         self.release_session_reservation(session, identity);
         self.session_by_identity.insert(identity, session);
@@ -398,16 +907,21 @@ impl ServerState {
             .collect()
     }
 
+    /// Routes a `PaneId` to its pane.
+    ///
+    /// `PaneId` and `SessionId` are two names for the same daemon coordinate:
+    /// `spawn_pane` sets `pane = PaneId(session.0)` and nothing ever changes it,
+    /// so the map lookup is exhaustive. (They stay distinct wire newtypes
+    /// because `mult_protocol` and the client both use them; collapsing them is
+    /// a protocol change, not a daemon change.)
+    ///
+    /// This used to fall back to a linear scan that locked **every** pane while
+    /// holding the server lock, on every `Input`, `Resize` and `Detach`. The
+    /// fallback could never match anything the lookup had missed, and it
+    /// violated lock rule L2 — one pane blocked in the scan blocked routing for
+    /// all of them.
     fn pane_by_id(&self, pane: PaneId) -> Option<SharedPane> {
-        self.sessions.get(&SessionId(pane.0)).cloned().or_else(|| {
-            self.sessions.values().find_map(|candidate| {
-                candidate
-                    .lock()
-                    .ok()
-                    .is_some_and(|candidate| candidate.pane == pane)
-                    .then(|| Arc::clone(candidate))
-            })
-        })
+        self.sessions.get(&SessionId(pane.0)).cloned()
     }
 
     fn remove_session_if_same(&mut self, session: SessionId, pane: &SharedPane) -> bool {
@@ -699,55 +1213,6 @@ fn restrict_socket_permissions(path: &PathBuf) -> io::Result<()> {
     fs::set_permissions(path, permissions)
 }
 
-fn verify_peer_owner(stream: &UnixStream, peer_label: &str) -> io::Result<()> {
-    let Some(peer_uid) = peer_uid(stream)? else {
-        return Ok(());
-    };
-    let current_uid = current_euid();
-    if peer_uid == current_uid {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("rejecting {peer_label} uid {peer_uid}; expected current uid {current_uid}"),
-        ))
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> io::Result<Option<u32>> {
-    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            credentials.as_mut_ptr().cast(),
-            &mut length,
-        )
-    };
-    if result == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    if length < std::mem::size_of::<libc::ucred>() as libc::socklen_t {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "short SO_PEERCRED response",
-        ));
-    }
-    Ok(Some(unsafe { credentials.assume_init().uid }))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn peer_uid(_stream: &UnixStream) -> io::Result<Option<u32>> {
-    Ok(None)
-}
-
-fn current_euid() -> u32 {
-    unsafe { libc::geteuid() as u32 }
-}
-
 fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SpawnedPane> {
     let (rows, cols) = bounded_pty_dimensions(spec.rows, spec.cols);
     let pair = native_pty_system()
@@ -763,7 +1228,9 @@ fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SpawnedPane
     // child exists, either the waiter owns it or the unpublished cleanup path
     // below kills and reaps it exactly once.
     let reader = pair.master.try_clone_reader().map_err(error_to_io)?;
-    let writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(error_to_io)?));
+    // Taken here because it is fallible; the writer thread is only started once
+    // the child is published, so a failed spawn cannot leak one.
+    let writer = pair.master.take_writer().map_err(error_to_io)?;
 
     let shell = default_shell();
     let mut command = CommandBuilder::new(&shell);
@@ -808,11 +1275,11 @@ fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SpawnedPane
         title,
         rows,
         cols,
-        raw_history: Vec::new(),
+        raw_history: RawHistory::default(),
         history_start: OutputSequence::ZERO,
         next_output: OutputSequence::ZERO,
         master,
-        writer,
+        writes: PtyWriteQueue::spawn(writer),
         child_pid,
         process_group,
         foreground_process: ForegroundProcessInfo {
@@ -884,7 +1351,7 @@ fn cleanup_unpublished_child(
 }
 
 fn handle_client(stream: UnixStream, server: SharedServer) -> io::Result<()> {
-    verify_peer_owner(&stream, "client")?;
+    verify_peer_is_self(&stream, "client")?;
     let (sender, receiver) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
     let client_id = server.lock().map_err(lock_error)?.allocate_client_id()?;
     let shutdown_handle = Arc::new(stream.try_clone()?);
@@ -900,13 +1367,11 @@ fn handle_client(stream: UnixStream, server: SharedServer) -> io::Result<()> {
     let writer_server = Arc::clone(&server);
     thread::spawn(move || {
         while let Ok(delivery) = receiver.recv() {
-            match delivery {
-                ClientDelivery::Message(message) => {
-                    if write_message(&mut writer_stream, &message).is_err() {
-                        break;
-                    }
-                }
-                ClientDelivery::Close => break,
+            let Some(message) = delivery_message(delivery) else {
+                break;
+            };
+            if write_message(&mut writer_stream, &message).is_err() {
+                break;
             }
         }
         active.store(false, Ordering::Release);
@@ -942,12 +1407,14 @@ fn handle_client_messages(
     } = message
     else {
         let _ = client.try_deliver(ServerMessage::Error {
+            code: RejectCode::ProtocolOrder,
             message: "expected protocol hello before other client messages".to_string(),
         });
         return Ok(());
     };
     if protocol_version != PROTOCOL_VERSION {
         let _ = client.try_deliver(ServerMessage::Error {
+            code: RejectCode::ProtocolMismatch,
             message: format!(
                 "client protocol version {protocol_version} is incompatible with server version {PROTOCOL_VERSION}; restart mult clients"
             ),
@@ -972,6 +1439,7 @@ fn handle_client_messages(
         match message {
             ClientMessage::Hello { .. } => {
                 let _ = client.try_deliver(ServerMessage::Error {
+                    code: RejectCode::ProtocolOrder,
                     message: "protocol hello may only be sent once per connection".to_string(),
                 });
                 break;
@@ -1011,9 +1479,6 @@ fn handle_client_messages(
                     LeaseOperation::Paste,
                 );
             }
-            ClientMessage::Scroll { .. }
-            | ClientMessage::ScrollToTop { .. }
-            | ClientMessage::ScrollToBottom { .. } => {}
             ClientMessage::Resize {
                 pane,
                 lease,
@@ -1076,6 +1541,7 @@ fn handle_create_request(
             let response = ServerMessage::CreateResult {
                 request_id: *request_id,
                 outcome: CreateOutcome::Error(CreateError::Failed {
+                    code: RejectCode::TooManyPendingRequests,
                     message: "too many pending requests".to_string(),
                 }),
             };
@@ -1141,7 +1607,9 @@ fn handle_create_request(
             Ok(pane) => CreateOutcome::Created {
                 session: pane.lock().map_err(lock_error)?.session_info(),
             },
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            // The code, not an `io::ErrorKind`, decides whether this was a
+            // collision worth re-resolving into a structured "already exists".
+            Err(error) if error.code == RejectCode::SessionAlreadyExists => {
                 let numeric = requested_id.and_then(|id| {
                     server
                         .lock()
@@ -1169,14 +1637,10 @@ fn handle_create_request(
                         session: pane.lock().map_err(lock_error)?.session_info(),
                     })
                 } else {
-                    CreateOutcome::Error(CreateError::Failed {
-                        message: error.to_string(),
-                    })
+                    CreateOutcome::Error(error.into_create_error())
                 }
             }
-            Err(error) => CreateOutcome::Error(CreateError::Failed {
-                message: error.to_string(),
-            }),
+            Err(error) => CreateOutcome::Error(error.into_create_error()),
         }
     };
     let response = ServerMessage::CreateResult {
@@ -1237,16 +1701,21 @@ fn handle_attach_request(
     client: &ClientHandle,
     request: ClientMessage,
 ) -> io::Result<()> {
-    handle_attach_request_with_hook(server, scope, resumed, client, request, || {})
+    handle_attach_request_with_hooks(server, scope, resumed, client, request, || {}, || {})
 }
 
-fn handle_attach_request_with_hook(
+/// `before_commit` runs at the attach/shutdown linearization boundary;
+/// `before_replay` runs once the server lock has been released but while the
+/// pane barrier is still held, which is exactly the state lock rule L4
+/// requires. Both are no-ops in production.
+fn handle_attach_request_with_hooks(
     server: &SharedServer,
     scope: ClientScopeId,
     resumed: bool,
     client: &ClientHandle,
     request: ClientMessage,
     before_commit: impl FnOnce(),
+    before_replay: impl FnOnce(),
 ) -> io::Result<()> {
     let ClientMessage::Attach {
         request_id,
@@ -1280,6 +1749,7 @@ fn handle_attach_request_with_hook(
             let response = ServerMessage::AttachResult {
                 request_id: *request_id,
                 outcome: AttachOutcome::Error(AttachError::Failed {
+                    code: RejectCode::TooManyPendingRequests,
                     message: "too many pending requests".to_string(),
                 }),
             };
@@ -1311,6 +1781,7 @@ fn handle_attach_request_with_hook(
         let response = ServerMessage::AttachResult {
             request_id: *request_id,
             outcome: AttachOutcome::Error(AttachError::Failed {
+                code: RejectCode::ShuttingDown,
                 message: SHUTDOWN_ERROR_MESSAGE.to_string(),
             }),
         };
@@ -1404,6 +1875,7 @@ fn handle_attach_request_with_hook(
                     client,
                     *request_id,
                     AttachError::Failed {
+                        code: RejectCode::DaemonInternal,
                         message: error.to_string(),
                     },
                 );
@@ -1432,16 +1904,22 @@ fn handle_attach_request_with_hook(
             },
         };
         let foreground = pane_state.refresh_foreground_process();
-        if !deliver_attach_transaction(
+        // Lock rule L4: the replay below keeps the pane barrier but must not
+        // keep the global lock.
+        drop(state);
+        before_replay();
+        // An overflowed transaction leaves the attachment unreconciled, which
+        // the client already handles by re-attaching. It must not disconnect
+        // the connection it has just attached — that turned one full queue into
+        // a reconnect loop.
+        let _ = deliver_attach_transaction(
             client,
             &response,
             *request_id,
             lease,
             &pane_state,
             &foreground,
-        ) {
-            client.disconnect();
-        }
+        );
         return Ok(());
     }
 
@@ -1450,6 +1928,7 @@ fn handle_attach_request_with_hook(
             let response = ServerMessage::AttachResult {
                 request_id: *request_id,
                 outcome: AttachOutcome::Error(AttachError::Failed {
+                    code: RejectCode::DaemonInternal,
                     message: error.to_string(),
                 }),
             };
@@ -1462,12 +1941,10 @@ fn handle_attach_request_with_hook(
     }
     let lease = match state.allocate_lease() {
         Ok(lease) => lease,
-        Err(error) => {
+        Err(rejection) => {
             let response = ServerMessage::AttachResult {
                 request_id: *request_id,
-                outcome: AttachOutcome::Error(AttachError::Failed {
-                    message: error.to_string(),
-                }),
+                outcome: AttachOutcome::Error(rejection.into_attach_error()),
             };
             let waiters = state.complete_request(key, response.clone());
             drop(pane_state);
@@ -1508,6 +1985,11 @@ fn handle_attach_request_with_hook(
         client: selected_owner.clone(),
     });
     let foreground = pane_state.refresh_foreground_process();
+    // Lock rule L4: hand the global lock back before replay. Replay still holds
+    // the pane barrier, so ordering against live output is unchanged, but an
+    // attach to a busy pane no longer serializes every other pane and client.
+    drop(state);
+    before_replay();
     for waiter in waiters {
         let accepted = deliver_attach_transaction(
             &waiter,
@@ -1517,9 +1999,11 @@ fn handle_attach_request_with_hook(
             &pane_state,
             &foreground,
         );
-        if !accepted {
-            waiter.disconnect();
-        } else if waiter.id != selected_owner.id {
+        // A transaction that overflowed the waiter's queue is abandoned, not
+        // punished: the client re-attaches once its writer thread has caught
+        // up. Disconnecting here made a momentarily-behind client reconnect in
+        // a loop, and it tore down that connection's other panes too.
+        if accepted && waiter.id != selected_owner.id {
             let _ = waiter.try_deliver(ServerMessage::TakenOver {
                 pane: pane_state.pane,
                 lease,
@@ -1570,18 +2054,22 @@ fn deliver_attach_transaction_with_hook(
         after_replay_begin();
     }
     let mut sequence = pane.history_start;
-    for chunk in pane.raw_history.chunks(RAW_HISTORY_CHUNK_BYTES) {
+    // The chunks are the pane's own retained history, refcounted. A queued
+    // replay therefore costs one pointer per chunk rather than a second copy of
+    // everything the pane is holding.
+    for chunk in pane.raw_history.replay_chunks() {
         if !accepted {
             break;
         }
-        accepted = client.try_deliver(ServerMessage::ReplayChunk {
+        let length = chunk.len();
+        accepted = client.try_enqueue(ClientDelivery::Replay {
             request_id,
             pane: pane.pane,
             lease,
             sequence,
-            bytes: chunk.to_vec(),
+            bytes: chunk,
         });
-        let Some(next) = sequence.checked_add_bytes(chunk.len()) else {
+        let Some(next) = sequence.checked_add_bytes(length) else {
             return false;
         };
         sequence = next;
@@ -1621,6 +2109,14 @@ fn deliver_attach_error(
     Ok(())
 }
 
+/// Routes `Input`/`Paste` to a pane's PTY.
+///
+/// Lock rule L3 is the whole point of the shape here: the server and pane
+/// mutexes cover only the O(1) lease validation — which keeps validation
+/// linearized against shutdown and takeover exactly as before — and are both
+/// released before a single byte is handed to the pane's writer thread. The
+/// blocking `write_all`/`flush` used to run under both, so a child that stopped
+/// reading its stdin froze every pane and every client in the daemon.
 fn handle_leased_input(
     server: &SharedServer,
     scope: ClientScopeId,
@@ -1630,41 +2126,67 @@ fn handle_leased_input(
     bytes: Vec<u8>,
     operation: LeaseOperation,
 ) {
-    let state = match server.lock() {
-        Ok(state) => state,
-        Err(_) => return,
+    let (writes, pane, scheduled) = {
+        let state = match server.lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        let Some(pane) = state.pane_by_id(pane_id) else {
+            drop(state);
+            reject_lease(
+                client,
+                pane_id,
+                lease,
+                operation,
+                LeaseRejectionReason::PaneMissing,
+            );
+            return;
+        };
+        let pane_state = match pane.lock() {
+            Ok(pane_state) => pane_state,
+            Err(_) => return,
+        };
+        if let Err(reason) =
+            pane_state.validate_mutation_lease(state.shutting_down, scope, client.id, lease)
+        {
+            drop(pane_state);
+            drop(state);
+            reject_lease(client, pane_id, lease, operation, reason);
+            return;
+        }
+        // Ordinary mutations never change the connection binding. Only a fresh
+        // attach or an exact cached attach on a resumed scope may do that.
+        let writes = Arc::clone(&pane_state.writes);
+        let scheduled = Arc::clone(&pane_state.foreground_poll_scheduled);
+        drop(pane_state);
+        (writes, pane, scheduled)
     };
-    let Some(pane) = state.pane_by_id(pane_id) else {
+
+    let schedule = input_may_change_foreground(&bytes);
+    if let Err(refusal) = writes.enqueue(bytes) {
+        // The bytes were definitely not delivered, so say so. `LeaseRejected`
+        // is the pane-scoped refusal channel: it does not close the connection,
+        // and the client treats it as conclusive rather than assuming the
+        // keystrokes landed. Protocol 11 gives this its own reason: reusing
+        // `NotOwner` (which `validate_mutation_lease` returns for shutdown and
+        // for a stopping pane) made a wedged child indistinguishable from a
+        // lost lease, and a client that tears down its attachment on `NotOwner`
+        // did the wrong thing for a queue that will drain (F8).
+        eprintln!(
+            "refusing PTY input for pane {}: writer queue {refusal:?}",
+            pane_id.0
+        );
         reject_lease(
             client,
             pane_id,
             lease,
             operation,
-            LeaseRejectionReason::PaneMissing,
+            LeaseRejectionReason::WriteRefused,
         );
         return;
-    };
-    let pane_state = match pane.lock() {
-        Ok(pane) => pane,
-        Err(_) => return,
-    };
-    if let Err(reason) =
-        pane_state.validate_mutation_lease(state.shutting_down, scope, client.id, lease)
-    {
-        reject_lease(client, pane_id, lease, operation, reason);
-        return;
     }
-    if let Err(error) = write_pty_input(&pane_state.writer, &bytes) {
-        eprintln!("failed to write PTY input for pane {}: {error}", pane_id.0);
-        return;
-    }
-    // Ordinary mutations never change the connection binding. Only a fresh
-    // attach or an exact cached attach on a resumed scope may do that.
-    let schedule = input_may_change_foreground(&bytes);
-    drop(pane_state);
-    drop(state);
     if schedule {
-        schedule_foreground_process_poll(pane);
+        schedule_foreground_process_poll(pane, scheduled);
     }
 }
 
@@ -1790,6 +2312,7 @@ fn handle_stop_request(
             let response = ServerMessage::StopResult {
                 request_id: *request_id,
                 outcome: StopOutcome::Error(StopError::Failed {
+                    code: RejectCode::TooManyPendingRequests,
                     message: "too many pending requests".to_string(),
                 }),
             };
@@ -1910,6 +2433,7 @@ fn handle_agent_status_request(
                 ServerMessage::AgentStatusResult {
                     request_id,
                     outcome: AgentStatusOutcome::Error(AgentStatusError::Failed {
+                        code: RejectCode::TooManyPendingRequests,
                         message: "too many pending requests".to_string(),
                     }),
                 },
@@ -2094,7 +2618,7 @@ fn is_client_disconnect(error: &io::Error) -> bool {
     )
 }
 
-fn create_session(server: &SharedServer, spec: SessionCreateSpec) -> io::Result<SharedPane> {
+fn create_session(server: &SharedServer, spec: SessionCreateSpec) -> Result<SharedPane, Rejection> {
     create_session_with_spawner(server, spec, spawn_pane)
 }
 
@@ -2102,19 +2626,21 @@ fn create_session_with_spawner(
     server: &SharedServer,
     spec: SessionCreateSpec,
     spawn: impl FnOnce(SessionId, PaneSpawnSpec) -> io::Result<SpawnedPane>,
-) -> io::Result<SharedPane> {
+) -> Result<SharedPane, Rejection> {
     let identity = spec.pane.identity;
     let session = {
         let mut state = server.lock().map_err(lock_error)?;
         state.reserve_session(spec.requested_id, identity)?
     };
+    // Spawning is the one step here that is genuine I/O; everything it can
+    // report is a failure to launch the child, so it classifies as one.
     let mut spawned = match spawn(session, spec.pane) {
         Ok(spawned) => spawned,
         Err(error) => {
             if let Ok(mut state) = server.lock() {
                 state.release_session_reservation(session, identity);
             }
-            return Err(error);
+            return Err(Rejection::new(RejectCode::LaunchFailed, error.to_string()));
         }
     };
 
@@ -2124,10 +2650,12 @@ fn create_session_with_spawner(
             .map_err(lock_error)?
             .publish_reserved_session(session, Arc::clone(&spawned.pane));
         if let Err(error) = publish {
-            cleanup_unpublished_child(
-                &mut spawned.child,
-                spawned.pane.lock().ok().map(|pane| pane.process_group),
-            );
+            let unpublished = spawned.pane.lock().ok().map(|pane| {
+                // Retire the writer thread with the child it would have fed.
+                pane.writes.close();
+                pane.process_group
+            });
+            cleanup_unpublished_child(&mut spawned.child, unpublished);
             if let Ok(mut state) = server.lock() {
                 state.release_session_reservation(session, identity);
             }
@@ -2145,18 +2673,27 @@ fn create_session_with_spawner(
 
 fn spawn_reader(mut reader: Box<dyn Read + Send>, pane: SharedPane, server: SharedServer) {
     thread::spawn(move || {
+        let Some(scheduled) = pane
+            .lock()
+            .ok()
+            .map(|pane_state| Arc::clone(&pane_state.foreground_poll_scheduled))
+        else {
+            return;
+        };
         let mut buffer = [0; 8192];
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(n) => {
-                    let bytes = buffer[..n].to_vec();
-                    if let Err(error) = publish_pty_output(&pane, bytes) {
+                Ok(n) => match handle_pty_read(&pane, &scheduled, Arc::from(&buffer[..n])) {
+                    Ok(true) => {
+                        start_foreground_process_poll(Arc::clone(&pane), Arc::clone(&scheduled))
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
                         eprintln!("failed to sequence PTY output: {error}");
                         break;
                     }
-                    broadcast_foreground_process_if_changed(&pane);
-                }
+                },
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
                     eprintln!("failed to read PTY output: {error}");
@@ -2172,13 +2709,30 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, pane: SharedPane, server: Shar
     });
 }
 
-fn publish_pty_output(pane: &SharedPane, bytes: Vec<u8>) -> io::Result<()> {
+/// Publishes one PTY read and reports whether it newly claimed the debounced
+/// foreground-process poll.
+///
+/// The reader used to call `broadcast_foreground_process_if_changed` after
+/// **every** 8 KiB read: a pane lock, a master lock, a `tcgetpgrp` ioctl and a
+/// `/proc/<pid>/cmdline` read per read, on a path that runs at whatever rate
+/// the child produces output. It now shares the same debounced poll the input
+/// path already used, so a chatty pane probes at most once per debounce window.
+fn handle_pty_read(
+    pane: &SharedPane,
+    scheduled: &AtomicBool,
+    bytes: Arc<[u8]>,
+) -> io::Result<bool> {
+    publish_pty_output(pane, bytes)?;
+    Ok(claim_foreground_process_poll(scheduled))
+}
+
+fn publish_pty_output(pane: &SharedPane, bytes: Arc<[u8]>) -> io::Result<()> {
     publish_pty_output_with_hook(pane, bytes, || {})
 }
 
 fn publish_pty_output_with_hook(
     pane: &SharedPane,
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
     before_pane_lock: impl FnOnce(),
 ) -> io::Result<()> {
     // The test hook makes contention against the same pane barrier observable
@@ -2187,7 +2741,10 @@ fn publish_pty_output_with_hook(
     let mut pane_state = pane.lock().map_err(lock_error)?;
     let sequence = pane_state.append_raw_history(&bytes)?;
     if let Some(owner) = pane_state.owner.clone() {
-        if !owner.client.try_deliver(ServerMessage::PtyOutput {
+        // The retained history chunk and the queued frame are the same
+        // allocation, so a backed-up client no longer doubles the pane's
+        // resident output.
+        if !owner.client.try_enqueue(ClientDelivery::Output {
             pane: pane_state.pane,
             lease: owner.lease,
             sequence,
@@ -2220,6 +2777,7 @@ fn spawn_waiter(mut child: Box<dyn Child + Send + Sync>, pane: SharedPane, serve
                 fail_pending_stops(
                     &server,
                     &pane,
+                    RejectCode::DaemonInternal,
                     format!("failed to wait for PTY child: {message}"),
                 );
                 let signal = pane
@@ -2272,6 +2830,9 @@ fn maybe_finalize(server: &SharedServer, pane: &SharedPane) {
         state.remove_session_if_same(session, pane);
         pane_state.lifecycle = PaneLifecycle::Removed;
         pane_state.stop_driver_active = false;
+        // Retire the writer thread with the pane. `close` only touches the
+        // queue's own leaf mutex, so it is safe under the pane lock.
+        pane_state.writes.close();
         let owner = pane_state.owner.take();
         let pending = std::mem::take(&mut pane_state.pending_stops);
         pane_state.notify_lifecycle();
@@ -2355,7 +2916,7 @@ fn start_stop_if_needed(server: SharedServer, pane: SharedPane) {
             }
             pane_state.notify_lifecycle();
         }
-        fail_pending_stops(&server, &pane, message);
+        fail_pending_stops(&server, &pane, RejectCode::DaemonInternal, message);
     });
 }
 
@@ -2436,7 +2997,11 @@ fn wait_for_finalization(pane: &SharedPane, timeout: Duration) -> bool {
     }
 }
 
-fn fail_pending_stops(server: &SharedServer, pane: &SharedPane, message: String) {
+/// Completes every stop still awaiting this pane with the same failure.
+///
+/// `code` is the classification the client switches on; `message` says which
+/// step of termination failed and is diagnostic only.
+fn fail_pending_stops(server: &SharedServer, pane: &SharedPane, code: RejectCode, message: String) {
     let deliveries = {
         let mut state = match server.lock() {
             Ok(state) => state,
@@ -2453,6 +3018,7 @@ fn fail_pending_stops(server: &SharedServer, pane: &SharedPane, message: String)
                 let response = ServerMessage::StopResult {
                     request_id: key.request_id,
                     outcome: StopOutcome::Error(StopError::Failed {
+                        code,
                         message: message.clone(),
                     }),
                 };
@@ -2535,14 +3101,19 @@ fn deliver_foreground_process(pane: &PaneState, process: ForegroundProcessInfo) 
     }
 }
 
-fn schedule_foreground_process_poll(pane: SharedPane) {
-    let scheduled = match pane.lock() {
-        Ok(pane) => Arc::clone(&pane.foreground_poll_scheduled),
-        Err(_) => return,
-    };
-    if scheduled.swap(true, Ordering::AcqRel) {
-        return;
+/// Claims the debounce slot, returning whether this caller now owns a poll.
+fn claim_foreground_process_poll(scheduled: &AtomicBool) -> bool {
+    !scheduled.swap(true, Ordering::AcqRel)
+}
+
+fn schedule_foreground_process_poll(pane: SharedPane, scheduled: Arc<AtomicBool>) {
+    if claim_foreground_process_poll(&scheduled) {
+        start_foreground_process_poll(pane, scheduled);
     }
+}
+
+/// Runs the debounced poll. The caller must already own the debounce slot.
+fn start_foreground_process_poll(pane: SharedPane, scheduled: Arc<AtomicBool>) {
     thread::spawn(move || {
         for delay in [
             Duration::from_millis(25),
@@ -2671,13 +3242,18 @@ impl PaneState {
         Ok(())
     }
 
-    fn append_raw_history(&mut self, bytes: &[u8]) -> io::Result<OutputSequence> {
+    fn append_raw_history(&mut self, bytes: &Arc<[u8]>) -> io::Result<OutputSequence> {
         self.append_raw_history_with_limit(bytes, RAW_HISTORY_MAX_BYTES)
     }
 
+    /// Appends one PTY read to the retained history and advances the sequence
+    /// counters.
+    ///
+    /// Trimming is O(bytes dropped), not O(history): `RawHistory` releases whole
+    /// chunks instead of memmoving the retained suffix down a flat `Vec`.
     fn append_raw_history_with_limit(
         &mut self,
-        bytes: &[u8],
+        bytes: &Arc<[u8]>,
         limit: usize,
     ) -> io::Result<OutputSequence> {
         let sequence = self.next_output;
@@ -2685,13 +3261,11 @@ impl PaneState {
             .next_output
             .checked_add_bytes(bytes.len())
             .ok_or_else(|| io::Error::other("PTY output sequence exhausted"))?;
-        self.raw_history.extend_from_slice(bytes);
-        let overflow = self.raw_history.len().saturating_sub(limit);
-        if overflow > 0 {
-            self.raw_history.drain(..overflow);
+        let dropped = self.raw_history.append(bytes, limit);
+        if dropped > 0 {
             self.history_start = self
                 .history_start
-                .checked_add_bytes(overflow)
+                .checked_add_bytes(dropped)
                 .ok_or_else(|| io::Error::other("PTY history sequence exhausted"))?;
         }
         Ok(sequence)
@@ -2707,7 +3281,9 @@ impl PaneState {
 }
 
 fn bounded_pty_dimensions(rows: u16, cols: u16) -> (u16, u16) {
-    bounded_screen_dimensions(rows.max(1), cols.max(1))
+    // `bounded_screen_dimensions` owns both ends of the range, including the
+    // emulator floor a zero used to fall through (A13).
+    bounded_screen_dimensions(rows, cols)
 }
 
 fn command_line_for_pid(pid: u32) -> Option<String> {
@@ -2732,36 +3308,10 @@ fn command_line_from_cmdline_bytes(bytes: &[u8]) -> Option<String> {
     }
     Some(
         args.into_iter()
-            .map(shell_display_arg)
+            .map(|arg| quote_display_argument(&arg))
             .collect::<Vec<_>>()
             .join(" "),
     )
-}
-
-fn shell_display_arg(arg: String) -> String {
-    if arg
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '='))
-    {
-        arg
-    } else {
-        format!("'{}'", arg.replace('\'', "'\\''"))
-    }
-}
-
-fn write_pty_input(writer: &SharedPtyWriter, bytes: &[u8]) -> io::Result<()> {
-    let mut writer = writer
-        .lock()
-        .map_err(|_| io::Error::other("PTY writer lock poisoned"))?;
-    writer.write_all(bytes)?;
-    writer.flush()
-}
-
-fn shell_command_args(command: String) -> Vec<String> {
-    // TerminalLaunch::Command and both chat-agent commands are intentionally
-    // evaluated by the login shell. Keep this distinct from MULT_AGENT_CMD's
-    // client-side argv parser.
-    vec!["-lc".to_string(), command]
 }
 
 fn pane_title(shell: &str, launch: &LaunchSpec) -> String {
@@ -2769,10 +3319,6 @@ fn pane_title(shell: &str, launch: &LaunchSpec) -> String {
         LaunchSpec::Shell => shell.to_string(),
         LaunchSpec::Command(command) => command.clone(),
     }
-}
-
-fn default_shell() -> String {
-    env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
 
 fn lock_error<T>(_: std::sync::PoisonError<T>) -> io::Error {
@@ -2790,12 +3336,20 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use mult_protocol::{MIN_SCREEN_COLS, MIN_SCREEN_ROWS};
+
     use super::*;
 
     const TEST_IO_TIMEOUT: Duration = Duration::from_secs(2);
 
     fn request_id(value: u64) -> RequestId {
         RequestId::new(value).expect("non-zero request ID")
+    }
+
+    /// One PTY read's worth of bytes, in the refcounted shape the reader
+    /// thread produces.
+    fn shared(bytes: &[u8]) -> Arc<[u8]> {
+        Arc::from(bytes)
     }
 
     struct TestClientReceiver(mpsc::Receiver<ClientDelivery>);
@@ -2815,17 +3369,21 @@ mod tests {
 
     impl TestClientReceiver {
         fn recv_timeout(&self, timeout: Duration) -> Result<ServerMessage, mpsc::RecvTimeoutError> {
-            match self.0.recv_timeout(timeout)? {
-                ClientDelivery::Message(message) => Ok(message),
-                ClientDelivery::Close => Err(mpsc::RecvTimeoutError::Disconnected),
-            }
+            // Decode exactly as the client's writer thread would, so tests see
+            // the wire messages rather than the queue's internal shape.
+            delivery_message(self.0.recv_timeout(timeout)?)
+                .ok_or(mpsc::RecvTimeoutError::Disconnected)
+        }
+
+        fn recv_delivery_timeout(
+            &self,
+            timeout: Duration,
+        ) -> Result<ClientDelivery, mpsc::RecvTimeoutError> {
+            self.0.recv_timeout(timeout)
         }
 
         fn try_recv(&self) -> Result<ServerMessage, mpsc::TryRecvError> {
-            match self.0.try_recv()? {
-                ClientDelivery::Message(message) => Ok(message),
-                ClientDelivery::Close => Err(mpsc::TryRecvError::Disconnected),
-            }
+            delivery_message(self.0.try_recv()?).ok_or(mpsc::TryRecvError::Disconnected)
         }
     }
 
@@ -2954,7 +3512,7 @@ mod tests {
     #[test]
     fn peer_owner_check_accepts_same_user_socket_pair() {
         let (client, _server) = UnixStream::pair().expect("socket pair");
-        verify_peer_owner(&client, "test client").expect("same uid peer");
+        verify_peer_is_self(&client, "test client").expect("same uid peer");
     }
 
     #[test]
@@ -3033,8 +3591,8 @@ mod tests {
             server
                 .reserve_session(Some(SessionId(1)), test_identity())
                 .unwrap_err()
-                .kind(),
-            io::ErrorKind::AlreadyExists
+                .code,
+            RejectCode::SessionAlreadyExists
         );
         server.release_session_reservation(SessionId(1), test_identity());
         assert!(server.reserved_sessions.is_empty());
@@ -3093,13 +3651,14 @@ mod tests {
         let (client, receiver) = test_client(1);
         let shutdown_server = Arc::clone(&server);
 
-        handle_attach_request_with_hook(
+        handle_attach_request_with_hooks(
             &server,
             scope,
             false,
             &client,
             request.clone(),
             move || shutdown_server.lock().unwrap().shutting_down = true,
+            || {},
         )
         .unwrap();
         let first = receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap();
@@ -3107,8 +3666,10 @@ mod tests {
             &first,
             ServerMessage::AttachResult {
                 request_id: received,
-                outcome: AttachOutcome::Error(AttachError::Failed { message }),
-            } if *received == request_id && message == SHUTDOWN_ERROR_MESSAGE
+                outcome: AttachOutcome::Error(AttachError::Failed { code, message }),
+            } if *received == request_id
+                && *code == RejectCode::ShuttingDown
+                && message == SHUTDOWN_ERROR_MESSAGE
         ));
         {
             let pane_state = pane.lock().unwrap();
@@ -3147,13 +3708,14 @@ mod tests {
         let (new_client, new_receiver) = test_client(2);
         let shutdown_server = Arc::clone(&server);
 
-        handle_attach_request_with_hook(
+        handle_attach_request_with_hooks(
             &server,
             new_scope,
             false,
             &new_client,
             attach_request(request_id, 9, 11),
             move || shutdown_server.lock().unwrap().shutting_down = true,
+            || {},
         )
         .unwrap();
 
@@ -3161,8 +3723,10 @@ mod tests {
             new_receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
             ServerMessage::AttachResult {
                 request_id: received,
-                outcome: AttachOutcome::Error(AttachError::Failed { ref message }),
-            } if received == request_id && message == SHUTDOWN_ERROR_MESSAGE
+                outcome: AttachOutcome::Error(AttachError::Failed { code, ref message }),
+            } if received == request_id
+                && code == RejectCode::ShuttingDown
+                && message == SHUTDOWN_ERROR_MESSAGE
         ));
         let pane_state = pane.lock().unwrap();
         assert_eq!((pane_state.rows, pane_state.cols), (1, 1));
@@ -3198,8 +3762,10 @@ mod tests {
             replacement_receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
             ServerMessage::AttachResult {
                 request_id: received,
-                outcome: AttachOutcome::Error(AttachError::Failed { ref message }),
-            } if received == request_id && message == SHUTDOWN_ERROR_MESSAGE
+                outcome: AttachOutcome::Error(AttachError::Failed { code, ref message }),
+            } if received == request_id
+                && code == RejectCode::ShuttingDown
+                && message == SHUTDOWN_ERROR_MESSAGE
         ));
         assert!(pane.lock().unwrap().owner.as_ref().is_some_and(|owner| {
             owner.scope == scope && owner.lease == lease && owner.client.id == first.id
@@ -3224,6 +3790,7 @@ mod tests {
         let response = ServerMessage::CreateResult {
             request_id: id,
             outcome: CreateOutcome::Error(CreateError::Failed {
+                code: RejectCode::DaemonInternal,
                 message: "injected".to_string(),
             }),
         };
@@ -3392,6 +3959,7 @@ mod tests {
         let response = ServerMessage::CreateResult {
             request_id: rejected_id,
             outcome: CreateOutcome::Error(CreateError::Failed {
+                code: RejectCode::TooManyPendingRequests,
                 message: "too many pending requests".to_string(),
             }),
         };
@@ -3432,14 +4000,16 @@ mod tests {
     fn history_offsets_report_the_exact_retained_suffix() {
         let mut pane = test_pane_state(None);
         assert_eq!(
-            pane.append_raw_history_with_limit(b"012345", 10).unwrap(),
+            pane.append_raw_history_with_limit(&shared(b"012345"), 10)
+                .unwrap(),
             OutputSequence::ZERO
         );
         assert_eq!(
-            pane.append_raw_history_with_limit(b"6789ABCD", 10).unwrap(),
+            pane.append_raw_history_with_limit(&shared(b"6789ABCD"), 10)
+                .unwrap(),
             OutputSequence::new(6)
         );
-        assert_eq!(pane.raw_history, b"456789ABCD");
+        assert_eq!(pane.raw_history.to_vec(), b"456789ABCD");
         assert_eq!(pane.history_start, OutputSequence::new(4));
         assert_eq!(pane.next_output, OutputSequence::new(14));
     }
@@ -3540,9 +4110,13 @@ mod tests {
             assert!(matches!(
                 receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
                 ServerMessage::AttachResult {
-                    outcome: AttachOutcome::Error(AttachError::Failed { ref message }),
+                    // F8: the *code* is what the client keys off. This used to
+                    // assert on a substring of the daemon's prose, which is
+                    // exactly the coupling that made rewording a message a
+                    // silent behaviour change.
+                    outcome: AttachOutcome::Error(AttachError::Failed { code, .. }),
                     ..
-                } if message.contains("lease space exhausted")
+                } if code == RejectCode::ResourceExhausted
             ));
         }
     }
@@ -3552,9 +4126,10 @@ mod tests {
         let server = Arc::new(Mutex::new(ServerState::default()));
         let scope = server.lock().unwrap().allocate_scope().unwrap();
         let pane = Arc::new(Mutex::new(test_pane_state(None)));
-        let written = Arc::new(Mutex::new(Vec::new()));
-        pane.lock().unwrap().writer =
-            Arc::new(Mutex::new(Box::new(RecordingWriter(Arc::clone(&written)))));
+        // A queue with no writer thread: whatever a rejected mutation would
+        // have written stays observable instead of vanishing into a PTY.
+        let writes = PtyWriteQueue::with_capacity(PTY_WRITE_QUEUE_MAX_BYTES);
+        pane.lock().unwrap().writes = Arc::clone(&writes);
         server
             .lock()
             .unwrap()
@@ -3568,7 +4143,7 @@ mod tests {
         let lease = receive_empty_attach_transaction(&first_receiver, request_id);
         fill_client_queue(&first, 8);
 
-        publish_pty_output(&pane, b"delivery-failed-but-retained".to_vec()).unwrap();
+        publish_pty_output(&pane, shared(b"delivery-failed-but-retained")).unwrap();
 
         assert!(!first.is_active());
         {
@@ -3646,7 +4221,7 @@ mod tests {
                 ..
             } if received == request_id
                 && received_lease == lease
-                && bytes == b"delivery-failed-but-retained"
+                && bytes.as_ref() == b"delivery-failed-but-retained"
         ));
         assert!(matches!(
             resumed_receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
@@ -3720,8 +4295,14 @@ mod tests {
             } if received == stale_stop_request_id
         ));
         let pane_state = pane.lock().unwrap();
-        assert!(written.lock().unwrap().is_empty());
-        assert_eq!((pane_state.rows, pane_state.cols), (1, 1));
+        assert_eq!(writes.queued_bytes(), 0, "no rejected byte reached the PTY");
+        // The stale resize was rejected, so the pane keeps the size its attach
+        // established: 1×1 raised to the emulator floor by
+        // `bounded_pty_dimensions` (A13).
+        assert_eq!(
+            (pane_state.rows, pane_state.cols),
+            (MIN_SCREEN_ROWS, MIN_SCREEN_COLS)
+        );
         assert_eq!(pane_state.lifecycle, PaneLifecycle::Running);
         assert!(pane_state.pending_stops.is_empty());
         assert!(pane_state.owner.as_ref().is_some_and(|owner| {
@@ -3809,7 +4390,11 @@ mod tests {
             } if received == request_id && received_lease == lease
         ));
         assert!(first_receiver.try_recv().is_err());
-        assert!(!first.is_active());
+        assert!(
+            first.is_active(),
+            "an overflowed attach transaction leaves the attachment unreconciled; \
+             disconnecting the connection it just attached produced a reconnect loop"
+        );
         assert!(pane.lock().unwrap().owner.as_ref().is_some_and(|owner| {
             owner.scope == scope && owner.lease == lease && owner.client.id == first.id
         }));
@@ -3894,7 +4479,7 @@ mod tests {
         let expected_bytes = (0..64).flat_map(&record).collect::<Vec<_>>();
         pane.lock()
             .unwrap()
-            .append_raw_history(&replay_bytes)
+            .append_raw_history(&shared(&replay_bytes))
             .unwrap();
         let response = ServerMessage::AttachResult {
             request_id,
@@ -3910,7 +4495,7 @@ mod tests {
         let barrier_probe = Arc::clone(&pane);
         let producer = thread::spawn(move || {
             start_receiver.recv().unwrap();
-            publish_pty_output_with_hook(&producer_pane, record(32), || {
+            publish_pty_output_with_hook(&producer_pane, shared(&record(32)), || {
                 assert!(matches!(
                     barrier_probe.try_lock(),
                     Err(std::sync::TryLockError::WouldBlock)
@@ -3919,7 +4504,7 @@ mod tests {
             })
             .unwrap();
             for number in 33..64 {
-                publish_pty_output(&producer_pane, record(number)).unwrap();
+                publish_pty_output(&producer_pane, shared(&record(number))).unwrap();
             }
         });
 
@@ -3969,7 +4554,7 @@ mod tests {
             } if received == request_id && received_lease == lease => bytes,
             message => panic!("unexpected replay message: {message:?}"),
         };
-        assert_eq!(replay, replay_bytes);
+        assert_eq!(replay.as_ref(), replay_bytes.as_slice());
         assert!(matches!(
             receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
             ServerMessage::ReplayEnd {
@@ -3988,7 +4573,7 @@ mod tests {
             } if received_lease == lease
         ));
 
-        let mut combined = replay;
+        let mut combined = replay.to_vec();
         let mut expected_sequence = replay_watermark;
         for number in 32..64 {
             match receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap() {
@@ -3998,7 +4583,7 @@ mod tests {
                     sequence,
                     bytes,
                 } if received_lease == lease && sequence == expected_sequence => {
-                    assert_eq!(bytes, record(number));
+                    assert_eq!(bytes.as_ref(), record(number).as_slice());
                     expected_sequence = expected_sequence.checked_add_bytes(bytes.len()).unwrap();
                     combined.extend_from_slice(&bytes);
                 }
@@ -4328,6 +4913,690 @@ mod tests {
         );
     }
 
+    fn attached_pane(
+        server: &SharedServer,
+        scope: ClientScopeId,
+        client: &ClientHandle,
+        lease: AttachmentLease,
+    ) -> SharedPane {
+        let pane = Arc::new(Mutex::new(test_pane_state(Some(AttachmentOwner {
+            scope,
+            lease,
+            client: client.clone(),
+        }))));
+        server
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(SessionId(1), Arc::clone(&pane));
+        pane
+    }
+
+    /// A2: a child that stops reading its stdin used to freeze the daemon,
+    /// because `write_all` + `flush` ran on the socket-reader thread with both
+    /// the server and pane mutex held.
+    #[test]
+    fn a_wedged_pty_write_holds_neither_the_server_nor_the_pane_lock() {
+        struct BlockingWriter {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+
+        impl Write for BlockingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let scope = server.lock().unwrap().allocate_scope().unwrap();
+        let lease = AttachmentLease::MIN;
+        let (client, receiver) = test_client(1);
+        let pane = attached_pane(&server, scope, &client, lease);
+        pane.lock().unwrap().writes = PtyWriteQueue::spawn(Box::new(BlockingWriter {
+            entered: entered_tx,
+            release: release_rx,
+        }));
+
+        // Run the handler off-thread so a regression fails this deadline rather
+        // than hanging the suite.
+        let (done_tx, done_rx) = mpsc::channel();
+        let input_server = Arc::clone(&server);
+        let input_client = client.clone();
+        thread::spawn(move || {
+            handle_leased_input(
+                &input_server,
+                scope,
+                &input_client,
+                PaneId(1),
+                lease,
+                b"wedge".to_vec(),
+                LeaseOperation::Input,
+            );
+            let _ = done_tx.send(());
+        });
+
+        done_rx
+            .recv_timeout(TEST_IO_TIMEOUT)
+            .expect("input returned without waiting for the PTY write");
+        entered_rx
+            .recv_timeout(TEST_IO_TIMEOUT)
+            .expect("the writer thread reached the blocking write");
+
+        // The PTY write is in flight and parked. The daemon must still be
+        // completely usable.
+        assert!(
+            server.try_lock().is_ok(),
+            "a wedged PTY write held the global server lock"
+        );
+        assert!(
+            pane.try_lock().is_ok(),
+            "a wedged PTY write held the pane lock"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "an accepted write is accepted"
+        );
+        let _ = release_tx.send(());
+    }
+
+    /// A2: the bounded queue refuses rather than dropping or blocking.
+    #[test]
+    fn a_full_pty_write_queue_refuses_instead_of_dropping_bytes() {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let scope = server.lock().unwrap().allocate_scope().unwrap();
+        let lease = AttachmentLease::MIN;
+        let (client, receiver) = test_client(1);
+        let pane = attached_pane(&server, scope, &client, lease);
+        // No writer thread: exactly a child that never reads its stdin.
+        let writes = PtyWriteQueue::with_capacity(8);
+        pane.lock().unwrap().writes = Arc::clone(&writes);
+
+        handle_leased_input(
+            &server,
+            scope,
+            &client,
+            PaneId(1),
+            lease,
+            b"12345678".to_vec(),
+            LeaseOperation::Input,
+        );
+        assert_eq!(writes.queued_bytes(), 8);
+        assert!(receiver.try_recv().is_err());
+
+        handle_leased_input(
+            &server,
+            scope,
+            &client,
+            PaneId(1),
+            lease,
+            b"9".to_vec(),
+            LeaseOperation::Paste,
+        );
+
+        assert_eq!(
+            writes.queued_bytes(),
+            8,
+            "a refused write is never partially accepted"
+        );
+        assert!(matches!(
+            receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::LeaseRejected {
+                pane: PaneId(1),
+                lease: rejected,
+                operation: LeaseOperation::Paste,
+                ..
+            } if rejected == lease
+        ));
+        assert!(
+            client.is_active(),
+            "a pane-scoped refusal never closes the connection"
+        );
+    }
+
+    #[test]
+    fn queued_pty_input_reaches_the_master_through_the_writer_thread() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let scope = server.lock().unwrap().allocate_scope().unwrap();
+        let lease = AttachmentLease::MIN;
+        let (client, _receiver) = test_client(1);
+        let pane = attached_pane(&server, scope, &client, lease);
+        pane.lock().unwrap().writes =
+            PtyWriteQueue::spawn(Box::new(RecordingWriter(Arc::clone(&written))));
+
+        handle_leased_input(
+            &server,
+            scope,
+            &client,
+            PaneId(1),
+            lease,
+            b"hello".to_vec(),
+            LeaseOperation::Input,
+        );
+
+        let deadline = Instant::now() + TEST_IO_TIMEOUT;
+        while written.lock().unwrap().len() < 5 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(*written.lock().unwrap(), b"hello");
+    }
+
+    /// N1: an attach must not serialize the whole daemon, but must still hold
+    /// the pane barrier that orders replay against live output.
+    #[test]
+    fn attach_replay_releases_the_server_lock_and_keeps_the_pane_barrier() {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let scope = server.lock().unwrap().allocate_scope().unwrap();
+        let pane = Arc::new(Mutex::new(test_pane_state(None)));
+        pane.lock()
+            .unwrap()
+            .append_raw_history(&shared(b"scrollback"))
+            .unwrap();
+        server
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(SessionId(1), Arc::clone(&pane));
+        let request_id = request_id(1);
+        let (client, receiver) = test_client_with_capacity(1, 16);
+        let probe_server = Arc::clone(&server);
+        let probe_pane = Arc::clone(&pane);
+
+        handle_attach_request_with_hooks(
+            &server,
+            scope,
+            false,
+            &client,
+            attach_request(request_id, 1, 1),
+            || {},
+            move || {
+                assert!(
+                    probe_server.try_lock().is_ok(),
+                    "attach replay still held the global server lock"
+                );
+                assert!(
+                    matches!(
+                        probe_pane.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ),
+                    "attach replay must keep the pane barrier (docs/DAEMON.md, replay ordering)"
+                );
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::AttachResult {
+                outcome: AttachOutcome::Attached { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::ReplayBegin { .. }
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::ReplayChunk { ref bytes, .. } if bytes.as_ref() == b"scrollback"
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::ReplayEnd { .. }
+        ));
+    }
+
+    /// N1: an overflowed replay must leave the connection alive.
+    #[test]
+    fn replay_overflow_leaves_the_freshly_attached_client_connected() {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let scope = server.lock().unwrap().allocate_scope().unwrap();
+        let pane = Arc::new(Mutex::new(test_pane_state(None)));
+        for _ in 0..4 {
+            pane.lock()
+                .unwrap()
+                .append_raw_history(&shared(b"history"))
+                .unwrap();
+        }
+        server
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(SessionId(1), Arc::clone(&pane));
+        let request_id = request_id(1);
+        // Two slots cannot hold the acknowledgement, ReplayBegin, four chunks,
+        // ReplayEnd and the foreground frame.
+        let (client, receiver) = test_client_with_capacity(1, 2);
+
+        handle_attach_request(
+            &server,
+            scope,
+            false,
+            &client,
+            attach_request(request_id, 1, 1),
+        )
+        .unwrap();
+
+        assert!(
+            client.is_active(),
+            "the client that just attached must not be disconnected by its own replay"
+        );
+        assert!(matches!(
+            receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::AttachResult {
+                outcome: AttachOutcome::Attached { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::ReplayBegin { .. }
+        ));
+        assert!(
+            pane.lock().unwrap().owner.is_some(),
+            "the lease is retained so a fresh attach can reconcile"
+        );
+    }
+
+    /// N3: a queued replay must not make the pane's history resident twice.
+    #[test]
+    fn queued_replay_chunks_share_the_pane_history_instead_of_copying_it() {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let scope = server.lock().unwrap().allocate_scope().unwrap();
+        let pane = Arc::new(Mutex::new(test_pane_state(None)));
+        for value in 0..3_u8 {
+            pane.lock()
+                .unwrap()
+                .append_raw_history(&shared(&[value; 16]))
+                .unwrap();
+        }
+        let history = pane
+            .lock()
+            .unwrap()
+            .raw_history
+            .replay_chunks()
+            .iter()
+            .map(|chunk| chunk.as_ptr() as usize)
+            .collect::<Vec<_>>();
+        assert_eq!(history.len(), 3);
+        server
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(SessionId(1), Arc::clone(&pane));
+        let request_id = request_id(1);
+        let (client, receiver) = test_client_with_capacity(1, 16);
+
+        handle_attach_request(
+            &server,
+            scope,
+            false,
+            &client,
+            attach_request(request_id, 1, 1),
+        )
+        .unwrap();
+
+        let mut queued = Vec::new();
+        for _ in 0..7 {
+            if let ClientDelivery::Replay { bytes, .. } = receiver
+                .recv_delivery_timeout(TEST_IO_TIMEOUT)
+                .expect("attach transaction delivery")
+            {
+                queued.push(bytes.as_ptr() as usize);
+            }
+        }
+        assert_eq!(
+            queued, history,
+            "queued replay chunks must reference the pane's own retained chunks"
+        );
+    }
+
+    /// A9: a live frame shares the allocation the history retains.
+    #[test]
+    fn live_output_frames_share_the_retained_history_allocation() {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let scope = server.lock().unwrap().allocate_scope().unwrap();
+        let lease = AttachmentLease::MIN;
+        let (client, receiver) = test_client(1);
+        let pane = attached_pane(&server, scope, &client, lease);
+        let bytes = shared(b"once");
+
+        publish_pty_output(&pane, Arc::clone(&bytes)).unwrap();
+
+        match receiver
+            .recv_delivery_timeout(TEST_IO_TIMEOUT)
+            .expect("live output delivery")
+        {
+            ClientDelivery::Output { bytes: queued, .. } => assert_eq!(
+                queued.as_ptr(),
+                bytes.as_ptr(),
+                "a queued frame must not copy what the pane already retains"
+            ),
+            other => panic!("unexpected delivery: {other:?}"),
+        }
+        assert_eq!(
+            pane.lock().unwrap().raw_history.chunks[0].as_ptr(),
+            bytes.as_ptr()
+        );
+    }
+
+    /// N2: shutdown is bounded, and the socket is unlinked on every exit path.
+    #[test]
+    fn shutdown_drain_is_bounded_and_always_unlinks_the_socket() {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        assert!(wait_for_sessions_drained(
+            &server,
+            Duration::from_millis(500)
+        ));
+
+        // A pane whose stop driver reported TimedOut is never removed. The old
+        // unbounded spin then kept the daemon — and its socket — alive forever.
+        server
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(SessionId(1), Arc::new(Mutex::new(test_pane_state(None))));
+        let started = Instant::now();
+        assert!(!wait_for_sessions_drained(
+            &server,
+            Duration::from_millis(100)
+        ));
+        assert!(
+            started.elapsed() < TEST_IO_TIMEOUT,
+            "the shutdown wait must be bounded"
+        );
+
+        let path = unique_socket_path();
+        let listener = UnixListener::bind(&path).expect("bind socket");
+        let guard = SocketGuard::new(path.clone());
+        drop(listener);
+        assert!(path.exists());
+        drop(guard);
+        assert!(!path.exists(), "every exit path unlinks the socket");
+    }
+
+    /// A1: trimming releases whole chunks and never moves a retained byte.
+    #[test]
+    fn history_trimming_drops_whole_chunks_without_moving_retained_bytes() {
+        let mut pane = test_pane_state(None);
+        let limit = 44;
+        let chunk = |value: u8| shared(&[value; 8]);
+        for value in 0..6 {
+            pane.append_raw_history_with_limit(&chunk(value), limit)
+                .unwrap();
+        }
+        assert_eq!(pane.raw_history.len(), 44);
+        assert_eq!(pane.history_start, OutputSequence::new(4));
+        let retained = pane
+            .raw_history
+            .chunks
+            .iter()
+            .map(|chunk| chunk.as_ptr() as usize)
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 6);
+
+        for value in 6..8 {
+            pane.append_raw_history_with_limit(&chunk(value), limit)
+                .unwrap();
+        }
+
+        let surviving = pane
+            .raw_history
+            .chunks
+            .iter()
+            .map(|chunk| chunk.as_ptr() as usize)
+            .collect::<Vec<_>>();
+        // Two whole chunks were released and an offset advanced into the third.
+        // Every surviving chunk is the *same allocation* it was before, so no
+        // retained byte was memmoved; the old flat `Vec` copied all 44 twice.
+        assert_eq!(surviving.len(), 6);
+        assert_eq!(
+            surviving[..4],
+            retained[2..],
+            "a trim copied bytes it was supposed to retain"
+        );
+        assert_eq!(pane.raw_history.len(), 44);
+        assert_eq!(pane.history_start, OutputSequence::new(20));
+        assert_eq!(pane.next_output, OutputSequence::new(64));
+        let bytes = pane.raw_history.to_vec();
+        assert_eq!(bytes.len(), 44);
+        assert_eq!(bytes[0], 2, "the retained suffix starts mid-chunk");
+        assert_eq!(bytes[43], 7);
+    }
+
+    /// G9: `RAW_HISTORY_CHUNK_BYTES` was referenced by no test, and the largest
+    /// replay fixture was ~416 bytes — one chunk — so the split, the sequence
+    /// arithmetic *across* chunks, and the terminator were all untested. A
+    /// single large append is the case that splits: the reader's 8 KiB buffer
+    /// never reaches the bound, so only one big write (a `cat` of a large file,
+    /// a full-screen redraw) crosses it.
+    #[test]
+    fn replay_splits_history_at_the_chunk_bound_and_delivers_it_byte_for_byte() {
+        for length in [
+            RAW_HISTORY_CHUNK_BYTES - 1,
+            RAW_HISTORY_CHUNK_BYTES,
+            RAW_HISTORY_CHUNK_BYTES + 1,
+            3 * RAW_HISTORY_CHUNK_BYTES + 7,
+        ] {
+            // Non-repeating within a chunk, so a reordered or duplicated chunk
+            // cannot compare equal to the source.
+            let source = (0..length)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+
+            let (replayed, chunk_lengths) = replay_of_history(&source);
+
+            assert_eq!(
+                chunk_lengths.len(),
+                length.div_ceil(RAW_HISTORY_CHUNK_BYTES),
+                "{length} bytes should split into ceil({length}/{RAW_HISTORY_CHUNK_BYTES}) chunks, got {chunk_lengths:?}"
+            );
+            assert!(
+                chunk_lengths
+                    .iter()
+                    .all(|chunk| *chunk <= RAW_HISTORY_CHUNK_BYTES),
+                "a replay chunk became a wire frame larger than the bound: {chunk_lengths:?}"
+            );
+            assert_eq!(replayed.len(), length, "replayed byte count for {length}");
+            assert_eq!(
+                replayed, source,
+                "the concatenated replay must equal the source for {length} bytes"
+            );
+        }
+    }
+
+    /// G9: the terminator case. An empty history still owes the client a
+    /// `ReplayEnd` on the watermark, and must not send a zero-length chunk.
+    #[test]
+    fn an_empty_history_replays_as_a_bare_begin_and_end() {
+        let (replayed, chunk_lengths) = replay_of_history(&[]);
+
+        assert!(replayed.is_empty());
+        assert!(
+            chunk_lengths.is_empty(),
+            "an empty history must not send a chunk at all, got {chunk_lengths:?}"
+        );
+    }
+
+    /// Attaches a fresh client to a pane holding exactly `source` and returns
+    /// the replayed bytes in delivery order plus each chunk's length. Asserts
+    /// the transaction's own invariants (contiguity, watermark) on the way
+    /// through, so callers only assert about the bytes.
+    fn replay_of_history(source: &[u8]) -> (Vec<u8>, Vec<usize>) {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let scope = server.lock().unwrap().allocate_scope().unwrap();
+        let pane = Arc::new(Mutex::new(test_pane_state(None)));
+        if !source.is_empty() {
+            pane.lock()
+                .unwrap()
+                .append_raw_history(&shared(source))
+                .unwrap();
+        }
+        server
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(SessionId(1), Arc::clone(&pane));
+        // Room for the acknowledgement, the begin/end pair, the foreground
+        // frame and every chunk the largest case produces.
+        let (client, receiver) = test_client_with_capacity(1, 64);
+
+        handle_attach_request(
+            &server,
+            scope,
+            false,
+            &client,
+            attach_request(request_id(1), 1, 1),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::AttachResult {
+                outcome: AttachOutcome::Attached { .. },
+                ..
+            }
+        ));
+        let (first_sequence, watermark) = match receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap() {
+            ServerMessage::ReplayBegin {
+                first_sequence,
+                watermark,
+                ..
+            } => (first_sequence, watermark),
+            other => panic!("expected ReplayBegin, got {other:?}"),
+        };
+
+        let mut bytes = Vec::new();
+        let mut lengths = Vec::new();
+        let mut sequence = first_sequence;
+        loop {
+            match receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap() {
+                ServerMessage::ReplayChunk {
+                    sequence: received,
+                    bytes: chunk,
+                    ..
+                } => {
+                    assert_eq!(received, sequence, "replay chunks must be contiguous");
+                    sequence = sequence
+                        .checked_add_bytes(chunk.len())
+                        .expect("replay sequence must not overflow");
+                    lengths.push(chunk.len());
+                    bytes.extend_from_slice(&chunk);
+                }
+                ServerMessage::ReplayEnd {
+                    watermark: reported,
+                    ..
+                } => {
+                    assert_eq!(reported, watermark, "the terminator restates the watermark");
+                    assert_eq!(
+                        sequence, watermark,
+                        "the chunks must cover the whole watermark"
+                    );
+                    break;
+                }
+                other => panic!("unexpected message during replay: {other:?}"),
+            }
+        }
+        (bytes, lengths)
+    }
+
+    /// A12: the cap is a scrollback budget, not the wire frame limit.
+    #[test]
+    fn retained_history_is_sized_from_the_client_scrollback() {
+        assert_eq!(
+            RAW_HISTORY_MAX_BYTES,
+            RAW_HISTORY_SCROLLBACK_LINES * RAW_HISTORY_BYTES_PER_LINE
+        );
+        const { assert!(RAW_HISTORY_MAX_BYTES < MAX_MESSAGE_BYTES / 4) };
+
+        let mut pane = test_pane_state(None);
+        let read = shared(&[b'x'; 8192]);
+        for _ in 0..(RAW_HISTORY_MAX_BYTES / 8192 + 8) {
+            pane.append_raw_history(&read).unwrap();
+        }
+        assert!(pane.raw_history.len() <= RAW_HISTORY_MAX_BYTES);
+        assert!(pane.raw_history.len() > RAW_HISTORY_MAX_BYTES - 8192);
+    }
+
+    /// A8: the reader path shares the input path's debounced poll instead of
+    /// probing `tcgetpgrp` and `/proc/<pid>/cmdline` after every 8 KiB read.
+    #[test]
+    fn pty_reads_debounce_the_foreground_poll_instead_of_probing_every_read() {
+        let scope = ClientScopeId::from_bytes([13; 16]);
+        let lease = AttachmentLease::MIN;
+        let (client, receiver) = test_client(1);
+        let pane = Arc::new(Mutex::new(test_pane_state(Some(AttachmentOwner {
+            scope,
+            lease,
+            client,
+        }))));
+        let scheduled = {
+            let pane_state = pane.lock().unwrap();
+            Arc::clone(&pane_state.foreground_poll_scheduled)
+        };
+
+        assert!(handle_pty_read(&pane, &scheduled, shared(b"first")).unwrap());
+        assert!(
+            !handle_pty_read(&pane, &scheduled, shared(b"second")).unwrap(),
+            "a second read reuses the poll the first one scheduled"
+        );
+
+        for expected in [&b"first"[..], &b"second"[..]] {
+            match receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap() {
+                ServerMessage::PtyOutput { bytes, .. } => assert_eq!(bytes.as_ref(), expected),
+                message => panic!("unexpected delivery: {message:?}"),
+            }
+        }
+        assert!(
+            receiver.try_recv().is_err(),
+            "the reader path must not broadcast a foreground process per read"
+        );
+    }
+
+    /// A11: routing is a map lookup, never a scan that locks every pane while
+    /// the server lock is held.
+    #[test]
+    fn pane_lookup_is_a_map_hit_and_never_locks_another_pane() {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let pane = Arc::new(Mutex::new(test_pane_state(None)));
+        server
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(SessionId(1), Arc::clone(&pane));
+        assert!(server.lock().unwrap().pane_by_id(PaneId(1)).is_some());
+        {
+            let pane_state = pane.lock().unwrap();
+            assert_eq!(
+                pane_state.pane.0, pane_state.session.0,
+                "PaneId and SessionId are one daemon coordinate"
+            );
+        }
+
+        let held = pane.lock().unwrap();
+        let (found_tx, found_rx) = mpsc::channel();
+        let probe = Arc::clone(&server);
+        thread::spawn(move || {
+            let _ = found_tx.send(probe.lock().unwrap().pane_by_id(PaneId(999)).is_some());
+        });
+
+        assert_eq!(
+            found_rx.recv_timeout(TEST_IO_TIMEOUT),
+            Ok(false),
+            "a routing miss must not scan and lock every pane under the server lock"
+        );
+        drop(held);
+    }
+
     fn test_pane_state(owner: Option<AttachmentOwner>) -> PaneState {
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -4346,11 +5615,13 @@ mod tests {
             title: "test".to_string(),
             rows: 1,
             cols: 1,
-            raw_history: Vec::new(),
+            raw_history: RawHistory::default(),
             history_start: OutputSequence::ZERO,
             next_output: OutputSequence::ZERO,
             master: Arc::new(Mutex::new(pair.master)),
-            writer: Arc::new(Mutex::new(Box::new(io::sink()))),
+            // No writer thread by default: tests that care assert on the queue,
+            // and the rest must not leak a thread per pane.
+            writes: PtyWriteQueue::with_capacity(PTY_WRITE_QUEUE_MAX_BYTES),
             child_pid: std::process::id(),
             process_group: unsafe { libc::getpgrp() },
             foreground_process: ForegroundProcessInfo {

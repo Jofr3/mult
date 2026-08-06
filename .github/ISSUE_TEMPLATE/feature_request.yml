@@ -1,0 +1,57 @@
+name: Feature request
+description: Suggest a capability or a change in behaviour.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Planned work is tracked in [docs/ROADMAP.md](../blob/main/docs/ROADMAP.md).
+        Please check it first — a fair amount is already scheduled, and adding to
+        an existing backlog item is more useful than opening a duplicate.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that mult makes hard or impossible today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+      description: What should mult do instead? Be concrete about keys, config keys, or output.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you have tried, or other designs you rejected and why.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - TUI / navigation
+        - Terminal panes and input
+        - Agent chats (pi / Claude Code)
+        - mult-server daemon and IPC
+        - Configuration
+        - Packaging / release
+        - Other
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: roadmap
+    attributes:
+      label: Checks
+      options:
+        - label: I checked docs/ROADMAP.md and this is not already tracked.
+          required: true

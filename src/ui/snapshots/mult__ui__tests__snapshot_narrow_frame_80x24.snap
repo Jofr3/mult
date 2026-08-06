@@ -1,0 +1,66 @@
+---
+source: src/ui.rs
+expression: "buffer_snapshot(&render_buffer(&app, &PtyRuntime::new_offline(),\n&config::Config::default(), 80, 24,))"
+---
+size: 80x24
+
+symbols:
+| ▣ mult                           Terminal is stopped. Type to start it and send|
+|   $ terminal                                                                   |
+|                                                                                |
+| ▣ website                                                                      |
+|   $ terminal                                                                   |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+
+styles:
+|abbccccaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|eeeffeeeeeeeeeeeeeeeeeeeeeeeeeeeeedddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|abbcccccccaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaggaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddd|
+
+legend:
+  a = Style::new().fg(Color::Rgb(224, 222, 244)).bg(Color::Rgb(31, 29, 48)).underline_color(Color::Reset)
+  b = Style::new().fg(Color::Rgb(156, 207, 216)).bg(Color::Rgb(31, 29, 48)).underline_color(Color::Reset)
+  c = Style::new().fg(Color::Rgb(156, 207, 216)).bg(Color::Rgb(31, 29, 48)).underline_color(Color::Reset).bold()
+  d = Style::new().fg(Color::Rgb(224, 222, 244)).bg(Color::Rgb(35, 33, 54)).underline_color(Color::Reset)
+  e = Style::new().fg(Color::Rgb(224, 222, 244)).bg(Color::Rgb(68, 65, 90)).underline_color(Color::Reset).bold()
+  f = Style::new().fg(Color::Rgb(110, 106, 134)).bg(Color::Rgb(68, 65, 90)).underline_color(Color::Reset).bold()
+  g = Style::new().fg(Color::Rgb(110, 106, 134)).bg(Color::Rgb(31, 29, 48)).underline_color(Color::Reset)

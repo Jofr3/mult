@@ -8,8 +8,29 @@ use std::{
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
-pub const STATE_VERSION: u32 = 2;
+/// Version 3 replaced the terminals' persisted `status` (liveness, which the
+/// daemon actually owns) with `restore_on_launch` (intent, which only the state
+/// file can hold) and folded the "user has seen this Done" bit into
+/// [`ChatStatus`] itself (F16). See `storage::migrate_v2_to_v3`.
+pub const STATE_VERSION: u32 = 3;
 pub const DEFAULT_AGENT_CHAT_TITLE: &str = "agent";
+/// Upper bound on the text of a single persisted [`ChatMessage`].
+///
+/// Streamed assistant output arrives as deltas that are appended to the *last*
+/// message, and nothing in the protocol terminates a message — so without a cap
+/// one runaway agent grows one `String` without bound, and every save
+/// re-serializes all of it. 64 KiB is roughly 10 000 words: far more than any
+/// message a person reads in a chat pane, while keeping the whole transcript in
+/// a range where `serde_json::to_string_pretty` stays inexpensive.
+///
+/// The transcript path this guards is Phase 3.4 scaffolding and currently has
+/// no production caller (see `docs/ROADMAP.md` and the `agent` module), so this
+/// is about being safe to wire up rather than a live bug being fixed.
+pub const MAX_CHAT_MESSAGE_BYTES: usize = 64 * 1024;
+/// Marks a message that hit [`MAX_CHAT_MESSAGE_BYTES`]. Written once, in place
+/// of the bytes that were dropped, so a truncated transcript never looks like a
+/// complete one.
+pub const CHAT_MESSAGE_TRUNCATION_NOTICE: &str = "\n[truncated]";
 pub const RUNTIME_TERMINAL_ID_FLAG: u64 = 1 << 63;
 pub const MAX_DURABLE_SESSION_ID: u64 = RUNTIME_TERMINAL_ID_FLAG - 1;
 
@@ -127,10 +148,6 @@ impl SessionIdentities {
     fn len(&self) -> usize {
         self.chats.len() + self.terminals.len()
     }
-
-    fn is_empty(&self) -> bool {
-        self.chats.is_empty() && self.terminals.is_empty()
-    }
 }
 
 pub trait IdentitySource {
@@ -151,17 +168,40 @@ impl IdentitySource for SecureIdentitySource {
     }
 }
 
+/// Decoding is deliberately lenient about fields that can be *reconstructed*
+/// and strict about everything else.
+///
+/// A single renamed or `null`ed field used to make the whole file undecodable,
+/// which routed it into backup-and-reset and discarded every workspace, chat
+/// and terminal the user had (E11). Fields whose value can be rebuilt — the ID
+/// allocator hints, the identity table, a workspace's terminals, a session's
+/// status — therefore fall back to a default and are repaired on load, while
+/// anything carrying information nothing else holds (an ID, a name, the state
+/// namespace) stays required, because inventing one silently would be a
+/// different kind of data loss.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectState {
     pub version: u32,
     pub(crate) namespace: StateNamespace,
+    /// Reconciled against the sessions that decoded — see
+    /// [`ProjectState::normalize_session_identities`].
+    #[serde(default, deserialize_with = "null_or_default")]
     pub(crate) session_identities: SessionIdentities,
     /// Active daemon process incarnations for agent chats. Kept in a private
     /// identity table so ordinary chat edits cannot replace generations.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "null_or_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub(crate) agent_generations: BTreeMap<ChatId, AgentGeneration>,
+    /// Allocator hints, recomputed by `normalize_next_ids` when they are absent
+    /// or inconsistent with the IDs actually in use.
+    #[serde(default, deserialize_with = "null_or_default")]
     pub next_workspace_id: u64,
+    #[serde(default, deserialize_with = "null_or_default")]
     pub next_chat_id: u64,
+    #[serde(default, deserialize_with = "null_or_default")]
     pub next_terminal_id: u64,
     pub workspaces: Vec<Workspace>,
 }
@@ -170,9 +210,15 @@ pub struct ProjectState {
 pub struct Workspace {
     pub id: WorkspaceId,
     pub name: String,
+    #[serde(default, deserialize_with = "null_or_default")]
     pub cwd: Option<PathBuf>,
+    #[serde(default, deserialize_with = "null_or_default")]
     pub environment: BTreeMap<String, String>,
+    /// A workspace that loses its chats keeps its terminals, and vice versa:
+    /// the two lists fail independently rather than taking the file with them.
+    #[serde(default, deserialize_with = "null_or_default")]
     pub chats: Vec<ChatSession>,
+    #[serde(default, deserialize_with = "null_or_default")]
     pub terminals: Vec<TerminalSession>,
 }
 
@@ -180,10 +226,13 @@ pub struct Workspace {
 pub struct ChatSession {
     pub id: ChatId,
     pub name: String,
+    /// Runtime-derived: an unowned `Thinking`/`Waiting` is reset to `Idle` on
+    /// load anyway, so a missing status costs nothing.
+    #[serde(default, deserialize_with = "null_or_default")]
     pub status: ChatStatus,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_or_default")]
     pub agent: AgentKind,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_or_default")]
     pub messages: Vec<ChatMessage>,
 }
 
@@ -214,6 +263,17 @@ impl AgentKind {
             Self::ClaudeCode => "Claude Code",
         }
     }
+
+    /// The `config.json` keys that select and auto-start this backend, as
+    /// `(command, auto_start)`. The chat pane names them when the agent has
+    /// not started; before F18 it named `pi`'s pair whatever the chat's kind
+    /// actually was.
+    pub fn config_keys(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Pi => ("pi_agent_command", "auto_start_pi_agent"),
+            Self::ClaudeCode => ("claude_code_command", "auto_start_claude_code_agent"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,8 +295,22 @@ pub enum ChatMessageRole {
 pub struct TerminalSession {
     pub id: TerminalId,
     pub name: String,
-    pub status: TerminalStatus,
-    #[serde(default)]
+    /// **Intent, not liveness.** Whether this terminal was meant to be running
+    /// when the state was last written, and should therefore be reattached the
+    /// next time the client starts.
+    ///
+    /// Version 2 persisted a `TerminalStatus` here instead, which duelled with
+    /// `PtyRuntime`'s actual attachment state: the two were reconciled by hand
+    /// from several call sites, so missing one rendered a terminal live forever
+    /// or auto-restarted it unexpectedly (F16). Displayed liveness now comes
+    /// only from `PtyRuntime::is_running`, and this field answers the one
+    /// question the runtime cannot: what the user wanted.
+    ///
+    /// It is **not** an authorization to relaunch. A [`TerminalLaunch::Command`]
+    /// is restored attach-only and never re-executed, whatever this says (C1).
+    #[serde(default, deserialize_with = "null_or_default")]
+    pub restore_on_launch: bool,
+    #[serde(default, deserialize_with = "null_or_default")]
     pub launch: TerminalLaunch,
 }
 
@@ -259,19 +333,47 @@ pub enum PtyKey {
     ChatAgent(ChatId),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChatStatus {
+    #[default]
     Idle,
     Thinking,
     Waiting,
     Failed,
+    /// One agent turn finished and the user has not looked at the chat since:
+    /// the sidebar renders it as an unseen "finished" notification.
     Done,
+    /// Finished, and the user has since selected the chat. Renders inactive.
+    ///
+    /// The seen bit used to live in an `App`-side `seen_done: BTreeSet<ChatId>`
+    /// — a side table qualifying a status it was not part of, kept in sync by
+    /// hand at five call sites (F16). Folding it in makes "which Done is this"
+    /// unrepresentable-wrong: there is one value, and it changes atomically.
+    DoneSeen,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TerminalStatus {
-    Stopped,
-    Running,
+impl ChatStatus {
+    /// Whether one agent turn has finished, seen or not.
+    pub const fn is_done(self) -> bool {
+        matches!(self, Self::Done | Self::DoneSeen)
+    }
+
+    /// Whether the user has looked at this chat since it finished. Only
+    /// meaningful for a finished chat; the renderer uses it to choose between
+    /// the green notification and the gray inactive icon.
+    pub const fn done_seen(self) -> bool {
+        matches!(self, Self::DoneSeen)
+    }
+
+    /// The same status with its seen bit set as requested. A status that is not
+    /// finished has no seen bit and is returned unchanged.
+    pub const fn with_done_seen(self, seen: bool) -> Self {
+        match (self, seen) {
+            (Self::Done | Self::DoneSeen, true) => Self::DoneSeen,
+            (Self::Done | Self::DoneSeen, false) => Self::Done,
+            (other, _) => other,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,13 +391,22 @@ impl Default for ProjectState {
 }
 
 impl ProjectState {
+    /// An empty project with a fresh namespace: no workspaces, and nothing
+    /// read from the environment.
+    ///
+    /// This is what the corrupt-state recovery path returns, which is why it
+    /// is empty (F12). A user whose state file could not be decoded is told so
+    /// by `LoadedState::notice` and starts from nothing; handing them a
+    /// fabricated `website`/`shell` demo project instead read as data recovery
+    /// that had not happened. The seed lives in [`Self::try_first_run_with`],
+    /// which only a genuinely absent state file reaches.
     pub fn try_default() -> io::Result<Self> {
         let mut source = SecureIdentitySource::new()?;
         Self::try_default_with(&mut source)
     }
 
     pub fn try_default_with(source: &mut impl IdentitySource) -> io::Result<Self> {
-        let mut state = Self {
+        Ok(Self {
             version: STATE_VERSION,
             namespace: generate_identity(source, |_| false)?,
             session_identities: SessionIdentities::default(),
@@ -304,7 +415,21 @@ impl ProjectState {
             next_chat_id: 1,
             next_terminal_id: 1,
             workspaces: Vec::new(),
-        };
+        })
+    }
+
+    /// The project a first run starts from: a workspace for the current
+    /// directory and a demo one, each with one stopped shell.
+    ///
+    /// Called only when no state file existed at all. Anything else — a
+    /// decode failure, a rejected file — is *not* a first run.
+    pub fn try_first_run() -> io::Result<Self> {
+        let mut source = SecureIdentitySource::new()?;
+        Self::try_first_run_with(&mut source)
+    }
+
+    pub fn try_first_run_with(source: &mut impl IdentitySource) -> io::Result<Self> {
+        let mut state = Self::try_default_with(source)?;
 
         let mult = state
             .add_workspace("mult".to_string(), std::env::current_dir().ok())
@@ -313,7 +438,6 @@ impl ProjectState {
             .add_terminal_with_source(
                 mult,
                 "dev server".to_string(),
-                TerminalStatus::Stopped,
                 TerminalLaunch::Shell,
                 source,
             )
@@ -323,13 +447,7 @@ impl ProjectState {
             .add_workspace("website".to_string(), None)
             .expect("initial workspace ID is available");
         state
-            .add_terminal_with_source(
-                website,
-                "shell".to_string(),
-                TerminalStatus::Stopped,
-                TerminalLaunch::Shell,
-                source,
-            )
+            .add_terminal_with_source(website, "shell".to_string(), TerminalLaunch::Shell, source)
             .map_err(allocation_io_error)?;
 
         Ok(state)
@@ -439,41 +557,70 @@ impl ProjectState {
         Ok(())
     }
 
-    pub(crate) fn assign_session_identities(
+    /// Reconciles the identity table against the sessions that are actually
+    /// present: drops entries for sessions that are gone or share a token, and
+    /// mints a token for every session that has none.
+    ///
+    /// This is the only way tokens are assigned. There used to be a second,
+    /// `assign_session_identities`, which refused to run unless the table was
+    /// empty — usable by the V1 migration and nothing else. The V2->V3 migration
+    /// has to *keep* an existing table, so the two collapsed into this one (F16).
+    pub(crate) fn normalize_session_identities(
         &mut self,
         source: &mut impl IdentitySource,
-    ) -> io::Result<()> {
-        if !self.session_identities.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "session identity table must be empty before assignment",
-            ));
-        }
-
+    ) -> io::Result<bool> {
         let chat_ids = self
             .workspaces
             .iter()
             .flat_map(|workspace| workspace.chats.iter().map(|chat| chat.id))
-            .collect::<Vec<_>>();
-        for id in chat_ids {
-            let token = self
-                .allocate_session_token(source)
-                .map_err(allocation_io_error)?;
-            self.session_identities.chats.insert(id, token);
-        }
-
+            .collect::<BTreeSet<_>>();
         let terminal_ids = self
             .workspaces
             .iter()
             .flat_map(|workspace| workspace.terminals.iter().map(|terminal| terminal.id))
-            .collect::<Vec<_>>();
+            .collect::<BTreeSet<_>>();
+
+        let mut changed = false;
+        let mut seen_tokens = BTreeSet::new();
+        let identities = &mut self.session_identities;
+        let before = identities.chats.len() + identities.terminals.len();
+        identities
+            .chats
+            .retain(|id, token| chat_ids.contains(id) && seen_tokens.insert(*token));
+        identities
+            .terminals
+            .retain(|id, token| terminal_ids.contains(id) && seen_tokens.insert(*token));
+        changed |= identities.chats.len() + identities.terminals.len() != before;
+
+        let generations = &mut self.agent_generations;
+        let before = generations.len();
+        let mut seen_generations = BTreeSet::new();
+        generations
+            .retain(|id, generation| chat_ids.contains(id) && seen_generations.insert(*generation));
+        changed |= generations.len() != before;
+
+        for id in chat_ids {
+            if self.session_identities.chats.contains_key(&id) {
+                continue;
+            }
+            let token = self
+                .allocate_session_token(source)
+                .map_err(allocation_io_error)?;
+            self.session_identities.chats.insert(id, token);
+            changed = true;
+        }
         for id in terminal_ids {
+            if self.session_identities.terminals.contains_key(&id) {
+                continue;
+            }
             let token = self
                 .allocate_session_token(source)
                 .map_err(allocation_io_error)?;
             self.session_identities.terminals.insert(id, token);
+            changed = true;
         }
-        Ok(())
+
+        Ok(changed)
     }
 }
 
@@ -484,7 +631,8 @@ impl ProjectState {
     /// Startup no longer creates agent chats, so tests that need a populated
     /// project construct one explicitly via this helper.
     pub(crate) fn seeded() -> Self {
-        let mut state = Self::default();
+        let mut state =
+            Self::try_first_run().expect("secure entropy is required to create project state");
         let mult = state.workspaces[0].id;
         let _ = state
             .add_chat(
@@ -771,7 +919,12 @@ impl ProjectState {
             return false;
         };
 
-        chat.messages.push(ChatMessage { role, text });
+        let mut message = ChatMessage {
+            role,
+            text: String::new(),
+        };
+        push_capped_message_text(&mut message.text, &text);
+        chat.messages.push(message);
         true
     }
 
@@ -795,52 +948,56 @@ impl ProjectState {
             .last_mut()
             .filter(|message| message.role == role)
         {
-            message.text.push_str(text);
+            // A full message swallows further deltas *and* reports "unchanged",
+            // so a runaway agent stops dirtying the project and therefore stops
+            // provoking saves as well as stopping the growth.
+            push_capped_message_text(&mut message.text, text)
         } else {
-            chat.messages.push(ChatMessage {
+            let mut message = ChatMessage {
                 role,
-                text: text.to_string(),
-            });
+                text: String::new(),
+            };
+            push_capped_message_text(&mut message.text, text);
+            chat.messages.push(message);
+            true
         }
-
-        true
     }
 
+    /// Adds a terminal. A new terminal is never already running, and nothing
+    /// has yet expressed an intent to restore it, so it starts with
+    /// `restore_on_launch` clear — the old `status: TerminalStatus` parameter
+    /// was `Stopped` at every call site (F16).
     pub fn add_terminal(
         &mut self,
         workspace_id: WorkspaceId,
         name: String,
-        status: TerminalStatus,
     ) -> Result<Option<TerminalId>, IdAllocationError> {
-        self.add_terminal_with_launch(workspace_id, name, status, TerminalLaunch::Shell)
+        self.add_terminal_with_launch(workspace_id, name, TerminalLaunch::Shell)
     }
 
     pub fn add_command_terminal(
         &mut self,
         workspace_id: WorkspaceId,
         name: String,
-        status: TerminalStatus,
         command: String,
     ) -> Result<Option<TerminalId>, IdAllocationError> {
-        self.add_terminal_with_launch(workspace_id, name, status, TerminalLaunch::Command(command))
+        self.add_terminal_with_launch(workspace_id, name, TerminalLaunch::Command(command))
     }
 
     fn add_terminal_with_launch(
         &mut self,
         workspace_id: WorkspaceId,
         name: String,
-        status: TerminalStatus,
         launch: TerminalLaunch,
     ) -> Result<Option<TerminalId>, IdAllocationError> {
         let mut source = SecureIdentitySource::new().map_err(identity_allocation_error)?;
-        self.add_terminal_with_source(workspace_id, name, status, launch, &mut source)
+        self.add_terminal_with_source(workspace_id, name, launch, &mut source)
     }
 
     fn add_terminal_with_source(
         &mut self,
         workspace_id: WorkspaceId,
         name: String,
-        status: TerminalStatus,
         launch: TerminalLaunch,
         source: &mut impl IdentitySource,
     ) -> Result<Option<TerminalId>, IdAllocationError> {
@@ -858,7 +1015,7 @@ impl ProjectState {
             .push(TerminalSession {
                 id,
                 name,
-                status,
+                restore_on_launch: false,
                 launch,
             });
         self.session_identities.terminals.insert(id, token);
@@ -1035,6 +1192,21 @@ fn decode_hex_digit(byte: u8) -> Option<u8> {
     }
 }
 
+/// Accepts a missing field, an explicit `null`, or a value.
+///
+/// `#[serde(default)]` alone covers only the *missing* case, and a `null` where
+/// a struct or an array belongs is the other half of the shape errors that used
+/// to cost a user their whole state file (E11). A wrong *type* is still an
+/// error: `"workspaces": "nonsense"` carries data this code cannot interpret,
+/// and quietly treating it as empty would destroy it rather than report it.
+pub(crate) fn null_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 fn generate_identity<T>(
     source: &mut impl IdentitySource,
     collision: impl Fn(&T) -> bool,
@@ -1090,6 +1262,38 @@ fn allocation_io_error(error: IdAllocationError) -> io::Error {
 
 fn is_valid_durable_session_id(id: u64) -> bool {
     (1..=MAX_DURABLE_SESSION_ID).contains(&id)
+}
+
+/// Append `text` to a chat message, enforcing [`MAX_CHAT_MESSAGE_BYTES`].
+///
+/// Returns whether anything was appended. The last
+/// `CHAT_MESSAGE_TRUNCATION_NOTICE.len()` bytes of the budget are reserved for
+/// the notice, so a message that overflows ends with it and lands exactly at or
+/// above the content limit — which is what makes every later append a cheap,
+/// allocation-free `false`. The notice is longer than the at most three bytes a
+/// UTF-8 boundary retreat can cost, so that is guaranteed rather than likely.
+fn push_capped_message_text(existing: &mut String, text: &str) -> bool {
+    let content_limit = MAX_CHAT_MESSAGE_BYTES - CHAT_MESSAGE_TRUNCATION_NOTICE.len();
+    let Some(budget) = content_limit.checked_sub(existing.len()) else {
+        return false;
+    };
+    if budget == 0 {
+        return false;
+    }
+    if text.len() <= budget {
+        existing.push_str(text);
+        return true;
+    }
+
+    // Never split a character: retreat to the nearest boundary at or below the
+    // budget (at most three bytes).
+    let mut keep = budget;
+    while keep > 0 && !text.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    existing.push_str(&text[..keep]);
+    existing.push_str(CHAT_MESSAGE_TRUNCATION_NOTICE);
+    true
 }
 
 /// Takes a free ID at or after `hint`, wrapping once at `max`. The returned
@@ -1160,7 +1364,7 @@ impl ChatStatus {
             Self::Thinking => "thinking",
             Self::Waiting => "waiting",
             Self::Failed => "failed",
-            Self::Done => "done",
+            Self::Done | Self::DoneSeen => "done",
         }
     }
 }
@@ -1183,7 +1387,7 @@ mod tests {
 
     #[test]
     fn project_state_round_trips_through_json() {
-        let mut state = ProjectState::default();
+        let mut state = ProjectState::try_first_run().expect("first-run project");
         let workspace = state.workspaces[0].id;
         let chat = state
             .add_chat(
@@ -1200,6 +1404,98 @@ mod tests {
         let decoded: ProjectState = serde_json::from_str(&json).expect("deserialize project state");
 
         assert_eq!(decoded, state);
+    }
+
+    /// B9: streamed deltas append to the last message forever, so the message
+    /// itself carries the bound. Once it is reached the message stops growing
+    /// *and* stops reporting a change, so it also stops provoking saves.
+    #[test]
+    fn a_streamed_message_stops_growing_at_the_cap() {
+        let mut state = ProjectState::try_first_run().expect("first-run project");
+        let workspace = state.workspaces[0].id;
+        let chat = state
+            .add_chat(
+                workspace,
+                "agent".to_string(),
+                ChatStatus::Idle,
+                AgentKind::Pi,
+            )
+            .unwrap()
+            .unwrap();
+
+        let delta = "x".repeat(8 * 1024);
+        let mut appended = 0;
+        for _ in 0..64 {
+            if state.append_chat_delta(workspace, chat, ChatMessageRole::Assistant, &delta) {
+                appended += 1;
+            }
+        }
+
+        let messages = &state.chat(workspace, chat).unwrap().messages;
+        assert_eq!(messages.len(), 1, "deltas keep extending one message");
+        let text = &messages[0].text;
+        assert!(
+            text.len() <= MAX_CHAT_MESSAGE_BYTES,
+            "message grew to {} bytes, past the {MAX_CHAT_MESSAGE_BYTES}-byte cap",
+            text.len()
+        );
+        assert!(text.ends_with(CHAT_MESSAGE_TRUNCATION_NOTICE));
+        assert!(
+            appended < 64,
+            "appends past the cap must report no change so they cannot dirty the project"
+        );
+        assert!(
+            !state.append_chat_delta(workspace, chat, ChatMessageRole::Assistant, &delta),
+            "a full message accepts nothing further"
+        );
+    }
+
+    /// The truncation point is a byte budget, but it must still land on a
+    /// character boundary — a split multi-byte character would make the whole
+    /// state file undecodable, not just this message.
+    #[test]
+    fn truncation_never_splits_a_character() {
+        let mut text = String::new();
+        assert!(push_capped_message_text(
+            &mut text,
+            &"é".repeat(MAX_CHAT_MESSAGE_BYTES)
+        ));
+
+        assert!(text.ends_with(CHAT_MESSAGE_TRUNCATION_NOTICE));
+        assert!(text.len() <= MAX_CHAT_MESSAGE_BYTES);
+        let body = text
+            .strip_suffix(CHAT_MESSAGE_TRUNCATION_NOTICE)
+            .expect("notice is present");
+        assert!(body.chars().all(|character| character == 'é'));
+        assert!(!push_capped_message_text(&mut text, "more"));
+    }
+
+    /// A single oversized message (not a stream of deltas) is capped on the way
+    /// in as well, so the cap cannot be bypassed by sending one huge message.
+    #[test]
+    fn a_single_oversized_message_is_capped_on_append() {
+        let mut state = ProjectState::try_first_run().expect("first-run project");
+        let workspace = state.workspaces[0].id;
+        let chat = state
+            .add_chat(
+                workspace,
+                "agent".to_string(),
+                ChatStatus::Idle,
+                AgentKind::Pi,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(state.append_chat_message(
+            workspace,
+            chat,
+            ChatMessageRole::Assistant,
+            "y".repeat(MAX_CHAT_MESSAGE_BYTES * 4),
+        ));
+
+        let text = &state.chat(workspace, chat).unwrap().messages[0].text;
+        assert!(text.len() <= MAX_CHAT_MESSAGE_BYTES);
+        assert!(text.ends_with(CHAT_MESSAGE_TRUNCATION_NOTICE));
     }
 
     #[test]
@@ -1222,7 +1518,7 @@ mod tests {
             }
         }
 
-        let mut state = ProjectState::default();
+        let mut state = ProjectState::try_first_run().expect("first-run project");
         let workspace = state.workspaces[0].id;
         let before = state.clone();
         let error = state
@@ -1434,11 +1730,7 @@ mod tests {
             )
             .expect("chat allocation should succeed");
         let max_terminal = state
-            .add_terminal(
-                workspace,
-                "max terminal".to_string(),
-                TerminalStatus::Stopped,
-            )
+            .add_terminal(workspace, "max terminal".to_string())
             .expect("terminal allocation should succeed");
         let wrapped_chat = state
             .add_chat(
@@ -1449,11 +1741,7 @@ mod tests {
             )
             .expect("chat allocation should wrap");
         let wrapped_terminal = state
-            .add_terminal(
-                workspace,
-                "wrapped terminal".to_string(),
-                TerminalStatus::Stopped,
-            )
+            .add_terminal(workspace, "wrapped terminal".to_string())
             .expect("terminal allocation should wrap");
 
         assert_eq!(max_chat, Some(ChatId(MAX_DURABLE_SESSION_ID)));
@@ -1480,7 +1768,7 @@ mod tests {
         workspace.terminals.push(TerminalSession {
             id: TerminalId(MAX_DURABLE_SESSION_ID),
             name: "terminal".to_string(),
-            status: TerminalStatus::Stopped,
+            restore_on_launch: false,
             launch: TerminalLaunch::Shell,
         });
         state.workspaces.push(workspace);
@@ -1503,7 +1791,7 @@ mod tests {
 
     #[test]
     fn allocation_skips_colliding_hints() {
-        let mut state = ProjectState::default();
+        let mut state = ProjectState::try_first_run().expect("first-run project");
         state.next_workspace_id = state.workspaces[0].id.0;
         state.next_chat_id = 7;
         state.workspaces[0].chats.push(ChatSession {
@@ -1591,6 +1879,73 @@ mod tests {
             next_terminal_id: 1,
             workspaces: Vec::new(),
         }
+    }
+
+    /// E11: reconciliation is what makes a lenient decode usable. Whatever the
+    /// identity table lost, gained or duplicated, the state that comes out has
+    /// to be one the writer accepts.
+    #[test]
+    fn reconciling_identities_drops_stale_entries_and_mints_missing_ones() {
+        let mut source = SecureIdentitySource::new().unwrap();
+        let mut state = ProjectState::try_first_run().expect("first-run project");
+        let terminal = state.workspaces[0].terminals[0].id;
+        let chat = state
+            .add_chat(
+                state.workspaces[0].id,
+                "chat".to_string(),
+                ChatStatus::Idle,
+                AgentKind::Pi,
+            )
+            .unwrap()
+            .unwrap();
+        let generation = state.begin_agent_generation(chat).unwrap().unwrap();
+
+        // A table describing a session that is gone, missing one that is here,
+        // and reusing a token across the two.
+        let stolen = state.session_identities.terminals[&terminal];
+        state.session_identities.chats.insert(ChatId(9_999), stolen);
+        state.session_identities.terminals.remove(&terminal);
+        state.agent_generations.insert(ChatId(9_999), generation);
+
+        assert!(state.normalize_session_identities(&mut source).unwrap());
+
+        state.validate_session_identities().unwrap();
+        assert!(!state.session_identities.chats.contains_key(&ChatId(9_999)));
+        assert!(!state.agent_generations.contains_key(&ChatId(9_999)));
+        assert!(state.session_identities.terminals.contains_key(&terminal));
+        assert!(state.agent_generations.contains_key(&chat));
+        // A consistent table is left exactly as it is.
+        assert!(!state.normalize_session_identities(&mut source).unwrap());
+    }
+
+    /// E11: `#[serde(default)]` covers a missing field; a `null` needs the
+    /// helper. Both must reach the same place, and a value of the wrong *type*
+    /// must still be an error rather than being silently dropped.
+    #[test]
+    fn a_missing_or_null_reconstructible_field_decodes_to_its_default() {
+        let missing: Workspace =
+            serde_json::from_str(r#"{"id":1,"name":"w"}"#).expect("missing fields default");
+        let nulled: Workspace = serde_json::from_str(
+            r#"{"id":1,"name":"w","cwd":null,"environment":null,"chats":null,"terminals":null}"#,
+        )
+        .expect("null fields default");
+
+        assert_eq!(missing, nulled);
+        assert!(missing.chats.is_empty() && missing.terminals.is_empty());
+
+        let terminal: TerminalSession = serde_json::from_str(r#"{"id":1,"name":"t"}"#)
+            .expect("missing restore intent defaults");
+        assert!(!terminal.restore_on_launch);
+        assert_eq!(terminal.launch, TerminalLaunch::Shell);
+
+        // Wrong type, not absent: this carries data, and treating it as empty
+        // would destroy it instead of reporting it.
+        assert!(
+            serde_json::from_str::<Workspace>(r#"{"id":1,"name":"w","chats":"none"}"#).is_err()
+        );
+        // Nothing reconstructs an ID or a name.
+        assert!(serde_json::from_str::<Workspace>(r#"{"name":"w"}"#).is_err());
+        assert!(serde_json::from_str::<Workspace>(r#"{"id":1}"#).is_err());
     }
 
     fn empty_workspace(id: WorkspaceId, name: &str) -> Workspace {

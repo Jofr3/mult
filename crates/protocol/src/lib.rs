@@ -1,14 +1,21 @@
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env,
+    ffi::OsStr,
+    fmt, fs,
     io::{self, Read, Write},
     num::NonZeroU64,
     path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
 };
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
-pub const PROTOCOL_VERSION: u16 = 10;
+#[cfg(unix)]
+pub mod peer;
+pub mod shell;
+
+pub const PROTOCOL_VERSION: u16 = 11;
 pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 1;
 pub const DEFAULT_SOCKET_NAME: &str = "mult.sock";
 pub const SOCKET_PATH_ENV: &str = "MULT_SOCKET_PATH";
@@ -16,17 +23,73 @@ pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SCREEN_ROWS: u16 = 1_000;
 pub const MAX_SCREEN_COLS: u16 = 1_000;
 pub const MAX_SCREEN_CELLS: usize = 200_000;
+/// Smallest screen the terminal emulator can be driven at.
+///
+/// `fnug-vt100` subtracts from a dimension without checking it, so a screen with
+/// a single row or a single column panics ("attempt to subtract with overflow")
+/// on input as ordinary as a stray non-UTF-8 byte, an emoji, or a line feed —
+/// in debug it aborts, and in release the wrapped arithmetic corrupts the grid.
+/// Two rows by two columns is the smallest size that survives every byte class
+/// we can produce; it is enforced here rather than at each call site so no path
+/// can reach the parser below it. A pane too small to hold a 2×2 screen is
+/// reported as too small by the renderer instead of being drawn.
+pub const MIN_SCREEN_ROWS: u16 = 2;
+pub const MIN_SCREEN_COLS: u16 = 2;
 /// Maximum number of correlated requests a client may have awaiting results.
 pub const MAX_PENDING_REQUESTS_PER_CLIENT: usize = 1_024;
 /// Maximum number of completed request results retained for one resumable scope.
 pub const MAX_CACHED_REQUEST_RESULTS_PER_SCOPE: usize = 4_096;
 
+/// A `--socket` value installed by the CLI, ahead of `$MULT_SOCKET_PATH`.
+///
+/// The client resolves its socket deep inside `PtyRuntime`, not in `main`, so a
+/// command-line override has to reach the resolver rather than a constructor
+/// argument. The obvious alternative — `set_var(SOCKET_PATH_ENV, …)` — mutates a
+/// process global that other threads read, which this workspace deliberately
+/// does not do (G7). This cell is written at most once, from `main`, before any
+/// thread exists, and is only ever read afterwards; `OnceLock` makes both of
+/// those structural rather than a convention.
+static SOCKET_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Installs the command-line socket override. Fails, handing the path back, if
+/// one was already installed — the CLI installs exactly one, before anything
+/// resolves a socket.
+pub fn set_socket_path_override(path: PathBuf) -> Result<(), PathBuf> {
+    SOCKET_PATH_OVERRIDE.set(path)
+}
+
+/// The socket path in force: `--socket`, then `$MULT_SOCKET_PATH`, then the
+/// default under `$XDG_RUNTIME_DIR`.
 pub fn default_socket_path() -> PathBuf {
-    if let Some(path) = env::var_os(SOCKET_PATH_ENV) {
+    let environment = env::var_os(SOCKET_PATH_ENV);
+    socket_path_from(
+        SOCKET_PATH_OVERRIDE
+            .get()
+            .map(|path| path.as_os_str())
+            .or(environment.as_deref()),
+        env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        socket_user_component,
+    )
+}
+
+/// The socket-path policy as a pure function of its inputs.
+///
+/// `default_socket_path` reads two process-global environment variables; tests
+/// that exercised the policy therefore had to `set_var` them, racing every
+/// sibling test that resolves a socket path on another thread (G7). The policy
+/// lives here instead, and the environment is read exactly once, by the wrapper.
+/// `user_component` stays lazy because the fallback is the only branch that
+/// needs a UID lookup.
+fn socket_path_from(
+    explicit: Option<&OsStr>,
+    runtime_dir: Option<&OsStr>,
+    user_component: impl FnOnce() -> String,
+) -> PathBuf {
+    if let Some(path) = explicit {
         return PathBuf::from(path);
     }
 
-    if let Some(runtime_dir) = env::var_os("XDG_RUNTIME_DIR") {
+    if let Some(runtime_dir) = runtime_dir {
         return PathBuf::from(runtime_dir).join(DEFAULT_SOCKET_NAME);
     }
 
@@ -35,7 +98,7 @@ pub fn default_socket_path() -> PathBuf {
     // can collide, letting another local user predict or pre-create ("squat")
     // the path. `ensure_private_dir` verifies ownership before the socket binds.
     PathBuf::from("/tmp")
-        .join(format!("mult-{}", socket_user_component()))
+        .join(format!("mult-{}", user_component()))
         .join(DEFAULT_SOCKET_NAME)
 }
 
@@ -43,8 +106,7 @@ pub fn default_socket_path() -> PathBuf {
 fn socket_user_component() -> String {
     #[cfg(unix)]
     {
-        // SAFETY: `geteuid` is always successful and has no failure mode.
-        unsafe { libc::geteuid() }.to_string()
+        peer::effective_uid().to_string()
     }
 
     #[cfg(not(unix))]
@@ -97,8 +159,7 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
         .mode(0o700)
         .create(dir)?;
 
-    // SAFETY: `geteuid` is always successful and has no failure mode.
-    let euid = unsafe { libc::geteuid() } as u32;
+    let euid = peer::effective_uid();
     let mut cursor = Some(dir);
     while let Some(path) = cursor {
         let metadata = fs::symlink_metadata(path)?;
@@ -328,6 +389,112 @@ impl OutputSequence {
     }
 }
 
+/// Machine-readable classification of every rejection the daemon can produce.
+///
+/// Before version 11 a rejection reached the client as English prose in a
+/// `Failed { message }`, and the client matched substrings of it to decide what
+/// to do next. That makes the daemon's *wording* a protocol contract: when an
+/// `"already attached"` message was reworded during this effort, the client
+/// behaviour keyed off it went dead and nothing failed. The code is now the
+/// contract; `message` is diagnostic text that may be reworded freely and must
+/// never be parsed.
+///
+/// Every error the wire carries maps onto exactly one code — see the `code()`
+/// methods on [`CreateError`], [`AttachError`], [`StopError`],
+/// [`AgentStatusError`] and [`LeaseRejectionReason`] — so a client can switch on
+/// one exhaustive enum instead of on five error shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RejectCode {
+    /// The peer's `PROTOCOL_VERSION` does not match ours. The daemon must be
+    /// restarted; nothing else will make this connection work.
+    ProtocolMismatch,
+    /// A message arrived out of the order the protocol requires (no hello
+    /// first, or a second hello on one connection).
+    ProtocolOrder,
+    /// The request ID was previously used with a different operation or body.
+    RequestCollision,
+    /// The request ID predates the bounded retained-result window.
+    RetryExpired,
+    /// The client has more correlated requests in flight than the scope allows.
+    TooManyPendingRequests,
+    /// A daemon identifier space ran out (attachment leases, session IDs,
+    /// client IDs, output sequences). Not retryable within this daemon.
+    ResourceExhausted,
+    /// No session or pane exists for the requested coordinate.
+    UnknownSession,
+    /// The requested numeric session ID or logical identity is already taken.
+    SessionAlreadyExists,
+    /// The namespace or session token did not match the session's stored
+    /// identity. A copied or reset state file cannot drive another's session.
+    IdentityMismatch,
+    /// The caller does not hold the pane's current lease, or the pane is not
+    /// accepting mutations right now (stopping, or the daemon is draining).
+    NotOwner,
+    /// The lease belongs to an older attachment generation for this pane.
+    StaleLease,
+    /// The attachment this result refers to was displaced by a takeover.
+    Superseded,
+    /// The pane's bounded writer queue refused the bytes. They were definitely
+    /// *not* delivered, so the client must not assume the keystrokes landed.
+    /// Distinct from [`Self::NotOwner`], which the daemon reused for this case
+    /// before version 11 (R1).
+    InputRefused,
+    /// An agent-status precondition failed: wrong schema, chat, agent kind or
+    /// generation, a non-agent session, or a conflict with a final status.
+    AgentStatusRejected,
+    /// The daemon is shutting down and accepts no new work.
+    ShuttingDown,
+    /// Spawning or configuring the PTY child failed.
+    LaunchFailed,
+    /// A failure inside the daemon that is none of the above: a poisoned lock,
+    /// a failed `ioctl`, an unexpected OS error.
+    DaemonInternal,
+}
+
+impl RejectCode {
+    /// A short, stable phrase for logs and user-facing notices.
+    ///
+    /// Callers may render this; they may not parse it. Control flow switches on
+    /// the variant.
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::ProtocolMismatch => "protocol version mismatch",
+            Self::ProtocolOrder => "protocol message out of order",
+            Self::RequestCollision => "request ID collision",
+            Self::RetryExpired => "request retry expired",
+            Self::TooManyPendingRequests => "too many pending requests",
+            Self::ResourceExhausted => "daemon identifier space exhausted",
+            Self::UnknownSession => "unknown session",
+            Self::SessionAlreadyExists => "session already exists",
+            Self::IdentityMismatch => "session identity mismatch",
+            Self::NotOwner => "not the pane's current owner",
+            Self::StaleLease => "stale attachment lease",
+            Self::Superseded => "attachment superseded by a takeover",
+            Self::InputRefused => "PTY input refused",
+            Self::AgentStatusRejected => "agent status rejected",
+            Self::ShuttingDown => "daemon is shutting down",
+            Self::LaunchFailed => "failed to launch the PTY",
+            Self::DaemonInternal => "internal daemon failure",
+        }
+    }
+
+    /// Whether repeating the identical request could plausibly succeed once the
+    /// transient condition clears. A code that is *not* retryable will keep
+    /// failing until something about the request or the daemon changes.
+    pub const fn is_transient(self) -> bool {
+        matches!(
+            self,
+            Self::TooManyPendingRequests | Self::InputRefused | Self::ShuttingDown
+        )
+    }
+}
+
+impl fmt::Display for RejectCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.description())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LaunchSpec {
     Shell,
@@ -458,16 +625,6 @@ pub enum ClientMessage {
         lease: AttachmentLease,
         bytes: Vec<u8>,
     },
-    Scroll {
-        pane: PaneId,
-        rows: i32,
-    },
-    ScrollToTop {
-        pane: PaneId,
-    },
-    ScrollToBottom {
-        pane: PaneId,
-    },
     Resize {
         pane: PaneId,
         lease: AttachmentLease,
@@ -524,9 +681,28 @@ pub enum CreateError {
         mismatch: IdentityMismatch,
     },
     InvalidAgentMetadata(AgentStatusError),
+    /// A rejection with no dedicated variant. `code` is the contract; `message`
+    /// is diagnostic text and must not be parsed.
     Failed {
+        code: RejectCode,
         message: String,
     },
+}
+
+impl CreateError {
+    /// This error's machine-readable classification.
+    pub const fn code(&self) -> RejectCode {
+        match self {
+            Self::RequestCollision => RejectCode::RequestCollision,
+            Self::RetryExpired => RejectCode::RetryExpired,
+            Self::SessionAlreadyExists { .. } | Self::IdentityAlreadyExists { .. } => {
+                RejectCode::SessionAlreadyExists
+            }
+            Self::IdentityMismatch { .. } => RejectCode::IdentityMismatch,
+            Self::InvalidAgentMetadata(error) => error.code(),
+            Self::Failed { code, .. } => *code,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -552,9 +728,26 @@ pub enum AttachError {
     },
     /// The cached attachment result's lease was invalidated by a takeover.
     Superseded,
+    /// A rejection with no dedicated variant. `code` is the contract; `message`
+    /// is diagnostic text and must not be parsed.
     Failed {
+        code: RejectCode,
         message: String,
     },
+}
+
+impl AttachError {
+    /// This error's machine-readable classification.
+    pub const fn code(&self) -> RejectCode {
+        match self {
+            Self::RequestCollision => RejectCode::RequestCollision,
+            Self::RetryExpired => RejectCode::RetryExpired,
+            Self::SessionNotFound { .. } => RejectCode::UnknownSession,
+            Self::IdentityMismatch { .. } => RejectCode::IdentityMismatch,
+            Self::Superseded => RejectCode::Superseded,
+            Self::Failed { code, .. } => *code,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -570,6 +763,23 @@ pub enum LeaseRejectionReason {
     PaneMissing,
     NotOwner,
     StaleLease,
+    /// The pane's bounded writer queue refused the bytes; they were definitely
+    /// not written to the PTY. Before version 11 the daemon reported this as
+    /// `NotOwner` because there was no other reason to reuse, which made a full
+    /// queue indistinguishable from a lost lease (R1).
+    WriteRefused,
+}
+
+impl LeaseRejectionReason {
+    /// This rejection's machine-readable classification.
+    pub const fn code(self) -> RejectCode {
+        match self {
+            Self::PaneMissing => RejectCode::UnknownSession,
+            Self::NotOwner => RejectCode::NotOwner,
+            Self::StaleLease => RejectCode::StaleLease,
+            Self::WriteRefused => RejectCode::InputRefused,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -592,9 +802,25 @@ pub enum StopError {
         mismatch: IdentityMismatch,
     },
     LeaseRejected(LeaseRejectionReason),
+    /// A rejection with no dedicated variant. `code` is the contract; `message`
+    /// is diagnostic text and must not be parsed.
     Failed {
+        code: RejectCode,
         message: String,
     },
+}
+
+impl StopError {
+    /// This error's machine-readable classification.
+    pub const fn code(&self) -> RejectCode {
+        match self {
+            Self::RequestCollision => RejectCode::RequestCollision,
+            Self::RetryExpired => RejectCode::RetryExpired,
+            Self::IdentityMismatch { .. } => RejectCode::IdentityMismatch,
+            Self::LeaseRejected(reason) => reason.code(),
+            Self::Failed { code, .. } => *code,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -635,9 +861,36 @@ pub enum AgentStatusError {
         current: AgentStatus,
         attempted: AgentStatus,
     },
+    /// A rejection with no dedicated variant. `code` is the contract; `message`
+    /// is diagnostic text and must not be parsed.
     Failed {
+        code: RejectCode,
         message: String,
     },
+}
+
+impl AgentStatusError {
+    /// This error's machine-readable classification.
+    ///
+    /// Every precondition failure collapses to
+    /// [`RejectCode::AgentStatusRejected`]: the client's response to all of
+    /// them is the same — re-query the daemon, which is authoritative — and the
+    /// specific variant remains available for the message it renders.
+    pub const fn code(&self) -> RejectCode {
+        match self {
+            Self::RequestCollision => RejectCode::RequestCollision,
+            Self::RetryExpired => RejectCode::RetryExpired,
+            Self::SessionNotFound { .. } => RejectCode::UnknownSession,
+            Self::IdentityMismatch(_) => RejectCode::IdentityMismatch,
+            Self::WrongSchema { .. }
+            | Self::NotAgentSession { .. }
+            | Self::WrongChat { .. }
+            | Self::WrongAgent { .. }
+            | Self::StaleGeneration { .. }
+            | Self::FinalStatusConflict { .. } => RejectCode::AgentStatusRejected,
+            Self::Failed { code, .. } => *code,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -672,12 +925,15 @@ pub enum ServerMessage {
         watermark: OutputSequence,
         omitted_prefix_bytes: u64,
     },
+    /// `bytes` is an `Arc<[u8]>` so the daemon can hand the retained history
+    /// chunk straight to the wire. It used to be a `Vec<u8>`, which forced a
+    /// copy of every replayed byte purely to change container type (A9).
     ReplayChunk {
         request_id: RequestId,
         pane: PaneId,
         lease: AttachmentLease,
         sequence: OutputSequence,
-        bytes: Vec<u8>,
+        bytes: Arc<[u8]>,
     },
     ReplayEnd {
         request_id: RequestId,
@@ -685,11 +941,13 @@ pub enum ServerMessage {
         lease: AttachmentLease,
         watermark: OutputSequence,
     },
+    /// `bytes` is an `Arc<[u8]>` for the same reason as [`Self::ReplayChunk`]:
+    /// one live frame is broadcast from the same allocation the reader produced.
     PtyOutput {
         pane: PaneId,
         lease: AttachmentLease,
         sequence: OutputSequence,
-        bytes: Vec<u8>,
+        bytes: Arc<[u8]>,
     },
     ForegroundProcess {
         pane: PaneId,
@@ -721,7 +979,8 @@ pub enum ServerMessage {
         reason: LeaseRejectionReason,
     },
     /// Reserved for handshake, framing, and connection-wide protocol errors.
-    Error { message: String },
+    /// `code` is the contract; `message` is diagnostic text.
+    Error { code: RejectCode, message: String },
 }
 
 pub fn read_message<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> io::Result<T> {
@@ -760,15 +1019,21 @@ pub fn write_message<T: Serialize>(writer: &mut impl Write, message: &T) -> io::
     writer.flush()
 }
 
+/// Clamp a requested screen size into the range the emulator can actually be
+/// driven at: never larger than the memory ceilings, and never smaller than
+/// [`MIN_SCREEN_ROWS`]×[`MIN_SCREEN_COLS`], which the parser panics below.
+///
+/// The floor wins over the cell budget, so a zero — the size a collapsed pane
+/// reports — comes out as a drawable screen rather than one with no cells. The
+/// two never actually compete: `MAX_SCREEN_CELLS` allows at least 200 rows at
+/// the widest permitted screen.
 pub fn bounded_screen_dimensions(rows: u16, cols: u16) -> (u16, u16) {
+    let cols = cols.clamp(MIN_SCREEN_COLS, MAX_SCREEN_COLS);
     let rows = rows.min(MAX_SCREEN_ROWS);
-    let cols = cols.min(MAX_SCREEN_COLS);
-    if rows == 0 || cols == 0 {
-        return (rows, cols);
-    }
 
     let max_rows_by_cells = (MAX_SCREEN_CELLS / usize::from(cols)).max(1);
-    (rows.min(max_rows_by_cells as u16), cols)
+    let rows = rows.min(max_rows_by_cells as u16).max(MIN_SCREEN_ROWS);
+    (rows, cols)
 }
 
 fn message_too_large(kind: io::ErrorKind, len: u64) -> io::Error {
@@ -778,7 +1043,11 @@ fn message_too_large(kind: io::ErrorKind, len: u64) -> io::Error {
     )
 }
 
-fn invalid_data(error: impl std::fmt::Display) -> io::Error {
+/// An `InvalidData` error carrying `error`'s message.
+///
+/// Shared rather than redefined per module: `storage` and `transcript` each had
+/// their own copy over `serde_json::Error` (F20).
+pub fn invalid_data(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
@@ -914,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_every_protocol_v10_client_message_fixture() {
+    fn round_trips_every_protocol_v11_client_message_fixture() {
         let scope = ClientScopeId::from_bytes([0x11; 16]);
         let mut env = BTreeMap::new();
         env.insert("FIXTURE_KEY".to_string(), "fixture value".to_string());
@@ -1033,7 +1302,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_every_protocol_v10_server_message_fixture() {
+    fn round_trips_every_protocol_v11_server_message_fixture() {
         let scope = ClientScopeId::from_bytes([0x22; 16]);
         let server_instance = ServerInstanceId::from_bytes([0x33; 16]);
         let session = session_info();
@@ -1078,6 +1347,7 @@ mod tests {
             ServerMessage::CreateResult {
                 request_id: request_id(5),
                 outcome: CreateOutcome::Error(CreateError::Failed {
+                    code: RejectCode::LaunchFailed,
                     message: "spawn failed".to_string(),
                 }),
             },
@@ -1132,6 +1402,7 @@ mod tests {
             ServerMessage::AttachResult {
                 request_id: request_id(11),
                 outcome: AttachOutcome::Error(AttachError::Failed {
+                    code: RejectCode::ShuttingDown,
                     message: "attach failed".to_string(),
                 }),
             },
@@ -1163,7 +1434,7 @@ mod tests {
                 pane: PaneId(17),
                 lease: lease(101),
                 sequence: OutputSequence::new(3),
-                bytes: vec![0, 0xff, b'x'],
+                bytes: Arc::from(&[0, 0xff, b'x'][..]),
             },
             ServerMessage::ReplayEnd {
                 request_id: request_id(6),
@@ -1175,13 +1446,13 @@ mod tests {
                 pane: PaneId(17),
                 lease: lease(101),
                 sequence: OutputSequence::new(12),
-                bytes: Vec::new(),
+                bytes: Arc::from(&[][..]),
             },
             ServerMessage::PtyOutput {
                 pane: PaneId(17),
                 lease: lease(101),
                 sequence: OutputSequence::new(12),
-                bytes: vec![0, 0x1b, 0xff],
+                bytes: Arc::from(&[0, 0x1b, 0xff][..]),
             },
             ServerMessage::ForegroundProcess {
                 pane: PaneId(17),
@@ -1250,6 +1521,7 @@ mod tests {
             ServerMessage::StopResult {
                 request_id: request_id(20),
                 outcome: StopOutcome::Error(StopError::Failed {
+                    code: RejectCode::DaemonInternal,
                     message: "kill or wait failed".to_string(),
                 }),
             },
@@ -1310,6 +1582,7 @@ mod tests {
                 attempted: AgentStatus::Running,
             },
             AgentStatusError::Failed {
+                code: RejectCode::DaemonInternal,
                 message: "status state failed".to_string(),
             },
         ]
@@ -1332,6 +1605,7 @@ mod tests {
                 LeaseRejectionReason::PaneMissing,
                 LeaseRejectionReason::NotOwner,
                 LeaseRejectionReason::StaleLease,
+                LeaseRejectionReason::WriteRefused,
             ] {
                 fixtures.push(ServerMessage::LeaseRejected {
                     pane: PaneId(17),
@@ -1342,9 +1616,77 @@ mod tests {
             }
         }
 
+        fixtures.push(ServerMessage::Error {
+            code: RejectCode::ProtocolMismatch,
+            message: "client protocol version 10 is incompatible".to_string(),
+        });
+
         for fixture in &fixtures {
             assert_framed_round_trip(fixture);
         }
+    }
+
+    /// F8: the code is the contract, so every error the wire can carry must
+    /// classify — no error may be reachable only through its prose.
+    #[test]
+    fn every_wire_error_maps_to_a_reject_code() {
+        assert_eq!(
+            CreateError::SessionAlreadyExists {
+                session: session_info()
+            }
+            .code(),
+            RejectCode::SessionAlreadyExists
+        );
+        assert_eq!(
+            CreateError::InvalidAgentMetadata(AgentStatusError::WrongChat {
+                expected: 1,
+                received: 2,
+            })
+            .code(),
+            RejectCode::AgentStatusRejected,
+            "a nested agent-status rejection keeps its own classification"
+        );
+        assert_eq!(
+            AttachError::SessionNotFound {
+                session: SessionId(1)
+            }
+            .code(),
+            RejectCode::UnknownSession
+        );
+        assert_eq!(AttachError::Superseded.code(), RejectCode::Superseded);
+        assert_eq!(
+            StopError::LeaseRejected(LeaseRejectionReason::WriteRefused).code(),
+            RejectCode::InputRefused,
+            "a full writer queue is no longer indistinguishable from NotOwner"
+        );
+        assert_eq!(
+            StopError::LeaseRejected(LeaseRejectionReason::PaneMissing).code(),
+            RejectCode::UnknownSession
+        );
+        assert_eq!(
+            AgentStatusError::StaleGeneration {
+                current: generation(1),
+                received: generation(2),
+            }
+            .code(),
+            RejectCode::AgentStatusRejected
+        );
+        assert_eq!(
+            StopError::Failed {
+                code: RejectCode::ShuttingDown,
+                message: String::new(),
+            }
+            .code(),
+            RejectCode::ShuttingDown,
+            "a generic failure carries its own code rather than a catch-all"
+        );
+
+        // Only genuinely transient conditions invite an identical retry.
+        assert!(RejectCode::TooManyPendingRequests.is_transient());
+        assert!(RejectCode::InputRefused.is_transient());
+        assert!(!RejectCode::IdentityMismatch.is_transient());
+        assert!(!RejectCode::ProtocolMismatch.is_transient());
+        assert!(!RejectCode::description(RejectCode::UnknownSession).is_empty());
     }
 
     #[cfg(not(unix))]
@@ -1363,7 +1705,7 @@ mod tests {
         let component = socket_user_component();
         assert!(!component.is_empty());
         assert!(component.chars().all(|ch| ch.is_ascii_digit()));
-        assert_eq!(component, unsafe { libc::geteuid() }.to_string());
+        assert_eq!(component, peer::effective_uid().to_string());
     }
 
     #[cfg(unix)]
@@ -1431,14 +1773,31 @@ mod tests {
         dir
     }
 
+    /// G7: the policy is tested through its pure seam. The old version of this
+    /// test called `set_var`/`remove_var` on a process global while sibling
+    /// tests resolved socket paths from other threads.
     #[test]
-    fn socket_path_can_be_overridden_by_environment() {
-        let path = PathBuf::from("/tmp/mult-test-override.sock");
-        std::env::set_var(SOCKET_PATH_ENV, &path);
+    fn socket_path_prefers_the_override_then_the_runtime_dir_then_a_per_uid_dir() {
+        let explicit = socket_path_from(
+            Some(OsStr::new("/tmp/mult-test-override.sock")),
+            Some(OsStr::new("/run/user/1000")),
+            || panic!("the override must not need a UID lookup"),
+        );
+        assert_eq!(explicit, Path::new("/tmp/mult-test-override.sock"));
 
-        assert_eq!(default_socket_path(), path);
+        let runtime = socket_path_from(None, Some(OsStr::new("/run/user/1000")), || {
+            panic!("XDG_RUNTIME_DIR must not need a UID lookup")
+        });
+        assert_eq!(
+            runtime,
+            Path::new("/run/user/1000").join(DEFAULT_SOCKET_NAME)
+        );
 
-        std::env::remove_var(SOCKET_PATH_ENV);
+        let fallback = socket_path_from(None, None, || "4242".to_string());
+        assert_eq!(
+            fallback,
+            Path::new("/tmp/mult-4242").join(DEFAULT_SOCKET_NAME)
+        );
     }
 
     #[test]
@@ -1490,5 +1849,37 @@ mod tests {
         assert!(rows <= MAX_SCREEN_ROWS);
         assert!(cols <= MAX_SCREEN_COLS);
         assert!(usize::from(rows) * usize::from(cols) <= MAX_SCREEN_CELLS);
+    }
+
+    #[test]
+    fn bounded_screen_dimensions_raises_sizes_to_the_emulator_floor() {
+        // Every shape a collapsed or single-line pane can report. None of them
+        // may pass through: the emulator panics below the floor (A13).
+        for (rows, cols) in [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (1, 80),
+            (24, 1),
+            (0, 200),
+            (200, 0),
+        ] {
+            let (bounded_rows, bounded_cols) = bounded_screen_dimensions(rows, cols);
+
+            assert!(
+                bounded_rows >= MIN_SCREEN_ROWS && bounded_cols >= MIN_SCREEN_COLS,
+                "{rows}x{cols} was not raised to the floor"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_screen_dimensions_leaves_ordinary_sizes_alone() {
+        assert_eq!(bounded_screen_dimensions(24, 80), (24, 80));
+        assert_eq!(
+            bounded_screen_dimensions(MIN_SCREEN_ROWS, MIN_SCREEN_COLS),
+            (MIN_SCREEN_ROWS, MIN_SCREEN_COLS)
+        );
     }
 }
