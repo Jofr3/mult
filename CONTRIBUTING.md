@@ -51,6 +51,33 @@ cargo test  --workspace --all-targets --all-features
 cargo fmt --all
 ```
 
+## Fuzzing
+
+The `fuzz/` crate holds two `cargo-fuzz` targets. It is **its own workspace**, so
+nothing above touches it: normal builds, `cargo deny` and the MSRV job never see
+`libfuzzer-sys`, and `just ci` does not run it. It needs a nightly toolchain.
+
+```sh
+cargo install cargo-fuzz
+cd fuzz
+cargo +nightly fuzz build
+cargo +nightly fuzz run protocol_read_message -- -max_total_time=60
+cargo +nightly fuzz run vt_response_detector  -- -max_total_time=60
+```
+
+| Target | What it drives |
+| --- | --- |
+| `protocol_read_message` | An arbitrary byte stream through `mult_protocol::read_message` in both directions. Any error is fine; a panic, an unbounded allocation or a hang is not. |
+| `vt_response_detector` | Arbitrary PTY output through the terminal-query responder and the emulator, with interleaved resizes, at pane sizes taken from the input — including the clamped floor. This is the target that found `A13`. |
+
+`fuzz/target`, `fuzz/corpus` and `fuzz/artifacts` are gitignored. A crash lands
+in `fuzz/artifacts/<target>/`; reproduce it with `cargo +nightly fuzz run
+<target> <artifact>`, then add the shrunk input as a deterministic regression
+test in the crate it belongs to rather than relying on the corpus.
+
+`fuzz_feed_terminal_output` in `src/pty.rs` is the seam the second target uses;
+it is behind the `fuzzing` feature and is not compiled into anything shipped.
+
 ## Test environment variables
 
 Two variables gate the PTY integration suite. Both are read by

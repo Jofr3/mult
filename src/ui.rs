@@ -856,6 +856,10 @@ fn render_terminal_parser(
     palette: Palette,
     selection: Option<&TextSelection>,
 ) {
+    if !area_fits_a_screen(area) {
+        render_pane_too_small(frame, area, focused, palette);
+        return;
+    }
     let cursor_style = Style::default().fg(palette.cursor).bg(palette.base);
     let cursor_overlay_style = Style::default()
         .fg(readable_fg(palette.nc, palette.cursor))
@@ -883,6 +887,47 @@ fn render_terminal_parser(
             .collect();
         render_text_selection(frame, area, &row_content_widths, selection, palette);
     }
+}
+
+/// Whether a pane area can hold a screen at the size the emulator is actually
+/// driven at.
+///
+/// The parser is never built below `MIN_SCREEN_ROWS`×`MIN_SCREEN_COLS`
+/// (see [`crate::pty::PtyDimensions::clamped`] — anything smaller panics
+/// `fnug-vt100`), so a smaller area cannot show its screen: it would render a
+/// crop of a differently sized terminal, with the cursor and every mouse
+/// coordinate off. Say so instead.
+fn area_fits_a_screen(area: Rect) -> bool {
+    crate::pty::PtyDimensions {
+        rows: area.height,
+        cols: area.width,
+    }
+    .fits_a_screen()
+}
+
+/// Fill a pane that is too small to draw with a visible marker. Anything wider
+/// than a couple of columns gets words; below that the pane is filled with `!`
+/// so the degradation still reads as deliberate rather than as a blank pane.
+fn render_pane_too_small(frame: &mut Frame, area: Rect, focused: bool, palette: Palette) {
+    let style = pane_style(focused, palette).fg(palette.gold);
+    let label = if area.width >= 9 {
+        "too small".to_string()
+    } else {
+        "!".repeat(usize::from(area.width))
+    };
+    let lines = (0..area.height)
+        .map(|row| {
+            if row == area.height / 2 {
+                Line::from(label.clone())
+            } else {
+                Line::from("")
+            }
+        })
+        .collect::<Vec<_>>();
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().style(style))
+        .style(style);
+    frame.render_widget(paragraph, area);
 }
 
 /// Bytes of cell contents stored inline. `vt100` caps a cell at six `char`s
@@ -2478,6 +2523,73 @@ mod tests {
         let mut parser = vt100::Parser::new(rows, cols, 0);
         parser.process(bytes);
         parser
+    }
+
+    /// Every symbol painted inside `area`, in reading order.
+    fn painted_area(backend: &TestBackend, area: Rect) -> String {
+        let buffer = backend.buffer();
+        (0..area.height)
+            .flat_map(|row| (0..area.width).map(move |col| (row, col)))
+            .map(|(row, col)| {
+                buffer
+                    .cell((area.x + col, area.y + row))
+                    .expect("cell is in bounds")
+                    .symbol()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_pane_below_the_emulator_floor_is_marked_too_small() {
+        // The parser is never built below 2×2 (A13), so a one-row or one-column
+        // pane cannot show its screen. It must say so rather than paint a crop
+        // of a differently sized terminal.
+        let parser = vt100_parser(2, 4, b"WXYZ");
+        let palette = test_palette();
+
+        for area in [
+            Rect::new(0, 0, 1, 4),
+            Rect::new(0, 0, 4, 1),
+            Rect::new(0, 0, 1, 1),
+            Rect::new(0, 0, 20, 1),
+        ] {
+            let backend = TestBackend::new(24, 8);
+            let mut terminal = Terminal::new(backend).expect("create test terminal");
+            terminal
+                .draw(|frame| render_terminal_parser(frame, area, &parser, true, palette, None))
+                .expect("draw pane");
+
+            let painted = painted_area(terminal.backend(), area);
+            assert!(
+                !painted.contains('W'),
+                "{area:?} drew the screen at the wrong size: {painted:?}"
+            );
+            if area.width >= 9 {
+                assert!(
+                    painted.contains("too small"),
+                    "{area:?} did not say why it is blank: {painted:?}"
+                );
+            } else {
+                assert!(
+                    painted.contains('!'),
+                    "{area:?} degraded invisibly: {painted:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pane_at_the_emulator_floor_still_draws_its_screen() {
+        let parser = vt100_parser(2, 2, b"ab");
+        let area = Rect::new(0, 0, 2, 2);
+        let backend = TestBackend::new(8, 8);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| render_terminal_parser(frame, area, &parser, true, test_palette(), None))
+            .expect("draw pane");
+
+        assert!(painted_area(terminal.backend(), area).starts_with("ab"));
     }
 
     #[test]

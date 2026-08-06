@@ -3158,7 +3158,9 @@ impl PaneState {
 }
 
 fn bounded_pty_dimensions(rows: u16, cols: u16) -> (u16, u16) {
-    bounded_screen_dimensions(rows.max(1), cols.max(1))
+    // `bounded_screen_dimensions` owns both ends of the range, including the
+    // emulator floor a zero used to fall through (A13).
+    bounded_screen_dimensions(rows, cols)
 }
 
 fn command_line_for_pid(pid: u32) -> Option<String> {
@@ -3232,6 +3234,8 @@ mod tests {
         os::unix::fs::PermissionsExt,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    use mult_protocol::{MIN_SCREEN_COLS, MIN_SCREEN_ROWS};
 
     use super::*;
 
@@ -4179,7 +4183,13 @@ mod tests {
         ));
         let pane_state = pane.lock().unwrap();
         assert_eq!(writes.queued_bytes(), 0, "no rejected byte reached the PTY");
-        assert_eq!((pane_state.rows, pane_state.cols), (1, 1));
+        // The stale resize was rejected, so the pane keeps the size its attach
+        // established: 1×1 raised to the emulator floor by
+        // `bounded_pty_dimensions` (A13).
+        assert_eq!(
+            (pane_state.rows, pane_state.cols),
+            (MIN_SCREEN_ROWS, MIN_SCREEN_COLS)
+        );
         assert_eq!(pane_state.lifecycle, PaneLifecycle::Running);
         assert!(pane_state.pending_stops.is_empty());
         assert!(pane_state.owner.as_ref().is_some_and(|owner| {

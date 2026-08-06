@@ -17,7 +17,7 @@ use std::{
 };
 
 use mult_protocol::{
-    default_socket_path,
+    bounded_screen_dimensions, default_socket_path,
     peer::{effective_uid, verify_peer_is_self},
     read_message, write_message, AgentSessionMetadata, AgentStatusError, AgentStatusOutcome,
     AgentStatusQuery, AgentStatusRecord, AttachError, AttachOutcome, AttachmentLease,
@@ -25,7 +25,7 @@ use mult_protocol::{
     LeaseRejectionReason, OutputSequence, PaneId, RequestId, ServerInstanceId, ServerMessage,
     SessionId, SessionIdentity as WireSessionIdentity, SessionInfo,
     StateNamespace as WireStateNamespace, StopError, StopOutcome, MAX_PENDING_REQUESTS_PER_CLIENT,
-    PROTOCOL_VERSION, SOCKET_PATH_ENV,
+    MIN_SCREEN_COLS, MIN_SCREEN_ROWS, PROTOCOL_VERSION, SOCKET_PATH_ENV,
 };
 use vt100::{MouseProtocolEncoding, MouseProtocolMode, Parser};
 
@@ -251,9 +251,28 @@ struct EstablishedConnection {
     hello: ServerHello,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct TerminalResponseDetector {
     state: TerminalResponseState,
+    /// Parameter and intermediate bytes of the CSI sequence being scanned.
+    ///
+    /// Held here rather than inside [`TerminalResponseState::Csi`] so entering
+    /// a CSI costs no allocation: a TUI child redrawing a frame emits thousands
+    /// of them, and every one used to start with an empty `Vec`. The sequence
+    /// was already capped at [`TERMINAL_MAX_CSI_SEQUENCE_BYTES`], so the bound
+    /// is the array's length rather than a second check.
+    csi: [u8; TERMINAL_MAX_CSI_SEQUENCE_BYTES],
+    csi_len: usize,
+}
+
+impl Default for TerminalResponseDetector {
+    fn default() -> Self {
+        Self {
+            state: TerminalResponseState::default(),
+            csi: [0; TERMINAL_MAX_CSI_SEQUENCE_BYTES],
+            csi_len: 0,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -271,12 +290,14 @@ enum TerminalInputTrackState {
     Csi,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum TerminalResponseState {
     #[default]
     Ground,
     Escape,
-    Csi(Vec<u8>),
+    /// Inside a CSI sequence; its bytes accumulate in
+    /// [`TerminalResponseDetector::csi`].
+    Csi,
     CsiIgnored,
     String {
         esc_seen: bool,
@@ -387,6 +408,30 @@ impl Default for PtyDimensions {
     }
 }
 
+impl PtyDimensions {
+    /// The size the emulator and the daemon will actually be driven at.
+    ///
+    /// The fields are `pub`, so a private constructor cannot enforce this;
+    /// instead every path into the parser and every size put on the wire goes
+    /// through here. [`mult_protocol::bounded_screen_dimensions`] owns the
+    /// policy — both the memory ceilings and the [`MIN_SCREEN_ROWS`] /
+    /// [`MIN_SCREEN_COLS`] floor the parser panics below (A13) — so the client,
+    /// the daemon and the wire agree on one answer.
+    #[must_use]
+    pub fn clamped(self) -> Self {
+        let (rows, cols) = bounded_screen_dimensions(self.rows, self.cols);
+        Self { rows, cols }
+    }
+
+    /// Whether an area of this size is big enough to hold a screen without
+    /// being enlarged by [`Self::clamped`]. The renderer uses this to show a
+    /// "too small" pane rather than a screen that does not match its area.
+    #[must_use]
+    pub fn fits_a_screen(self) -> bool {
+        self.rows >= MIN_SCREEN_ROWS && self.cols >= MIN_SCREEN_COLS
+    }
+}
+
 impl PtyRuntime {
     pub fn is_running(&self, terminal: PtyKey) -> bool {
         self.terminal_to_pane.get(&terminal).is_some_and(|pane| {
@@ -482,24 +527,18 @@ impl PtyRuntime {
     }
 
     pub fn ensure_parser(&mut self, terminal: PtyKey, size: PtyDimensions) {
-        self.parsers.entry(terminal).or_insert_with(|| {
-            Parser::new(
-                size.rows.max(1),
-                size.cols.max(1),
-                TERMINAL_SCROLLBACK_LINES,
-            )
-        });
+        let size = size.clamped();
+        self.parsers
+            .entry(terminal)
+            .or_insert_with(|| Parser::new(size.rows, size.cols, TERMINAL_SCROLLBACK_LINES));
         self.resize_parser(terminal, size);
     }
 
     pub fn reset_parser(&mut self, terminal: PtyKey, size: PtyDimensions) {
+        let size = size.clamped();
         self.parsers.insert(
             terminal,
-            Parser::new(
-                size.rows.max(1),
-                size.cols.max(1),
-                TERMINAL_SCROLLBACK_LINES,
-            ),
+            Parser::new(size.rows, size.cols, TERMINAL_SCROLLBACK_LINES),
         );
         self.responders.remove(&terminal);
         self.terminals_with_output.remove(&terminal);
@@ -618,6 +657,7 @@ impl PtyRuntime {
         terminal: PtyKey,
         size: PtyDimensions,
     ) -> io::Result<AttachExistingResult> {
+        let size = size.clamped();
         if self.is_running(terminal) {
             return Ok(AttachExistingResult::Attached);
         }
@@ -659,7 +699,8 @@ impl PtyRuntime {
         }
     }
 
-    pub fn start(&mut self, spawn: PtySpawn) -> io::Result<()> {
+    pub fn start(&mut self, mut spawn: PtySpawn) -> io::Result<()> {
+        spawn.size = spawn.size.clamped();
         if self.is_running(spawn.terminal) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -988,6 +1029,9 @@ impl PtyRuntime {
     }
 
     pub fn resize(&mut self, terminal: PtyKey, size: PtyDimensions) -> io::Result<()> {
+        // Clamped once here so the parser and the daemon's PTY are driven at
+        // the same size; the daemon applies the same policy independently.
+        let size = size.clamped();
         self.resize_parser(terminal, size);
         let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
             return Ok(());
@@ -1417,11 +1461,13 @@ impl PtyRuntime {
     }
 
     fn resize_parser(&mut self, terminal: PtyKey, size: PtyDimensions) {
+        let size = size.clamped();
         let parser = self
             .parsers
             .entry(terminal)
             .or_insert_with(|| Parser::new(24, 80, TERMINAL_SCROLLBACK_LINES));
-        parser.set_size(size.rows.max(1), size.cols.max(1));
+        repair_wide_cells_before_narrowing(parser, size);
+        parser.set_size(size.rows, size.cols);
         clamp_parser_scrollback(parser);
     }
 
@@ -2202,6 +2248,75 @@ fn clamp_parser_scrollback(parser: &mut Parser) {
     parser.set_scrollback(current);
 }
 
+/// Clear double-width characters that a narrowing resize would cut in half.
+///
+/// `fnug-vt100` narrows a row with `Row::resize`, which drops the trailing cells
+/// but — unlike its own `Row::truncate` — leaves the `is_wide` flag on the cell
+/// that becomes the last one. That cell then claims a second half that no
+/// longer exists, and the next character printed there unwraps `None` inside
+/// the emulator and panics (A14). Dragging a pane one column narrower with any
+/// CJK text or emoji on screen is enough to reach it, and a panic here takes
+/// down a UI holding the terminal in raw mode.
+///
+/// The repair erases the doomed character *before* the resize, while the grid
+/// is still consistent: `EL` goes through `Row::erase`, which clears both
+/// halves of a wide cell. Nothing is lost that the resize was not already going
+/// to destroy — the character being erased is exactly the one whose second half
+/// the truncation removes — and the work is skipped entirely unless a row
+/// actually ends in a split wide character.
+///
+/// `DECSC`/`DECRC` bracket the repair because they are the only way to restore
+/// the cursor *and* origin mode, and origin mode decides what the `CUP` below
+/// addresses. That costs the pane's saved-cursor slot, which is acceptable
+/// only because this runs during a resize, after which the child redraws from
+/// scratch anyway.
+///
+/// **Known residual:** `Screen::set_size` resizes the alternate grid too, but
+/// only the *current* grid is reachable through the public API, so an orphan
+/// left in the inactive grid survives. Entering the alternate screen clears it
+/// (`CSI ? 1049 h`), so the gap is one-directional: a pane narrowed while in
+/// the alternate screen can still carry a split wide character back to the
+/// normal grid on exit.
+fn repair_wide_cells_before_narrowing(parser: &mut Parser, size: PtyDimensions) {
+    let (rows, cols) = parser.screen().size();
+    if size.cols >= cols {
+        return;
+    }
+    // The floor guarantees at least two columns, so the surviving last column
+    // is always a valid index and always has a cell before it.
+    let last_col = size.cols.saturating_sub(1);
+
+    // `Screen::cell` reads the *visible* rows, which are the drawing rows only
+    // while the view is not scrolled back; the drawing rows are the ones
+    // `set_size` truncates.
+    let scrollback = parser.screen().scrollback();
+    parser.set_scrollback(0);
+    let split: Vec<u16> = (0..rows)
+        .filter(|row| {
+            parser
+                .screen()
+                .cell(*row, last_col)
+                .is_some_and(vt100::Cell::is_wide)
+        })
+        .collect();
+
+    if !split.is_empty() {
+        let mut repair = Vec::with_capacity(split.len() * 12 + 8);
+        // DECSC, then absolute (origin-mode-independent) addressing.
+        repair.extend_from_slice(b"\x1b7\x1b[?6l");
+        for row in split {
+            // CUP is 1-based, so `last_col` addresses column `last_col + 1`,
+            // and EL erases from there to the end of the row.
+            repair
+                .extend_from_slice(format!("\x1b[{};{}H\x1b[K", row + 1, last_col + 1).as_bytes());
+        }
+        repair.extend_from_slice(b"\x1b8");
+        parser.process(&repair);
+    }
+
+    parser.set_scrollback(scrollback);
+}
+
 /// Encode a single mouse event for a program that has enabled mouse
 /// reporting. `button` is the xterm button byte; `col`/`row` are 1-based,
 /// screen-relative cell coordinates.
@@ -2324,36 +2439,43 @@ impl TerminalResponseDetector {
         matches!(self.state, TerminalResponseState::Ground)
     }
 
-    fn advance(&mut self, byte: u8, screen: &vt100::Screen) -> Option<TerminalQueryResponse> {
-        let state = std::mem::take(&mut self.state);
-        let (next, response) = match state {
+    /// Step the detector over one byte, reporting any query it completed.
+    ///
+    /// Deliberately free of the screen: a query's *content* may depend on it
+    /// (the cursor position report does), but whether one was asked never does.
+    /// Keeping the two apart is what lets [`feed_parser_with_responder`] scan a
+    /// whole escape sequence before handing it to the parser.
+    fn advance(&mut self, byte: u8) -> Option<TerminalQuery> {
+        let (next, query) = match self.state {
             TerminalResponseState::Ground => match byte {
                 0x1b => (TerminalResponseState::Escape, None),
                 _ => (TerminalResponseState::Ground, None),
             },
             TerminalResponseState::Escape => match byte {
-                b'[' => (TerminalResponseState::Csi(Vec::new()), None),
+                b'[' => {
+                    self.csi_len = 0;
+                    (TerminalResponseState::Csi, None)
+                }
                 b']' | b'P' | b'_' | b'^' | b'X' => {
                     (TerminalResponseState::String { esc_seen: false }, None)
                 }
                 b'(' | b')' | b'*' | b'+' => (TerminalResponseState::IgnoreOne, None),
                 b'Z' => (
                     TerminalResponseState::Ground,
-                    Some(TerminalQueryResponse::device(
-                        PRIMARY_DEVICE_ATTRIBUTES_RESPONSE.to_vec(),
-                    )),
+                    Some(TerminalQuery::Device(PRIMARY_DEVICE_ATTRIBUTES_RESPONSE)),
                 ),
                 _ => (TerminalResponseState::Ground, None),
             },
-            TerminalResponseState::Csi(mut sequence) => {
+            TerminalResponseState::Csi => {
                 if (0x40..=0x7e).contains(&byte) {
-                    let response = csi_terminal_response(&sequence, byte as char, screen);
-                    (TerminalResponseState::Ground, response)
-                } else if sequence.len() >= TERMINAL_MAX_CSI_SEQUENCE_BYTES {
+                    let query = csi_terminal_query(&self.csi[..self.csi_len], byte as char);
+                    (TerminalResponseState::Ground, query)
+                } else if self.csi_len >= TERMINAL_MAX_CSI_SEQUENCE_BYTES {
                     (TerminalResponseState::CsiIgnored, None)
                 } else {
-                    sequence.push(byte);
-                    (TerminalResponseState::Csi(sequence), None)
+                    self.csi[self.csi_len] = byte;
+                    self.csi_len += 1;
+                    (TerminalResponseState::Csi, None)
                 }
             }
             TerminalResponseState::CsiIgnored => {
@@ -2371,7 +2493,7 @@ impl TerminalResponseDetector {
             TerminalResponseState::IgnoreOne => (TerminalResponseState::Ground, None),
         };
         self.state = next;
-        response
+        query
     }
 }
 
@@ -2409,30 +2531,90 @@ enum TerminalQueryKind {
     Device,
 }
 
-impl TerminalQueryResponse {
-    fn device(bytes: Vec<u8>) -> Self {
-        Self {
-            kind: TerminalQueryKind::Device,
-            bytes,
-        }
-    }
+/// A query the detector recognised, before its answer is built. Separating this
+/// from [`TerminalQueryResponse`] keeps the state machine independent of the
+/// screen; only [`TerminalQuery::resolve`] reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalQuery {
+    /// A fixed answer: device attributes or device status.
+    Device(&'static [u8]),
+    /// A cursor position report, private (DECXCPR) or not.
+    CursorPosition { private: bool },
+}
 
-    fn cursor_position(bytes: Vec<u8>) -> Self {
-        Self {
-            kind: TerminalQueryKind::CursorPosition,
-            bytes,
+impl TerminalQuery {
+    fn resolve(self, screen: &vt100::Screen) -> TerminalQueryResponse {
+        match self {
+            Self::Device(bytes) => TerminalQueryResponse {
+                kind: TerminalQueryKind::Device,
+                bytes: bytes.to_vec(),
+            },
+            Self::CursorPosition { private } => TerminalQueryResponse {
+                kind: TerminalQueryKind::CursorPosition,
+                bytes: cursor_position_report(screen, private),
+            },
         }
     }
+}
+
+/// Drive the responding feed path over `chunks`, resizing to `sizes[i]` before
+/// chunk `i`, and return the answer produced for each chunk.
+///
+/// The seam `fuzz/fuzz_targets/vt_response_detector.rs` needs: production code
+/// reaches [`feed_parser_with_responder`] only from a daemon output event, and
+/// the fuzz crate lives outside this workspace. Behind the `fuzzing` feature so
+/// ordinary builds are byte-for-byte unaffected.
+///
+/// Sizes go through [`PtyDimensions::clamped`] exactly as a pane's do, so the
+/// clamped floor is exercised on every run — the size the emulator used to
+/// panic at (A13) — and interleaving resizes with output is what reaches the
+/// narrowing case (A14).
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_feed_terminal_output(sizes: &[(u16, u16)], chunks: &[&[u8]]) -> Vec<Vec<u8>> {
+    let terminal = PtyKey::Terminal(TerminalId(0));
+    let mut runtime = PtyRuntime::new_offline();
+    runtime.ensure_parser(terminal, PtyDimensions::default());
+    let mut responder = TerminalResponseDetector::default();
+
+    chunks
+        .iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            if let Some(&(rows, cols)) = sizes.get(index % sizes.len().max(1)) {
+                runtime.resize_parser(terminal, PtyDimensions { rows, cols });
+            }
+            let parser = runtime
+                .parsers
+                .get_mut(&terminal)
+                .expect("parser was just ensured");
+            let answer = feed_parser_with_responder(parser, &mut responder, chunk);
+            clamp_parser_scrollback(parser);
+            answer
+        })
+        .collect()
 }
 
 /// Feed `bytes` to `parser` while letting `responder` answer terminal queries,
 /// returning the answers coalesced into a single input payload.
 ///
-/// While the responder is idle (Ground) no query can begin until an escape, so
-/// the run of bytes up to the next ESC is fed in a single `process` call; only
-/// escape sequences are stepped one byte at a time, which is what the responder
-/// needs to report state such as the cursor position at the exact query point.
-/// This is behaviourally identical to feeding every byte individually.
+/// The parser is driven in two kinds of batch, never byte by byte. While the
+/// responder is idle (Ground) no query can begin until an escape, so the run of
+/// printable bytes up to the next ESC goes in one `process` call. From the ESC
+/// onwards the responder scans ahead — it is a pure state machine — until the
+/// sequence ends or the chunk does, and that whole sequence then goes in one
+/// `process` call too. Escape-dense output is the normal case for a TUI child,
+/// and it used to pay a full `vte` dispatch per byte.
+///
+/// The carve-out that made the old code per-byte is preserved: a cursor
+/// position report must describe the screen *at the query point*. Batching one
+/// sequence at a time keeps that exact, because the only sequences that produce
+/// an answer — `CSI c`, `CSI n`, `ESC Z` — are queries, and a query never moves
+/// the cursor or touches the grid. The screen the parser holds after the
+/// sequence is therefore the screen it held at the query point, and answers
+/// still come out in stream order. Nothing may be batched *across* a sequence
+/// boundary: `CSI 3;4H` followed by `CSI 6n` would then report the wrong
+/// position. `batched_feed_matches_byte_at_a_time_feed_on_*` pins all of this
+/// against an explicit byte-at-a-time reference.
 ///
 /// The answers are bounded, because a chunk of PTY output is chosen by whatever
 /// is running in the pane: 8 KiB of `\x1b[6n` used to become ~2048 separate
@@ -2460,9 +2642,26 @@ fn feed_parser_with_responder(
                 continue;
             }
         }
-        let byte = bytes[index];
-        parser.process(std::slice::from_ref(&byte));
-        if let Some(response) = responder.advance(byte, parser.screen()) {
+
+        // One escape sequence: scan it out of the chunk, then hand the parser
+        // all of it at once. An unterminated sequence simply runs to the end of
+        // the chunk and the responder resumes mid-sequence on the next one.
+        let start = index;
+        let mut query = None;
+        while index < bytes.len() {
+            let recognised = responder.advance(bytes[index]);
+            index += 1;
+            if recognised.is_some() {
+                query = recognised;
+            }
+            if responder.is_ground() {
+                break;
+            }
+        }
+        parser.process(&bytes[start..index]);
+
+        if let Some(query) = query {
+            let response = query.resolve(parser.screen());
             let repeated_cursor =
                 cursor_reported && response.kind == TerminalQueryKind::CursorPosition;
             let over_budget = answered >= MAX_TERMINAL_QUERY_RESPONSES_PER_CHUNK
@@ -2473,34 +2672,25 @@ fn feed_parser_with_responder(
                 payload.extend_from_slice(&response.bytes);
             }
         }
-        index += 1;
     }
     payload
 }
 
-fn csi_terminal_response(
-    sequence: &[u8],
-    final_char: char,
-    screen: &vt100::Screen,
-) -> Option<TerminalQueryResponse> {
+fn csi_terminal_query(sequence: &[u8], final_char: char) -> Option<TerminalQuery> {
     let private = sequence.contains(&b'?');
     let params = parse_csi_params(sequence);
     match final_char {
-        'c' if !private && param_or_default(&params, 0, 0) == 0 => Some(
-            TerminalQueryResponse::device(PRIMARY_DEVICE_ATTRIBUTES_RESPONSE.to_vec()),
-        ),
+        'c' if !private && param_or_default(&params, 0, 0) == 0 => {
+            Some(TerminalQuery::Device(PRIMARY_DEVICE_ATTRIBUTES_RESPONSE))
+        }
         'n' if !private => match param_or_default(&params, 0, 0) {
-            5 => Some(TerminalQueryResponse::device(
-                DEVICE_STATUS_OK_RESPONSE.to_vec(),
-            )),
-            6 => Some(TerminalQueryResponse::cursor_position(
-                cursor_position_report(screen, false),
-            )),
+            5 => Some(TerminalQuery::Device(DEVICE_STATUS_OK_RESPONSE)),
+            6 => Some(TerminalQuery::CursorPosition { private: false }),
             _ => None,
         },
-        'n' if private && param_or_default(&params, 0, 0) == 6 => Some(
-            TerminalQueryResponse::cursor_position(cursor_position_report(screen, true)),
-        ),
+        'n' if private && param_or_default(&params, 0, 0) == 6 => {
+            Some(TerminalQuery::CursorPosition { private: true })
+        }
         _ => None,
     }
 }
@@ -4058,6 +4248,363 @@ mod tests {
             payload.len(),
             PRIMARY_DEVICE_ATTRIBUTES_RESPONSE.len() * MAX_TERMINAL_QUERY_RESPONSES_PER_CHUNK
         );
+    }
+
+    /// Byte classes that reach the emulator from a real pane and that used to
+    /// panic it at one row or one column: raw non-UTF-8, a double-width glyph,
+    /// wrapping text, and the control bytes every shell emits.
+    fn emulator_byte_classes() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("invalid-utf8", vec![0xff, 0xfe, 0xfd]),
+            ("emoji", "😀😀".as_bytes().to_vec()),
+            ("cjk", "漢字".as_bytes().to_vec()),
+            ("ascii-overflowing-the-row", b"hello world".to_vec()),
+            ("newlines", b"a\r\nb\r\nc\r\n".to_vec()),
+            ("tabs", b"\tab\t\tcd".to_vec()),
+            ("backspace", b"abc\x08\x08\x08".to_vec()),
+            (
+                "combining-marks",
+                "e\u{301}\u{301}\u{301}".as_bytes().to_vec(),
+            ),
+            ("cursor-addressing", b"\x1b[2J\x1b[H\x1b[9;9Hx".to_vec()),
+            ("wide-then-newline", "漢\r\n漢".as_bytes().to_vec()),
+        ]
+    }
+
+    #[test]
+    fn parser_dimensions_are_clamped_to_the_emulator_floor() {
+        // Sizes a collapsed pane really reports. `fnug-vt100` panics with
+        // "attempt to subtract with overflow" below 2×2 on ordinary output, so
+        // no size may reach it unclamped (A13).
+        let requested = [
+            PtyDimensions { rows: 0, cols: 0 },
+            PtyDimensions { rows: 1, cols: 1 },
+            PtyDimensions { rows: 1, cols: 80 },
+            PtyDimensions { rows: 24, cols: 1 },
+            PtyDimensions { rows: 0, cols: 40 },
+            PtyDimensions { rows: 40, cols: 0 },
+            PtyDimensions {
+                rows: MIN_SCREEN_ROWS,
+                cols: MIN_SCREEN_COLS,
+            },
+        ];
+
+        for size in requested {
+            let clamped = size.clamped();
+            assert!(
+                clamped.rows >= MIN_SCREEN_ROWS && clamped.cols >= MIN_SCREEN_COLS,
+                "{size:?} was not raised to the floor"
+            );
+
+            // Every public route into a parser, not just the clamp helper.
+            for (index, build) in [0_u8, 1, 2].into_iter().enumerate() {
+                let terminal = PtyKey::Terminal(TerminalId(200 + index as u64));
+                let mut runtime = PtyRuntime::new_offline();
+                match build {
+                    0 => runtime.ensure_parser(terminal, size),
+                    1 => runtime.reset_parser(terminal, size),
+                    _ => runtime.resize(terminal, size).expect("offline resize"),
+                }
+                let parser = runtime.parser(terminal).expect("parser exists");
+                assert_eq!(
+                    parser.screen().size(),
+                    (clamped.rows, clamped.cols),
+                    "{size:?} reached the parser unclamped via route {build}"
+                );
+
+                for (name, bytes) in emulator_byte_classes() {
+                    // A panic here is the A13 regression; it aborts the test
+                    // process in debug and corrupts the grid in release.
+                    runtime.process_terminal_output(terminal, &bytes);
+                    assert!(
+                        !runtime.terminal_lines(terminal).is_empty(),
+                        "{name} at {size:?} produced no rows"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn narrowing_a_screen_holding_a_wide_character_does_not_panic() {
+        // A14: `Row::resize` drops the second half of a double-width character
+        // in the last column but leaves the first half flagged wide, and the
+        // next print there unwraps `None` inside `fnug-vt100`. Dragging a pane
+        // one column narrower with CJK or emoji on screen reaches it.
+        for glyph in ["漢", "😀"] {
+            for start_cols in [3_u16, 8, 21] {
+                for end_cols in MIN_SCREEN_COLS..start_cols {
+                    let terminal = PtyKey::Terminal(TerminalId(300));
+                    let mut runtime = PtyRuntime::new_offline();
+                    runtime.ensure_parser(
+                        terminal,
+                        PtyDimensions {
+                            rows: 4,
+                            cols: start_cols,
+                        },
+                    );
+                    // Straddle the future last column: the glyph's first half
+                    // lands on it and its second half is what the resize drops.
+                    let padding = " ".repeat(usize::from(end_cols) - 1);
+                    runtime
+                        .process_terminal_output(terminal, format!("{padding}{glyph}").as_bytes());
+
+                    runtime
+                        .resize(
+                            terminal,
+                            PtyDimensions {
+                                rows: 4,
+                                cols: end_cols,
+                            },
+                        )
+                        .expect("offline resize");
+                    // The print that used to panic: it lands exactly on the
+                    // half-glyph the truncation left behind.
+                    runtime.process_terminal_output(
+                        terminal,
+                        format!("\x1b[1;{end_cols}Hx").as_bytes(),
+                    );
+
+                    let lines = runtime.terminal_lines(terminal);
+                    assert!(
+                        lines.first().is_some_and(|line| line.ends_with('x')),
+                        "{glyph} {start_cols}->{end_cols} lost the print that follows the resize"
+                    );
+                    assert!(
+                        !lines.first().is_some_and(|line| line.contains(glyph)),
+                        "{glyph} {start_cols}->{end_cols} kept a character the resize cut in half"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn narrowing_keeps_rows_that_do_not_end_in_a_split_wide_character() {
+        // The A14 repair must not erase anything the resize was not already
+        // going to destroy: only the split glyph goes.
+        let terminal = PtyKey::Terminal(TerminalId(301));
+        let mut runtime = PtyRuntime::new_offline();
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 3, cols: 10 });
+        runtime.process_terminal_output(terminal, "abcdefgh\r\nij漢klmn".as_bytes());
+
+        runtime
+            .resize(terminal, PtyDimensions { rows: 3, cols: 8 })
+            .expect("offline resize");
+
+        let lines = runtime.terminal_lines(terminal);
+        assert_eq!(lines.first().map(String::as_str), Some("abcdefgh"));
+        // The wide glyph sits at columns 2-3, well inside the new width, so it
+        // survives untouched.
+        assert_eq!(lines.get(1).map(String::as_str), Some("ij漢klmn"));
+    }
+
+    /// xorshift64*, mirroring `crates/protocol/tests/framing.rs`: the generated
+    /// streams below must reproduce from their printed seed alone, so no
+    /// `proptest` and no wall-clock or thread-local entropy.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next_u64() % bound as u64) as usize
+        }
+    }
+
+    /// The unbatched reference for [`feed_parser_with_responder`]: one
+    /// `Parser::process` call per byte, with the responder observing the screen
+    /// after every single one. The batched implementation documents itself as
+    /// "behaviourally identical to feeding every byte individually"; this is
+    /// what that sentence is measured against.
+    fn feed_parser_byte_at_a_time(
+        parser: &mut Parser,
+        responder: &mut TerminalResponseDetector,
+        bytes: &[u8],
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        let mut answered = 0_usize;
+        let mut cursor_reported = false;
+        for byte in bytes {
+            parser.process(std::slice::from_ref(byte));
+            let Some(query) = responder.advance(*byte) else {
+                continue;
+            };
+            let response = query.resolve(parser.screen());
+            let repeated_cursor =
+                cursor_reported && response.kind == TerminalQueryKind::CursorPosition;
+            let over_budget = answered >= MAX_TERMINAL_QUERY_RESPONSES_PER_CHUNK
+                || payload.len() + response.bytes.len() > MAX_TERMINAL_QUERY_RESPONSE_BYTES;
+            if !repeated_cursor && !over_budget {
+                cursor_reported |= response.kind == TerminalQueryKind::CursorPosition;
+                answered += 1;
+                payload.extend_from_slice(&response.bytes);
+            }
+        }
+        payload
+    }
+
+    /// Everything an observer of the two feeds can tell apart: what is on the
+    /// screen, where the cursor is, how deep the scrollback went, and the bytes
+    /// sent back to the pane.
+    #[derive(Debug, PartialEq, Eq)]
+    struct FeedObservation {
+        contents: String,
+        cursor: (u16, u16),
+        scrollback_len: usize,
+        payloads: Vec<Vec<u8>>,
+    }
+
+    fn observe_feed(
+        rows: u16,
+        cols: u16,
+        chunks: &[&[u8]],
+        feed: fn(&mut Parser, &mut TerminalResponseDetector, &[u8]) -> Vec<u8>,
+    ) -> FeedObservation {
+        let mut parser = Parser::new(rows, cols, TERMINAL_SCROLLBACK_LINES);
+        let mut responder = TerminalResponseDetector::default();
+        let payloads = chunks
+            .iter()
+            .map(|chunk| feed(&mut parser, &mut responder, chunk))
+            .collect();
+        let screen = parser.screen();
+        FeedObservation {
+            contents: screen.contents(),
+            cursor: screen.cursor_position(),
+            scrollback_len: screen.scrollback_len(),
+            payloads,
+        }
+    }
+
+    /// The hand-written half of the corpus: every shape where batching a run of
+    /// bytes could plausibly diverge from feeding them one at a time.
+    fn batching_corpus() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("plain-text", b"hello world".to_vec()),
+            ("truncated-csi", b"abc\x1b[12".to_vec()),
+            ("esc-at-end", b"abc\x1b".to_vec()),
+            ("bare-esc-run", b"\x1b\x1b\x1b".to_vec()),
+            ("oversized-csi", {
+                let mut bytes = b"\x1b[".to_vec();
+                bytes.extend(std::iter::repeat_n(
+                    b'1',
+                    TERMINAL_MAX_CSI_SEQUENCE_BYTES + 32,
+                ));
+                bytes.extend_from_slice(b"m tail");
+                bytes
+            }),
+            ("cpr-mid-stream", b"ab\x1b[6ncd\x1b[6nef".to_vec()),
+            ("cpr-after-move", b"\x1b[2;3H\x1b[6nx".to_vec()),
+            ("private-cpr", b"\x1b[?6n\x1b[?6n".to_vec()),
+            ("device-attributes", b"x\x1b[c\x1b[0cy".to_vec()),
+            ("device-status", b"\x1b[5n\x1b[7n".to_vec()),
+            ("decid", b"a\x1bZb".to_vec()),
+            ("osc-title", b"\x1b]0;title\x07after".to_vec()),
+            ("osc-st-terminated", b"\x1b]0;title\x1b\\after".to_vec()),
+            ("dcs", b"\x1bP1$r0m\x1b\\rest".to_vec()),
+            ("charset-designator", b"\x1b(B\x1b)0text".to_vec()),
+            ("mixed-utf8", "héllo 漢字 😀 done".as_bytes().to_vec()),
+            ("split-utf8-tail", {
+                let mut bytes = "漢".as_bytes().to_vec();
+                bytes.truncate(2);
+                bytes
+            }),
+            ("invalid-utf8", vec![0xff, 0xfe, b'a', 0x80, b'b']),
+            (
+                "wrap-and-scroll",
+                b"aaaaaaaaaaaa\r\nbbbbbbbbbbbb\r\ncccc".to_vec(),
+            ),
+            ("erase-and-move", b"xyz\x1b[2J\x1b[H\x1b[3;4Hq".to_vec()),
+            ("scroll-region", b"\x1b[1;2r\r\n\r\n\r\nend".to_vec()),
+            ("alternate-screen", b"a\x1b[?1049hb\x1b[?1049lc".to_vec()),
+            ("query-flood", b"\x1b[6n".repeat(64)),
+            ("csi-flood", b"\x1b[c".repeat(64)),
+            (
+                "control-bytes",
+                vec![0x00, 0x07, 0x08, 0x09, 0x0a, 0x0d, 0x7f],
+            ),
+            ("c1-controls", vec![0x9b, b'6', b'n', 0x84, 0x85]),
+        ]
+    }
+
+    /// Deterministic streams biased towards escape sequences, so the generated
+    /// half of the corpus exercises the batched path rather than long printable
+    /// runs.
+    fn generated_stream(seed: u64, len: usize) -> Vec<u8> {
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let fragments: [&[u8]; 14] = [
+            b"\x1b[6n",
+            b"\x1b[?6n",
+            b"\x1b[c",
+            b"\x1b[5n",
+            b"\x1bZ",
+            b"\x1b[2J",
+            b"\x1b[H",
+            b"\x1b[1;1H",
+            b"\x1b]0;t\x07",
+            b"\x1b(B",
+            b"\x1b",
+            b"\r\n",
+            "漢".as_bytes(),
+            "😀".as_bytes(),
+        ];
+        let mut bytes = Vec::with_capacity(len);
+        while bytes.len() < len {
+            match rng.below(4) {
+                0 => bytes.push(0x20_u8.wrapping_add((rng.below(95)) as u8)),
+                1 => bytes.push((rng.next_u64() >> 33) as u8),
+                _ => bytes.extend_from_slice(fragments[rng.below(fragments.len())]),
+            }
+        }
+        bytes.truncate(len);
+        bytes
+    }
+
+    fn chunked(bytes: &[u8], chunk: usize) -> Vec<&[u8]> {
+        bytes.chunks(chunk.max(1)).collect()
+    }
+
+    #[test]
+    fn batched_feed_matches_byte_at_a_time_feed_on_adversarial_input() {
+        // 1×1 is deliberately absent: the emulator cannot be driven there at
+        // all (see `parser_dimensions_are_clamped_to_the_emulator_floor`), and
+        // the equivalence claim is about batching, not about dimensions.
+        for (rows, cols) in [(2_u16, 2_u16), (2, 8), (4, 10), (24, 80)] {
+            for (name, bytes) in batching_corpus() {
+                for chunk in [1_usize, 2, 3, 5, 7, 16, 64, usize::MAX] {
+                    let chunks = chunked(&bytes, chunk);
+                    let batched = observe_feed(rows, cols, &chunks, feed_parser_with_responder);
+                    let reference = observe_feed(rows, cols, &chunks, feed_parser_byte_at_a_time);
+                    assert_eq!(
+                        batched, reference,
+                        "case {name} diverged at {rows}x{cols} with chunk size {chunk}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_feed_matches_byte_at_a_time_feed_on_generated_streams() {
+        for seed in 1..=64_u64 {
+            let bytes = generated_stream(seed, 512);
+            for chunk in [1_usize, 3, 8, 61, 512] {
+                let chunks = chunked(&bytes, chunk);
+                let batched = observe_feed(6, 20, &chunks, feed_parser_with_responder);
+                let reference = observe_feed(6, 20, &chunks, feed_parser_byte_at_a_time);
+                assert_eq!(
+                    batched, reference,
+                    "seed {seed} diverged with chunk size {chunk}"
+                );
+            }
+        }
     }
 
     #[test]

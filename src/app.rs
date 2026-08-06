@@ -36,6 +36,13 @@ pub struct App {
     pub text_selection: Option<TextSelection>,
     pub should_quit: bool,
     dirty: bool,
+    /// Set alongside `dirty` when the change altered the *structure* of the
+    /// project — a workspace, chat or terminal added or removed — rather than
+    /// only the contents of one. The runtime rate-limits ordinary content saves
+    /// (B9) but never defers a structural one: they are rare, they are the
+    /// changes a crash would most visibly lose, and they are what a restart
+    /// reconstructs the session from. Cleared with `dirty` by `mark_saved`.
+    structural_dirty: bool,
     recoverable_terminals: BTreeSet<TerminalId>,
     save_error: Option<String>,
     operation_error: Option<String>,
@@ -263,6 +270,7 @@ impl App {
             text_selection: None,
             should_quit: false,
             dirty: titles_normalized,
+            structural_dirty: false,
             recoverable_terminals,
             save_error: None,
             operation_error: None,
@@ -284,12 +292,25 @@ impl App {
         self.dirty
     }
 
+    /// Whether the unsaved changes include a structural one. See
+    /// [`App::structural_dirty`].
+    pub fn has_structural_change(&self) -> bool {
+        self.structural_dirty
+    }
+
+    /// Record a change that added or removed a workspace, chat or terminal.
+    fn mark_structural_change(&mut self) {
+        self.dirty = true;
+        self.structural_dirty = true;
+    }
+
     pub fn mark_clean(&mut self) {
         self.mark_saved();
     }
 
     pub fn mark_saved(&mut self) {
         self.dirty = false;
+        self.structural_dirty = false;
         self.save_error = None;
     }
 
@@ -947,7 +968,7 @@ impl App {
                     });
                 if can_remove && self.project.remove_workspace(workspace_id).is_some() {
                     self.workspace_git_branches.remove(&workspace_id);
-                    self.dirty = true;
+                    self.mark_structural_change();
                 }
             }
             DeleteTarget::Chat { workspace, chat } => {
@@ -955,7 +976,7 @@ impl App {
                     runtime_terminals.push(PtyKey::ChatAgent(chat));
                     self.chat_buffers.remove(&chat);
                     self.seen_done.remove(&chat);
-                    self.dirty = true;
+                    self.mark_structural_change();
                     self.remove_workspace_if_empty(workspace);
                 }
             }
@@ -966,7 +987,7 @@ impl App {
                 if self.project.remove_terminal(workspace, terminal).is_some() {
                     runtime_terminals.push(PtyKey::Terminal(terminal));
                     self.recoverable_terminals.remove(&terminal);
-                    self.dirty = true;
+                    self.mark_structural_change();
                     self.remove_workspace_if_empty(workspace);
                 }
             }
@@ -1033,7 +1054,7 @@ impl App {
 
         if self.project.remove_workspace(workspace_id).is_some() {
             self.workspace_git_branches.remove(&workspace_id);
-            self.dirty = true;
+            self.mark_structural_change();
         }
     }
 
@@ -1507,7 +1528,7 @@ impl App {
         self.prompt = None;
         self.select_first_item_in_workspace(workspace);
         self.clear_operation_error();
-        self.dirty = true;
+        self.mark_structural_change();
     }
 
     pub fn submit_new_terminal_command(&mut self) {
@@ -1545,7 +1566,7 @@ impl App {
                     terminal,
                 });
                 self.clear_operation_error();
-                self.dirty = true;
+                self.mark_structural_change();
             }
             Ok(None) => self.set_terminal_command_error("selected workspace no longer exists"),
             Err(error) => self.set_terminal_command_error(error.to_string()),
@@ -1574,7 +1595,7 @@ impl App {
         };
         self.select_item(NavItem::Chat { workspace, chat });
         self.clear_operation_error();
-        self.dirty = true;
+        self.mark_structural_change();
         Some((workspace, chat))
     }
 
@@ -1599,7 +1620,7 @@ impl App {
                     terminal,
                 });
                 self.clear_operation_error();
-                self.dirty = true;
+                self.mark_structural_change();
             }
             Ok(None) => self.record_operation_failure("selected workspace no longer exists"),
             Err(error) => self.record_operation_failure(error.to_string()),
@@ -2373,6 +2394,40 @@ mod tests {
         assert!(runtime_terminals.is_empty());
         assert!(app.project.workspace(workspace).is_none());
         assert!(app.is_dirty());
+    }
+
+    /// B9: content changes may be batched by the runtime's save rate limit, but
+    /// adding or removing a workspace/chat/terminal must be flagged so the save
+    /// happens immediately.
+    #[test]
+    fn structural_changes_are_flagged_and_content_changes_are_not() {
+        let mut app = App::seeded();
+        let workspace = app.project.workspaces[0].id;
+        let chat = app.project.workspaces[0].chats[0].id;
+        app.mark_clean();
+        assert!(!app.has_structural_change());
+
+        app.apply_agent_event(crate::agent::AgentEvent::MessageDelta {
+            target: crate::agent::AgentTarget { workspace, chat },
+            role: crate::agent::AgentMessageRole::Assistant,
+            text: "streamed".to_string(),
+        });
+        assert!(app.is_dirty());
+        assert!(
+            !app.has_structural_change(),
+            "a streamed delta is content, not structure"
+        );
+
+        app.add_terminal_to_selected_workspace();
+        assert!(app.has_structural_change());
+
+        app.mark_saved();
+        assert!(!app.has_structural_change());
+
+        // Deleting is structural too, in both directions.
+        assert!(app.begin_delete_selected());
+        assert!(!app.confirm_delete().is_empty());
+        assert!(app.has_structural_change());
     }
 
     #[test]

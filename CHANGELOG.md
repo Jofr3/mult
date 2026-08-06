@@ -388,6 +388,123 @@ and the project aims to adhere to
   shell in the sandbox reads `$SHELL` and falls back to a `/bin/sh` that does
   not exist there — a trap the next test to spawn a pane would have hit.
 
+### Fixed — idle cost and save discipline (R3)
+
+- **A visible pane is resized only when its size changed.** Both resize sites
+  (terminal and chat agent) computed a `changed` flag for their return value and
+  then called `resize` unconditionally, so an idle session serialized and wrote
+  a `Resize` to the socket about 125 times a second from two sites — each one
+  costing the daemon a pane lock, a master lock and a `TIOCSWINSZ` to set the
+  size the pane already had. Both now gate the call, so idle writes nothing.
+- **Agent status journals are polled on a timer, with cached paths.** The status
+  bridge ran on every ~16 ms tick per agent chat: a `format!`, two `join`s and a
+  `PathBuf` clone (four allocations) followed by
+  `open`+`fstat`+`seek`+`read`+`close`. With four chats that was ~1250 syscalls
+  and ~1000 allocations a second at complete idle. The journal path is now built
+  once per agent session and cached (keyed by chat, invalidated by a new
+  generation), and the journals are read every 250 ms instead of every tick — a
+  16× reduction with no perceptible change to the status dot.
+- **An unchanged git branch no longer forces a redraw.** The two-second branch
+  refresh returns whether anything changed, but the caller discarded it and set
+  `needs_redraw` unconditionally, defeating the client's own redraw gating twice
+  a minute on a completely idle session. The return value is now used.
+- **State saves are rate-limited and go through the locked store only.** Two
+  fixes to one path: saves were being made through the free `storage::save`
+  while `main` held a lock-holding `StateStore`, so there were two write paths
+  and only one held the ownership lock; and `save_if_dirty_with` ran on every
+  tick while dirty, doing a full `to_string_pretty` of the project plus
+  `sync_all`, a rename and a directory `sync` — once per streamed agent delta.
+  The event loop now saves exclusively through the store `main` locked (the
+  thread-local side channel that used to bridge the two is gone, and the free
+  `storage::save` acquires the same lock for its whole write), and ordinary
+  content saves are spaced at least one second apart. Quitting, a signal, a
+  fatal host-terminal error, an agent launch, and any structural change (a
+  workspace, chat or terminal added or removed) still save immediately, so
+  nothing is lost on exit.
+- **A chat message can no longer grow without bound.** Streamed deltas append to
+  the last message and nothing terminates it, so one runaway agent could grow a
+  single `String` until the process died — and every save re-serialized all of
+  it. A message is now capped at 64 KiB and marked `[truncated]`; further deltas
+  are dropped *and* reported as no change, so a full message stops provoking
+  saves as well as stopping the growth. This path is Phase 3.4 scaffolding with
+  no production caller today, so the cap is about being safe to wire up.
+- **Generated runtime artifacts no longer take a blocking lock on the render
+  thread.** `write_private_runtime_file` took `flock(LOCK_EX)` on a fixed path,
+  so a second `mult` instance starting an agent stalled the first one's event
+  loop for as long as it held the lock. The lock is now `LOCK_EX|LOCK_NB` with a
+  bounded retry (5 × 2 ms); contention that outlasts that degrades to starting
+  the agent without its status extension instead of freezing the UI.
+- The git probe (D5) needed nothing further: R4 already replaced the `git -C`
+  fork with a direct, size-capped, `O_NOFOLLOW` read of `.git/HEAD`, so the
+  two-second refresh is now a couple of syscalls per workspace on the UI thread
+  rather than a process spawn.
+
+### Fixed — emulator panics and fuzzing (R5)
+
+- **A pane one row or one column in size no longer panics the terminal
+  emulator.** `fnug-vt100` subtracts from a screen dimension without checking
+  it, so a 1×N or N×1 pane aborted on input as ordinary as a stray non-UTF-8
+  byte, an emoji or a line feed — in debug it panicked, in release the wrapped
+  arithmetic corrupted the grid, and either way it took down a UI holding the
+  terminal in raw mode. The safe floor was established empirically at 2×2 (every
+  smaller size fails on at least one ordinary byte class; 2×2 and up survived the
+  hand corpus and 12 000 seeded streams) and is now enforced in one place,
+  `bounded_screen_dimensions`, so the client, the daemon and the wire agree and
+  no `.max(1)` call site can undercut it. A pane too small to hold a screen now
+  renders a visible "too small" marker instead of a crop of a differently sized
+  terminal (A13).
+- **Narrowing a pane that holds a double-width character no longer panics.**
+  `fnug-vt100` truncates a row on resize without clearing the orphaned "wide"
+  flag on the cell that becomes the last one, so the next character printed
+  there unwrapped `None` — reachable by dragging a pane one column narrower with
+  any CJK text or emoji on screen. The split character is now erased before the
+  resize, which destroys nothing the truncation was not already destroying, and
+  the work is skipped unless a row actually ends in one. Known residual: the
+  emulator resizes its alternate grid too and only the current grid is reachable
+  through its public API, so a pane narrowed while in the alternate screen can
+  still carry a split character back to the normal grid on exit (A14).
+- Both of the above are upstream defects in `fnug-vt100` 0.15.2; the backlog
+  rows record them so the notes survive a dependency bump.
+
+### Performance — emulator feed (R5)
+
+- **Escape sequences are no longer fed to the emulator one byte at a time.**
+  Only the printable run was batched, so for escape-dense output — any TUI child,
+  which is the primary use case — most bytes paid a full `vte` dispatch setup on
+  a one-byte slice. The query detector's state machine is now independent of the
+  screen, which lets the feed scan a whole escape sequence ahead and hand it to
+  the parser in one call. The behaviour that forced the per-byte feed is
+  preserved exactly: batching stops at every sequence boundary, and the only
+  sequences that produce an answer are queries, which never move the cursor, so
+  a cursor position report still describes the screen at the query point (D7).
+- **Entering a CSI sequence no longer allocates.** The detector held its
+  parameter bytes in a `Vec` built on entry to every CSI; a TUI child redrawing
+  emits thousands per frame. The 128-byte bound already existed, so it is now an
+  inline array plus a length held across states (D6).
+
+### Tested — emulator panics and fuzzing (R5)
+
+- **The batched feed's "behaviourally identical to feeding every byte
+  individually" claim is now tested.** It is compared against an explicit
+  byte-at-a-time reference on screen contents, cursor position, scrollback depth
+  and the emitted response bytes, over 26 hand-written adversarial cases (split
+  and truncated CSI, oversized CSI, `ESC` at the end of a chunk, CPR mid-stream,
+  OSC/DCS, mixed and invalid UTF-8) at four screen sizes and eight chunk sizes,
+  plus 64 seeded xorshift streams at five chunk sizes. No `proptest`: a failure
+  reproduces from its printed seed. Both a naive and a D7-shaped batching bug
+  were injected to confirm the test catches them (G4).
+- **Fuzz targets are back**, in a top-level `fuzz/` that is its own Cargo
+  workspace, so normal builds, `cargo deny` and the MSRV job are unaffected and
+  nothing is added to CI. `protocol_read_message` drives an arbitrary byte
+  stream through the framing reader in both directions; `vt_response_detector`
+  drives arbitrary output through the query detector and the emulator with
+  interleaved resizes at input-chosen pane sizes, including the clamped floor —
+  it reproduces A13 in under a minute with the floor removed. Running them is
+  documented in `CONTRIBUTING.md` (G3).
+- Boundary regression tests cover 0×0, 1×1, 1×N, N×1 and 2×2 across ten byte
+  classes on every public route into a parser, and the narrowing panic is pinned
+  across two glyph widths and every shrink step down to the floor.
+
 ## [0.1.0] - 2026-05-19
 
 Initial prototype: a Ratatui/Crossterm client plus a persistent `mult-server`

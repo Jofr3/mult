@@ -1,5 +1,4 @@
 use std::{
-    cell::RefCell,
     collections::BTreeMap,
     env,
     ffi::{CStr, CString, OsStr, OsString},
@@ -38,20 +37,18 @@ const MAX_TEMP_ATTEMPTS: usize = 64;
 /// state is kilobytes; this leaves four orders of magnitude of headroom.
 pub(crate) const MAX_STATE_FILE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Process-lifetime ownership of one state file.
+///
+/// Acquiring the store takes the `flock` that makes this process the single
+/// writer, and the directory descriptor it keeps is the *only* way state is
+/// written: every save goes through [`StateStore::save`] on the instance that
+/// holds the lock, so a save can neither re-resolve an environment path nor
+/// follow a directory that was replaced after the lock was taken. Nothing else
+/// in the client saves (B16).
 pub struct StateStore {
     paths: StatePaths,
     directory: SecureDirectory,
     _lock: File,
-    active_runtime_save: bool,
-}
-
-struct ActiveRuntimeStore {
-    directory: SecureDirectory,
-    state_name: OsString,
-}
-
-thread_local! {
-    static ACTIVE_RUNTIME_STORE: RefCell<Option<ActiveRuntimeStore>> = const { RefCell::new(None) };
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,9 +108,7 @@ impl StatePaths {
 
 impl StateStore {
     pub fn acquire_default() -> io::Result<Self> {
-        let mut store = Self::acquire(StatePaths::resolve()?)?;
-        store.activate_runtime_saves()?;
-        Ok(store)
+        Self::acquire(StatePaths::resolve()?)
     }
 
     pub fn acquire(paths: StatePaths) -> io::Result<Self> {
@@ -148,7 +143,6 @@ impl StateStore {
             paths,
             directory,
             _lock: lock,
-            active_runtime_save: false,
         };
         store.normalize_corrupt_backups()?;
         Ok(store)
@@ -166,25 +160,6 @@ impl StateStore {
     pub fn save(&self, state: &ProjectState) -> io::Result<()> {
         validate_current_state(state)?;
         save_to_directory(state, &self.directory, self.paths.state_name())
-    }
-
-    fn activate_runtime_saves(&mut self) -> io::Result<()> {
-        let active = ActiveRuntimeStore {
-            directory: self.directory.try_clone()?,
-            state_name: self.paths.state_name().to_os_string(),
-        };
-        ACTIVE_RUNTIME_STORE.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            if slot.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "a state store is already active on this thread",
-                ));
-            }
-            *slot = Some(active);
-            self.active_runtime_save = true;
-            Ok(())
-        })
     }
 
     fn load_with_identity_source(
@@ -316,33 +291,14 @@ impl StateStore {
     }
 }
 
-impl Drop for StateStore {
-    fn drop(&mut self) {
-        if self.active_runtime_save {
-            ACTIVE_RUNTIME_STORE.with(|slot| {
-                slot.borrow_mut().take();
-            });
-        }
-    }
-}
-
-/// Compatibility entry point for the current runtime. After startup acquires a
-/// default [`StateStore`], saves use a cloned descriptor for that exact parent
-/// directory rather than re-resolving an environment path or following a
-/// replacement directory.
+/// One-shot save for library callers that do not hold a [`StateStore`].
+///
+/// The client never uses this: `main` acquires the store and `runtime` saves
+/// through it, so there is exactly one locked write path. A caller here
+/// acquires the same lifetime lock for the duration of its write, and therefore
+/// fails with `WouldBlock` while a `mult` session owns the state file rather
+/// than racing it with an unlocked atomic rename.
 pub fn save(state: &ProjectState) -> io::Result<()> {
-    validate_current_state(state)?;
-    if let Some(result) = ACTIVE_RUNTIME_STORE.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .map(|active| save_to_directory(state, &active.directory, &active.state_name))
-    }) {
-        return result;
-    }
-
-    // Library callers outside the TUI must acquire the same lifetime lock for
-    // their complete write. If another process/thread owns it, fail instead of
-    // bypassing that authority with an unlocked atomic rename.
     let store = StateStore::acquire(StatePaths::resolve()?)?;
     store.save(state)
 }
@@ -583,12 +539,6 @@ pub(crate) struct SecureDirectory {
 }
 
 impl SecureDirectory {
-    fn try_clone(&self) -> io::Result<Self> {
-        Ok(Self {
-            file: self.file.try_clone()?,
-        })
-    }
-
     pub(crate) fn open_parent(
         path: &Path,
         create: bool,
@@ -989,21 +939,43 @@ mod tests {
         let parent = root.join("owned");
         let moved_parent = root.join("moved");
         let path = parent.join("state.json");
-        let mut store =
+        let store =
             StateStore::acquire(StatePaths::from_explicit_path(path.clone()).unwrap()).unwrap();
-        store.activate_runtime_saves().unwrap();
         let mut state = ProjectState::try_default().unwrap();
         store.save(&state).unwrap();
 
         fs::rename(&parent, &moved_parent).unwrap();
         fs::create_dir(&parent).unwrap();
         state.workspaces[0].name = "saved through descriptor".to_string();
-        save(&state).unwrap();
+        store.save(&state).unwrap();
 
         assert!(!path.exists());
         let saved: ProjectState =
             serde_json::from_slice(&fs::read(moved_parent.join("state.json")).unwrap()).unwrap();
         assert_eq!(saved.workspaces[0].name, "saved through descriptor");
+        drop(store);
+    }
+
+    /// B16: with the lock held there must be no second way to write the state
+    /// file. The free `save` is the only other entry point, and it now acquires
+    /// the very same lock, so it refuses instead of writing behind the owner.
+    #[test]
+    fn a_free_save_cannot_bypass_the_owner_lock() {
+        let path = unique_test_dir().join("state.json");
+        let store =
+            StateStore::acquire(StatePaths::from_explicit_path(path.clone()).unwrap()).unwrap();
+        let state = ProjectState::try_default().unwrap();
+        store.save(&state).unwrap();
+        let owned_bytes = fs::read(&path).unwrap();
+
+        // `save` resolves `$MULT_STATE_PATH`, which tests must not mutate; call
+        // the acquiring path it delegates to with this test's explicit path.
+        let error = StateStore::acquire(StatePaths::from_explicit_path(path.clone()).unwrap())
+            .err()
+            .expect("a second acquisition must not succeed while the owner holds the lock");
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read(&path).unwrap(), owned_bytes);
         drop(store);
     }
 

@@ -10,6 +10,23 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 pub const STATE_VERSION: u32 = 2;
 pub const DEFAULT_AGENT_CHAT_TITLE: &str = "agent";
+/// Upper bound on the text of a single persisted [`ChatMessage`].
+///
+/// Streamed assistant output arrives as deltas that are appended to the *last*
+/// message, and nothing in the protocol terminates a message — so without a cap
+/// one runaway agent grows one `String` without bound, and every save
+/// re-serializes all of it. 64 KiB is roughly 10 000 words: far more than any
+/// message a person reads in a chat pane, while keeping the whole transcript in
+/// a range where `serde_json::to_string_pretty` stays inexpensive.
+///
+/// The transcript path this guards is Phase 3.4 scaffolding and currently has
+/// no production caller (see `docs/ROADMAP.md` and the `agent` module), so this
+/// is about being safe to wire up rather than a live bug being fixed.
+pub const MAX_CHAT_MESSAGE_BYTES: usize = 64 * 1024;
+/// Marks a message that hit [`MAX_CHAT_MESSAGE_BYTES`]. Written once, in place
+/// of the bytes that were dropped, so a truncated transcript never looks like a
+/// complete one.
+pub const CHAT_MESSAGE_TRUNCATION_NOTICE: &str = "\n[truncated]";
 pub const RUNTIME_TERMINAL_ID_FLAG: u64 = 1 << 63;
 pub const MAX_DURABLE_SESSION_ID: u64 = RUNTIME_TERMINAL_ID_FLAG - 1;
 
@@ -771,7 +788,12 @@ impl ProjectState {
             return false;
         };
 
-        chat.messages.push(ChatMessage { role, text });
+        let mut message = ChatMessage {
+            role,
+            text: String::new(),
+        };
+        push_capped_message_text(&mut message.text, &text);
+        chat.messages.push(message);
         true
     }
 
@@ -795,15 +817,19 @@ impl ProjectState {
             .last_mut()
             .filter(|message| message.role == role)
         {
-            message.text.push_str(text);
+            // A full message swallows further deltas *and* reports "unchanged",
+            // so a runaway agent stops dirtying the project and therefore stops
+            // provoking saves as well as stopping the growth.
+            push_capped_message_text(&mut message.text, text)
         } else {
-            chat.messages.push(ChatMessage {
+            let mut message = ChatMessage {
                 role,
-                text: text.to_string(),
-            });
+                text: String::new(),
+            };
+            push_capped_message_text(&mut message.text, text);
+            chat.messages.push(message);
+            true
         }
-
-        true
     }
 
     pub fn add_terminal(
@@ -1092,6 +1118,38 @@ fn is_valid_durable_session_id(id: u64) -> bool {
     (1..=MAX_DURABLE_SESSION_ID).contains(&id)
 }
 
+/// Append `text` to a chat message, enforcing [`MAX_CHAT_MESSAGE_BYTES`].
+///
+/// Returns whether anything was appended. The last
+/// `CHAT_MESSAGE_TRUNCATION_NOTICE.len()` bytes of the budget are reserved for
+/// the notice, so a message that overflows ends with it and lands exactly at or
+/// above the content limit — which is what makes every later append a cheap,
+/// allocation-free `false`. The notice is longer than the at most three bytes a
+/// UTF-8 boundary retreat can cost, so that is guaranteed rather than likely.
+fn push_capped_message_text(existing: &mut String, text: &str) -> bool {
+    let content_limit = MAX_CHAT_MESSAGE_BYTES - CHAT_MESSAGE_TRUNCATION_NOTICE.len();
+    let Some(budget) = content_limit.checked_sub(existing.len()) else {
+        return false;
+    };
+    if budget == 0 {
+        return false;
+    }
+    if text.len() <= budget {
+        existing.push_str(text);
+        return true;
+    }
+
+    // Never split a character: retreat to the nearest boundary at or below the
+    // budget (at most three bytes).
+    let mut keep = budget;
+    while keep > 0 && !text.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    existing.push_str(&text[..keep]);
+    existing.push_str(CHAT_MESSAGE_TRUNCATION_NOTICE);
+    true
+}
+
 /// Takes a free ID at or after `hint`, wrapping once at `max`. The returned
 /// next hint is zero only when taking this ID exhausted the supplied range.
 fn take_available_id(used: &mut BTreeSet<u64>, hint: u64, max: u64) -> Option<(u64, u64)> {
@@ -1200,6 +1258,98 @@ mod tests {
         let decoded: ProjectState = serde_json::from_str(&json).expect("deserialize project state");
 
         assert_eq!(decoded, state);
+    }
+
+    /// B9: streamed deltas append to the last message forever, so the message
+    /// itself carries the bound. Once it is reached the message stops growing
+    /// *and* stops reporting a change, so it also stops provoking saves.
+    #[test]
+    fn a_streamed_message_stops_growing_at_the_cap() {
+        let mut state = ProjectState::default();
+        let workspace = state.workspaces[0].id;
+        let chat = state
+            .add_chat(
+                workspace,
+                "agent".to_string(),
+                ChatStatus::Idle,
+                AgentKind::Pi,
+            )
+            .unwrap()
+            .unwrap();
+
+        let delta = "x".repeat(8 * 1024);
+        let mut appended = 0;
+        for _ in 0..64 {
+            if state.append_chat_delta(workspace, chat, ChatMessageRole::Assistant, &delta) {
+                appended += 1;
+            }
+        }
+
+        let messages = &state.chat(workspace, chat).unwrap().messages;
+        assert_eq!(messages.len(), 1, "deltas keep extending one message");
+        let text = &messages[0].text;
+        assert!(
+            text.len() <= MAX_CHAT_MESSAGE_BYTES,
+            "message grew to {} bytes, past the {MAX_CHAT_MESSAGE_BYTES}-byte cap",
+            text.len()
+        );
+        assert!(text.ends_with(CHAT_MESSAGE_TRUNCATION_NOTICE));
+        assert!(
+            appended < 64,
+            "appends past the cap must report no change so they cannot dirty the project"
+        );
+        assert!(
+            !state.append_chat_delta(workspace, chat, ChatMessageRole::Assistant, &delta),
+            "a full message accepts nothing further"
+        );
+    }
+
+    /// The truncation point is a byte budget, but it must still land on a
+    /// character boundary — a split multi-byte character would make the whole
+    /// state file undecodable, not just this message.
+    #[test]
+    fn truncation_never_splits_a_character() {
+        let mut text = String::new();
+        assert!(push_capped_message_text(
+            &mut text,
+            &"é".repeat(MAX_CHAT_MESSAGE_BYTES)
+        ));
+
+        assert!(text.ends_with(CHAT_MESSAGE_TRUNCATION_NOTICE));
+        assert!(text.len() <= MAX_CHAT_MESSAGE_BYTES);
+        let body = text
+            .strip_suffix(CHAT_MESSAGE_TRUNCATION_NOTICE)
+            .expect("notice is present");
+        assert!(body.chars().all(|character| character == 'é'));
+        assert!(!push_capped_message_text(&mut text, "more"));
+    }
+
+    /// A single oversized message (not a stream of deltas) is capped on the way
+    /// in as well, so the cap cannot be bypassed by sending one huge message.
+    #[test]
+    fn a_single_oversized_message_is_capped_on_append() {
+        let mut state = ProjectState::default();
+        let workspace = state.workspaces[0].id;
+        let chat = state
+            .add_chat(
+                workspace,
+                "agent".to_string(),
+                ChatStatus::Idle,
+                AgentKind::Pi,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(state.append_chat_message(
+            workspace,
+            chat,
+            ChatMessageRole::Assistant,
+            "y".repeat(MAX_CHAT_MESSAGE_BYTES * 4),
+        ));
+
+        let text = &state.chat(workspace, chat).unwrap().messages[0].text;
+        assert!(text.len() <= MAX_CHAT_MESSAGE_BYTES);
+        assert!(text.ends_with(CHAT_MESSAGE_TRUNCATION_NOTICE));
     }
 
     #[test]

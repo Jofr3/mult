@@ -21,6 +21,18 @@ pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_SCREEN_ROWS: u16 = 1_000;
 pub const MAX_SCREEN_COLS: u16 = 1_000;
 pub const MAX_SCREEN_CELLS: usize = 200_000;
+/// Smallest screen the terminal emulator can be driven at.
+///
+/// `fnug-vt100` subtracts from a dimension without checking it, so a screen with
+/// a single row or a single column panics ("attempt to subtract with overflow")
+/// on input as ordinary as a stray non-UTF-8 byte, an emoji, or a line feed —
+/// in debug it aborts, and in release the wrapped arithmetic corrupts the grid.
+/// Two rows by two columns is the smallest size that survives every byte class
+/// we can produce; it is enforced here rather than at each call site so no path
+/// can reach the parser below it. A pane too small to hold a 2×2 screen is
+/// reported as too small by the renderer instead of being drawn.
+pub const MIN_SCREEN_ROWS: u16 = 2;
+pub const MIN_SCREEN_COLS: u16 = 2;
 /// Maximum number of correlated requests a client may have awaiting results.
 pub const MAX_PENDING_REQUESTS_PER_CLIENT: usize = 1_024;
 /// Maximum number of completed request results retained for one resumable scope.
@@ -783,15 +795,21 @@ pub fn write_message<T: Serialize>(writer: &mut impl Write, message: &T) -> io::
     writer.flush()
 }
 
+/// Clamp a requested screen size into the range the emulator can actually be
+/// driven at: never larger than the memory ceilings, and never smaller than
+/// [`MIN_SCREEN_ROWS`]×[`MIN_SCREEN_COLS`], which the parser panics below.
+///
+/// The floor wins over the cell budget, so a zero — the size a collapsed pane
+/// reports — comes out as a drawable screen rather than one with no cells. The
+/// two never actually compete: `MAX_SCREEN_CELLS` allows at least 200 rows at
+/// the widest permitted screen.
 pub fn bounded_screen_dimensions(rows: u16, cols: u16) -> (u16, u16) {
+    let cols = cols.clamp(MIN_SCREEN_COLS, MAX_SCREEN_COLS);
     let rows = rows.min(MAX_SCREEN_ROWS);
-    let cols = cols.min(MAX_SCREEN_COLS);
-    if rows == 0 || cols == 0 {
-        return (rows, cols);
-    }
 
     let max_rows_by_cells = (MAX_SCREEN_CELLS / usize::from(cols)).max(1);
-    (rows.min(max_rows_by_cells as u16), cols)
+    let rows = rows.min(max_rows_by_cells as u16).max(MIN_SCREEN_ROWS);
+    (rows, cols)
 }
 
 fn message_too_large(kind: io::ErrorKind, len: u64) -> io::Error {
@@ -1530,5 +1548,37 @@ mod tests {
         assert!(rows <= MAX_SCREEN_ROWS);
         assert!(cols <= MAX_SCREEN_COLS);
         assert!(usize::from(rows) * usize::from(cols) <= MAX_SCREEN_CELLS);
+    }
+
+    #[test]
+    fn bounded_screen_dimensions_raises_sizes_to_the_emulator_floor() {
+        // Every shape a collapsed or single-line pane can report. None of them
+        // may pass through: the emulator panics below the floor (A13).
+        for (rows, cols) in [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (1, 80),
+            (24, 1),
+            (0, 200),
+            (200, 0),
+        ] {
+            let (bounded_rows, bounded_cols) = bounded_screen_dimensions(rows, cols);
+
+            assert!(
+                bounded_rows >= MIN_SCREEN_ROWS && bounded_cols >= MIN_SCREEN_COLS,
+                "{rows}x{cols} was not raised to the floor"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_screen_dimensions_leaves_ordinary_sizes_alone() {
+        assert_eq!(bounded_screen_dimensions(24, 80), (24, 80));
+        assert_eq!(
+            bounded_screen_dimensions(MIN_SCREEN_ROWS, MIN_SCREEN_COLS),
+            (MIN_SCREEN_ROWS, MIN_SCREEN_COLS)
+        );
     }
 }

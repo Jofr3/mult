@@ -37,6 +37,7 @@ fn main() -> io::Result<()> {
             App::new(project),
             config,
             shutdown.as_ref(),
+            &state_store,
         )
     }));
     let cleanup_result = terminal.cleanup();

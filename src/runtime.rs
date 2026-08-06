@@ -45,6 +45,10 @@ const MULT_AGENT_GENERATION_ENV: &str = "MULT_AGENT_GENERATION";
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const READY_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(0);
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the per-chat agent status journals are read (S3/B3).
+const AGENT_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Minimum spacing between two rate-limited state saves (B9).
+const MIN_CONTENT_SAVE_INTERVAL: Duration = Duration::from_secs(1);
 const MOUSE_SCROLL_ROWS: usize = 3;
 
 #[derive(Debug, Deserialize)]
@@ -59,9 +63,29 @@ struct MultAgentStatusRecord {
     status: String,
 }
 
+/// Client-side state of the agent status bridge: where each chat's status
+/// journal lives and how far it has been read.
+///
+/// Both halves exist to keep an idle session cheap (S3/B3). The journal path is
+/// derived from a namespace, a session token and a generation — four
+/// allocations to format — so it is built once per agent session and cached
+/// rather than rebuilt on every ~16 ms tick, and the journals are polled on
+/// [`AGENT_STATUS_POLL_INTERVAL`] rather than every tick. A status dot updating
+/// within a quarter second is indistinguishable from instant; 60 Hz `open` +
+/// `fstat` + `seek` + `read` + `close` per chat was not.
 #[derive(Default)]
 struct AgentStatusBridgeState {
-    cursors: HashMap<PathBuf, AgentStatusCursor>,
+    sources: HashMap<model::ChatId, AgentStatusSource>,
+    last_poll: Option<Instant>,
+}
+
+struct AgentStatusSource {
+    /// The identity/generation the cached `path` was built from. A restarted
+    /// agent gets a new generation, which invalidates the entry.
+    identity: model::SessionIdentity,
+    generation: model::AgentGeneration,
+    path: PathBuf,
+    cursor: AgentStatusCursor,
 }
 
 #[derive(Default)]
@@ -69,6 +93,42 @@ struct AgentStatusCursor {
     device: u64,
     inode: u64,
     offset: u64,
+}
+
+impl AgentStatusBridgeState {
+    /// Whether the journals are due to be polled at `now`.
+    fn is_due(&self, now: Instant) -> bool {
+        self.last_poll
+            .is_none_or(|last| now.saturating_duration_since(last) >= AGENT_STATUS_POLL_INTERVAL)
+    }
+
+    /// The cached journal for `chat`, rebuilding the path only when the agent
+    /// session behind it changed.
+    fn source_for(
+        &mut self,
+        chat: model::ChatId,
+        identity: model::SessionIdentity,
+        generation: model::AgentGeneration,
+    ) -> &mut AgentStatusSource {
+        let stale = self
+            .sources
+            .get(&chat)
+            .is_none_or(|source| source.identity != identity || source.generation != generation);
+        if stale {
+            self.sources.insert(
+                chat,
+                AgentStatusSource {
+                    identity,
+                    generation,
+                    path: mult_agent_status_path(identity, generation),
+                    cursor: AgentStatusCursor::default(),
+                },
+            );
+        }
+        self.sources
+            .get_mut(&chat)
+            .expect("a source for this chat was just ensured")
+    }
 }
 
 const MULT_STATUS_EXTENSION_SOURCE: &str = include_str!("../extensions/mult-status.ts");
@@ -194,15 +254,23 @@ fn split_process_agent_command(raw: &str) -> Result<Vec<String>, &'static str> {
     Ok(args)
 }
 
+/// Run the client event loop.
+///
+/// `store` is the process-lifetime state lock `main` acquired: it is the single
+/// save path, so no code here re-resolves the state path from the environment
+/// (B16).
 pub fn run(
     terminal: &mut DefaultTerminal,
     mut app: App,
     config: Config,
     shutdown: &AtomicBool,
+    store: &storage::StateStore,
 ) -> io::Result<()> {
+    let save = |state: &model::ProjectState| store.save(state);
     let mut pty_runtime = PtyRuntime::default();
     let mut agent_backend = RuntimeAgentBackend::from_env();
     let mut agent_status_bridges = AgentStatusBridgeState::default();
+    let mut save_schedule = SaveSchedule::default();
     let size = terminal.size()?;
     let mut frame_area = Rect::new(0, 0, size.width, size.height);
     register_project_session_identities(&app, &mut pty_runtime);
@@ -233,7 +301,7 @@ pub fn run(
                 Err(error) => match classify_host_terminal_error(error) {
                     HostTerminalFailure::Retry => $recovered,
                     HostTerminalFailure::Fatal(error) => {
-                        return finish_after_host_terminal_error(&mut app, error);
+                        return finish_after_host_terminal_error_with(&mut app, error, save);
                     }
                 },
             }
@@ -241,29 +309,35 @@ pub fn run(
     }
 
     while !app.should_quit {
+        // One clock reading per tick drives every timer below.
+        let now = Instant::now();
         if shutdown.load(Ordering::Relaxed) {
             // Signals must not strand the terminal in raw mode. Make one
             // best-effort checkpoint, then return so the terminal guard can
             // restore the user's TTY even when persistence remains broken.
-            save_if_dirty_with(&mut app, true, storage::save);
+            save_if_dirty_with(&mut app, true, save);
             return Ok(());
         }
-        if last_git_branch_refresh.elapsed() >= GIT_BRANCH_REFRESH_INTERVAL {
-            refresh_workspace_git_branches(&mut app);
-            last_git_branch_refresh = Instant::now();
-            needs_redraw = true;
+        if now.saturating_duration_since(last_git_branch_refresh) >= GIT_BRANCH_REFRESH_INTERVAL {
+            // Only an actual branch change is a reason to rebuild the frame.
+            needs_redraw |= refresh_workspace_git_branches(&mut app);
+            last_git_branch_refresh = now;
         }
         needs_redraw |= drain_pty_events(&mut app, &mut pty_runtime);
         needs_redraw |= drain_agent_events(&mut app, &mut agent_backend);
-        needs_redraw |=
-            drain_mult_agent_status_events(&mut app, &mut pty_runtime, &mut agent_status_bridges);
-        needs_redraw |= save_if_dirty_with(&mut app, false, storage::save);
+        needs_redraw |= drain_mult_agent_status_events(
+            &mut app,
+            &mut pty_runtime,
+            &mut agent_status_bridges,
+            now,
+        );
+        needs_redraw |= save_content_if_due(&mut app, &mut save_schedule, now, save);
         needs_redraw |= resize_visible_terminal(&mut app, &mut pty_runtime, &config, frame_area);
         needs_redraw |= resize_visible_chat_agent(&mut app, &mut pty_runtime, &config, frame_area);
         needs_redraw |=
             auto_start_selected_terminal(&mut app, &mut pty_runtime, &config, frame_area);
         needs_redraw |=
-            auto_start_selected_chat_agent(&mut app, &mut pty_runtime, &config, frame_area);
+            auto_start_selected_chat_agent(&mut app, &mut pty_runtime, &config, store, frame_area);
 
         if needs_redraw {
             // A retried draw keeps `needs_redraw` set so the frame is rebuilt on
@@ -283,7 +357,14 @@ pub fn run(
 
         if host_terminal_io!(event::poll(EVENT_POLL_INTERVAL), false) {
             if let Some(event) = host_terminal_io!(event::read().map(Some), None) {
-                handle_event(&mut app, &mut pty_runtime, &config, event, frame_area);
+                handle_event(
+                    &mut app,
+                    &mut pty_runtime,
+                    &config,
+                    store,
+                    event,
+                    frame_area,
+                );
                 needs_redraw = true;
                 while !app.should_quit
                     && host_terminal_io!(event::poll(READY_EVENT_POLL_INTERVAL), false)
@@ -291,9 +372,20 @@ pub fn run(
                     let Some(event) = host_terminal_io!(event::read().map(Some), None) else {
                         break;
                     };
-                    handle_event(&mut app, &mut pty_runtime, &config, event, frame_area);
+                    handle_event(
+                        &mut app,
+                        &mut pty_runtime,
+                        &config,
+                        store,
+                        event,
+                        frame_area,
+                    );
                 }
-                needs_redraw |= save_if_dirty_with(&mut app, true, storage::save);
+                // Everything the user just did is persisted before the loop can
+                // observe `should_quit`, so a quit never leaves work behind.
+                // This is also the retry for a previously failed save.
+                needs_redraw |= save_if_dirty_with(&mut app, true, save);
+                save_schedule.record(now);
             }
         }
     }
@@ -328,10 +420,6 @@ fn classify_host_terminal_error(error: io::Error) -> HostTerminalFailure {
 /// does still happens. A best-effort forced save runs first (so work since the
 /// last checkpoint survives a closed window), and the caller's `TerminalGuard`
 /// restores the TTY when this error unwinds out of `run`.
-fn finish_after_host_terminal_error(app: &mut App, error: io::Error) -> io::Result<()> {
-    finish_after_host_terminal_error_with(app, error, storage::save)
-}
-
 fn finish_after_host_terminal_error_with(
     app: &mut App,
     error: io::Error,
@@ -358,7 +446,10 @@ fn register_project_session_identities(app: &App, pty_runtime: &mut PtyRuntime) 
     }
 }
 
-fn refresh_workspace_git_branches(app: &mut App) {
+/// Re-read every workspace's checked-out branch. Returns whether any of them
+/// changed — a branch is only visible in the sidebar, so an unchanged probe must
+/// not force a redraw the loop otherwise skips (S4).
+fn refresh_workspace_git_branches(app: &mut App) -> bool {
     let branches = app
         .project
         .workspaces
@@ -368,7 +459,7 @@ fn refresh_workspace_git_branches(app: &mut App) {
             (workspace.id, branch)
         })
         .collect::<Vec<_>>();
-    app.replace_workspace_git_branches(branches);
+    app.replace_workspace_git_branches(branches)
 }
 
 fn restore_persisted_sessions(
@@ -486,15 +577,16 @@ fn handle_event(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
+    store: &storage::StateStore,
     event: Event,
     frame_area: Rect,
 ) {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
-            handle_key(app, pty_runtime, config, key, frame_area);
+            handle_key(app, pty_runtime, config, store, key, frame_area);
         }
         Event::Mouse(mouse) => handle_mouse(app, pty_runtime, config, mouse, frame_area),
-        Event::Paste(text) => handle_paste(app, pty_runtime, config, text, frame_area),
+        Event::Paste(text) => handle_paste(app, pty_runtime, config, store, text, frame_area),
         _ => {}
     }
 }
@@ -503,6 +595,7 @@ fn handle_key(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
+    store: &storage::StateStore,
     key: KeyEvent,
     frame_area: Rect,
 ) {
@@ -515,11 +608,11 @@ fn handle_key(
         Some(Prompt::OpenWorkspace(_)) => handle_open_workspace_key(app, config, key),
         Some(Prompt::NewTerminalCommand(_)) => handle_terminal_command_key(app, key),
         Some(Prompt::CommandPalette(_)) => {
-            handle_command_palette_key(app, pty_runtime, config, key, frame_area);
+            handle_command_palette_key(app, pty_runtime, config, store, key, frame_area);
         }
         Some(Prompt::Search(_)) => handle_search_key(app, key),
         Some(Prompt::ConfirmDelete(_)) => handle_delete_confirmation_key(app, pty_runtime, key),
-        None => handle_unprompted_key(app, pty_runtime, config, key, frame_area),
+        None => handle_unprompted_key(app, pty_runtime, config, store, key, frame_area),
     }
 }
 
@@ -558,6 +651,7 @@ fn handle_paste(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
+    store: &storage::StateStore,
     text: String,
     frame_area: Rect,
 ) {
@@ -568,7 +662,8 @@ fn handle_paste(
         return;
     }
 
-    let Some(terminal_id) = start_selected_pty_if_needed(app, pty_runtime, config, frame_area)
+    let Some(terminal_id) =
+        start_selected_pty_if_needed(app, pty_runtime, config, store, frame_area)
     else {
         return;
     };
@@ -854,20 +949,22 @@ fn handle_unprompted_key(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
+    store: &storage::StateStore,
     key: KeyEvent,
     frame_area: Rect,
 ) {
-    if handle_control_key(app, pty_runtime, config, key, frame_area) {
+    if handle_control_key(app, pty_runtime, config, store, key, frame_area) {
         return;
     }
 
-    handle_selected_pty_input_key(app, pty_runtime, config, key, frame_area);
+    handle_selected_pty_input_key(app, pty_runtime, config, store, key, frame_area);
 }
 
 fn handle_control_key(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
+    store: &storage::StateStore,
     key: KeyEvent,
     frame_area: Rect,
 ) -> bool {
@@ -896,7 +993,7 @@ fn handle_control_key(
         return true;
     }
     if is_unshifted_control_char(key, 'a') {
-        add_agent_to_selected_workspace(app, pty_runtime, config, frame_area, AgentKind::Pi);
+        add_agent_to_selected_workspace(app, pty_runtime, config, store, frame_area, AgentKind::Pi);
         return true;
     }
     if is_unshifted_control_char(key, 'x') {
@@ -904,6 +1001,7 @@ fn handle_control_key(
             app,
             pty_runtime,
             config,
+            store,
             frame_area,
             AgentKind::ClaudeCode,
         );
@@ -1008,11 +1106,23 @@ fn add_agent_to_selected_workspace(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
+    store: &storage::StateStore,
     frame_area: Rect,
     agent: AgentKind,
 ) {
     if let Some((workspace, chat)) = app.add_chat_to_selected_workspace_and_return(agent) {
-        start_or_focus_chat_agent(app, pty_runtime, config, frame_area, workspace, chat, true);
+        start_or_focus_chat_agent(
+            app,
+            pty_runtime,
+            config,
+            store,
+            frame_area,
+            ChatAgentLaunch {
+                workspace_id: workspace,
+                chat_id: chat,
+                focus_after_start: true,
+            },
+        );
     }
 }
 
@@ -1056,6 +1166,7 @@ fn handle_selected_pty_input_key(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
+    store: &storage::StateStore,
     key: KeyEvent,
     frame_area: Rect,
 ) {
@@ -1065,7 +1176,8 @@ fn handle_selected_pty_input_key(
         return;
     }
 
-    let Some(terminal_id) = start_selected_pty_if_needed(app, pty_runtime, config, frame_area)
+    let Some(terminal_id) =
+        start_selected_pty_if_needed(app, pty_runtime, config, store, frame_area)
     else {
         return;
     };
@@ -1093,6 +1205,7 @@ fn start_selected_pty_if_needed(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
+    store: &storage::StateStore,
     frame_area: Rect,
 ) -> Option<PtyKey> {
     match app.selected_item()? {
@@ -1105,10 +1218,13 @@ fn start_selected_pty_if_needed(
                     app,
                     pty_runtime,
                     config,
+                    store,
                     frame_area,
-                    workspace,
-                    chat,
-                    true,
+                    ChatAgentLaunch {
+                        workspace_id: workspace,
+                        chat_id: chat,
+                        focus_after_start: true,
+                    },
                 );
             }
             pty_runtime.is_running(terminal).then_some(terminal)
@@ -1169,6 +1285,7 @@ fn handle_command_palette_key(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
+    store: &storage::StateStore,
     key: KeyEvent,
     frame_area: Rect,
 ) {
@@ -1176,7 +1293,7 @@ fn handle_command_palette_key(
         KeyCode::Esc => app.cancel_prompt(),
         KeyCode::Enter => {
             if let Some(action) = app.submit_command_palette() {
-                execute_command_action(app, pty_runtime, config, action, frame_area);
+                execute_command_action(app, pty_runtime, config, store, action, frame_area);
             }
         }
         KeyCode::Up => app.select_previous_command_palette_entry(),
@@ -1218,6 +1335,7 @@ fn execute_command_action(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
+    store: &storage::StateStore,
     action: CommandAction,
     frame_area: Rect,
 ) {
@@ -1226,15 +1344,25 @@ fn execute_command_action(
         CommandAction::FocusSelectedPane => {
             app.focus_selected_main();
         }
-        CommandAction::StartInput => focus_selected_input(app, pty_runtime, config, frame_area),
+        CommandAction::StartInput => {
+            focus_selected_input(app, pty_runtime, config, store, frame_area)
+        }
         CommandAction::AddAgentChat => {
-            add_agent_to_selected_workspace(app, pty_runtime, config, frame_area, AgentKind::Pi);
+            add_agent_to_selected_workspace(
+                app,
+                pty_runtime,
+                config,
+                store,
+                frame_area,
+                AgentKind::Pi,
+            );
         }
         CommandAction::AddClaudeCodeChat => {
             add_agent_to_selected_workspace(
                 app,
                 pty_runtime,
                 config,
+                store,
                 frame_area,
                 AgentKind::ClaudeCode,
             );
@@ -1345,6 +1473,7 @@ fn start_or_focus_selected_chat_agent(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
+    store: &storage::StateStore,
     frame_area: Rect,
 ) {
     let Some((workspace_id, chat_id)) = app.selected_chat_id() else {
@@ -1355,22 +1484,39 @@ fn start_or_focus_selected_chat_agent(
         app,
         pty_runtime,
         config,
+        store,
         frame_area,
-        workspace_id,
-        chat_id,
-        true,
+        ChatAgentLaunch {
+            workspace_id,
+            chat_id,
+            focus_after_start: true,
+        },
     );
+}
+
+/// Which chat to start, and whether the caller wants focus moved into it once
+/// it is running. Grouped so the launch site reads as one decision rather than
+/// three trailing positional arguments.
+#[derive(Debug, Clone, Copy)]
+struct ChatAgentLaunch {
+    workspace_id: model::WorkspaceId,
+    chat_id: model::ChatId,
+    focus_after_start: bool,
 }
 
 fn start_or_focus_chat_agent(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
+    store: &storage::StateStore,
     frame_area: Rect,
-    workspace_id: model::WorkspaceId,
-    chat_id: model::ChatId,
-    focus_after_start: bool,
+    launch: ChatAgentLaunch,
 ) {
+    let ChatAgentLaunch {
+        workspace_id,
+        chat_id,
+        focus_after_start,
+    } = launch;
     let terminal_id = PtyKey::ChatAgent(chat_id);
 
     if pty_runtime.is_running(terminal_id) {
@@ -1441,7 +1587,7 @@ fn start_or_focus_chat_agent(
             Ok(AttachExistingResult::Missing) => {
                 app.clear_agent_generation(chat_id, generation);
                 app.mark_chat_status_by_id(chat_id, ChatStatus::Failed);
-                if !persist_before_agent_launch(app) {
+                if !persist_before_agent_launch(app, store) {
                     pty_runtime.append_terminal_system_line(
                         terminal_id,
                         "could not save missing agent generation; refusing to launch",
@@ -1472,7 +1618,7 @@ fn start_or_focus_chat_agent(
             return;
         }
     };
-    if !persist_before_agent_launch(app) {
+    if !persist_before_agent_launch(app, store) {
         pty_runtime.append_terminal_system_line(
             terminal_id,
             "could not save agent generation; refusing to launch",
@@ -1552,8 +1698,11 @@ fn start_or_focus_chat_agent(
     }
 }
 
-fn persist_before_agent_launch(app: &mut App) -> bool {
-    save_if_dirty_with(app, true, storage::save);
+/// An agent generation must be durable *before* the process that carries it
+/// starts, so this save is forced: deferring it (B9) would risk a launched
+/// agent whose generation no state file records.
+fn persist_before_agent_launch(app: &mut App, store: &storage::StateStore) -> bool {
+    save_if_dirty_with(app, true, |state| store.save(state));
     !app.is_dirty()
 }
 
@@ -1655,6 +1804,7 @@ fn auto_start_selected_chat_agent(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
+    store: &storage::StateStore,
     frame_area: Rect,
 ) -> bool {
     if app.is_prompt_active() {
@@ -1681,10 +1831,13 @@ fn auto_start_selected_chat_agent(
         app,
         pty_runtime,
         config,
+        store,
         frame_area,
-        workspace_id,
-        chat_id,
-        false,
+        ChatAgentLaunch {
+            workspace_id,
+            chat_id,
+            focus_after_start: false,
+        },
     );
     true
 }
@@ -1835,9 +1988,7 @@ fn write_private_runtime_file(
     {
         return None;
     }
-    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) } != 0 {
-        return None;
-    }
+    let _guard = RuntimeFileLock::try_acquire(&file)?;
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .ok()?;
     let mut existing = Vec::new();
@@ -1849,6 +2000,56 @@ fn write_private_runtime_file(
         file.sync_all().ok()?;
     }
     Some(path)
+}
+
+/// How many times a contended runtime artifact is retried, and how long each
+/// wait is. Two `mult` instances only collide while one of them writes three
+/// small files, so a bounded wait of a few milliseconds resolves virtually
+/// every real contention — and never costs the render loop more than
+/// [`RUNTIME_LOCK_ATTEMPTS`] × [`RUNTIME_LOCK_RETRY_DELAY`] (S5).
+const RUNTIME_LOCK_ATTEMPTS: u32 = 5;
+const RUNTIME_LOCK_RETRY_DELAY: Duration = Duration::from_millis(2);
+
+/// An exclusive `flock` held for the length of a runtime-artifact write.
+struct RuntimeFileLock(std::os::fd::RawFd);
+
+impl RuntimeFileLock {
+    /// Take the lock without ever blocking the render thread.
+    ///
+    /// A blocking `LOCK_EX` here meant a second `mult` starting an agent could
+    /// stall the first one's whole event loop for as long as it took to write
+    /// its files. `LOCK_NB` plus a bounded retry turns that into a short wait
+    /// and, at worst, a caller that degrades (the agent starts without the
+    /// status extension) instead of a frozen UI.
+    fn try_acquire(file: &fs::File) -> Option<Self> {
+        use std::os::fd::AsRawFd;
+
+        let descriptor = file.as_raw_fd();
+        for attempt in 0..RUNTIME_LOCK_ATTEMPTS {
+            if unsafe { libc::flock(descriptor, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Some(Self(descriptor));
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EWOULDBLOCK)
+                && error.raw_os_error() != Some(libc::EINTR)
+            {
+                return None;
+            }
+            if attempt + 1 < RUNTIME_LOCK_ATTEMPTS {
+                std::thread::sleep(RUNTIME_LOCK_RETRY_DELAY);
+            }
+        }
+        None
+    }
+}
+
+impl Drop for RuntimeFileLock {
+    fn drop(&mut self) {
+        // The descriptor is closed right after this, which would release the
+        // lock anyway; unlocking explicitly keeps the window closed even if the
+        // file ever outlives the guard.
+        unsafe { libc::flock(self.0, libc::LOCK_UN) };
+    }
 }
 
 fn rotate_legacy_runtime_artifacts(
@@ -1905,10 +2106,11 @@ fn focus_selected_input(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
+    store: &storage::StateStore,
     frame_area: Rect,
 ) {
     if app.selected_chat_id().is_some() {
-        start_or_focus_selected_chat_agent(app, pty_runtime, config, frame_area);
+        start_or_focus_selected_chat_agent(app, pty_runtime, config, store, frame_area);
     } else if app.selected_terminal_id().is_some() {
         start_or_focus_selected_terminal(app, pty_runtime, config, frame_area);
     }
@@ -1945,9 +2147,7 @@ fn resize_visible_terminal(
     };
     let size = pty_dimensions_from_area(area);
     let key = PtyKey::Terminal(terminal_id);
-    let changed = pty_dimensions_changed(pty_runtime, key, size);
-    let _ = pty_runtime.resize(key, size);
-    changed
+    resize_if_changed(pty_runtime, key, size)
 }
 
 fn resize_visible_chat_agent(
@@ -1961,9 +2161,22 @@ fn resize_visible_chat_agent(
     };
     let terminal_id = PtyKey::ChatAgent(chat_id);
     let size = pty_dimensions_from_area(area);
-    let changed = pty_dimensions_changed(pty_runtime, terminal_id, size);
-    let _ = pty_runtime.resize(terminal_id, size);
-    changed
+    resize_if_changed(pty_runtime, terminal_id, size)
+}
+
+/// Resize `terminal` only when the size actually differs (D1).
+///
+/// Both callers run on every ~16 ms tick, and a `Resize` is not free at either
+/// end: the client serializes and writes a message to the socket, and the
+/// daemon takes the pane lock, takes the master lock and issues a
+/// `TIOCSWINSZ`. Unconditionally resizing to the size the pane already has cost
+/// ~125 writes/s per site at complete idle and changed nothing.
+fn resize_if_changed(pty_runtime: &mut PtyRuntime, terminal: PtyKey, size: PtyDimensions) -> bool {
+    if !pty_dimensions_changed(pty_runtime, terminal, size) {
+        return false;
+    }
+    let _ = pty_runtime.resize(terminal, size);
+    true
 }
 
 /// Whether resizing `terminal` to `size` would actually change its parser
@@ -2240,7 +2453,13 @@ fn drain_mult_agent_status_events(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     bridges: &mut AgentStatusBridgeState,
+    now: Instant,
 ) -> bool {
+    if !bridges.is_due(now) {
+        return false;
+    }
+    bridges.last_poll = Some(now);
+
     let chats = app
         .project
         .workspaces
@@ -2253,28 +2472,29 @@ fn drain_mult_agent_status_events(
             })
         })
         .collect::<Vec<_>>();
+    // A chat that stopped, or was deleted, keeps no cursor: the journal it named
+    // is gone, and a later chat must never inherit a stale read offset.
+    bridges
+        .sources
+        .retain(|chat, _| chats.iter().any(|(live, ..)| live == chat));
 
     let mut changed = false;
     for (chat, agent, identity, generation) in chats {
-        let path = mult_agent_status_path(identity, generation);
-        let records = {
-            let cursor = bridges.cursors.entry(path.clone()).or_default();
-            match read_mult_agent_status_records(&path, cursor) {
-                Ok(records) => records,
-                Err(_) => continue,
-            }
+        // Borrowed for the whole chat: `app` and `pty_runtime` are distinct, so
+        // the cursor can be advanced in place as records are consumed.
+        let source = bridges.source_for(chat, identity, generation);
+        let AgentStatusSource { path, cursor, .. } = source;
+        let records = match read_mult_agent_status_records(path, cursor) {
+            Ok(records) => records,
+            Err(_) => continue,
         };
         for (record, consumed_offset) in records {
             if !status_record_matches(&record, chat, agent, identity, generation) {
-                if let Some(cursor) = bridges.cursors.get_mut(&path) {
-                    cursor.offset = consumed_offset;
-                }
+                cursor.offset = consumed_offset;
                 continue;
             }
             let Some(status) = mult_agent_status(&record.status) else {
-                if let Some(cursor) = bridges.cursors.get_mut(&path) {
-                    cursor.offset = consumed_offset;
-                }
+                cursor.offset = consumed_offset;
                 continue;
             };
             let Some(wire_identity) =
@@ -2296,19 +2516,14 @@ fn drain_mult_agent_status_events(
                         chat,
                         chat_status_from_agent_status(accepted.status),
                     );
-                    if let Some(cursor) = bridges.cursors.get_mut(&path) {
-                        cursor.offset = consumed_offset;
-                    }
                 }
                 Err(_) => {
                     // The daemon is authoritative. Reconcile a final status or
                     // stale generation instead of applying untrusted file data.
                     reconcile_agent_status(app, pty_runtime, chat, agent, generation);
-                    if let Some(cursor) = bridges.cursors.get_mut(&path) {
-                        cursor.offset = consumed_offset;
-                    }
                 }
             }
+            cursor.offset = consumed_offset;
         }
     }
     changed
@@ -2495,6 +2710,47 @@ fn mult_runtime_dir() -> PathBuf {
         .join("mult")
 }
 
+/// When the last state save ran, so ordinary content saves can be spaced out
+/// (B9).
+///
+/// A save is not cheap — `to_string_pretty` of the whole project, a write, an
+/// `fsync`, a rename and a directory `sync` — and streamed agent output dirties
+/// the project once per delta, which used to mean one full save per ~16 ms
+/// tick. Saves are therefore rate-limited to [`MIN_CONTENT_SAVE_INTERVAL`],
+/// with three deliberate exemptions that keep "nothing is lost on exit" true:
+/// quitting, a fatal host-terminal error, and any structural change
+/// (`App::has_structural_change`).
+#[derive(Default)]
+struct SaveSchedule {
+    last_save: Option<Instant>,
+}
+
+impl SaveSchedule {
+    fn is_due(&self, now: Instant) -> bool {
+        self.last_save
+            .is_none_or(|last| now.saturating_duration_since(last) >= MIN_CONTENT_SAVE_INTERVAL)
+    }
+
+    fn record(&mut self, now: Instant) {
+        self.last_save = Some(now);
+    }
+}
+
+/// The rate-limited save the event loop runs every tick (B9). Structural
+/// changes ignore the limit; everything else waits for the window.
+fn save_content_if_due(
+    app: &mut App,
+    schedule: &mut SaveSchedule,
+    now: Instant,
+    saver: impl FnMut(&model::ProjectState) -> io::Result<()>,
+) -> bool {
+    if !app.is_dirty() || (!app.has_structural_change() && !schedule.is_due(now)) {
+        return false;
+    }
+    schedule.record(now);
+    save_if_dirty_with(app, false, saver)
+}
+
 fn save_if_dirty_with(
     app: &mut App,
     force_retry: bool,
@@ -2535,6 +2791,144 @@ mod tests {
     enum RestorationReply {
         Attached,
         Missing,
+    }
+
+    /// A daemon that attaches every pane and records every client message until
+    /// the client closes the socket. Unlike [`connected_restoration_runtime`]
+    /// the server thread outlives the first request, so a test can assert on
+    /// what the client sent *after* startup — join it only once the runtime has
+    /// been dropped.
+    fn recording_attached_runtime(
+        terminal: model::TerminalId,
+    ) -> (
+        PtyRuntime,
+        mpsc::Receiver<ClientMessage>,
+        thread::JoinHandle<()>,
+        PathBuf,
+    ) {
+        let socket_path = unique_status_path("recording").with_extension("sock");
+        let _ = fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("bind recording test socket");
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept recording client");
+            let hello: ClientMessage = read_message(&mut stream).expect("read client hello");
+            assert!(matches!(hello, ClientMessage::Hello { .. }));
+            write_message(
+                &mut stream,
+                &ServerMessage::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    server_instance: ServerInstanceId::from_bytes([1; 16]),
+                    client_scope: ClientScopeId::from_bytes([2; 16]),
+                    resumed: false,
+                },
+            )
+            .expect("write server hello");
+
+            let lease = AttachmentLease::MIN;
+            let pane = PaneId(terminal.0);
+            // Ends when the client drops its socket: the test is over.
+            while let Ok(message) = read_message::<ClientMessage>(&mut stream) {
+                if let ClientMessage::Attach { request_id, .. } = &message {
+                    let request_id = *request_id;
+                    for reply in [
+                        ServerMessage::AttachResult {
+                            request_id,
+                            outcome: AttachOutcome::Attached {
+                                session: SessionId(terminal.0),
+                                pane: mult_protocol::PaneInfo {
+                                    id: pane,
+                                    title: "recorded".to_string(),
+                                    rows: 40,
+                                    cols: 86,
+                                },
+                                lease,
+                            },
+                        },
+                        ServerMessage::ReplayBegin {
+                            request_id,
+                            pane,
+                            lease,
+                            first_sequence: OutputSequence::ZERO,
+                            watermark: OutputSequence::ZERO,
+                            omitted_prefix_bytes: 0,
+                        },
+                        ServerMessage::ReplayEnd {
+                            request_id,
+                            pane,
+                            lease,
+                            watermark: OutputSequence::ZERO,
+                        },
+                    ] {
+                        write_message(&mut stream, &reply).expect("write attach reply");
+                    }
+                }
+                if observed_tx.send(message).is_err() {
+                    break;
+                }
+            }
+        });
+        let runtime =
+            PtyRuntime::connect_to_socket(socket_path.clone()).expect("connect recording runtime");
+        (runtime, observed_rx, server, socket_path)
+    }
+
+    /// D1: both resize sites ran on every ~16 ms tick and called `resize`
+    /// unconditionally, so an idle session wrote a `Resize` to the socket ~125
+    /// times a second — each one a pane lock, a master lock and a `TIOCSWINSZ`
+    /// in the daemon for a size that had not changed.
+    #[test]
+    fn a_visible_pane_is_resized_only_when_its_size_changed() {
+        let (mut app, _, terminal) = running_command_app("echo recorded".to_string());
+        let (mut runtime, observed, server, socket_path) = recording_attached_runtime(terminal);
+        let config = Config::default();
+        let area = Rect::new(0, 0, 120, 40);
+
+        restore_persisted_sessions(&mut app, &mut runtime, &config, area);
+        // Settle the pane at the visible size, whatever the attach reported.
+        resize_visible_terminal(&mut app, &mut runtime, &config, area);
+
+        for _ in 0..8 {
+            assert!(
+                !resize_visible_terminal(&mut app, &mut runtime, &config, area),
+                "an unchanged size is not a redraw reason either"
+            );
+        }
+        // A genuine resize must still reach the daemon.
+        assert!(resize_visible_terminal(
+            &mut app,
+            &mut runtime,
+            &config,
+            Rect::new(0, 0, 100, 30)
+        ));
+
+        drop(runtime);
+        server.join().expect("recording server exits");
+        let resizes = observed
+            .into_iter()
+            .filter_map(|message| match message {
+                ClientMessage::Resize { rows, cols, .. } => Some((rows, cols)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            !resizes.is_empty(),
+            "a genuine resize must still reach the daemon"
+        );
+        // The eight idle ticks are the point: before the fix each one wrote the
+        // size the pane already had.
+        let distinct = resizes.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            distinct.len(),
+            resizes.len(),
+            "no size may be written twice: {resizes:?}"
+        );
+        assert!(
+            resizes.len() <= 2,
+            "at most one write per size: {resizes:?}"
+        );
+        let _ = fs::remove_file(socket_path);
     }
 
     #[test]
@@ -2921,6 +3315,259 @@ mod tests {
         assert_eq!(app.save_error(), None);
     }
 
+    /// S3/B3: the status bridge used to `open`+`fstat`+`seek`+`read`+`close`
+    /// every journal on every ~16 ms tick, after rebuilding each journal path
+    /// from scratch (four allocations per chat per tick). Both are now bounded:
+    /// the poll is on a timer and the path is cached per agent session.
+    #[test]
+    fn agent_status_polling_is_timed_and_journal_paths_are_cached() {
+        let mut app = App::default();
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let mut bridges = AgentStatusBridgeState::default();
+        let start = Instant::now();
+
+        assert!(bridges.is_due(start), "the first tick always polls");
+        drain_mult_agent_status_events(&mut app, &mut pty_runtime, &mut bridges, start);
+        assert!(
+            !bridges.is_due(start + AGENT_STATUS_POLL_INTERVAL / 2),
+            "a tick inside the interval must not touch the filesystem"
+        );
+        assert!(bridges.is_due(start + AGENT_STATUS_POLL_INTERVAL));
+
+        // The cache is keyed by the agent session, so a restart (new
+        // generation) re-derives the path and starts reading from zero again.
+        let chat = model::ChatId(7);
+        let identity = model::ProjectState::default()
+            .session_identity(PtyKey::Terminal(model::TerminalId(1)))
+            .expect("the default project has a terminal identity");
+        let first_generation = model::AgentGeneration::from_bytes([3; 16]).unwrap();
+        let second_generation = model::AgentGeneration::from_bytes([4; 16]).unwrap();
+
+        let path = bridges
+            .source_for(chat, identity, first_generation)
+            .path
+            .clone();
+        bridges
+            .source_for(chat, identity, first_generation)
+            .cursor
+            .offset = 42;
+        assert_eq!(
+            bridges.source_for(chat, identity, first_generation).path,
+            path,
+            "an unchanged session reuses the cached path"
+        );
+        assert_eq!(
+            bridges
+                .source_for(chat, identity, first_generation)
+                .cursor
+                .offset,
+            42,
+            "and keeps its read cursor"
+        );
+
+        let restarted = bridges.source_for(chat, identity, second_generation);
+        assert_ne!(restarted.path, path, "a new generation names a new journal");
+        assert_eq!(restarted.cursor.offset, 0, "and is read from the beginning");
+        assert_eq!(bridges.sources.len(), 1, "one entry per chat, not per tick");
+    }
+
+    /// B9: a save is a full re-serialize plus `fsync`, rename and directory
+    /// `sync`, and streamed agent output dirties the project once per delta.
+    /// Content saves are therefore spaced out — but a structural change is
+    /// never deferred, and a failure is still not retried until asked.
+    #[test]
+    fn content_saves_are_rate_limited_and_structural_changes_are_not() {
+        let mut app = App::default();
+        let mut schedule = SaveSchedule::default();
+        let start = Instant::now();
+        let saves = Cell::new(0);
+        let mut saver = |_: &model::ProjectState| {
+            saves.set(saves.get() + 1);
+            Ok(())
+        };
+
+        let workspace = app.project.workspaces[0].id;
+        let chat = app
+            .project
+            .add_chat(
+                workspace,
+                "agent".to_string(),
+                ChatStatus::Idle,
+                AgentKind::Pi,
+            )
+            .unwrap()
+            .unwrap();
+        app.mark_clean();
+
+        let stream_delta = |app: &mut App, text: &str| {
+            app.apply_agent_event(AgentEvent::MessageDelta {
+                target: agent::AgentTarget { workspace, chat },
+                role: agent::AgentMessageRole::Assistant,
+                text: text.to_string(),
+            });
+        };
+
+        stream_delta(&mut app, "first");
+        assert!(save_content_if_due(
+            &mut app,
+            &mut schedule,
+            start,
+            &mut saver
+        ));
+        assert_eq!(saves.get(), 1, "the first content change saves at once");
+
+        // Sixty ticks of streamed output inside one second: still one save.
+        for tick in 1..=60_u32 {
+            stream_delta(&mut app, "more");
+            save_content_if_due(
+                &mut app,
+                &mut schedule,
+                start + Duration::from_millis(u64::from(tick) * 16),
+                &mut saver,
+            );
+        }
+        assert_eq!(saves.get(), 1, "streamed deltas must not save per delta");
+        assert!(app.is_dirty(), "the deferred change is still pending");
+
+        assert!(save_content_if_due(
+            &mut app,
+            &mut schedule,
+            start + MIN_CONTENT_SAVE_INTERVAL,
+            &mut saver
+        ));
+        assert_eq!(saves.get(), 2, "and lands once the window opens");
+        assert!(!app.is_dirty());
+
+        // A structural change ignores the window entirely.
+        app.add_terminal_to_selected_workspace();
+        assert!(save_content_if_due(
+            &mut app,
+            &mut schedule,
+            start + MIN_CONTENT_SAVE_INTERVAL,
+            &mut saver
+        ));
+        assert_eq!(saves.get(), 3);
+        assert!(!app.has_structural_change());
+    }
+
+    /// B9 (continued): nothing may be lost on the way out. The quit/signal and
+    /// fatal-host-terminal paths force a save regardless of the rate limit.
+    #[test]
+    fn a_deferred_change_is_still_saved_on_the_way_out() {
+        let mut app = App::default();
+        let mut schedule = SaveSchedule::default();
+        let start = Instant::now();
+        let saves = Cell::new(0);
+        let mut saver = |_: &model::ProjectState| {
+            saves.set(saves.get() + 1);
+            Ok(())
+        };
+
+        app.project.workspaces[0].name = "renamed".to_string();
+        app.mark_terminal_running(app.project.workspaces[0].terminals[0].id);
+        assert!(app.is_dirty());
+        schedule.record(start);
+        assert!(
+            !save_content_if_due(&mut app, &mut schedule, start, &mut saver),
+            "the window is closed, so the tick defers"
+        );
+
+        finish_after_host_terminal_error_with(
+            &mut app,
+            io::Error::from_raw_os_error(libc::EIO),
+            &mut saver,
+        )
+        .expect_err("the host-terminal error is still reported");
+
+        assert_eq!(
+            saves.get(),
+            1,
+            "the deferred change is checkpointed on exit"
+        );
+        assert!(!app.is_dirty());
+    }
+
+    /// S5: a second `mult` writing the same runtime artifact must not stall
+    /// this one's render loop. The lock is taken non-blocking with a bounded
+    /// retry, so contention degrades (no status extension) instead of hanging.
+    #[test]
+    fn a_contended_runtime_artifact_lock_gives_up_instead_of_blocking() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = unique_status_path("runtime-lock").with_extension("dir");
+        fs::create_dir_all(&directory).expect("create runtime artifact directory");
+        let path = directory.join("mult-status-extension-v2.ts");
+        let holder = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .expect("create contended artifact");
+        assert_eq!(
+            unsafe {
+                libc::flock(
+                    std::os::fd::AsRawFd::as_raw_fd(&holder),
+                    libc::LOCK_EX | libc::LOCK_NB,
+                )
+            },
+            0,
+            "the test takes the lock the other instance would hold"
+        );
+
+        assert!(
+            write_private_runtime_file(&directory, "mult-status-extension", "ts", b"source")
+                .is_none(),
+            "a contended write reports failure instead of blocking the render loop"
+        );
+
+        drop(holder);
+        assert_eq!(
+            write_private_runtime_file(&directory, "mult-status-extension", "ts", b"source")
+                .as_deref(),
+            Some(path.as_path()),
+            "and succeeds once the other instance is done"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// S4: the git probe runs every two seconds for every workspace, and its
+    /// result is only visible in the sidebar. An unchanged branch must not
+    /// force the redraw the loop otherwise skips.
+    #[test]
+    fn an_unchanged_git_branch_is_not_a_redraw_reason() {
+        let root = unique_status_path("git-branch").with_extension("repo");
+        fs::create_dir_all(root.join(".git")).expect("create fixture repository");
+        fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n")
+            .expect("write fixture HEAD");
+
+        let mut app = App::default();
+        app.project.workspaces[0].cwd = Some(root.clone());
+
+        assert!(
+            refresh_workspace_git_branches(&mut app),
+            "the first probe learns the branch"
+        );
+        assert_eq!(
+            app.workspace_git_branch(app.project.workspaces[0].id),
+            Some("main")
+        );
+        assert!(
+            !refresh_workspace_git_branches(&mut app),
+            "an unchanged branch reports no change"
+        );
+
+        fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/side\n")
+            .expect("switch fixture branch");
+        assert!(refresh_workspace_git_branches(&mut app));
+        assert_eq!(
+            app.workspace_git_branch(app.project.workspaces[0].id),
+            Some("side")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// B11: draw/poll/read failures must not propagate straight out of `run`.
     /// Transient ones are retried, and a permanent one still checkpoints state
     /// on its way out instead of discarding everything since the last save.
@@ -3131,6 +3778,21 @@ mod tests {
             "mult-status-test-{label}-{}-{nanos}.json",
             std::process::id()
         ))
+    }
+
+    /// A state store over a fresh private directory.
+    ///
+    /// Input handling reaches the agent-launch path, which persists through the
+    /// locked store (B16), so tests that drive keys need one even when they
+    /// never save.
+    fn test_state_store(label: &str) -> storage::StateStore {
+        let path = unique_status_path(label)
+            .with_extension("store")
+            .join("state.json");
+        storage::StateStore::acquire(
+            storage::StatePaths::from_explicit_path(path).expect("test state path"),
+        )
+        .expect("acquire test state store")
     }
 
     fn write_private_status(path: &Path, contents: &[u8]) -> io::Result<()> {
@@ -3353,6 +4015,7 @@ mod tests {
 
     #[test]
     fn ctrl_j_and_ctrl_k_navigate_selection() {
+        let store = test_state_store("ctrl-j-and-ctrl-k-navigate-selection");
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
         let config = Config::default();
@@ -3362,6 +4025,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
             frame_area,
         );
@@ -3372,6 +4036,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
             frame_area,
         );
@@ -3381,6 +4046,7 @@ mod tests {
 
     #[test]
     fn ctrl_p_opens_palette_and_ctrl_s_opens_search_for_selected_pane() {
+        let store = test_state_store("ctrl-p-opens-palette-and-ctrl-s-opens-se");
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
         let config = Config::default();
@@ -3390,6 +4056,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
             frame_area,
         );
@@ -3407,6 +4074,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
             frame_area,
         );
@@ -3415,6 +4083,7 @@ mod tests {
 
     #[test]
     fn plain_keys_are_not_workspace_commands() {
+        let store = test_state_store("plain-keys-are-not-workspace-commands");
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
         let config = Config::default();
@@ -3425,6 +4094,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
             frame_area,
         );
@@ -3432,6 +4102,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
             frame_area,
         );
@@ -3443,6 +4114,7 @@ mod tests {
 
     #[test]
     fn mouse_wheel_scrolls_output_under_cursor() {
+        let store = test_state_store("mouse-wheel-scrolls-output-under-cursor");
         let mut app = App::default();
         let (selected, terminal_id) = app
             .nav_items()
@@ -3473,6 +4145,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             Event::Mouse(MouseEvent {
                 kind: MouseEventKind::ScrollUp,
                 column: output_area.x,
@@ -3490,6 +4163,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             Event::Mouse(MouseEvent {
                 kind: MouseEventKind::ScrollDown,
                 column: output_area.x,
@@ -3506,6 +4180,7 @@ mod tests {
 
     #[test]
     fn mouse_wheel_does_not_scroll_local_buffer_when_program_grabs_mouse() {
+        let store = test_state_store("mouse-wheel-does-not-scroll-local-buffer");
         let mut app = App::default();
         let (selected, terminal_id) = app
             .nav_items()
@@ -3539,6 +4214,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             Event::Mouse(MouseEvent {
                 kind: MouseEventKind::ScrollUp,
                 column: output_area.x,
@@ -3564,6 +4240,7 @@ mod tests {
 
     #[test]
     fn mouse_wheel_scroll_moves_text_selection_with_scrollback() {
+        let store = test_state_store("mouse-wheel-scroll-moves-text-selection-");
         let mut app = App::default();
         let (selected, terminal_id) = app
             .nav_items()
@@ -3597,6 +4274,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             Event::Mouse(MouseEvent {
                 kind: MouseEventKind::ScrollUp,
                 column: output_area.x,
@@ -3615,6 +4293,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             Event::Mouse(MouseEvent {
                 kind: MouseEventKind::ScrollDown,
                 column: output_area.x,
@@ -3692,6 +4371,7 @@ mod tests {
 
     #[test]
     fn ctrl_keys_create_delete_and_quit() {
+        let store = test_state_store("ctrl-keys-create-delete-and-quit");
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
         let config = Config::default();
@@ -3702,6 +4382,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
             frame_area,
         );
@@ -3714,6 +4395,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             KeyEvent::new(
                 KeyCode::Char('Q'),
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT,
@@ -3726,6 +4408,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL),
             frame_area,
         );
@@ -3740,6 +4423,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
             frame_area,
         );
@@ -3753,6 +4437,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
             frame_area,
         );
@@ -3766,6 +4451,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
             frame_area,
         );
@@ -3773,6 +4459,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             frame_area,
         );
@@ -3782,6 +4469,7 @@ mod tests {
 
     #[test]
     fn ctrl_x_adds_a_claude_code_agent_chat() {
+        let store = test_state_store("ctrl-x-adds-a-claude-code-agent-chat");
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
         let config = Config::default();
@@ -3793,6 +4481,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
             frame_area,
         );
@@ -3810,6 +4499,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_is_not_a_command_terminal_shortcut() {
+        let store = test_state_store("ctrl-c-is-not-a-command-terminal-shortcu");
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
         let config = Config::default();
@@ -3820,6 +4510,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
             frame_area,
         );
@@ -3830,6 +4521,7 @@ mod tests {
 
     #[test]
     fn ctrl_shift_c_is_copy_shortcut_not_pty_interrupt() {
+        let store = test_state_store("ctrl-shift-c-is-copy-shortcut-not-pty-in");
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
         let config = Config::default();
@@ -3843,6 +4535,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             key,
             frame_area,
         ));
@@ -3856,6 +4549,7 @@ mod tests {
 
     #[test]
     fn ctrl_f_opens_workspace_prompt() {
+        let store = test_state_store("ctrl-f-opens-workspace-prompt");
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
         let config = Config::default();
@@ -3865,6 +4559,7 @@ mod tests {
             &mut app,
             &mut pty_runtime,
             &config,
+            &store,
             KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
             frame_area,
         );

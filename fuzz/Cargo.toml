@@ -1,0 +1,38 @@
+[package]
+name = "mult-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Deliberately its own workspace. `cargo-fuzz` needs nightly and pulls in
+# `libfuzzer-sys`; keeping the crate out of the root workspace means normal
+# builds, `cargo deny` and the MSRV job never see either.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mult = { path = "..", features = ["fuzzing"] }
+mult-protocol = { path = "../crates/protocol" }
+
+[[bin]]
+name = "protocol_read_message"
+path = "fuzz_targets/protocol_read_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vt_response_detector"
+path = "fuzz_targets/vt_response_detector.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true
+# Overflow checks stay on: A13 is an "attempt to subtract with overflow" in the
+# emulator, which release arithmetic would silently wrap instead of reporting.
+overflow-checks = true

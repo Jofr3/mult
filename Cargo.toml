@@ -29,6 +29,12 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
+[features]
+# Exposes the seams the out-of-workspace `fuzz/` crate drives (see
+# `src/pty.rs::fuzz_feed_terminal_output`). Off by default: no shipped build,
+# and no `cargo deny`/MSRV job, is affected by it.
+fuzzing = []
+
 [dependencies]
 anyhow = "1.0"
 crossterm = "0.29"
