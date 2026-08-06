@@ -217,6 +217,29 @@ pub fn run(
     // input event, drained PTY/agent/status change, git-branch refresh, or an
     // auto-start/resize that altered state.
     let mut needs_redraw = true;
+
+    // Host-terminal I/O is the one failure the loop cannot simply report: if
+    // `draw`, `poll` or `read` fails for good (the window closed, the ssh
+    // session dropped, the pty returned EIO) there is no UI left to show an
+    // error in. Such a failure must still leave through the same exit path as a
+    // quit, so unsaved state is checkpointed and `TerminalGuard` restores the
+    // user's TTY; only the error itself is propagated afterwards. Transient
+    // failures (`Interrupted`, `WouldBlock`, `TimedOut`) are retried on the next
+    // tick instead of ending the session.
+    macro_rules! host_terminal_io {
+        ($result:expr, $recovered:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => match classify_host_terminal_error(error) {
+                    HostTerminalFailure::Retry => $recovered,
+                    HostTerminalFailure::Fatal(error) => {
+                        return finish_after_host_terminal_error(&mut app, error);
+                    }
+                },
+            }
+        };
+    }
+
     while !app.should_quit {
         if shutdown.load(Ordering::Relaxed) {
             // Signals must not strand the terminal in raw mode. Make one
@@ -243,36 +266,79 @@ pub fn run(
             auto_start_selected_chat_agent(&mut app, &mut pty_runtime, &config, frame_area);
 
         if needs_redraw {
-            frame_area = terminal
-                .draw(|frame| ui::draw(frame, &app, &pty_runtime, &config))?
-                .area;
-            needs_redraw = false;
+            // A retried draw keeps `needs_redraw` set so the frame is rebuilt on
+            // the next tick rather than silently skipped.
+            let drawn = host_terminal_io!(
+                terminal
+                    .draw(|frame| ui::draw(frame, &app, &pty_runtime, &config))
+                    .map(|completed| Some(completed.area)),
+                None
+            );
+            if let Some(area) = drawn {
+                frame_area = area;
+                needs_redraw = false;
+            }
         }
         flush_host_terminal_writes(terminal, &mut pty_runtime);
 
-        if event::poll(EVENT_POLL_INTERVAL)? {
-            handle_event(
-                &mut app,
-                &mut pty_runtime,
-                &config,
-                event::read()?,
-                frame_area,
-            );
-            needs_redraw = true;
-            while !app.should_quit && event::poll(READY_EVENT_POLL_INTERVAL)? {
-                handle_event(
-                    &mut app,
-                    &mut pty_runtime,
-                    &config,
-                    event::read()?,
-                    frame_area,
-                );
+        if host_terminal_io!(event::poll(EVENT_POLL_INTERVAL), false) {
+            if let Some(event) = host_terminal_io!(event::read().map(Some), None) {
+                handle_event(&mut app, &mut pty_runtime, &config, event, frame_area);
+                needs_redraw = true;
+                while !app.should_quit
+                    && host_terminal_io!(event::poll(READY_EVENT_POLL_INTERVAL), false)
+                {
+                    let Some(event) = host_terminal_io!(event::read().map(Some), None) else {
+                        break;
+                    };
+                    handle_event(&mut app, &mut pty_runtime, &config, event, frame_area);
+                }
+                needs_redraw |= save_if_dirty_with(&mut app, true, storage::save);
             }
-            needs_redraw |= save_if_dirty_with(&mut app, true, storage::save);
         }
     }
 
     Ok(())
+}
+
+/// What the render loop should do about a failed host-terminal operation.
+enum HostTerminalFailure {
+    /// Transient: skip this step and try again on the next tick.
+    Retry,
+    /// The host terminal is unusable; end the session through the normal exit
+    /// path and report this error.
+    Fatal(io::Error),
+}
+
+fn classify_host_terminal_error(error: io::Error) -> HostTerminalFailure {
+    match error.kind() {
+        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+            HostTerminalFailure::Retry
+        }
+        // Everything else — EIO from a vanished pty, a broken pipe, a closed
+        // window — is permanent. `ErrorKind` has no variant for EIO, so it lands
+        // here rather than being matched by name.
+        _ => HostTerminalFailure::Fatal(error),
+    }
+}
+
+/// Exit after an unrecoverable host-terminal failure without losing state.
+///
+/// The session is over either way; the point is that everything the quit path
+/// does still happens. A best-effort forced save runs first (so work since the
+/// last checkpoint survives a closed window), and the caller's `TerminalGuard`
+/// restores the TTY when this error unwinds out of `run`.
+fn finish_after_host_terminal_error(app: &mut App, error: io::Error) -> io::Result<()> {
+    finish_after_host_terminal_error_with(app, error, storage::save)
+}
+
+fn finish_after_host_terminal_error_with(
+    app: &mut App,
+    error: io::Error,
+    saver: impl FnMut(&model::ProjectState) -> io::Result<()>,
+) -> io::Result<()> {
+    save_if_dirty_with(app, true, saver);
+    Err(error)
 }
 
 fn register_project_session_identities(app: &App, pty_runtime: &mut PtyRuntime) {
@@ -1989,7 +2055,10 @@ fn drain_pty_events(app: &mut App, pty_runtime: &mut PtyRuntime) -> bool {
             }
         }
     }
-    changed
+    // `drain_events` stops at a per-frame budget, so a busy pane can leave
+    // traffic (or queued re-attachments) behind. Asking for a redraw keeps the
+    // loop coming back for the rest instead of parking on a stale frame.
+    changed || pty_runtime.has_pending_work()
 }
 
 #[cfg(test)]
@@ -2850,6 +2919,53 @@ mod tests {
         assert_eq!(attempts.get(), 2);
         assert!(!app.is_dirty());
         assert_eq!(app.save_error(), None);
+    }
+
+    /// B11: draw/poll/read failures must not propagate straight out of `run`.
+    /// Transient ones are retried, and a permanent one still checkpoints state
+    /// on its way out instead of discarding everything since the last save.
+    #[test]
+    fn host_terminal_failures_are_classified_and_checkpointed_before_exit() {
+        assert!(matches!(
+            classify_host_terminal_error(io::Error::from(io::ErrorKind::Interrupted)),
+            HostTerminalFailure::Retry
+        ));
+        assert!(matches!(
+            classify_host_terminal_error(io::Error::from(io::ErrorKind::WouldBlock)),
+            HostTerminalFailure::Retry
+        ));
+        assert!(matches!(
+            classify_host_terminal_error(io::Error::from(io::ErrorKind::BrokenPipe)),
+            HostTerminalFailure::Fatal(_)
+        ));
+        // A host terminal that disappears reports EIO, which has no `ErrorKind`
+        // of its own and must still be treated as unrecoverable.
+        assert!(matches!(
+            classify_host_terminal_error(io::Error::from_raw_os_error(libc::EIO)),
+            HostTerminalFailure::Fatal(_)
+        ));
+
+        let mut app = App::default();
+        app.add_terminal_to_selected_workspace();
+        assert!(app.is_dirty());
+        let saved = Cell::new(false);
+
+        let error = finish_after_host_terminal_error_with(
+            &mut app,
+            io::Error::from_raw_os_error(libc::EIO),
+            |_| {
+                saved.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("a fatal host-terminal error is still reported to the caller");
+
+        assert!(
+            saved.get(),
+            "state since the last save must be checkpointed before the session ends"
+        );
+        assert!(!app.is_dirty());
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
     }
 
     #[test]

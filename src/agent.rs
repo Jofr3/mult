@@ -366,11 +366,44 @@ fn failed_status() -> ExitStatus {
     ExitStatus::from_raw(1)
 }
 
+/// # Status: scaffolding, not yet wired
+///
+/// Nothing in production constructs a `dyn AgentBackend` and `send_prompt` has
+/// no production caller — chats currently reach their agent through the PTY
+/// path, not through this module. It is deliberate in-progress scaffolding for
+/// the owner's Phase 3.4, so these tests are about making the module *safe to
+/// wire up later* rather than about live behaviour: every one of them drives
+/// `ProcessAgentBackend` (or its private thread helpers) directly.
+///
+/// They deliberately use only `cat`, which the Nix build sandbox provides;
+/// nothing here may depend on `$SHELL`.
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    /// G11: generous, because it is only ever reached when something is wrong.
+    /// `collect_events_until` returns the instant its predicate holds, so the
+    /// happy path costs one poll interval, not this.
+    const AGENT_TEST_TIMEOUT: Duration = Duration::from_secs(20);
+    const AGENT_TEST_POLL: Duration = Duration::from_millis(5);
+
+    fn target(chat: u64) -> AgentTarget {
+        AgentTarget {
+            workspace: WorkspaceId(1),
+            chat: ChatId(chat),
+        }
+    }
+
+    fn prompt_for(target: AgentTarget) -> AgentPrompt {
+        AgentPrompt {
+            target,
+            prompt: "hello".to_string(),
+            cwd: None,
+            env: BTreeMap::new(),
+        }
+    }
 
     #[test]
     fn agent_event_exposes_target() {
@@ -417,10 +450,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn process_backend_streams_stdout_and_completion() {
-        let target = AgentTarget {
-            workspace: WorkspaceId(1),
-            chat: ChatId(2),
-        };
+        let target = target(2);
         let mut backend = ProcessAgentBackend::new(ProcessAgentCommand::new("cat"));
 
         backend
@@ -432,7 +462,7 @@ mod tests {
             })
             .expect("send prompt to process");
 
-        let events = collect_events_until(&mut backend, Duration::from_secs(2), |events| {
+        let events = collect_events_until(&mut backend, AGENT_TEST_TIMEOUT, |events| {
             events.iter().any(|event| {
                 matches!(
                     event,
@@ -484,6 +514,205 @@ mod tests {
         assert!(!backend.is_running(target));
     }
 
+    /// G10: a spawn that never happens must not leave the chat marked running.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawn_failure_leaves_no_running_process_and_reports_the_error() {
+        let target = target(3);
+        let mut backend = ProcessAgentBackend::new(ProcessAgentCommand::new(
+            "mult-agent-binary-that-does-not-exist",
+        ));
+
+        let error = backend
+            .send_prompt(prompt_for(target))
+            .expect_err("a missing program cannot be spawned");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            !backend.is_running(target),
+            "a process that never started must not be tracked as running"
+        );
+        // The failure is reported through the return value only: `send_prompt`
+        // fails before the Thinking/CommandStarted pair is queued, so nothing
+        // arrives on the event stream and nothing has to be retracted. Whatever
+        // wires this up (Phase 3.4) must surface the `Err` itself — watching
+        // events alone would show the chat neither starting nor failing.
+        assert!(backend.drain_events().is_empty());
+    }
+
+    /// G10: a nonzero exit is a failure, not a completion.
+    #[cfg(unix)]
+    #[test]
+    fn a_nonzero_exit_is_reported_as_an_error_rather_than_done() {
+        let target = target(4);
+        // `cat` of a path that cannot exist exits 1 without needing a shell.
+        let mut backend = ProcessAgentBackend::new(ProcessAgentCommand::with_args(
+            "cat",
+            ["/nonexistent/mult-agent-test-path".to_string()],
+        ));
+
+        backend
+            .send_prompt(prompt_for(target))
+            .expect("spawn the failing process");
+
+        let events = collect_events_until(&mut backend, AGENT_TEST_TIMEOUT, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error { .. }))
+        });
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Error { target: reported, message }
+                    if *reported == target && message.contains("exited with")
+            )),
+            "a nonzero exit must be an Error naming the status: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AgentEvent::StatusChanged {
+                    status: ChatStatus::Done,
+                    ..
+                }
+            )),
+            "a failed run must never also report Done: {events:?}"
+        );
+        assert!(!backend.is_running(target));
+    }
+
+    /// G10: agent output is bytes, not text. A half-written multi-byte sequence
+    /// at the 8 KiB read boundary is routine, and a binary blob is possible.
+    #[test]
+    fn the_pipe_reader_survives_invalid_utf8() {
+        let target = target(5);
+        let (sender, receiver) = mpsc::sync_channel(AGENT_EVENT_QUEUE_CAPACITY);
+        let mut bytes = vec![0x80, 0xff, 0xfe];
+        bytes.extend_from_slice(b"still reading");
+
+        spawn_pipe_reader(
+            target,
+            AgentMessageRole::Assistant,
+            io::Cursor::new(bytes),
+            sender,
+        );
+
+        let mut text = String::new();
+        let deadline = Instant::now() + AGENT_TEST_TIMEOUT;
+        while Instant::now() < deadline && !text.contains("still reading") {
+            match receiver.recv_timeout(AGENT_TEST_POLL) {
+                Ok(AgentEvent::MessageDelta { text: delta, .. }) => text.push_str(&delta),
+                Ok(other) => panic!("unexpected event from the pipe reader: {other:?}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        assert!(
+            text.contains("still reading"),
+            "the reader must keep going past invalid bytes: {text:?}"
+        );
+        assert!(
+            text.contains('\u{fffd}'),
+            "invalid bytes must be replaced, not dropped: {text:?}"
+        );
+    }
+
+    /// G10: the queue is bounded at 1024 events, so a chatty agent *will* fill
+    /// it. Backpressure is the intended design — what must not happen is a lost
+    /// byte or a reader that never finishes.
+    #[test]
+    fn queue_backpressure_delays_a_pipe_reader_without_losing_its_bytes() {
+        const READS: usize = AGENT_EVENT_QUEUE_CAPACITY * 3;
+
+        let target = target(6);
+        let (sender, receiver) = mpsc::sync_channel(AGENT_EVENT_QUEUE_CAPACITY);
+        // One byte per read means one event per read, so the reader blocks on
+        // `send` after 1024 of the 3072 reads and can only continue as the
+        // consumer drains.
+        spawn_pipe_reader(
+            target,
+            AgentMessageRole::Assistant,
+            OneBytePerRead { remaining: READS },
+            sender,
+        );
+
+        let mut received = 0;
+        let deadline = Instant::now() + AGENT_TEST_TIMEOUT;
+        while received < READS && Instant::now() < deadline {
+            match receiver.recv_timeout(AGENT_TEST_POLL) {
+                Ok(AgentEvent::MessageDelta { text, .. }) => received += text.len(),
+                Ok(other) => panic!("unexpected event from the pipe reader: {other:?}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        assert_eq!(
+            received, READS,
+            "backpressure may delay a pipe reader but must never drop its bytes"
+        );
+    }
+
+    /// G10: the other half of backpressure. A blocked reader whose consumer has
+    /// gone away must fail its `send` and exit, not pin a thread forever.
+    #[test]
+    fn a_dropped_consumer_releases_a_blocked_pipe_reader() {
+        let (alive, reader_finished) = mpsc::channel::<()>();
+        let (sender, receiver) = mpsc::sync_channel(4);
+        spawn_pipe_reader(
+            target(7),
+            AgentMessageRole::Assistant,
+            EndlessReader { _alive: alive },
+            sender,
+        );
+
+        // Four sends fill the queue and the fifth blocks; dropping the receiver
+        // must make it fail rather than wait.
+        drop(receiver);
+
+        assert!(
+            matches!(
+                reader_finished.recv_timeout(AGENT_TEST_TIMEOUT),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "the reader thread must exit once nobody is listening"
+        );
+    }
+
+    /// Yields exactly one byte per `read`, then EOF.
+    struct OneBytePerRead {
+        remaining: usize,
+    }
+
+    impl Read for OneBytePerRead {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.remaining == 0 || output.is_empty() {
+                return Ok(0);
+            }
+            self.remaining -= 1;
+            output[0] = b'x';
+            Ok(1)
+        }
+    }
+
+    /// Never reaches EOF. Its `_alive` sender is dropped with the reader when
+    /// the reader thread ends, which is how the test observes that exit.
+    struct EndlessReader {
+        _alive: mpsc::Sender<()>,
+    }
+
+    impl Read for EndlessReader {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if output.is_empty() {
+                return Ok(0);
+            }
+            output[0] = b'x';
+            Ok(1)
+        }
+    }
+
     fn collect_events_until(
         backend: &mut impl AgentBackend,
         timeout: Duration,
@@ -496,7 +725,7 @@ mod tests {
             if done(&events) {
                 return events;
             }
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(AGENT_TEST_POLL);
         }
         events
     }

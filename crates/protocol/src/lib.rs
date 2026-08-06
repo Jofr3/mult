@@ -1469,7 +1469,10 @@ mod tests {
         let runtime = socket_path_from(None, Some(OsStr::new("/run/user/1000")), || {
             panic!("XDG_RUNTIME_DIR must not need a UID lookup")
         });
-        assert_eq!(runtime, Path::new("/run/user/1000").join(DEFAULT_SOCKET_NAME));
+        assert_eq!(
+            runtime,
+            Path::new("/run/user/1000").join(DEFAULT_SOCKET_NAME)
+        );
 
         let fallback = socket_path_from(None, None, || "4242".to_string());
         assert_eq!(

@@ -72,9 +72,9 @@ fn identity() -> SessionIdentity {
     }
 }
 
-fn sample_message(session: u32) -> ClientMessage {
+fn sample_message(session: u64) -> ClientMessage {
     ClientMessage::Attach {
-        request_id: mult_protocol::RequestId::new(u64::from(session) + 1).expect("non-zero"),
+        request_id: mult_protocol::RequestId::new(session + 1).expect("non-zero"),
         identity: identity(),
         session: SessionId(session),
         rows: 24,

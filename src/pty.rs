@@ -4,6 +4,7 @@ use std::{
     ffi::OsStr,
     fs,
     io::{self, Write},
+    net::Shutdown,
     os::unix::{net::UnixStream, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -149,6 +150,26 @@ pub struct PtyRuntime {
     // from reconnect re-attach because its session does not exist on the server
     // until `start`'s own CreateSession completes.
     starting: Option<PtyKey>,
+    // Terminals whose attachment must be rebuilt after a (re)connection, oldest
+    // first. Re-attaching is one synchronous round trip *per terminal*, so it is
+    // queued here and serviced a bounded slice at a time by
+    // [`Self::service_reattachments`] instead of running all N round trips in
+    // whichever frame happened to notice the reconnect.
+    pending_reattach: VecDeque<PtyKey>,
+    // The in-flight background connection attempt, if any. At most one exists at
+    // a time; see [`PendingConnect`].
+    pending_connect: Option<PendingConnect>,
+    // Earliest instant at which a *background* reconnect or re-attach may be
+    // retried. A dead or wedged daemon must not be retried on every frame.
+    retry_not_before: Option<Instant>,
+    // Current backoff applied on the next failed background attempt.
+    retry_backoff: Duration,
+    // Whether the current disconnection was already reported to the UI, so a
+    // permanently dead daemon produces one system line rather than one per retry.
+    disconnect_reported: bool,
+    // Set when the last `drain_events` stopped short of an empty queue, or left
+    // re-attachments queued, so the render loop knows to come back for the rest.
+    work_remaining: bool,
 }
 
 const SERVER_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -160,6 +181,28 @@ const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// which applies backpressure to the daemon instead of buffering for it, and
 /// the synchronous request loops drain the queue themselves while they wait.
 const SERVER_EVENT_QUEUE_CAPACITY: usize = 256;
+/// Ceiling on server messages consumed by a single [`PtyRuntime::drain_events`].
+/// Without one, a pane producing faster than the parser consumes keeps
+/// `try_recv` returning `Ok` forever and the frame never reaches the input poll.
+/// Anything left over stays queued and is reported by
+/// [`PtyRuntime::has_pending_work`], which keeps the render loop coming back.
+const MAX_SERVER_MESSAGES_PER_DRAIN: usize = 128;
+/// Companion byte ceiling for the same drain: 128 messages of 8 KiB is already a
+/// megabyte of parser work, and replay chunks are larger still.
+const MAX_SERVER_OUTPUT_BYTES_PER_DRAIN: usize = 256 * 1024;
+/// Wall-clock budget for re-attaching queued terminals inside one drain. A
+/// single attach can still overrun it — its own `ATTACH_ACK_TIMEOUT` is not
+/// preemptible — but the budget stops the loop from *starting* another attach
+/// once it is spent, so a frame costs at most one stalled round trip instead of
+/// one per terminal. A healthy daemon answers in microseconds and drains the
+/// whole queue in the first frame.
+const REATTACH_FRAME_BUDGET: Duration = Duration::from_millis(100);
+/// Backoff between failed background reconnect/re-attach attempts. The first
+/// retry waits `MIN` after the failure and each further failure doubles the wait
+/// up to `MAX`, so a daemon that is gone for good costs one attempt every five
+/// seconds rather than one per frame.
+const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(250);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const TERMINAL_SCROLLBACK_LINES: usize = 5_000;
 const TERMINAL_MAX_CSI_SEQUENCE_BYTES: usize = 128;
 const PRIMARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[?1;2c";
@@ -181,6 +224,31 @@ const WHEEL_DOWN_BUTTON: u8 = 65;
 struct ServerConnection {
     writer: Arc<Mutex<UnixStream>>,
     receiver: Receiver<ServerMessage>,
+}
+
+/// A connection attempt running on its own thread.
+///
+/// Establishing a connection means a blocking `connect(2)`, possibly an
+/// autospawn plus a two-second wait for the new daemon's socket, and then a
+/// `Hello` round trip with its own two-second timeout. None of that may happen
+/// on the render thread, so it happens here and the render thread only ever
+/// *collects* the result (see [`PtyRuntime::poll_connector`]), which is a
+/// non-blocking `is_finished` check plus a `join` that is already complete.
+struct PendingConnect {
+    handle: thread::JoinHandle<io::Result<EstablishedConnection>>,
+    /// Client scope this attempt asked the daemon to resume, captured when the
+    /// attempt started so a result cannot be judged against a scope that moved
+    /// on in the meantime.
+    resume: Option<ClientScopeId>,
+}
+
+/// A socket that has completed peer verification and the `Hello` exchange but
+/// has not yet been adopted by a [`PtyRuntime`] — installation touches runtime
+/// state and therefore stays on the owning thread.
+struct EstablishedConnection {
+    reader: UnixStream,
+    writer: UnixStream,
+    hello: ServerHello,
 }
 
 #[derive(Debug, Default)]
@@ -274,6 +342,12 @@ impl PtyRuntime {
             deferred_messages: VecDeque::new(),
             host_terminal_writes: Vec::new(),
             starting: None,
+            pending_reattach: VecDeque::new(),
+            pending_connect: None,
+            retry_not_before: None,
+            retry_backoff: RECONNECT_BACKOFF_MIN,
+            disconnect_reported: false,
+            work_remaining: false,
         }
     }
 }
@@ -711,7 +785,7 @@ impl PtyRuntime {
                     ));
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    self.connection = None;
+                    self.disconnect();
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
                         "mult-server disconnected while listing sessions",
@@ -939,24 +1013,56 @@ impl PtyRuntime {
         result
     }
 
+    /// Drain one frame's worth of daemon traffic.
+    ///
+    /// This is the render thread's only scheduled entry point into the runtime,
+    /// so everything it does is bounded: at most
+    /// `MAX_SERVER_MESSAGES_PER_DRAIN` messages carrying at most
+    /// `MAX_SERVER_OUTPUT_BYTES_PER_DRAIN` bytes are parsed, and at most
+    /// `REATTACH_FRAME_BUDGET` is spent starting queued re-attachments. Whatever
+    /// is left stays queued and is announced by [`Self::has_pending_work`].
     pub fn drain_events(&mut self) -> Vec<PtyEvent> {
         let mut events = std::mem::take(&mut self.pending_events);
+        self.work_remaining = false;
+        self.poll_connector();
         let was_connected = self.connection.is_some();
+        let mut messages = 0usize;
+        let mut output_bytes = 0usize;
         while let Some(connection) = self.connection.as_ref() {
+            if messages >= MAX_SERVER_MESSAGES_PER_DRAIN
+                || output_bytes >= MAX_SERVER_OUTPUT_BYTES_PER_DRAIN
+            {
+                self.work_remaining = true;
+                break;
+            }
             match connection.receiver.try_recv() {
-                Ok(message) => self.handle_server_message(message, &mut events),
+                Ok(message) => {
+                    messages += 1;
+                    output_bytes += server_message_output_bytes(&message);
+                    self.handle_server_message(message, &mut events);
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    self.connection = None;
+                    self.disconnect();
                     break;
                 }
             }
         }
         if was_connected && self.connection.is_none() {
             self.reconnect_or_report();
-            events.append(&mut self.pending_events);
         }
+        self.service_reattachments();
+        self.retry_connection_if_due();
+        events.append(&mut self.pending_events);
         events
+    }
+
+    /// Whether the last [`Self::drain_events`] left daemon traffic or queued
+    /// re-attachments behind. The render loop uses this to keep requesting a
+    /// redraw while work remains, so a per-frame budget throttles the client
+    /// rather than stalling it.
+    pub fn has_pending_work(&self) -> bool {
+        self.work_remaining || !self.pending_reattach.is_empty()
     }
 
     fn allocate_request(&mut self) -> io::Result<RequestId> {
@@ -1029,6 +1135,9 @@ impl PtyRuntime {
         request_id: RequestId,
         request: ClientMessage,
     ) -> io::Result<()> {
+        // This attach is authoritative for `terminal`, so a queued background
+        // re-attachment for it would only duplicate the round trip.
+        self.pending_reattach.retain(|queued| *queued != terminal);
         self.write_idempotent_request(&request)?;
         let pane_id = pane_for_key(terminal);
         let deadline = Instant::now() + ATTACH_ACK_TIMEOUT;
@@ -1161,6 +1270,9 @@ impl PtyRuntime {
                     }
                     self.pane_leases.insert(pane_id, lease);
                     self.expected_output.insert(pane_id, watermark);
+                    // A reconnect inside this request (see `resume_and_resend`)
+                    // re-queues every tracked terminal, including this one.
+                    self.pending_reattach.retain(|queued| *queued != terminal);
                     return Ok(());
                 }
                 ServerMessage::PtyOutput { pane, lease, .. }
@@ -1288,7 +1400,7 @@ impl PtyRuntime {
                     ));
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    self.connection = None;
+                    self.disconnect();
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
                         "mult-server disconnected before correlated response",
@@ -1517,35 +1629,64 @@ impl PtyRuntime {
         self.foreground_processes.insert(terminal, process);
     }
 
+    /// Guarantee a live connection for a caller that is about to send.
+    ///
+    /// This never establishes a connection itself: it collects one the connector
+    /// thread already finished, and otherwise starts a connector and reports
+    /// `NotConnected` right away. A `start`, `stop`, resize or keystroke issued
+    /// while the client is disconnected therefore **fails visibly and
+    /// immediately** instead of freezing the frame for up to eight seconds; the
+    /// connection lands in the background and the next attempt succeeds.
     fn ensure_connected(&mut self) -> io::Result<()> {
-        if self.connection.is_some() {
-            return Ok(());
+        self.poll_connector();
+        if self.connection.is_none() {
+            // An explicit user action is worth an immediate attempt, so this
+            // bypasses the retry backoff — but never runs two connectors at once.
+            self.start_connector(true);
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "not connected to mult-server; a connection attempt is in progress",
+            ));
         }
-        self.connect_inner(true)?;
-        self.reattach_terminals()
+        self.service_reattachments();
+        Ok(())
     }
 
+    /// React to a connection that just went away: hand the reconnect to the
+    /// connector thread and report the loss once.
     fn reconnect_or_report(&mut self) {
-        let result = self
-            .connect_inner(false)
-            .and_then(|_| self.reattach_terminals());
-        if let Err(error) = result {
-            let terminal = self
-                .terminal_to_pane
-                .keys()
-                .next()
-                .copied()
-                .unwrap_or(PtyKey::Terminal(TerminalId(0)));
-            self.pending_events.push(PtyEvent::Error {
-                terminal,
-                message: format!(
-                    "mult-server connection lost; attachment state is retained pending reconciliation: {error}"
-                ),
-            });
-        }
+        // Background reconnects never autospawn a daemon; only an explicit user
+        // action may start one.
+        self.start_connector(false);
+        self.report_disconnect("a background reconnect is in progress".to_string());
     }
 
-    fn reattach_terminals(&mut self) -> io::Result<()> {
+    /// Report daemon loss to the UI at most once per disconnection. A daemon
+    /// that is gone for good otherwise writes one system line per retry.
+    fn report_disconnect(&mut self, reason: String) {
+        if self.disconnect_reported {
+            return;
+        }
+        self.disconnect_reported = true;
+        let terminal = self
+            .terminal_to_pane
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(PtyKey::Terminal(TerminalId(0)));
+        self.pending_events.push(PtyEvent::Error {
+            terminal,
+            message: format!(
+                "mult-server connection lost; attachment state is retained pending reconciliation: {reason}"
+            ),
+        });
+    }
+
+    /// Queue every tracked terminal for re-attachment after a (re)connection.
+    ///
+    /// The terminal currently inside `start` is excluded: its session does not
+    /// exist on the daemon until `start`'s own `CreateSession` completes.
+    fn enqueue_reattachments(&mut self) {
         let terminals = self
             .terminal_to_pane
             .keys()
@@ -1553,37 +1694,130 @@ impl PtyRuntime {
             .filter(|terminal| Some(*terminal) != self.starting)
             .collect::<Vec<_>>();
         for terminal in terminals {
-            let size = self.parser_dimensions(terminal);
-            self.reset_parser(terminal, size);
-            let identity = self.identity_for_key(terminal)?;
-            let session = session_for_key(terminal);
-            let request_id = self.allocate_request()?;
-            let request = ClientMessage::Attach {
-                request_id,
-                identity,
-                session,
-                rows: size.rows,
-                cols: size.cols,
-            };
-            let result = self.perform_attach(terminal, session, size, request_id, request);
-            self.finish_request(request_id);
-            match result {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    let pane = pane_for_key(terminal);
-                    self.clear_attachment(pane);
-                    let status = PtyExit {
-                        code: 1,
-                        signal: Some("server session unavailable".to_string()),
-                    };
-                    self.terminal_exit_statuses.insert(terminal, status.clone());
-                    self.pending_events
-                        .push(PtyEvent::Exited { terminal, status });
-                }
-                Err(error) => return Err(error),
+            if !self.pending_reattach.contains(&terminal) {
+                self.pending_reattach.push_back(terminal);
             }
         }
-        Ok(())
+    }
+
+    /// Re-attach queued terminals, oldest first, for at most one
+    /// [`REATTACH_FRAME_BUDGET`].
+    ///
+    /// Each re-attach is a synchronous correlated round trip with its own
+    /// `ATTACH_ACK_TIMEOUT`, which is exactly why the queue exists: a wedged
+    /// daemon costs one such round trip per frame instead of N, and the frame in
+    /// between still draws and reads input. The queue is never serviced from
+    /// inside another correlated request — `pending_requests` being non-empty
+    /// means a `perform_*` loop owns the receiver, and re-entering it here would
+    /// interleave two request state machines.
+    fn service_reattachments(&mut self) {
+        if self.connection.is_none() || !self.pending_requests.is_empty() {
+            return;
+        }
+        if self
+            .retry_not_before
+            .is_some_and(|not_before| Instant::now() < not_before)
+        {
+            return;
+        }
+
+        let started = Instant::now();
+        while self.connection.is_some() {
+            let Some(terminal) = self.pending_reattach.pop_front() else {
+                break;
+            };
+            // The queue is advisory: a terminal that was retired or that `start`
+            // has since taken over must not be resurrected by a stale entry.
+            if !self.terminal_to_pane.contains_key(&terminal) || Some(terminal) == self.starting {
+                continue;
+            }
+            if !self.reattach_terminal(terminal) {
+                // Keep the terminal queued and stop starting new round trips
+                // until the backoff expires, so a wedged daemon is retried on a
+                // schedule instead of once per frame.
+                self.pending_reattach.push_back(terminal);
+                self.advance_retry_backoff();
+                break;
+            }
+            self.reset_retry_backoff();
+            if started.elapsed() >= REATTACH_FRAME_BUDGET {
+                break;
+            }
+        }
+    }
+
+    /// Re-attach one terminal. Returns false when the attempt failed in a way
+    /// that should be retried later; a vanished session is *not* such a failure
+    /// and retires the terminal instead.
+    fn reattach_terminal(&mut self, terminal: PtyKey) -> bool {
+        let size = self.parser_dimensions(terminal);
+        self.reset_parser(terminal, size);
+        let Ok(identity) = self.identity_for_key(terminal) else {
+            // Without a durable identity the attach can never succeed; drop it
+            // from the queue rather than retrying it every backoff round.
+            return true;
+        };
+        let session = session_for_key(terminal);
+        let Ok(request_id) = self.allocate_request() else {
+            return false;
+        };
+        let request = ClientMessage::Attach {
+            request_id,
+            identity,
+            session,
+            rows: size.rows,
+            cols: size.cols,
+        };
+        let result = self.perform_attach(terminal, session, size, request_id, request);
+        self.finish_request(request_id);
+        match result {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let pane = pane_for_key(terminal);
+                self.clear_attachment(pane);
+                let status = PtyExit {
+                    code: 1,
+                    signal: Some("server session unavailable".to_string()),
+                };
+                self.terminal_exit_statuses.insert(terminal, status.clone());
+                self.pending_events
+                    .push(PtyEvent::Exited { terminal, status });
+                true
+            }
+            Err(error) => {
+                self.report_disconnect(error.to_string());
+                false
+            }
+        }
+    }
+
+    /// Start a background reconnect once the backoff has expired. Only tracked
+    /// attachments justify reconnecting on their own: with nothing to reconcile,
+    /// the next user action starts a connector instead.
+    fn retry_connection_if_due(&mut self) {
+        if self.connection.is_some()
+            || self.pending_connect.is_some()
+            || self.terminal_to_pane.is_empty()
+        {
+            return;
+        }
+        if self
+            .retry_not_before
+            .is_some_and(|not_before| Instant::now() < not_before)
+        {
+            return;
+        }
+        self.start_connector(false);
+    }
+
+    fn reset_retry_backoff(&mut self) {
+        self.retry_not_before = None;
+        self.retry_backoff = RECONNECT_BACKOFF_MIN;
+    }
+
+    fn advance_retry_backoff(&mut self) {
+        self.retry_not_before = Some(Instant::now() + self.retry_backoff);
+        self.retry_backoff = (self.retry_backoff * 2).min(RECONNECT_BACKOFF_MAX);
     }
 
     fn parser_dimensions(&self, terminal: PtyKey) -> PtyDimensions {
@@ -1600,27 +1834,82 @@ impl PtyRuntime {
         self.connect_inner(true).map(|_| ())
     }
 
-    /// Connect and return whether the daemon resumed the exact previous
-    /// client-scope/server-instance pair.
+    /// Connect *synchronously* and return whether the daemon resumed the exact
+    /// previous client-scope/server-instance pair.
+    ///
+    /// Two callers remain, and both are deliberate: construction (which runs
+    /// before the first frame is ever drawn) and [`Self::resume_and_resend`],
+    /// which sits inside an already-synchronous correlated request whose
+    /// idempotency key must be replayed on the very connection it re-establishes.
+    /// Everything reachable from the render loop uses the connector thread
+    /// instead.
     fn connect_inner(&mut self, allow_spawn: bool) -> io::Result<bool> {
-        let mut stream = if allow_spawn {
-            connect_or_spawn_server(&self.socket_path)?
-        } else {
-            UnixStream::connect(&self.socket_path)?
+        let resume = self.client_scope;
+        let established = establish_connection(&self.socket_path, allow_spawn, resume)?;
+        Ok(self.install_connection(established, resume))
+    }
+
+    /// Start a background connection attempt, unless one is already running.
+    fn start_connector(&mut self, allow_spawn: bool) {
+        if self.pending_connect.is_some() || self.connection.is_some() {
+            return;
+        }
+        let socket_path = self.socket_path.clone();
+        let resume = self.client_scope;
+        let handle = thread::spawn(move || establish_connection(&socket_path, allow_spawn, resume));
+        self.pending_connect = Some(PendingConnect { handle, resume });
+    }
+
+    /// Collect a finished background connection attempt without ever blocking
+    /// the caller. A still-running attempt is left alone for the next poll.
+    fn poll_connector(&mut self) {
+        let Some(pending) = self.pending_connect.as_ref() else {
+            return;
         };
-        verify_peer_is_self(&stream, "mult-server")?;
-        stream.set_nonblocking(false)?;
-        let mut writer_stream = stream.try_clone()?;
-        write_message(
-            &mut writer_stream,
-            &ClientMessage::Hello {
-                protocol_version: PROTOCOL_VERSION,
-                resume: self.client_scope,
-            },
-        )?;
-        let hello = validate_server_hello_with_timeout(&mut stream, SERVER_HELLO_TIMEOUT)?;
+        if !pending.handle.is_finished() {
+            return;
+        }
+        let pending = self
+            .pending_connect
+            .take()
+            .expect("pending connector was just observed");
+        let resume = pending.resume;
+        match pending.handle.join() {
+            Ok(Ok(established)) => {
+                if self.connection.is_some() {
+                    // A synchronous reconnect won the race; this socket is
+                    // surplus and must not be leaked to the daemon.
+                    let _ = established.reader.shutdown(Shutdown::Both);
+                    return;
+                }
+                self.install_connection(established, resume);
+                self.reset_retry_backoff();
+            }
+            Ok(Err(error)) => {
+                self.report_disconnect(error.to_string());
+                self.advance_retry_backoff();
+            }
+            Err(_) => {
+                self.report_disconnect("the connection attempt panicked".to_string());
+                self.advance_retry_backoff();
+            }
+        }
+    }
+
+    /// Adopt an established socket: reconcile the resumed scope, start the
+    /// reader thread, and queue every tracked terminal for re-attachment.
+    fn install_connection(
+        &mut self,
+        established: EstablishedConnection,
+        requested_resume: Option<ClientScopeId>,
+    ) -> bool {
+        let EstablishedConnection {
+            reader,
+            writer: writer_stream,
+            hello,
+        } = established;
         let resumed_same = hello.resumed
-            && self.client_scope == Some(hello.client_scope)
+            && requested_resume == Some(hello.client_scope)
             && self.server_instance == Some(hello.server_instance);
         if self.client_scope.is_some() && !resumed_same {
             self.pending_requests.clear();
@@ -1635,7 +1924,7 @@ impl PtyRuntime {
         let writer = Arc::new(Mutex::new(writer_stream));
         let (sender, receiver) = mpsc::sync_channel(SERVER_EVENT_QUEUE_CAPACITY);
         thread::spawn(move || {
-            let mut reader = stream;
+            let mut reader = reader;
             loop {
                 match read_message::<ServerMessage>(&mut reader) {
                     Ok(message) => {
@@ -1663,7 +1952,31 @@ impl PtyRuntime {
             }
         });
         self.connection = Some(ServerConnection { writer, receiver });
-        Ok(resumed_same)
+        self.disconnect_reported = false;
+        self.enqueue_reattachments();
+        resumed_same
+    }
+
+    /// Drop the current connection *and* shut its socket down in both
+    /// directions.
+    ///
+    /// The reader thread owns its own `dup` of this socket and is parked in a
+    /// blocking `read`. Dropping only the client's `writer` handle therefore
+    /// leaves that thread parked forever on a still-open descriptor, so threads
+    /// and file descriptors accumulate once per reconnect. `shutdown(Both)`
+    /// applies to the socket rather than to one descriptor, so the parked read
+    /// returns EOF and the thread exits. A poisoned writer mutex must not skip
+    /// the shutdown: the lock only guards frame interleaving, and there is
+    /// nothing left to interleave with.
+    fn disconnect(&mut self) {
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        let writer = match connection.writer.lock() {
+            Ok(writer) => writer,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let _ = writer.shutdown(Shutdown::Both);
     }
 
     fn write_idempotent_request(&mut self, message: &ClientMessage) -> io::Result<()> {
@@ -1678,7 +1991,7 @@ impl PtyRuntime {
     fn resume_and_resend(&mut self, message: &ClientMessage) -> io::Result<()> {
         let previous_scope = self.client_scope;
         let previous_instance = self.server_instance;
-        self.connection = None;
+        self.disconnect();
         let resumed_same = self.connect_inner(true)?;
         if !resumed_same
             || self.client_scope != previous_scope
@@ -1717,7 +2030,7 @@ impl PtyRuntime {
                 .and_then(|source| source.downcast_ref::<PtyDeliveryError>())
                 .is_some()
         }) {
-            self.connection = None;
+            self.disconnect();
         }
         result
     }
@@ -1777,21 +2090,69 @@ fn write_non_replayable_frame(
 
 impl Drop for PtyRuntime {
     fn drop(&mut self) {
-        let Some(connection) = &self.connection else {
-            return;
-        };
-        if let Ok(mut writer) = connection.writer.lock() {
-            for (pane, lease) in &self.pane_leases {
-                let _ = write_message(
-                    &mut *writer,
-                    &ClientMessage::Detach {
-                        pane: *pane,
-                        lease: *lease,
-                    },
-                );
+        if let Some(connection) = &self.connection {
+            if let Ok(mut writer) = connection.writer.lock() {
+                for (pane, lease) in &self.pane_leases {
+                    let _ = write_message(
+                        &mut *writer,
+                        &ClientMessage::Detach {
+                            pane: *pane,
+                            lease: *lease,
+                        },
+                    );
+                }
             }
         }
+        // Release the reader thread as well: it is parked on a descriptor this
+        // runtime no longer owns, and `shutdown` after the detach frames still
+        // delivers them (only `SHUT_RD` discards, and only the receive queue).
+        self.disconnect();
     }
+}
+
+/// PTY payload bytes a single server message will hand to a parser. Used to
+/// budget one frame's parsing work in [`PtyRuntime::drain_events`].
+fn server_message_output_bytes(message: &ServerMessage) -> usize {
+    match message {
+        ServerMessage::PtyOutput { bytes, .. } | ServerMessage::ReplayChunk { bytes, .. } => {
+            bytes.len()
+        }
+        _ => 0,
+    }
+}
+
+/// Connect, verify the peer, and complete the `Hello` exchange.
+///
+/// Every blocking step of connection establishment lives here so it can run on
+/// either the constructing thread (before any frame exists) or a connector
+/// thread — never on the render thread mid-session. It deliberately touches no
+/// `PtyRuntime` state: adopting the result is [`PtyRuntime::install_connection`].
+fn establish_connection(
+    socket_path: &Path,
+    allow_spawn: bool,
+    resume: Option<ClientScopeId>,
+) -> io::Result<EstablishedConnection> {
+    let mut stream = if allow_spawn {
+        connect_or_spawn_server(socket_path)?
+    } else {
+        UnixStream::connect(socket_path)?
+    };
+    verify_peer_is_self(&stream, "mult-server")?;
+    stream.set_nonblocking(false)?;
+    let mut writer = stream.try_clone()?;
+    write_message(
+        &mut writer,
+        &ClientMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            resume,
+        },
+    )?;
+    let hello = validate_server_hello_with_timeout(&mut stream, SERVER_HELLO_TIMEOUT)?;
+    Ok(EstablishedConnection {
+        reader: stream,
+        writer,
+        hello,
+    })
 }
 
 impl PtyExit {
@@ -2750,33 +3111,9 @@ mod tests {
         let (_sender, receiver) = mpsc::channel();
         let terminal = PtyKey::Terminal(TerminalId(7));
         let pane = PaneId(7);
-        let mut runtime = PtyRuntime {
-            socket_path: unique_socket_path(),
-            connection: Some(ServerConnection {
-                writer: Arc::new(Mutex::new(client_stream)),
-                receiver,
-            }),
-            terminal_to_pane: HashMap::from([(terminal, pane)]),
-            pane_to_terminal: HashMap::from([(pane, terminal)]),
-            pane_leases: HashMap::from([(pane, test_lease())]),
-            expected_output: HashMap::from([(pane, OutputSequence::ZERO)]),
-            session_identities: HashMap::from([(terminal, test_wire_session_identity(terminal))]),
-            agent_sessions: HashMap::new(),
-            parsers: HashMap::new(),
-            responders: HashMap::new(),
-            terminals_with_output: HashSet::new(),
-            terminal_exit_statuses: HashMap::new(),
-            foreground_processes: HashMap::new(),
-            command_trackers: HashMap::new(),
-            pending_events: Vec::new(),
-            client_scope: Some(test_scope()),
-            server_instance: Some(test_server_instance()),
-            next_request_id: Some(RequestId::MIN),
-            pending_requests: HashSet::new(),
-            deferred_messages: VecDeque::new(),
-            host_terminal_writes: Vec::new(),
-            starting: None,
-        };
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.session_identities =
+            HashMap::from([(terminal, test_wire_session_identity(terminal))]);
         runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
         runtime.process_terminal_output(terminal, b"\x1b[?2004h");
 
@@ -3125,33 +3462,7 @@ mod tests {
         let (completed_tx, completed_rx) = mpsc::sync_channel(1);
         let terminal = PtyKey::Terminal(TerminalId(7));
         let pane = PaneId(7);
-        let mut runtime = PtyRuntime {
-            socket_path: unique_socket_path(),
-            connection: Some(ServerConnection {
-                writer: Arc::new(Mutex::new(client_stream)),
-                receiver,
-            }),
-            terminal_to_pane: HashMap::new(),
-            pane_to_terminal: HashMap::new(),
-            pane_leases: HashMap::new(),
-            expected_output: HashMap::new(),
-            session_identities: HashMap::new(),
-            agent_sessions: HashMap::new(),
-            parsers: HashMap::new(),
-            responders: HashMap::new(),
-            terminals_with_output: HashSet::new(),
-            terminal_exit_statuses: HashMap::new(),
-            foreground_processes: HashMap::new(),
-            command_trackers: HashMap::new(),
-            pending_events: Vec::new(),
-            client_scope: Some(test_scope()),
-            server_instance: Some(test_server_instance()),
-            next_request_id: Some(RequestId::MIN),
-            pending_requests: HashSet::new(),
-            deferred_messages: VecDeque::new(),
-            host_terminal_writes: Vec::new(),
-            starting: None,
-        };
+        let mut runtime = unattached_test_runtime(client_stream, receiver);
         let server = thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let create = read_client_message(&mut server_stream, "reading CreateSession");
@@ -3437,30 +3748,16 @@ mod tests {
             panic!("poison writer lock");
         })
         .join();
-        let mut runtime = PtyRuntime {
-            socket_path: unique_socket_path(),
-            connection: Some(ServerConnection { writer, receiver }),
-            terminal_to_pane: HashMap::from([(terminal, pane)]),
-            pane_to_terminal: HashMap::from([(pane, terminal)]),
-            pane_leases: HashMap::from([(pane, test_lease())]),
-            expected_output: HashMap::from([(pane, OutputSequence::ZERO)]),
-            session_identities: HashMap::from([(terminal, test_wire_session_identity(terminal))]),
-            agent_sessions: HashMap::new(),
-            parsers: HashMap::new(),
-            responders: HashMap::new(),
-            terminals_with_output: HashSet::new(),
-            terminal_exit_statuses: HashMap::new(),
-            foreground_processes: HashMap::new(),
-            command_trackers: HashMap::new(),
-            pending_events: Vec::new(),
-            client_scope: Some(test_scope()),
-            server_instance: Some(test_server_instance()),
-            next_request_id: Some(RequestId::MIN),
-            pending_requests: HashSet::new(),
-            deferred_messages: VecDeque::new(),
-            host_terminal_writes: Vec::new(),
-            starting: None,
-        };
+        let mut runtime = PtyRuntime::disconnected(unique_socket_path(), Vec::new());
+        runtime.connection = Some(ServerConnection { writer, receiver });
+        runtime.client_scope = Some(test_scope());
+        runtime.server_instance = Some(test_server_instance());
+        runtime.terminal_to_pane = HashMap::from([(terminal, pane)]);
+        runtime.pane_to_terminal = HashMap::from([(pane, terminal)]);
+        runtime.pane_leases = HashMap::from([(pane, test_lease())]);
+        runtime.expected_output = HashMap::from([(pane, OutputSequence::ZERO)]);
+        runtime.session_identities =
+            HashMap::from([(terminal, test_wire_session_identity(terminal))]);
 
         let error = runtime.stop(terminal).expect_err("stop should fail");
 
@@ -3908,7 +4205,10 @@ mod tests {
                 .unwrap();
         });
 
-        runtime.reattach_terminals().expect("reattach");
+        runtime.enqueue_reattachments();
+        runtime.service_reattachments();
+        assert!(runtime.pending_reattach.is_empty());
+        assert!(!runtime.has_pending_work());
         server.join().unwrap();
     }
 
@@ -3922,9 +4222,9 @@ mod tests {
         runtime.ensure_parser(terminal, PtyDimensions { rows: 6, cols: 20 });
         runtime.starting = Some(terminal);
 
-        runtime
-            .reattach_terminals()
-            .expect("skip starting terminal");
+        runtime.enqueue_reattachments();
+        runtime.service_reattachments();
+        assert!(runtime.pending_reattach.is_empty());
 
         // The terminal being started must not be re-attached, so nothing is sent.
         server_stream
@@ -4360,37 +4660,311 @@ mod tests {
         fs::remove_dir_all(&directory).expect("remove binary directory");
     }
 
+    /// N4: a stalled daemon must cost one attach round trip per drain, not one
+    /// per terminal. Two terminals are queued and the daemon answers neither;
+    /// exactly one `Attach` may leave the client before the budget stops it.
+    #[test]
+    fn a_stalled_reattach_starts_only_one_round_trip_per_drain() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let first = PtyKey::Terminal(TerminalId(21));
+        let second = PtyKey::Terminal(TerminalId(22));
+        let mut runtime = unattached_test_runtime(client_stream, receiver);
+        for terminal in [first, second] {
+            runtime
+                .terminal_to_pane
+                .insert(terminal, pane_for_key(terminal));
+            runtime
+                .pane_to_terminal
+                .insert(pane_for_key(terminal), terminal);
+            runtime.ensure_parser(terminal, PtyDimensions { rows: 4, cols: 10 });
+        }
+
+        runtime.enqueue_reattachments();
+        // Bounded by `ATTACH_ACK_TIMEOUT`: the daemon never answers, so this
+        // returns after one unanswered round trip rather than two.
+        runtime.service_reattachments();
+
+        server_stream
+            .set_read_timeout(Some(TEST_IO_TIMEOUT))
+            .expect("set read timeout");
+        let sent = read_client_message(&mut server_stream, "reading the first reattach");
+        assert!(matches!(sent, ClientMessage::Attach { .. }));
+        server_stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("set short read timeout");
+        assert!(
+            read_message::<ClientMessage>(&mut server_stream).is_err(),
+            "the second terminal must wait for a later drain"
+        );
+        assert_eq!(runtime.pending_reattach.len(), 2);
+        assert!(runtime.has_pending_work());
+    }
+
+    /// N4: the flip side — once the daemon answers, every queued terminal is
+    /// re-attached, and well within a single drain.
+    #[test]
+    fn queued_reattachments_all_complete_against_a_healthy_daemon() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (sender, receiver) = mpsc::channel();
+        let terminals = [
+            PtyKey::Terminal(TerminalId(31)),
+            PtyKey::Terminal(TerminalId(32)),
+            PtyKey::Terminal(TerminalId(33)),
+        ];
+        let mut runtime = unattached_test_runtime(client_stream, receiver);
+        for terminal in terminals {
+            runtime
+                .terminal_to_pane
+                .insert(terminal, pane_for_key(terminal));
+            runtime
+                .pane_to_terminal
+                .insert(pane_for_key(terminal), terminal);
+            runtime.ensure_parser(terminal, PtyDimensions { rows: 4, cols: 10 });
+        }
+
+        let server = thread::spawn(move || {
+            server_stream
+                .set_read_timeout(Some(TEST_IO_TIMEOUT))
+                .expect("set read timeout");
+            for _ in 0..terminals.len() {
+                let ClientMessage::Attach {
+                    request_id,
+                    session,
+                    rows,
+                    cols,
+                    ..
+                } = read_client_message(&mut server_stream, "reading a queued reattach")
+                else {
+                    panic!("expected Attach");
+                };
+                let pane = PaneId(session.0);
+                sender
+                    .send(ServerMessage::AttachResult {
+                        request_id,
+                        outcome: AttachOutcome::Attached {
+                            session,
+                            pane: mult_protocol::PaneInfo {
+                                id: pane,
+                                title: "reattached".to_string(),
+                                rows,
+                                cols,
+                            },
+                            lease: test_lease(),
+                        },
+                    })
+                    .expect("send attach result");
+                sender
+                    .send(ServerMessage::ReplayBegin {
+                        request_id,
+                        pane,
+                        lease: test_lease(),
+                        first_sequence: OutputSequence::ZERO,
+                        watermark: OutputSequence::ZERO,
+                        omitted_prefix_bytes: 0,
+                    })
+                    .expect("send replay begin");
+                sender
+                    .send(ServerMessage::ReplayEnd {
+                        request_id,
+                        pane,
+                        lease: test_lease(),
+                        watermark: OutputSequence::ZERO,
+                    })
+                    .expect("send replay end");
+            }
+        });
+
+        runtime.enqueue_reattachments();
+        runtime.service_reattachments();
+        server.join().expect("reattach server thread");
+
+        assert!(runtime.pending_reattach.is_empty());
+        assert!(!runtime.has_pending_work());
+        for terminal in terminals {
+            assert!(
+                runtime.is_running(terminal),
+                "{terminal:?} was not reattached"
+            );
+        }
+    }
+
+    /// B6: `ensure_connected` never performs the connect/hello round trip
+    /// itself. It reports `NotConnected` at once and the connector thread's
+    /// result is collected by a later drain.
+    #[test]
+    fn connection_establishment_happens_off_the_calling_thread() {
+        let socket_path = unique_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind test daemon socket");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            stream
+                .set_read_timeout(Some(TEST_IO_TIMEOUT))
+                .expect("set read timeout");
+            let hello = read_message::<ClientMessage>(&mut stream).expect("read client hello");
+            assert!(matches!(hello, ClientMessage::Hello { .. }));
+            write_message(
+                &mut stream,
+                &ServerMessage::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    server_instance: test_server_instance(),
+                    client_scope: test_scope(),
+                    resumed: false,
+                },
+            )
+            .expect("write server hello");
+            // Hold the accepted socket open so the client's reader thread stays
+            // alive for the assertion below.
+            thread::sleep(Duration::from_millis(50));
+        });
+
+        let mut runtime = PtyRuntime::disconnected(socket_path.clone(), Vec::new());
+        let error = runtime
+            .ensure_connected()
+            .expect_err("a disconnected runtime must not block on connect");
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+
+        let deadline = Instant::now() + TEST_IO_TIMEOUT;
+        while runtime.connection.is_none() && Instant::now() < deadline {
+            runtime.drain_events();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            runtime.connection.is_some(),
+            "the background connector's result must be collected by a drain"
+        );
+
+        server.join().expect("hello server thread");
+        let _ = fs::remove_file(&socket_path);
+    }
+
+    /// B5: dropping a connection must shut the socket down, or the reader
+    /// thread stays parked on its own descriptor forever.
+    #[test]
+    fn dropping_a_connection_releases_the_parked_reader_thread() {
+        use std::io::Read;
+
+        let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
+        // Stands in for the reader thread's own `dup` of the socket: it keeps
+        // the descriptor open after the runtime drops its writer handle.
+        let mut parked = client_stream.try_clone().expect("clone client stream");
+        let (exited, reader_exited) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut byte = [0_u8; 1];
+            let _ = parked.read(&mut byte);
+            let _ = exited.send(());
+        });
+
+        let (sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::Terminal(TerminalId(41));
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane_for_key(terminal));
+        // Losing the queue is what drops the connection in production.
+        drop(sender);
+        runtime.drain_events();
+
+        assert!(runtime.connection.is_none());
+        assert!(
+            reader_exited.recv_timeout(TEST_IO_TIMEOUT).is_ok(),
+            "shutdown must release a reader parked on a duplicated descriptor"
+        );
+        reader.join().expect("reader thread");
+    }
+
+    /// B7: a pane producing faster than the parser consumes must not starve the
+    /// frame; the overflow stays queued and is announced as pending work.
+    #[test]
+    fn drain_events_stops_at_the_message_budget_and_reports_pending_work() {
+        const EXTRA: usize = 5;
+
+        let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
+        let (sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::Terminal(TerminalId(51));
+        let pane = pane_for_key(terminal);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 4, cols: 10 });
+        let mut sequence = OutputSequence::ZERO;
+        for _ in 0..MAX_SERVER_MESSAGES_PER_DRAIN + EXTRA {
+            sender
+                .send(ServerMessage::PtyOutput {
+                    pane,
+                    lease: test_lease(),
+                    sequence,
+                    bytes: b"x".to_vec(),
+                })
+                .expect("queue output");
+            sequence = sequence.checked_add_bytes(1).expect("advance sequence");
+        }
+
+        let events = runtime.drain_events();
+
+        assert_eq!(
+            events,
+            vec![PtyEvent::Output {
+                terminal,
+                byte_count: MAX_SERVER_MESSAGES_PER_DRAIN,
+            }]
+        );
+        assert!(runtime.has_pending_work());
+
+        let rest = runtime.drain_events();
+        assert_eq!(
+            rest,
+            vec![PtyEvent::Output {
+                terminal,
+                byte_count: EXTRA,
+            }]
+        );
+        assert!(!runtime.has_pending_work());
+    }
+
+    /// B7: the same budget counts bytes, so a few very large chunks cannot
+    /// monopolise a frame either.
+    #[test]
+    fn drain_events_stops_at_the_output_byte_budget() {
+        let chunk = MAX_SERVER_OUTPUT_BYTES_PER_DRAIN / 2;
+        let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
+        let (sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::Terminal(TerminalId(52));
+        let pane = pane_for_key(terminal);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 4, cols: 10 });
+        let mut sequence = OutputSequence::ZERO;
+        for _ in 0..3 {
+            sender
+                .send(ServerMessage::PtyOutput {
+                    pane,
+                    lease: test_lease(),
+                    sequence,
+                    bytes: vec![b'x'; chunk],
+                })
+                .expect("queue output");
+            sequence = sequence.checked_add_bytes(chunk).expect("advance sequence");
+        }
+
+        let events = runtime.drain_events();
+
+        assert_eq!(
+            events,
+            vec![PtyEvent::Output {
+                terminal,
+                byte_count: MAX_SERVER_OUTPUT_BYTES_PER_DRAIN,
+            }]
+        );
+        assert!(runtime.has_pending_work());
+    }
+
     fn unattached_test_runtime(
         client_stream: UnixStream,
         receiver: Receiver<ServerMessage>,
     ) -> PtyRuntime {
-        PtyRuntime {
-            socket_path: unique_socket_path(),
-            connection: Some(ServerConnection {
-                writer: Arc::new(Mutex::new(client_stream)),
-                receiver,
-            }),
-            terminal_to_pane: HashMap::new(),
-            pane_to_terminal: HashMap::new(),
-            pane_leases: HashMap::new(),
-            expected_output: HashMap::new(),
-            session_identities: HashMap::new(),
-            agent_sessions: HashMap::new(),
-            parsers: HashMap::new(),
-            responders: HashMap::new(),
-            terminals_with_output: HashSet::new(),
-            terminal_exit_statuses: HashMap::new(),
-            foreground_processes: HashMap::new(),
-            command_trackers: HashMap::new(),
-            pending_events: Vec::new(),
-            client_scope: Some(test_scope()),
-            server_instance: Some(test_server_instance()),
-            next_request_id: Some(RequestId::MIN),
-            pending_requests: HashSet::new(),
-            deferred_messages: VecDeque::new(),
-            host_terminal_writes: Vec::new(),
-            starting: None,
-        }
+        let mut runtime = PtyRuntime::disconnected(unique_socket_path(), Vec::new());
+        runtime.connection = Some(ServerConnection {
+            writer: Arc::new(Mutex::new(client_stream)),
+            receiver,
+        });
+        runtime.client_scope = Some(test_scope());
+        runtime.server_instance = Some(test_server_instance());
+        runtime
     }
 
     fn test_model_session_identity(namespace: u8, token: u8) -> SessionIdentity {

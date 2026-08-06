@@ -282,6 +282,112 @@ and the project aims to adhere to
   off with the new `clipboard_osc52` config key (default `true`, today's
   behaviour).
 
+### Fixed — client responsiveness (R2)
+
+- **A dead or slow daemon no longer freezes the UI.** Re-attaching after a
+  reconnect used to walk every terminal serially on the render thread, each with
+  its own 2 s attach timeout, on *every* frame that retried — roughly 2N seconds
+  of frozen UI per frame with N terminals. Re-attachments are now queued and
+  serviced with a 100 ms per-frame budget (so a wedged daemon costs one stalled
+  round trip per frame instead of N), and failed reconnects back off from 250 ms
+  to 5 s instead of retrying every frame. A healthy daemon still restores every
+  terminal in the first frame after reconnecting.
+- **Connection establishment moved off the render thread.** The socket connect,
+  the autospawn wait, and the `Hello` exchange now run on a short-lived connector
+  thread; the render loop only collects the finished result. A `start`, `stop`,
+  resize, or keystroke issued while disconnected now fails immediately and
+  visibly ("not connected to mult-server; a connection attempt is in progress")
+  instead of blocking the frame for up to 8 s, and succeeds on the next attempt
+  once the background connection lands. Daemon loss is reported once per
+  disconnection rather than once per retry. The synchronous request/response
+  model, its idempotency keys, and scope resumption are unchanged: correlated
+  waits still run on the calling thread, and the only remaining synchronous
+  connects are at construction (before the first frame) and inside
+  `resume_and_resend`, which must replay a request on the connection it
+  re-establishes.
+- **Sockets are shut down before being dropped.** Every place that dropped
+  `ServerConnection` left the reader thread parked in `read_message` on its own
+  duplicate of a still-open descriptor, so a thread and an fd leaked on every
+  reconnect. Dropping a connection now calls `shutdown(Both)`, which releases the
+  parked read; a poisoned writer lock no longer skips it.
+- **`drain_events` has a per-frame budget** of 128 messages / 256 KiB of PTY
+  output. A pane producing faster than the parser consumes previously kept the
+  drain loop spinning until the queue emptied, so the frame never reached the
+  input poll and the UI stopped responding. Leftover traffic stays queued and is
+  reported to the render loop, which keeps requesting redraws until it is done.
+- **A lost host terminal no longer discards unsaved state.** `terminal.draw`,
+  `event::poll`, and `event::read` failures used to propagate straight out of
+  `run`. Transient failures (`Interrupted`, `WouldBlock`, `TimedOut`) are now
+  retried on the next tick, and a permanent one (a closed window, a dropped ssh
+  session, `EIO` from a vanished pty) exits through the same path as a quit: a
+  forced save checkpoint first, then the error, with the terminal guard restoring
+  the TTY as before.
+
+### Tested — hardening slice R11
+
+- Wire-framing coverage for the cases a real `UnixStream` produces and a
+  `&[u8]` reader never does: new `crates/protocol/tests/framing.rs` covers a
+  truncated frame at every prefix offset (`UnexpectedEof`), a `len == 0` frame
+  (`InvalidData`), a payload delivered one byte per `read`, an `Interrupted`
+  read being retried, back-to-back frames decoded from one stream, an oversize
+  length prefix refused before the payload is touched, and 256 seeded postcard
+  mutations that must always error and never panic. The mutation generator is a
+  hand-rolled xorshift64\*; no property-testing dependency was added.
+- Storage decode-failure coverage: a serde *shape* error (valid JSON, current
+  version, a field of the wrong type) and a corrupt-state backup whose
+  `renameat` fails. Both pin today's behaviour — any shape error discards every
+  workspace, and a failed rename aborts the reset and leaves the original bytes
+  alone — so the leniency and user-notification work tracked as E11 has a
+  regression net to change.
+- Attach-replay chunk boundaries: replay is now driven at
+  `RAW_HISTORY_CHUNK_BYTES - 1`, `RAW_HISTORY_CHUNK_BYTES`, `+ 1` and
+  `3 × + 7`, asserting the chunk count, that no chunk exceeds the wire bound,
+  that sequences stay contiguous through the watermark, and that the
+  concatenated delivery equals the source byte for byte. An empty history is
+  covered as the terminator case.
+- Agent-backend failure paths: a spawn that fails leaves nothing marked
+  running, a nonzero exit reports `Error` rather than `Done`, the pipe reader
+  survives invalid UTF-8, the bounded event queue delays a reader without
+  losing a byte, and a dropped consumer releases a blocked reader instead of
+  pinning a thread. The test module records that this whole module is still
+  unwired scaffolding, so the tests are about being safe to wire up later.
+- `TranscriptJournal` gained a module-level "shipped but unwired" note listing
+  what must be true before anything opens a journal. It has no production call
+  site and is deliberately kept.
+
+### Changed — hardening slice R11
+
+- No test mutates process-global environment variables any more. Socket-path
+  and config-path resolution each grew a pure seam taking the override and the
+  base as parameters, with the environment-reading wrapper delegating to it;
+  the fallbacks stay lazy, so an explicit override still works on a machine
+  with no resolvable home directory.
+- PTY integration deadlines are failure detectors rather than schedules:
+  30 s for the suite, 15 s for child reaping, 20 s for the agent tests. Every
+  wait returns the moment its condition holds, so the suite still completes in
+  about a second. The embedded `sleep 1`/`2`/`3` fixtures were replaced by FIFO
+  handshakes or keep-alive loops.
+- `client_receives_scrollback_output_and_real_exit_from_server_pty` no longer
+  races its own fixture. It requires live PTY output *after* the replay, but a
+  command that finished before the client attached delivered everything as
+  scrollback instead, so the awaited event never existed. The command now
+  blocks on a FIFO that the test opens only once create-and-attach has
+  returned, making the second write live output by construction.
+
+### Fixed — hardening slice R11
+
+- CI now proves the PTY integration tests actually ran. The `nix` job must skip
+  them (its sandbox cannot allocate PTYs) and reported 24 tests in 0.00 s while
+  nothing anywhere asserted otherwise. `MULT_REQUIRE_PTY_INTEGRATION=1` turns a
+  requested skip into a failure, and the suite prints an execution sentinel only
+  after a real daemon has driven a real PTY; the `cargo` job sets the variable,
+  runs the suite with `--nocapture`, and greps for both the sentinel and a
+  plausible passed count.
+- The Nix derivation now sets `SHELL` as well as `MULT_TEST_SHELL`. Only the
+  (skipped) integration harness read the latter, while the code that needs a
+  shell in the sandbox reads `$SHELL` and falls back to a `/bin/sh` that does
+  not exist there — a trap the next test to spawn a pane would have hit.
+
 ## [0.1.0] - 2026-05-19
 
 Initial prototype: a Ratatui/Crossterm client plus a persistent `mult-server`

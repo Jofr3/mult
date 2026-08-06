@@ -209,7 +209,7 @@ tag↔version and runs tests before publishing; the docs tree has one roadmap.
 | Slice | Title | Status |
 |-------|-------|--------|
 | R1 | Daemon lock discipline and pane lifecycle | done |
-| R2 | Client responsiveness | todo |
+| R2 | Client responsiveness | done |
 | R3 | Idle cost and save discipline | todo |
 | R4 | Security | done |
 | R5 | Emulator panics and fuzzing | todo |
@@ -218,5 +218,5 @@ tag↔version and runs tests before publishing; the docs tree has one roadmap.
 | R8 | Interaction affordances | todo |
 | R9 | Architecture, mechanical | todo |
 | R10 | Architecture, structural | todo |
-| R11 | Tests | todo |
+| R11 | Tests | done |
 | R12 | CI, docs and release | done |

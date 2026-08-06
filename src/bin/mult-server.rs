@@ -5250,6 +5250,142 @@ mod tests {
         assert_eq!(bytes[43], 7);
     }
 
+    /// G9: `RAW_HISTORY_CHUNK_BYTES` was referenced by no test, and the largest
+    /// replay fixture was ~416 bytes — one chunk — so the split, the sequence
+    /// arithmetic *across* chunks, and the terminator were all untested. A
+    /// single large append is the case that splits: the reader's 8 KiB buffer
+    /// never reaches the bound, so only one big write (a `cat` of a large file,
+    /// a full-screen redraw) crosses it.
+    #[test]
+    fn replay_splits_history_at_the_chunk_bound_and_delivers_it_byte_for_byte() {
+        for length in [
+            RAW_HISTORY_CHUNK_BYTES - 1,
+            RAW_HISTORY_CHUNK_BYTES,
+            RAW_HISTORY_CHUNK_BYTES + 1,
+            3 * RAW_HISTORY_CHUNK_BYTES + 7,
+        ] {
+            // Non-repeating within a chunk, so a reordered or duplicated chunk
+            // cannot compare equal to the source.
+            let source = (0..length)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+
+            let (replayed, chunk_lengths) = replay_of_history(&source);
+
+            assert_eq!(
+                chunk_lengths.len(),
+                length.div_ceil(RAW_HISTORY_CHUNK_BYTES),
+                "{length} bytes should split into ceil({length}/{RAW_HISTORY_CHUNK_BYTES}) chunks, got {chunk_lengths:?}"
+            );
+            assert!(
+                chunk_lengths
+                    .iter()
+                    .all(|chunk| *chunk <= RAW_HISTORY_CHUNK_BYTES),
+                "a replay chunk became a wire frame larger than the bound: {chunk_lengths:?}"
+            );
+            assert_eq!(replayed.len(), length, "replayed byte count for {length}");
+            assert_eq!(
+                replayed, source,
+                "the concatenated replay must equal the source for {length} bytes"
+            );
+        }
+    }
+
+    /// G9: the terminator case. An empty history still owes the client a
+    /// `ReplayEnd` on the watermark, and must not send a zero-length chunk.
+    #[test]
+    fn an_empty_history_replays_as_a_bare_begin_and_end() {
+        let (replayed, chunk_lengths) = replay_of_history(&[]);
+
+        assert!(replayed.is_empty());
+        assert!(
+            chunk_lengths.is_empty(),
+            "an empty history must not send a chunk at all, got {chunk_lengths:?}"
+        );
+    }
+
+    /// Attaches a fresh client to a pane holding exactly `source` and returns
+    /// the replayed bytes in delivery order plus each chunk's length. Asserts
+    /// the transaction's own invariants (contiguity, watermark) on the way
+    /// through, so callers only assert about the bytes.
+    fn replay_of_history(source: &[u8]) -> (Vec<u8>, Vec<usize>) {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let scope = server.lock().unwrap().allocate_scope().unwrap();
+        let pane = Arc::new(Mutex::new(test_pane_state(None)));
+        if !source.is_empty() {
+            pane.lock()
+                .unwrap()
+                .append_raw_history(&shared(source))
+                .unwrap();
+        }
+        server
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(SessionId(1), Arc::clone(&pane));
+        // Room for the acknowledgement, the begin/end pair, the foreground
+        // frame and every chunk the largest case produces.
+        let (client, receiver) = test_client_with_capacity(1, 64);
+
+        handle_attach_request(
+            &server,
+            scope,
+            false,
+            &client,
+            attach_request(request_id(1), 1, 1),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
+            ServerMessage::AttachResult {
+                outcome: AttachOutcome::Attached { .. },
+                ..
+            }
+        ));
+        let (first_sequence, watermark) = match receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap() {
+            ServerMessage::ReplayBegin {
+                first_sequence,
+                watermark,
+                ..
+            } => (first_sequence, watermark),
+            other => panic!("expected ReplayBegin, got {other:?}"),
+        };
+
+        let mut bytes = Vec::new();
+        let mut lengths = Vec::new();
+        let mut sequence = first_sequence;
+        loop {
+            match receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap() {
+                ServerMessage::ReplayChunk {
+                    sequence: received,
+                    bytes: chunk,
+                    ..
+                } => {
+                    assert_eq!(received, sequence, "replay chunks must be contiguous");
+                    sequence = sequence
+                        .checked_add_bytes(chunk.len())
+                        .expect("replay sequence must not overflow");
+                    lengths.push(chunk.len());
+                    bytes.extend_from_slice(&chunk);
+                }
+                ServerMessage::ReplayEnd {
+                    watermark: reported,
+                    ..
+                } => {
+                    assert_eq!(reported, watermark, "the terminator restates the watermark");
+                    assert_eq!(
+                        sequence, watermark,
+                        "the chunks must cover the whole watermark"
+                    );
+                    break;
+                }
+                other => panic!("unexpected message during replay: {other:?}"),
+            }
+        }
+        (bytes, lengths)
+    }
+
     /// A12: the cap is a scrollback budget, not the wire frame limit.
     #[test]
     fn retained_history_is_sized_from_the_client_scrollback() {

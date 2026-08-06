@@ -1100,6 +1100,94 @@ mod tests {
         assert_eq!(fs::read(path).unwrap(), original);
     }
 
+    /// G5: a *shape* error — well-formed JSON whose fields have the wrong types
+    /// — is currently indistinguishable from a truncated or garbled file. Both
+    /// are `serde_json::Error`, so both take the corrupt-backup-and-reset path
+    /// and the user loses every workspace in exchange for a backup file nobody
+    /// tells them about.
+    ///
+    /// This pins that behaviour rather than endorsing it: leniency and user
+    /// notification are R7/E11's problem. What matters here is that the reset
+    /// is not silent on disk — the original bytes survive under a
+    /// `.corrupt-<timestamp>-<random>` name, owner-only.
+    #[test]
+    fn a_shape_error_backs_the_file_up_and_resets_to_a_fresh_state() {
+        let root = unique_test_dir();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.json");
+        // Valid JSON, current version, and `workspaces` is a string where the
+        // schema wants an array. Nothing about it is truncated or garbled.
+        let original =
+            br#"{"version":2,"namespace":"11111111111111111111111111111111","workspaces":"not an array"}"#;
+        fs::write(&path, original).unwrap();
+        let store =
+            StateStore::acquire(StatePaths::from_explicit_path(path.clone()).unwrap()).unwrap();
+
+        let loaded = store.load_or_default().unwrap();
+
+        assert!(loaded.needs_save);
+        assert_eq!(loaded.state.version, STATE_VERSION);
+        // The whole file is discarded, not just the field that failed: what
+        // comes back is the built-in default state, workspaces and all.
+        let fresh = ProjectState::try_default().expect("fresh default state");
+        let names = |state: &ProjectState| {
+            state
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&loaded.state), names(&fresh));
+        assert!(!path.exists(), "the invalid file is moved, not rewritten");
+
+        let backups = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.as_bytes().starts_with(b"state.json.corrupt-"))
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1, "exactly one backup, found {backups:?}");
+        let backup = root.join(&backups[0]);
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    /// G5: the backup rename is the one step that can fail after the decision to
+    /// reset has been made. When it does, the reset must not proceed — the
+    /// invalid file has to stay exactly where it is, and the caller has to hear
+    /// about it, or a subsequent save would overwrite bytes the user may still
+    /// want.
+    #[test]
+    fn a_failed_backup_rename_aborts_the_reset_and_keeps_the_original_bytes() {
+        let root = unique_test_dir();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.json");
+        let original = b"{ not json at all";
+        fs::write(&path, original).unwrap();
+        let store =
+            StateStore::acquire(StatePaths::from_explicit_path(path.clone()).unwrap()).unwrap();
+        // Read and execute but not write: `renameat` in this directory now
+        // fails with EACCES. The descriptor the store already holds keeps
+        // working, so this is a rename failure and nothing else.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let error = store.load_or_default().unwrap_err();
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("failed to move"),
+            "the error must name the step that failed: {error}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original,
+            "a failed backup must leave the original in place"
+        );
+    }
+
     #[test]
     fn migration_keeps_command_as_data_and_does_not_execute_it() {
         let root = unique_test_dir();

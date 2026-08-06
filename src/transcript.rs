@@ -1,3 +1,33 @@
+//! Append-only journal of authoritative chat messages.
+//!
+//! # Status: shipped but unwired (S1)
+//!
+//! [`TranscriptJournal`] has **no call site outside this file's own tests**.
+//! It is compiled into both binaries and exercised only by `cargo test`; no
+//! chat, pane, or save path opens a journal today. This is intentional — the
+//! owner's Phase 3.4 wires it — so do not read the absence of callers as dead
+//! code to delete, and do not read the presence of the type as evidence that
+//! transcripts are being persisted. They are not.
+//!
+//! Before it is wired up, all of the following must hold:
+//!
+//! - **The path is chosen by `mult`, never by a user string.** `open` takes a
+//!   caller-supplied [`PathBuf`] and validates the parent through
+//!   [`SecureDirectory`], but the caller still decides *which* directory; it
+//!   must be the app-owned state directory, alongside `state.json`.
+//! - **Recovery stays opt-in.** [`TranscriptRecovery::Refuse`] is the default
+//!   precisely because `open` must not truncate a file it was merely pointed
+//!   at (R4/S2). Only a caller that knows the path names its own journal may
+//!   pass [`TranscriptRecovery::TruncatePartialTail`].
+//! - **Only structured messages are appended.** Raw PTY bytes have no role and
+//!   no message boundary; feeding them here would produce a journal that
+//!   cannot be replayed.
+//! - **Writes stay off the render thread.** Every append is a `write_all` plus
+//!   a flush to a real file, and the client's UI loop is synchronous.
+//! - **The caps are the retention policy.** [`MAX_TRANSCRIPT_FILE_BYTES`] is a
+//!   refusal, not a rotation: whoever wires this up owns deciding what happens
+//!   to a chat that reaches it.
+
 use std::{
     fs::File,
     io::{self, Read, Write},

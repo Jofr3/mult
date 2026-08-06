@@ -40,6 +40,22 @@ jobs:
       - name: Run local CI gate
         run: just ci
 
+      # S9: the `nix` job sets MULT_SKIP_PTY_INTEGRATION, so it reports 24
+      # integration tests in 0.00 s — green with zero PTY coverage. Nothing
+      # asserted that any job actually ran them. This step is that assertion:
+      # MULT_REQUIRE_PTY_INTEGRATION makes a requested skip a hard failure, and
+      # the sentinel is printed only after a real daemon has driven a real PTY,
+      # so neither an accidental skip nor a `--skip` filter can pass here.
+      - name: Prove the PTY integration tests ran
+        shell: bash
+        env:
+          MULT_REQUIRE_PTY_INTEGRATION: "1"
+        run: |
+          set -euo pipefail
+          cargo test --locked --test pty_integration -- --nocapture | tee integration.log
+          grep -q 'MULT_PTY_INTEGRATION_RAN' integration.log
+          grep -Eq 'test result: ok\. ([2-9][0-9]|[0-9]{3,}) passed' integration.log
+
   msrv:
     name: Rust 1.88 cargo check (Linux)
     runs-on: ubuntu-latest

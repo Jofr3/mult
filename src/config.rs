@@ -1,5 +1,7 @@
 use std::{
-    env, io,
+    env,
+    ffi::OsStr,
+    io,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
@@ -250,11 +252,25 @@ pub fn load_or_default() -> io::Result<Config> {
 }
 
 pub fn resolve_config_path() -> io::Result<PathBuf> {
-    if let Some(path) = env::var_os(CONFIG_PATH_ENV) {
-        return Ok(PathBuf::from(path));
-    }
+    config_path_from(env::var_os(CONFIG_PATH_ENV).as_deref(), paths::config_home)
+}
 
-    Ok(paths::config_home()?.join("mult").join(CONFIG_FILE_NAME))
+/// The config-path policy as a pure function of its inputs.
+///
+/// `$MULT_CONFIG_PATH` is a process global, so the test that used to cover this
+/// either mutated it — racing every sibling test — or branched on whatever the
+/// developer's environment happened to hold and asserted nothing useful (G7).
+/// The wrapper above reads the environment once and this decides; the test
+/// drives this directly. `config_home` stays lazy because an explicit override
+/// must keep working on a machine with no resolvable configuration home.
+fn config_path_from(
+    explicit: Option<&OsStr>,
+    config_home: impl FnOnce() -> io::Result<PathBuf>,
+) -> io::Result<PathBuf> {
+    match explicit {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => Ok(config_home()?.join("mult").join(CONFIG_FILE_NAME)),
+    }
 }
 
 /// Display-oriented compatibility helper. Loading uses [`resolve_config_path`]
@@ -415,13 +431,26 @@ mod tests {
 
     #[test]
     fn config_path_uses_config_home_or_override() {
-        let path = config_path();
+        let from_home = config_path_from(None, || Ok(PathBuf::from("/xdg-config")))
+            .expect("a resolvable config home yields a path");
+        assert_eq!(from_home, Path::new("/xdg-config/mult/config.json"));
 
-        if let Some(override_path) = env::var_os(CONFIG_PATH_ENV) {
-            assert_eq!(path, PathBuf::from(override_path));
-        } else {
-            assert!(path.ends_with("mult/config.json"));
-        }
+        let overridden = config_path_from(Some(OsStr::new("/elsewhere/mult.json")), || {
+            panic!("an override must not consult the configuration home")
+        })
+        .expect("an override is used verbatim");
+        assert_eq!(overridden, Path::new("/elsewhere/mult.json"));
+    }
+
+    #[test]
+    fn config_path_reports_an_unresolvable_home_instead_of_guessing() {
+        let error = config_path_from(None, || {
+            Err(io::Error::new(io::ErrorKind::NotFound, "no home"))
+        })
+        .expect_err("without a config home there is no path to return");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("no home"));
     }
 
     #[test]
