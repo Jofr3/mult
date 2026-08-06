@@ -1,12 +1,17 @@
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     io::{self, Read, Write},
     num::NonZeroU64,
     path::{Path, PathBuf},
 };
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+
+#[cfg(unix)]
+pub mod peer;
 
 pub const PROTOCOL_VERSION: u16 = 10;
 pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 1;
@@ -22,11 +27,31 @@ pub const MAX_PENDING_REQUESTS_PER_CLIENT: usize = 1_024;
 pub const MAX_CACHED_REQUEST_RESULTS_PER_SCOPE: usize = 4_096;
 
 pub fn default_socket_path() -> PathBuf {
-    if let Some(path) = env::var_os(SOCKET_PATH_ENV) {
+    socket_path_from(
+        env::var_os(SOCKET_PATH_ENV).as_deref(),
+        env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        socket_user_component,
+    )
+}
+
+/// The socket-path policy as a pure function of its inputs.
+///
+/// `default_socket_path` reads two process-global environment variables; tests
+/// that exercised the policy therefore had to `set_var` them, racing every
+/// sibling test that resolves a socket path on another thread (G7). The policy
+/// lives here instead, and the environment is read exactly once, by the wrapper.
+/// `user_component` stays lazy because the fallback is the only branch that
+/// needs a UID lookup.
+fn socket_path_from(
+    explicit: Option<&OsStr>,
+    runtime_dir: Option<&OsStr>,
+    user_component: impl FnOnce() -> String,
+) -> PathBuf {
+    if let Some(path) = explicit {
         return PathBuf::from(path);
     }
 
-    if let Some(runtime_dir) = env::var_os("XDG_RUNTIME_DIR") {
+    if let Some(runtime_dir) = runtime_dir {
         return PathBuf::from(runtime_dir).join(DEFAULT_SOCKET_NAME);
     }
 
@@ -35,7 +60,7 @@ pub fn default_socket_path() -> PathBuf {
     // can collide, letting another local user predict or pre-create ("squat")
     // the path. `ensure_private_dir` verifies ownership before the socket binds.
     PathBuf::from("/tmp")
-        .join(format!("mult-{}", socket_user_component()))
+        .join(format!("mult-{}", user_component()))
         .join(DEFAULT_SOCKET_NAME)
 }
 
@@ -43,8 +68,7 @@ pub fn default_socket_path() -> PathBuf {
 fn socket_user_component() -> String {
     #[cfg(unix)]
     {
-        // SAFETY: `geteuid` is always successful and has no failure mode.
-        unsafe { libc::geteuid() }.to_string()
+        peer::effective_uid().to_string()
     }
 
     #[cfg(not(unix))]
@@ -97,8 +121,7 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
         .mode(0o700)
         .create(dir)?;
 
-    // SAFETY: `geteuid` is always successful and has no failure mode.
-    let euid = unsafe { libc::geteuid() } as u32;
+    let euid = peer::effective_uid();
     let mut cursor = Some(dir);
     while let Some(path) = cursor {
         let metadata = fs::symlink_metadata(path)?;
@@ -1363,7 +1386,7 @@ mod tests {
         let component = socket_user_component();
         assert!(!component.is_empty());
         assert!(component.chars().all(|ch| ch.is_ascii_digit()));
-        assert_eq!(component, unsafe { libc::geteuid() }.to_string());
+        assert_eq!(component, peer::effective_uid().to_string());
     }
 
     #[cfg(unix)]
@@ -1431,14 +1454,28 @@ mod tests {
         dir
     }
 
+    /// G7: the policy is tested through its pure seam. The old version of this
+    /// test called `set_var`/`remove_var` on a process global while sibling
+    /// tests resolved socket paths from other threads.
     #[test]
-    fn socket_path_can_be_overridden_by_environment() {
-        let path = PathBuf::from("/tmp/mult-test-override.sock");
-        std::env::set_var(SOCKET_PATH_ENV, &path);
+    fn socket_path_prefers_the_override_then_the_runtime_dir_then_a_per_uid_dir() {
+        let explicit = socket_path_from(
+            Some(OsStr::new("/tmp/mult-test-override.sock")),
+            Some(OsStr::new("/run/user/1000")),
+            || panic!("the override must not need a UID lookup"),
+        );
+        assert_eq!(explicit, Path::new("/tmp/mult-test-override.sock"));
 
-        assert_eq!(default_socket_path(), path);
+        let runtime = socket_path_from(None, Some(OsStr::new("/run/user/1000")), || {
+            panic!("XDG_RUNTIME_DIR must not need a UID lookup")
+        });
+        assert_eq!(runtime, Path::new("/run/user/1000").join(DEFAULT_SOCKET_NAME));
 
-        std::env::remove_var(SOCKET_PATH_ENV);
+        let fallback = socket_path_from(None, None, || "4242".to_string());
+        assert_eq!(
+            fallback,
+            Path::new("/tmp/mult-4242").join(DEFAULT_SOCKET_NAME)
+        );
     }
 
     #[test]

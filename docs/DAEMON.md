@@ -10,7 +10,19 @@ Path selection comes from `mult-protocol::default_socket_path()`:
 2. `$XDG_RUNTIME_DIR/mult.sock`, when `XDG_RUNTIME_DIR` is set.
 3. `/tmp/mult-<uid>/mult.sock`, where the fallback directory is private to the user.
 
-The server creates missing socket parent directories with mode `0700`, binds with a restrictive umask, and sets the socket file to `0600` after binding. Linux builds also verify that connected peers have the same effective UID.
+The server creates missing socket parent directories with mode `0700`, binds with a restrictive umask, and sets the socket file to `0600` after binding.
+
+## Peer verification
+
+Both ends verify the socket peer before exchanging anything: the daemon checks every accepted connection, and the client checks the daemon it connected to (a squatted socket path otherwise sees every keystroke of every pane and can inject input). One shared implementation — `mult_protocol::peer::verify_peer_is_self` — is used by both, and it fails **closed**:
+
+| Platform | Mechanism |
+|---|---|
+| Linux, Android | `SO_PEERCRED` |
+| macOS/iOS, FreeBSD, DragonFly, OpenBSD, NetBSD | `getpeereid(3)` |
+| anything else | no mechanism, so the connection is **refused** |
+
+A credential that cannot be obtained is treated exactly like a mismatched one. There is no platform on which the check silently passes.
 
 ## Autospawn
 
@@ -18,9 +30,11 @@ The client attempts to autospawn `mult-server` when:
 
 - the socket is missing, or the socket path is a stale Unix socket that refuses connections;
 - `MULT_SERVER_AUTOSPAWN` is not `0`, `false`, `False`, or `FALSE`; and
-- a `mult-server` executable exists next to the running `mult` executable.
+- a **trusted** `mult-server` executable exists next to the running `mult` executable — a regular file owned by this user or by root, with no group/other write bit, in a directory with the same property. Symlinks are followed deliberately (packaged installs link into a store), and both the link's directory and the target are checked.
 
 Set `MULT_SERVER_AUTOSPAWN=0` to require starting the server manually.
+
+An autospawned daemon does **not** inherit the client's environment. It is spawned with `env_clear()` plus an allow-list: `PATH`, `HOME`, `SHELL`, `USER`, `LOGNAME`, `TERM`, `LANG`, anything starting with `LC_`, and anything starting with `MULT_`. The daemon outlives the client that started it and hands its environment to every PTY it later spawns for every client, so inheriting one shell's secrets would re-export them into every later pane. A manually started `mult-server` keeps whatever environment its operator gives it.
 
 ## Protocol and compatibility
 

@@ -140,9 +140,158 @@ and the project aims to adhere to
 - The client's server-event queue holds 256 messages rather than 4096, capping
   the backlog at roughly 2 MiB instead of 32 MiB when the render thread stalls.
 
-## [0.1.0]
+### Changed — CI, documentation and release
+
+- **One roadmap.** `README.md` and `CONTRIBUTING.md` pointed at
+  `docs/REMAINING_WORK.md` as the authoritative follow-up list while the list
+  work was actually being done from was linked from nowhere. There is now a
+  single entry point, `docs/ROADMAP.md`, fronting `docs/BACKLOG.md` (items) and
+  `docs/PLAN.md` (execution order). Nothing was discarded: the Phase 3
+  transcript contract, the open decisions about incomplete public paths, the
+  extension-dependency migration, the standing per-phase rules and the Phase 7
+  projects were carried into it, and `REMAINING_WORK.md`, `BACKLOG-v1.md` and
+  `PLAN-v1.md` are retained with explicit historical banners.
+- **The MSRV job now provably tests 1.88.** It ran a bare `cargo check` while
+  `rust-toolchain.toml` pins 1.94, and a toolchain file outranks
+  `rustup default` — so whether it tested the MSRV at all depended on the
+  toolchain action exporting `RUSTUP_TOOLCHAIN`. It runs `cargo +1.88` now.
+  1.88 was re-verified against the current tree.
+- **`just ci` matches CI again.** It was `fmt-check lint test audit` while CI
+  additionally ran macOS, `cargo deny`, an npm typecheck and more. It is now
+  `version-check fmt-check lint test deny typecheck`, and GitHub Actions runs
+  exactly that on Linux and macOS. The extension typecheck degrades to a notice
+  when `npm` or `extensions/node_modules` is missing, so the gate still
+  completes offline.
+- **`cargo audit` removed in favour of `cargo deny`.** Both ran, and `deny.toml`
+  already said deny supersedes audit. `just audit` is now `just deny`, and the
+  redundant standalone CI job is gone since `just ci` covers it.
+- **CI runs weekly and on demand**, not only on push and pull request, so a
+  newly published RustSec advisory surfaces without anyone opening a PR.
+- **Coverage is measured.** `just coverage` and a CI job run `cargo llvm-cov`.
+  The baseline is 82.13% of lines (18 150 lines, 3 243 uncovered); CI's floor is
+  75%, deliberately well below it so unrelated work is not blocked.
+- **Tag-triggered releases.** `.github/workflows/release.yml` builds Linux
+  (gnu + musl) and macOS (x86_64 + aarch64) archives, each containing **both**
+  binaries plus both licences — the client resolves the daemon from the path
+  next to its own executable, so they have to ship together. The tag is checked
+  against the declared crate version and the full gate runs *before* anything is
+  published; the release stays a draft until every target has uploaded.
+  `docs/RELEASING.md` documents the process. No tag has been cut.
+- **The version is declared once.** `[workspace.package] version` is inherited
+  by `crates/protocol`; `flake.nix` and `extensions/package.json` still mirror it
+  and `just version-check` (wired into `just ci`) fails if they disagree.
+- **`cargo-deny` is in the dev shell**, which `CONTRIBUTING.md` had promised for
+  some time without it being true. `cargo-llvm-cov` joined it.
+- **New documentation.** `docs/CONFIG.md` covers all 12 colorscheme keys and
+  every top-level key with type, default and effect — the README documented 3 of
+  12, and `_nc` was unguessable. `docs/TROUBLESHOOTING.md` maps the failure
+  modes this code actually produces to fixes, quoting the messages from source.
+- **The README project layout was regenerated from the tree** — it omitted
+  `runtime.rs`, `git.rs`, `paths.rs`, `lib.rs`, `terminal_guard.rs` and
+  `transcript.rs`, and attributed the event loop to `main.rs`. The environment
+  table now lists every `MULT_*` variable the code reads, marks `MULT_AGENT_CMD`
+  experimental and inert rather than implying it works, and separates the
+  variables `mult` sets for its children from the ones you set.
+  `extensions/package.json` no longer claims the extension is embedded in
+  `src/main.rs` (it is `src/runtime.rs`).
+- **Issue and PR templates, and `CODEOWNERS`.** The bug template captures
+  terminal emulator, `$TERM`, OS and whether the kitty keyboard protocol is
+  active, since input encoding depends on all four.
+- **`CHANGELOG.md` reference links.** `[Unreleased]` and `[0.1.0]` rendered
+  literally for want of link definitions; `[0.1.0]` is now dated.
+- **`.gitignore`** covers `.claude/settings.local.json`, `*.corrupt-*`
+  (state backups), `src/snapshots/*.snap.new` (insta), the future `fuzz/`
+  outputs, and editor/OS scratch.
+- **`just install-hooks`** writes a pre-commit hook that runs only
+  `cargo fmt --all -- --check` — fast enough not to be worth bypassing.
+
+### Security — hardening slice R4
+
+- **Socket peer verification now fails closed on every platform.** `peer_uid`
+  returned "unknown" on every non-Linux target and both callers treated that as
+  *accept*, so on macOS/BSD a squatted socket passed validation and could read
+  every keystroke in every pane and inject input. There is now a single shared
+  implementation (`mult_protocol::peer`) using `SO_PEERCRED` on Linux/Android
+  and `getpeereid(3)` on macOS and the BSDs; a credential that cannot be
+  obtained — including on a platform with no such API — is a hard rejection.
+  The byte-duplicated check in `pty.rs`/`mult-server.rs` and the three copies of
+  `current_euid` (plus the inline `geteuid()` calls in `storage.rs`,
+  `paths.rs` and the protocol crate) are gone.
+- **`config.json` is read with the same discipline as state.** It was a bare
+  `fs::read`: symlink-following, unbounded, with no owner, mode or regular-file
+  check — while the `pi_agent_command`/`claude_code_command` it yields are
+  shell-evaluated and auto-started by default, making a planted symlink or write
+  at that path silent code execution with no keystroke required. Both
+  attacker-steerable routes to it (`$MULT_CONFIG_PATH` and `$XDG_CONFIG_HOME`)
+  are now closed by the same check: every parent component is opened with
+  `O_NOFOLLOW`, the containing directory must be owned by this user and not
+  group/other-writable, and the file must be a regular, singly-linked,
+  owner-only file read under a 1 MiB cap. State and config share one hardened
+  read implementation. **This breaks a symlinked `config.json`**, which is what
+  dotfile managers such as GNU stow leave behind; copy the file or point
+  `$MULT_CONFIG_PATH` at a real one. `docs/TROUBLESHOOTING.md` has the messages
+  and the workaround.
+- **The state read is size-capped** (16 MiB). A large *regular* state file — one
+  passing every ownership and link check — could still OOM the client at
+  startup.
+- **Private files are proved owner-only before their bytes are read.** The
+  mode is re-checked after the normalizing `fchmod`, closing the inconsistency
+  with `read_mult_agent_status_records`, which already refused `mode & 0o077`.
+- **The git branch probe no longer runs `git`.** It forked `git -C <cwd>` every
+  two seconds per workspace with no `GIT_CONFIG_NOSYSTEM`, ceiling directory or
+  `--git-dir` pin, so a hostile repository's `.git/config` (`include.path`,
+  `core.fsmonitor`, `core.hooksPath`) was parsed merely by opening the
+  workspace. The branch is now read from the first line of `.git/HEAD` with a
+  bounded, `O_NOFOLLOW`, regular-file-checked read that follows `gitdir:`
+  pointers and resolves a symlinked `.git` deliberately — a broken link yields
+  no branch rather than the enclosing repository's. Detached `HEAD` and non-repo
+  directories behave as before, and a branch name containing control characters
+  is rejected instead of being rendered.
+- **Daemon autospawn checks the binary and clears the environment.** The
+  daemon was resolved purely by filename next to `current_exe()` with no owner
+  or mode check, and inherited the first client's entire environment — which it
+  then handed to every later client's PTYs, re-exporting one shell's API keys
+  into every pane. It is now executed only when it (and its directory) is owned
+  by this user or root and not group/other-writable, and is spawned with
+  `env_clear()` plus an allow-list (`PATH`, `HOME`, `SHELL`, `USER`, `LOGNAME`,
+  `TERM`, `LANG`, `LC_*`, `MULT_*`).
+- **Terminal query auto-responses are coalesced and bounded.** They accumulated
+  in an uncapped `Vec<Vec<u8>>` and were sent as one blocking socket write each
+  from the render thread — roughly 2048 writes per 8 KiB of `\x1b[6n`. A chunk
+  of output now produces at most one cursor report, at most eight answers, and
+  exactly one write.
+- **Daemon-supplied text can no longer forge terminal output.** `PtyEvent::Error`
+  messages and `ExitInfo::signal` names reached `parser.process()` raw; control
+  bytes in a `[mult]` system line are now replaced with U+FFFD.
+- **`TranscriptJournal::open` is no longer destructive.** It called `set_len()`
+  on any caller-supplied file whose tail lacked a newline, and `fchmod`ed the
+  parent directory to `0700` — so a mistyped path silently truncated a file and
+  re-permissioned a directory. Recovery is now opt-in
+  (`TranscriptRecovery::TruncatePartialTail`) and opening never changes an
+  existing parent's mode.
+- **The status-bridge extensions stop following symlinks when appending.**
+  `mult-claude-status.sh` refuses a symlinked journal, and `mult-status.ts` uses
+  `lstat` plus `O_NOFOLLOW` instead of `statSync` + `appendFileSync`.
+
+### Changed — hardening slice R4
+
+- OSC 52 clipboard writes are queued and emitted through the frame's own output
+  after the next draw instead of being written straight to `io::stdout()` from a
+  mouse handler, they are wrapped in tmux's passthrough DCS when `$TMUX` is set
+  (previously copying inside tmux silently did nothing), and they can be turned
+  off with the new `clipboard_osc52` config key (default `true`, today's
+  behaviour).
+
+## [0.1.0] - 2026-05-19
 
 Initial prototype: a Ratatui/Crossterm client plus a persistent `mult-server`
 PTY daemon over a Unix socket — multiple workspaces with `pi` agent chats and
 shell/command terminals, persistent JSON project state, terminal scrollback,
 mouse selection, and OSC52 clipboard copy.
+
+> Dated from the first commit. **No `v0.1.0` tag has been cut and no binaries
+> were published**, so the link below resolves only once the tag exists. See
+> [docs/RELEASING.md](docs/RELEASING.md) for the process.
+
+[Unreleased]: https://github.com/Jofr3/mult/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Jofr3/mult/releases/tag/v0.1.0

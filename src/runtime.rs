@@ -27,8 +27,9 @@ use mult::{
     storage, ui,
 };
 use mult_protocol::{
-    AgentGeneration as WireAgentGeneration, AgentKind as WireAgentKind, AgentSessionMetadata,
-    AgentStatus, AgentStatusQuery, AgentStatusRecord, AGENT_STATUS_SCHEMA_VERSION,
+    peer::effective_uid, AgentGeneration as WireAgentGeneration, AgentKind as WireAgentKind,
+    AgentSessionMetadata, AgentStatus, AgentStatusQuery, AgentStatusRecord,
+    AGENT_STATUS_SCHEMA_VERSION,
 };
 use ratatui::{layout::Rect, DefaultTerminal};
 use serde::Deserialize;
@@ -247,6 +248,7 @@ pub fn run(
                 .area;
             needs_redraw = false;
         }
+        flush_host_terminal_writes(terminal, &mut pty_runtime);
 
         if event::poll(EVENT_POLL_INTERVAL)? {
             handle_event(
@@ -425,7 +427,7 @@ fn handle_event(
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             handle_key(app, pty_runtime, config, key, frame_area);
         }
-        Event::Mouse(mouse) => handle_mouse(app, pty_runtime, mouse, frame_area),
+        Event::Mouse(mouse) => handle_mouse(app, pty_runtime, config, mouse, frame_area),
         Event::Paste(text) => handle_paste(app, pty_runtime, config, text, frame_area),
         _ => {}
     }
@@ -455,7 +457,13 @@ fn handle_key(
     }
 }
 
-fn handle_mouse(app: &mut App, pty_runtime: &mut PtyRuntime, mouse: MouseEvent, frame_area: Rect) {
+fn handle_mouse(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    config: &Config,
+    mouse: MouseEvent,
+    frame_area: Rect,
+) {
     if app.is_prompt_active() {
         return;
     }
@@ -468,7 +476,7 @@ fn handle_mouse(app: &mut App, pty_runtime: &mut PtyRuntime, mouse: MouseEvent, 
             update_text_selection_at_mouse(app, frame_area, mouse);
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            finish_text_selection_at_mouse(app, pty_runtime, frame_area, mouse);
+            finish_text_selection_at_mouse(app, pty_runtime, config, frame_area, mouse);
         }
         MouseEventKind::ScrollUp => {
             scroll_output_at_mouse(app, pty_runtime, frame_area, mouse, ScrollDirection::Up);
@@ -536,7 +544,8 @@ fn update_text_selection_at_mouse(app: &mut App, frame_area: Rect, mouse: MouseE
 
 fn finish_text_selection_at_mouse(
     app: &mut App,
-    pty_runtime: &PtyRuntime,
+    pty_runtime: &mut PtyRuntime,
+    config: &Config,
     frame_area: Rect,
     mouse: MouseEvent,
 ) -> bool {
@@ -550,25 +559,29 @@ fn finish_text_selection_at_mouse(
         app.clear_text_selection();
         return false;
     }
-    let _ = copy_text_selection_to_clipboard(pty_runtime, selection);
+    copy_text_selection_to_clipboard(pty_runtime, config, selection);
     true
 }
 
-fn copy_current_text_selection(app: &App, pty_runtime: &PtyRuntime) -> bool {
+fn copy_current_text_selection(app: &App, pty_runtime: &mut PtyRuntime, config: &Config) -> bool {
     let Some(selection) = app.text_selection else {
         return false;
     };
-    copy_text_selection_to_clipboard(pty_runtime, selection)
+    copy_text_selection_to_clipboard(pty_runtime, config, selection)
 }
 
-fn copy_text_selection_to_clipboard(pty_runtime: &PtyRuntime, selection: TextSelection) -> bool {
+fn copy_text_selection_to_clipboard(
+    pty_runtime: &mut PtyRuntime,
+    config: &Config,
+    selection: TextSelection,
+) -> bool {
     if selection.anchor == selection.focus {
         return false;
     }
     let Some(text) = selected_text(pty_runtime, selection) else {
         return false;
     };
-    copy_text_to_clipboard(&text).is_ok()
+    copy_text_to_clipboard(pty_runtime, config, &text)
 }
 
 fn active_selection_cell_at_mouse(
@@ -644,14 +657,49 @@ fn selected_text(pty_runtime: &PtyRuntime, selection: TextSelection) -> Option<S
     (!text.is_empty()).then_some(text)
 }
 
-fn copy_text_to_clipboard(text: &str) -> io::Result<()> {
-    if text.is_empty() {
-        return Ok(());
+/// Queue an OSC 52 clipboard write for the host terminal.
+///
+/// Two changes from writing straight to `io::stdout()` here: the user can turn
+/// it off (`clipboard_osc52`), and the sequence leaves through the frame's own
+/// output after the next draw rather than from a handle grabbed inside a mouse
+/// handler.
+fn copy_text_to_clipboard(pty_runtime: &mut PtyRuntime, config: &Config, text: &str) -> bool {
+    if text.is_empty() || !config.clipboard_osc52 {
+        return false;
     }
-    let encoded = base64_encode(text.as_bytes());
-    let mut stdout = io::stdout();
-    write!(stdout, "\x1b]52;c;{encoded}\x07")?;
-    stdout.flush()
+    let sequence = osc52_clipboard_sequence(&base64_encode(text.as_bytes()), inside_tmux());
+    pty_runtime.queue_host_terminal_write(&sequence);
+    true
+}
+
+/// OSC 52 "set clipboard", wrapped for tmux when running inside it.
+///
+/// tmux does not forward an OSC it does not implement to the outer terminal
+/// unless the sequence is wrapped in its passthrough DCS with every inner ESC
+/// doubled. Without the wrapper, copying inside tmux silently does nothing.
+fn osc52_clipboard_sequence(encoded: &str, tmux_passthrough: bool) -> Vec<u8> {
+    let sequence = format!("\x1b]52;c;{encoded}\x07");
+    if !tmux_passthrough {
+        return sequence.into_bytes();
+    }
+    format!("\x1bPtmux;{}\x1b\\", sequence.replace('\x1b', "\x1b\x1b")).into_bytes()
+}
+
+fn inside_tmux() -> bool {
+    std::env::var_os("TMUX").is_some()
+}
+
+/// Write everything queued for the host terminal through the frame's own
+/// output, right after the frame that produced it.
+fn flush_host_terminal_writes(terminal: &mut DefaultTerminal, pty_runtime: &mut PtyRuntime) {
+    let bytes = pty_runtime.take_host_terminal_writes();
+    if bytes.is_empty() {
+        return;
+    }
+    // A clipboard write must never take down the session: the selection is
+    // already made, and the next frame repaints regardless.
+    let backend = terminal.backend_mut();
+    let _ = backend.write_all(&bytes).and_then(|()| backend.flush());
 }
 
 fn base64_encode(input: &[u8]) -> String {
@@ -758,7 +806,7 @@ fn handle_control_key(
     frame_area: Rect,
 ) -> bool {
     if is_shifted_control_char(key, 'c') {
-        let _ = copy_current_text_selection(app, pty_runtime);
+        copy_current_text_selection(app, pty_runtime, config);
         return true;
     }
 
@@ -1715,7 +1763,7 @@ fn write_private_runtime_file(
     let mut file = options.open(&path).ok()?;
     let metadata = file.metadata().ok()?;
     if !metadata.file_type().is_file()
-        || metadata.uid() != current_euid()
+        || metadata.uid() != effective_uid()
         || metadata.nlink() != 1
         || metadata.len() > 1024 * 1024
     {
@@ -1757,7 +1805,7 @@ fn rotate_legacy_runtime_artifacts(
         }
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_file()
-            && metadata.uid() == current_euid()
+            && metadata.uid() == effective_uid()
             && metadata.nlink() == 1
         {
             candidates.push((metadata.modified().ok(), path));
@@ -2217,7 +2265,7 @@ fn read_mult_agent_status_records(
     };
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file()
-        || metadata.uid() != current_euid()
+        || metadata.uid() != effective_uid()
         || metadata.nlink() != 1
         || metadata.mode() & 0o077 != 0
         || metadata.len() > MAX_STATUS_FILE_BYTES
@@ -2351,7 +2399,7 @@ fn rotate_stale_status_files(directory: &Path, current: &Path) -> io::Result<()>
         }
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_file()
-            && metadata.uid() == current_euid()
+            && metadata.uid() == effective_uid()
             && metadata.nlink() == 1
         {
             candidates.push((metadata.modified().ok(), path));
@@ -2374,12 +2422,8 @@ fn ensure_mult_runtime_dir() -> io::Result<PathBuf> {
 fn mult_runtime_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("mult-{}", current_euid())))
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("mult-{}", effective_uid())))
         .join("mult")
-}
-
-fn current_euid() -> u32 {
-    unsafe { libc::geteuid() as u32 }
 }
 
 fn save_if_dirty_with(
@@ -2422,6 +2466,49 @@ mod tests {
     enum RestorationReply {
         Attached,
         Missing,
+    }
+
+    #[test]
+    fn clipboard_copy_queues_one_sequence_for_the_frame_and_honours_the_opt_out() {
+        let mut pty_runtime = PtyRuntime::new_offline();
+
+        assert!(copy_text_to_clipboard(
+            &mut pty_runtime,
+            &Config::default(),
+            "hello"
+        ));
+        assert_eq!(
+            pty_runtime.take_host_terminal_writes(),
+            osc52_clipboard_sequence("aGVsbG8=", inside_tmux()),
+            "the copy is queued for the frame's output, not written to stdout"
+        );
+        assert!(
+            pty_runtime.take_host_terminal_writes().is_empty(),
+            "taking the queue drains it"
+        );
+
+        let opted_out = Config {
+            clipboard_osc52: false,
+            ..Config::default()
+        };
+        assert!(!copy_text_to_clipboard(
+            &mut pty_runtime,
+            &opted_out,
+            "hello"
+        ));
+        assert!(pty_runtime.take_host_terminal_writes().is_empty());
+    }
+
+    #[test]
+    fn osc52_is_wrapped_for_tmux_with_doubled_escapes() {
+        assert_eq!(
+            osc52_clipboard_sequence("aGk=", false),
+            b"\x1b]52;c;aGk=\x07".to_vec()
+        );
+        assert_eq!(
+            osc52_clipboard_sequence("aGk=", true),
+            b"\x1bPtmux;\x1b\x1b]52;c;aGk=\x07\x1b\\".to_vec()
+        );
     }
 
     fn connected_restoration_runtime(

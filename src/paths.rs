@@ -61,7 +61,7 @@ fn absolute_nonempty(value: Option<&OsStr>) -> Option<PathBuf> {
 
 #[cfg(unix)]
 fn passwd_home() -> io::Result<Option<PathBuf>> {
-    let uid = unsafe { libc::geteuid() };
+    let uid = mult_protocol::peer::effective_uid();
     let suggested = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
     let mut capacity = if suggested > 0 {
         usize::try_from(suggested).unwrap_or(16 * 1024)

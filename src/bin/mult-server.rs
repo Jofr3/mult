@@ -31,10 +31,7 @@ use std::{
     env, fs,
     io::{self, Read, Write},
     net::Shutdown,
-    os::unix::{
-        io::AsRawFd,
-        net::{UnixListener, UnixStream},
-    },
+    os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -45,15 +42,15 @@ use std::{
 };
 
 use mult_protocol::{
-    bounded_screen_dimensions, default_socket_path, ensure_private_dir, read_message,
-    write_message, AgentSessionMetadata, AgentStatus, AgentStatusError, AgentStatusOutcome,
-    AgentStatusQuery, AgentStatusRecord, AttachError, AttachOutcome, AttachmentLease,
-    ClientMessage, ClientScopeId, CreateError, CreateOutcome, ExitInfo, ForegroundProcessInfo,
-    IdentityMismatch, LaunchSpec, LeaseOperation, LeaseRejectionReason, OutputSequence, PaneId,
-    PaneInfo, RequestId, ServerInstanceId, ServerMessage, SessionId, SessionIdentity, SessionInfo,
-    StateNamespace, StopError, StopOutcome, AGENT_STATUS_SCHEMA_VERSION,
-    MAX_CACHED_REQUEST_RESULTS_PER_SCOPE, MAX_MESSAGE_BYTES, MAX_PENDING_REQUESTS_PER_CLIENT,
-    PROTOCOL_VERSION,
+    bounded_screen_dimensions, default_socket_path, ensure_private_dir, peer::verify_peer_is_self,
+    read_message, write_message, AgentSessionMetadata, AgentStatus, AgentStatusError,
+    AgentStatusOutcome, AgentStatusQuery, AgentStatusRecord, AttachError, AttachOutcome,
+    AttachmentLease, ClientMessage, ClientScopeId, CreateError, CreateOutcome, ExitInfo,
+    ForegroundProcessInfo, IdentityMismatch, LaunchSpec, LeaseOperation, LeaseRejectionReason,
+    OutputSequence, PaneId, PaneInfo, RequestId, ServerInstanceId, ServerMessage, SessionId,
+    SessionIdentity, SessionInfo, StateNamespace, StopError, StopOutcome,
+    AGENT_STATUS_SCHEMA_VERSION, MAX_CACHED_REQUEST_RESULTS_PER_SCOPE, MAX_MESSAGE_BYTES,
+    MAX_PENDING_REQUESTS_PER_CLIENT, PROTOCOL_VERSION,
 };
 use portable_pty::{native_pty_system, Child, CommandBuilder, ExitStatus, MasterPty, PtySize};
 use signal_hook::{
@@ -1105,55 +1102,6 @@ fn restrict_socket_permissions(path: &PathBuf) -> io::Result<()> {
     fs::set_permissions(path, permissions)
 }
 
-fn verify_peer_owner(stream: &UnixStream, peer_label: &str) -> io::Result<()> {
-    let Some(peer_uid) = peer_uid(stream)? else {
-        return Ok(());
-    };
-    let current_uid = current_euid();
-    if peer_uid == current_uid {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("rejecting {peer_label} uid {peer_uid}; expected current uid {current_uid}"),
-        ))
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> io::Result<Option<u32>> {
-    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            credentials.as_mut_ptr().cast(),
-            &mut length,
-        )
-    };
-    if result == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    if length < std::mem::size_of::<libc::ucred>() as libc::socklen_t {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "short SO_PEERCRED response",
-        ));
-    }
-    Ok(Some(unsafe { credentials.assume_init().uid }))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn peer_uid(_stream: &UnixStream) -> io::Result<Option<u32>> {
-    Ok(None)
-}
-
-fn current_euid() -> u32 {
-    unsafe { libc::geteuid() as u32 }
-}
-
 fn spawn_pane(session: SessionId, spec: PaneSpawnSpec) -> io::Result<SpawnedPane> {
     let (rows, cols) = bounded_pty_dimensions(spec.rows, spec.cols);
     let pair = native_pty_system()
@@ -1292,7 +1240,7 @@ fn cleanup_unpublished_child(
 }
 
 fn handle_client(stream: UnixStream, server: SharedServer) -> io::Result<()> {
-    verify_peer_owner(&stream, "client")?;
+    verify_peer_is_self(&stream, "client")?;
     let (sender, receiver) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
     let client_id = server.lock().map_err(lock_error)?.allocate_client_id()?;
     let shutdown_handle = Arc::new(stream.try_clone()?);
@@ -3459,7 +3407,7 @@ mod tests {
     #[test]
     fn peer_owner_check_accepts_same_user_socket_pair() {
         let (client, _server) = UnixStream::pair().expect("socket pair");
-        verify_peer_owner(&client, "test client").expect("same uid peer");
+        verify_peer_is_self(&client, "test client").expect("same uid peer");
     }
 
     #[test]

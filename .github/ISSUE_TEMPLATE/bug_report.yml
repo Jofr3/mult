@@ -1,0 +1,104 @@
+name: Bug report
+description: Something in mult or mult-server behaves incorrectly.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, please check [docs/TROUBLESHOOTING.md](../blob/main/docs/TROUBLESHOOTING.md) —
+        several common symptoms (protocol-version mismatch after an upgrade, a
+        missing `mult-server`, a `.corrupt-*` state backup) have known causes.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. …
+        2. …
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: mult version
+      description: Release tag, or the commit you built from (`git rev-parse HEAD`).
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "e.g. Ubuntu 24.04, macOS 15.1, NixOS unstable"
+    validations:
+      required: true
+
+  - type: input
+    id: emulator
+    attributes:
+      label: Terminal emulator and version
+      description: >
+        Which terminal you run mult in. Input encoding, mouse reporting and
+        colour behaviour all differ between emulators, so this is usually the
+        first thing needed to reproduce.
+      placeholder: "e.g. kitty 0.37, WezTerm 20240203, Ghostty 1.0, tmux 3.5 inside Alacritty"
+    validations:
+      required: true
+
+  - type: input
+    id: term
+    attributes:
+      label: "$TERM"
+      description: Output of `echo $TERM` in the terminal running mult.
+      placeholder: "e.g. xterm-256color, xterm-kitty, tmux-256color"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kitty-keyboard
+    attributes:
+      label: Is the kitty keyboard protocol active?
+      description: >
+        mult enables the kitty disambiguate-escape-codes mode when the terminal
+        supports it, and that changes how modified keys are reported. If you are
+        unsure, run `printf '\e[?u\e[c'` and say whether the reply begins with
+        `\e[?<number>u`. Answer "Unsure" if that means nothing to you.
+      options:
+        - "Yes"
+        - "No"
+        - "Unsure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: keys
+    attributes:
+      label: For input/keyboard bugs only — which key, and what reached the program
+      description: >
+        The key combination pressed, the program running in the pane (shell,
+        `vim`, Claude Code, …), and what it received. `cat -v` in the affected
+        pane shows the raw bytes.
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: >
+        Any error text from mult or `mult-server`, and any `[mult]` system lines
+        shown inside the pane. Please redact paths or command lines you consider
+        sensitive.
+      render: text
+    validations:
+      required: false

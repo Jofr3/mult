@@ -14,6 +14,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use mult_protocol::peer::effective_uid;
 use serde::Deserialize;
 
 use crate::{
@@ -29,6 +30,13 @@ const STATE_PATH_ENV: &str = "MULT_STATE_PATH";
 const LOCK_SUFFIX: &str = ".lock";
 const CORRUPT_SUFFIX: &str = ".corrupt-";
 const MAX_TEMP_ATTEMPTS: usize = 64;
+/// Upper bound on a state file that is read into memory at startup.
+///
+/// The path is environment-steerable (`$MULT_STATE_PATH`, `$XDG_DATA_HOME`), so
+/// without a cap an ordinary *regular* file — one that passes every ownership
+/// and link check — still OOMs the client before a single byte is parsed. Real
+/// state is kilobytes; this leaves four orders of magnitude of headroom.
+pub(crate) const MAX_STATE_FILE_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct StateStore {
     paths: StatePaths,
@@ -117,8 +125,7 @@ impl StateStore {
             libc::O_RDWR | libc::O_CREAT | libc::O_NONBLOCK,
             0o600,
         )?;
-        validate_private_regular_file(&lock, &format!("state lock {}", paths.state.display()))?;
-        set_file_mode(&lock, 0o600)?;
+        secure_private_regular_file(&lock, &format!("state lock {}", paths.state.display()))?;
 
         let flock_status = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if flock_status != 0 {
@@ -232,24 +239,12 @@ impl StateStore {
     }
 
     fn read_state_bytes(&self) -> io::Result<Option<Vec<u8>>> {
-        let mut file = match self.directory.open_file(
+        read_private_file(
+            &self.directory,
             self.paths.state_name(),
-            libc::O_RDONLY | libc::O_NONBLOCK,
-            0,
-        ) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        validate_private_regular_file(
-            &file,
             &format!("state file {}", self.paths.state.display()),
-        )?;
-        set_file_mode(&file, 0o600)?;
-
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        Ok(Some(bytes))
+            MAX_STATE_FILE_BYTES,
+        )
     }
 
     fn backup_invalid_state(&self, decode_error: serde_json::Error) -> io::Result<()> {
@@ -285,8 +280,7 @@ impl StateStore {
             let backup =
                 self.directory
                     .open_file(&backup_name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
-            validate_private_regular_file(&backup, "corrupt state backup")?;
-            set_file_mode(&backup, 0o600)?;
+            secure_private_regular_file(&backup, "corrupt state backup")?;
             self.directory.sync()?;
             return Ok(());
         }
@@ -503,8 +497,7 @@ fn save_to_directory(
         };
 
         let result = (|| {
-            validate_private_regular_file(&file, "temporary state file")?;
-            set_file_mode(&file, 0o600)?;
+            secure_private_regular_file(&file, "temporary state file")?;
             file.write_all(contents.as_bytes())?;
             file.sync_all()?;
             drop(file);
@@ -776,8 +769,7 @@ fn validate_directory(file: &File, path: &Path) -> io::Result<()> {
 
 pub(crate) fn validate_owned_directory(file: &File, path: &Path) -> io::Result<()> {
     let metadata = file.metadata()?;
-    let effective_uid = unsafe { libc::geteuid() };
-    if metadata.uid() != effective_uid {
+    if metadata.uid() != effective_uid() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -804,6 +796,62 @@ fn validate_authority_directory(file: &File, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Bounded, symlink-refusing read of a private file inside `directory`.
+///
+/// One implementation serves both files whose *contents* this process trusts:
+/// state (which names persisted commands) and config (whose
+/// `pi_agent_command`/`claude_code_command` are handed to `$SHELL -lc` and
+/// auto-started). Both live at environment-steerable paths, so both must be a
+/// regular, singly-linked, owner-only file opened without following a symlink
+/// and read under a size cap. `Ok(None)` means the file does not exist, which
+/// every caller treats as "use defaults".
+pub(crate) fn read_private_file(
+    directory: &SecureDirectory,
+    name: &OsStr,
+    description: &str,
+    max_bytes: usize,
+) -> io::Result<Option<Vec<u8>>> {
+    let file = match directory.open_file(name, libc::O_RDONLY | libc::O_NONBLOCK, 0) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    secure_private_regular_file(&file, description)?;
+
+    // Read one byte past the cap so an oversized file is detected without
+    // having been buffered whole.
+    let mut bytes = Vec::new();
+    file.take(max_bytes as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{description} exceeds {max_bytes} bytes"),
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+/// Validate a private file and normalize its mode before any byte is read.
+///
+/// The `0o077` check runs *after* the `fchmod`, not before it: the sibling
+/// check in `runtime::read_mult_agent_status_records` exists so no
+/// group/other-accessible file is ever read, while this module's long-standing
+/// behaviour is to repair a legacy `0644` state file rather than refuse to
+/// start. Doing both in this order keeps the repair and still guarantees the
+/// bytes came from an owner-only inode — a mode that could not be tightened
+/// (an ignored `fchmod`, an exotic filesystem) now fails instead of being read.
+pub(crate) fn secure_private_regular_file(file: &File, description: &str) -> io::Result<()> {
+    validate_private_regular_file(file, description)?;
+    set_file_mode(file, 0o600)?;
+    if file.metadata()?.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{description} could not be restricted to owner-only access"),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_private_regular_file(file: &File, description: &str) -> io::Result<()> {
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
@@ -812,8 +860,7 @@ pub(crate) fn validate_private_regular_file(file: &File, description: &str) -> i
             format!("{description} is not a regular file"),
         ));
     }
-    let effective_uid = unsafe { libc::geteuid() };
-    if metadata.uid() != effective_uid {
+    if metadata.uid() != effective_uid() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("{description} is not owned by the effective user"),
@@ -1188,6 +1235,63 @@ mod tests {
                 & 0o777,
             0o700
         );
+    }
+
+    #[test]
+    fn oversized_state_file_is_refused_and_left_untouched() {
+        let root = unique_test_dir();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.json");
+        // Sparse: the cap must be enforced on length, not on bytes on disk.
+        File::create(&path)
+            .unwrap()
+            .set_len(MAX_STATE_FILE_BYTES as u64 + 1)
+            .unwrap();
+        let store =
+            StateStore::acquire(StatePaths::from_explicit_path(path.clone()).unwrap()).unwrap();
+
+        let error = store.load_or_default().unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds"));
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            MAX_STATE_FILE_BYTES as u64 + 1
+        );
+    }
+
+    #[test]
+    fn private_read_caps_bytes_and_reports_a_missing_file_as_absent() {
+        let root = unique_test_dir();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("small"), b"12345678").unwrap();
+        let directory = SecureDirectory::open_parent(&root.join("any"), false, false).unwrap();
+
+        assert_eq!(
+            read_private_file(&directory, OsStr::new("small"), "test file", 8).unwrap(),
+            Some(b"12345678".to_vec())
+        );
+        assert_eq!(
+            read_private_file(&directory, OsStr::new("absent"), "test file", 8).unwrap(),
+            None
+        );
+        let error = read_private_file(&directory, OsStr::new("small"), "test file", 7).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds 7 bytes"));
+    }
+
+    #[test]
+    fn private_read_leaves_no_group_or_other_access_before_reading() {
+        let root = unique_test_dir();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("widened");
+        fs::write(&path, b"{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        let directory = SecureDirectory::open_parent(&path, false, false).unwrap();
+
+        read_private_file(&directory, OsStr::new("widened"), "test file", 64).unwrap();
+
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
     }
 
     fn assert_golden_migration(input: &[u8], expected: &[u8]) {

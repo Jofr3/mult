@@ -15,7 +15,7 @@ The current implementation is a Ratatui/Crossterm client plus a small `mult-serv
   Claude Code (via generated lifecycle hooks) — chosen when the chat is created,
   shown in the sidebar as `agent: pi` / `agent: cc`, and both reporting live
   status into the sidebar dot.
-- Terminal scrollback, paste handling, mouse wheel scrolling, mouse text selection, and OSC52 clipboard copy.
+- Terminal scrollback, paste handling, mouse wheel scrolling, mouse text selection, and OSC52 clipboard copy (opt-out via `clipboard_osc52`).
 - Configurable project shortcuts and colorscheme.
 
 ## Quick start
@@ -48,25 +48,63 @@ cargo run --bin mult-server
 ## Useful commands
 
 ```sh
-just run        # run the TUI client
-just server     # run the persistent PTY server
-just check      # cargo check --workspace --all-targets --all-features
-just test       # cargo test --workspace --all-targets --all-features
-just fmt        # format Rust, and flake.nix when nixpkgs-fmt exists
-just fmt-check  # check Rust formatting without modifying files
-just lint       # clippy with warnings denied
-just audit      # cargo audit -D warnings (requires cargo-audit)
-just ci         # strict local CI: fmt-check, lint, test, audit
-just watch      # cargo-watch check/test loop
-just nix-build  # nix build
-just nix-check  # nix flake check
+just run           # run the TUI client
+just server        # run the persistent PTY server
+just check         # cargo check --workspace --all-targets --all-features
+just test          # cargo test --workspace --all-targets --all-features
+just fmt           # format Rust, and flake.nix when nixpkgs-fmt exists
+just fmt-check     # check Rust formatting without modifying files
+just lint          # clippy with warnings denied
+just deny          # cargo deny check: advisories, licenses, bans, sources
+just typecheck     # tsc --noEmit for the bundled status extension
+just version-check # assert Cargo.toml / flake.nix / package.json agree
+just coverage      # cargo llvm-cov line/region summary
+just ci            # strict local gate (see below)
+just install-hooks # pre-commit hook running cargo fmt --check
+just watch         # cargo-watch check/test loop
+just nix-build     # nix build
+just nix-check     # nix flake check
 ```
 
 ## Validation / CI
 
-`just ci` is the local gate and intentionally fails if `cargo-audit` is missing. `nix develop` provides `just` and `cargo-audit`. GitHub Actions runs the same `just ci` gate on Linux and also runs `nix flake check` in a separate job.
+`just ci` is the local gate. It runs, in order:
 
-The audit gate currently avoids known RustSec advisories by using `postcard` for local IPC framing and current `ratatui`/`tui-term` releases.
+1. `just version-check` — the version in `Cargo.toml`, `flake.nix` and `extensions/package.json` still agree
+2. `just fmt-check` — `cargo fmt --all -- --check`
+3. `just lint` — `cargo clippy --workspace --all-targets --all-features -D warnings`
+4. `just test` — `cargo test --workspace --all-targets --all-features`
+5. `just deny` — `cargo deny check` (advisories, licenses, bans, sources)
+6. `just typecheck` — `tsc --noEmit` on the bundled status extension
+
+`just deny` intentionally fails if `cargo-deny` is missing; `nix develop`
+provides it, along with `just` and `cargo-llvm-cov`. `just typecheck` skips with
+a notice when `npm` or `extensions/node_modules` is unavailable, so `just ci`
+still completes offline and on a fresh clone.
+
+GitHub Actions runs that same `just ci` gate on **both** Linux and macOS, and
+adds four jobs it does not make sense to run on every local invocation:
+
+| Job | What it adds |
+| --- | --- |
+| `msrv` | `cargo +1.88 check --locked --workspace --all-targets --all-features`, proving the declared MSRV really builds |
+| `coverage` | `cargo llvm-cov` over the workspace |
+| `extension` | a real `npm ci --ignore-scripts` before the typecheck, so it cannot skip |
+| `nix` | `nix flake check` |
+
+CI also runs on a weekly schedule and on demand, not only on push and pull
+request, so a newly published RustSec advisory is caught without anyone opening
+a PR.
+
+`cargo deny check advisories` is the single supply-chain gate; the standalone
+`cargo audit` it supersedes (see `deny.toml`) has been removed rather than run
+alongside it. The dependency tree currently avoids known RustSec advisories by
+using `postcard` for local IPC framing and current `ratatui`/`tui-term`
+releases.
+
+Tagging `vX.Y.Z` triggers a release workflow that verifies the tag matches the
+crate version and runs the full gate before publishing anything. See
+[docs/RELEASING.md](docs/RELEASING.md).
 
 ## Controls
 
@@ -101,6 +139,7 @@ Mouse support:
 - Scroll wheel scrolls the selected output pane.
 - Drag over terminal/chat-agent output to select visible text and copy it through OSC52.
 - `Ctrl+Shift+C` copies the active `mult` text selection when the terminal forwards that key to `mult`.
+- Both copy paths are gated by `clipboard_osc52` (default `true`). Set it to `false` and `mult` never writes an OSC 52 escape: selection still highlights and `Ctrl+Shift+C` is still consumed, but nothing reaches the clipboard.
 
 The command palette includes discoverable actions for focus changes, starting input, adding/deleting sessions, opening workspaces, search, clearing search, and quitting.
 
@@ -112,6 +151,8 @@ Config path:
 - otherwise `$XDG_CONFIG_HOME/mult/config.json`
 - otherwise the effective user's passwd home at `~/.config/mult/config.json`; startup fails clearly if no durable home can be resolved
 
+Whichever path is used, the config must be a regular file owned by you, reached without traversing a symlink, in a directory of yours that is not group- or other-writable, and under 1 MiB — the commands it carries are shell-evaluated and auto-started, so a path anyone else can steer is code execution. A **symlinked** `config.json`, which is what most dotfile managers leave behind, is refused rather than read: see [docs/CONFIG.md](docs/CONFIG.md#the-file) and [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#too-many-levels-of-symbolic-links-at-startup-symlinked-config).
+
 Example:
 
 ```json
@@ -122,6 +163,7 @@ Example:
   "auto_start_claude_code_agent": true,
   "auto_start_terminals": true,
   "mouse_capture": true,
+  "clipboard_osc52": true,
   "projects": [
     { "name": "mult", "path": "~/projects/mult" },
     ["scratch", "/tmp/scratch"]
@@ -136,15 +178,50 @@ Example:
 
 `pi_agent_command` and `claude_code_command` select the binary for each agent backend (`Ctrl+a` starts a `pi` chat, `Ctrl+x` a Claude Code chat); `auto_start_*` toggle whether the selected chat of that kind starts on focus. Both commands are launched through your login shell (`$SHELL -lc …`), so shell features — pipelines, `$VAR` expansion, globbing — work inside them. This is intentionally different from `MULT_AGENT_CMD` (below), which `mult` splits into arguments itself with no shell involved.
 
-Environment variables:
+The example above sets 3 of the 12 colorscheme keys. **[docs/CONFIG.md](docs/CONFIG.md) is the complete reference** — every top-level and colorscheme key with its type, default and effect, including `_nc` (the unfocused-pane background, written with a leading underscore).
 
-| Variable | Purpose |
-| --- | --- |
-| `MULT_CONFIG_PATH` | Override config file path |
-| `MULT_STATE_PATH` | Override state file path |
-| `MULT_SOCKET_PATH` | Override `mult-server` Unix socket path |
-| `MULT_SERVER_AUTOSPAWN=0` | Disable server autospawn |
-| `MULT_AGENT_CMD` | Configure the experimental process-agent backend. Simple shell-style quotes and backslash escapes are supported; shell expansion is not performed. |
+### Environment variables
+
+Variables you may set. All are optional.
+
+| Variable | Read by | Purpose |
+| --- | --- | --- |
+| `MULT_CONFIG_PATH` | client | Override the config file path, used verbatim. |
+| `MULT_STATE_PATH` | client | Override the state file path. |
+| `MULT_SOCKET_PATH` | client, daemon | Override the `mult-server` Unix socket path. Both ends must agree. |
+| `MULT_SERVER_AUTOSPAWN` | client | Set to `0`, `false`, `False` or `FALSE` to stop the client autospawning `mult-server`. Any other value, or unset, leaves autospawn on. |
+| `MULT_AGENT_CMD` | client, daemon | **Experimental, and currently a no-op.** The process-agent backend it configures has no production call path, so setting it changes nothing today. When it is wired, it is argv-split with simple shell-style quotes and backslash escapes — no shell expansion, unlike `pi_agent_command`. Retained rather than removed because `src/transcript.rs` builds on the same types; see [docs/ROADMAP.md](docs/ROADMAP.md#open-decisions-carried-over). |
+| `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `HOME` | client | Standard. Used to resolve config and state when the overrides above are unset; must be absolute. |
+| `XDG_RUNTIME_DIR` | client, daemon | Standard. The default socket parent and the home of the agent status journals; falls back to `/tmp/mult-<euid>` when unset. |
+| `SHELL` | client, daemon | The login shell used for agent commands and command terminals. |
+
+`mult` also *sets* variables for the processes it spawns. These are the agent
+status bridge's private interface, read by `extensions/mult-status.ts` and
+`extensions/mult-claude-status.sh` — do not set them yourself:
+`MULT_AGENT_STATUS_PATH`, `MULT_AGENT_STATUS_VERSION`, `MULT_AGENT_CHAT_ID`,
+`MULT_AGENT_KIND`, `MULT_AGENT_NAMESPACE`, `MULT_AGENT_SESSION_TOKEN`,
+`MULT_AGENT_GENERATION`. An autospawned daemon inherits only an allow-list of
+the client's environment (`PATH`, `HOME`, `SHELL`, `USER`, `LOGNAME`, `TERM`,
+`LANG`, plus everything prefixed `LC_` or `MULT_`), so it cannot re-export the
+starting shell's secrets into every later pane; `TERM` and `COLORTERM` are then
+set explicitly for PTY children.
+
+That allow-list also decides what the daemon's PTYs see, so a variable exported
+for an agent — `ANTHROPIC_API_KEY` is the obvious one — **does not reach panes of
+an autospawned daemon**. Start the daemon yourself when a pane needs extra
+environment (`just server` or `mult-server`, then `MULT_SERVER_AUTOSPAWN=0 mult`);
+a manually started `mult-server` keeps whatever environment you give it.
+Exporting from `~/.profile` also works, since agent commands run through a login
+shell. See
+[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#an-agent-cant-see-its-api-key-or-any-other-exported-variable)
+and [docs/DAEMON.md](docs/DAEMON.md).
+
+Two further variables affect only the test suite —
+`MULT_SKIP_PTY_INTEGRATION` and `MULT_TEST_SHELL`. See
+[CONTRIBUTING.md](CONTRIBUTING.md#test-environment-variables).
+
+If something is not behaving, [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
+maps the errors this code actually emits to their causes.
 
 ## State
 
@@ -167,19 +244,35 @@ Pi and Claude Code lifecycle bridges write generation-scoped, append-only status
 ## Project layout
 
 ```text
-src/main.rs              TUI event loop and runtime wiring
-src/app.rs               app state, navigation, prompts, search, mutations
-src/model.rs             durable project model and IDs
-src/ui.rs                pure Ratatui rendering
-src/pty.rs               client-side PTY runtime and server protocol adapter
-src/bin/mult-server.rs   PTY server process
-src/config.rs            config loading/defaults
-src/storage.rs           state loading/saving
-src/agent.rs             experimental process-agent backend
-crates/protocol          shared client/server protocol types
-extensions/mult-status.ts bundled pi status extension
-extensions/mult-claude-status.sh bundled Claude Code status hook script
+src/lib.rs                        library root; the modules below marked (lib) are public
+src/main.rs                       `mult` entry point: state lock, config load, signal handlers, panic-safe cleanup
+src/runtime.rs                    TUI event loop, keymap, mouse, clipboard, agent status bridge, hook/extension generation, save scheduling
+src/terminal_guard.rs             RAII terminal mode setup and restore
+src/app.rs                  (lib) app state, navigation, prompts, search, mutations
+src/model.rs                (lib) durable project model, IDs, session identity, state schema
+src/ui.rs                   (lib) Ratatui rendering, palette, and the vt100 -> ratatui adapter
+src/pty.rs                  (lib) client-side PTY runtime and server protocol adapter
+src/config.rs               (lib) config loading, defaults, and DEFAULT_COLOR_SCHEME
+src/storage.rs              (lib) state load/save, ownership lock, migrations, corrupt-state backups
+src/paths.rs                (lib) XDG/HOME resolution for the config and state directories
+src/git.rs                  (lib) workspace git branch probe
+src/agent.rs                (lib) experimental process-agent backend
+src/transcript.rs           (lib) bounded append-only transcript journal (built, not yet wired)
+src/snapshots/                    insta snapshots for the ui.rs render tests
+src/bin/mult-server.rs            PTY server process
+crates/protocol/                  shared client/server protocol types, framing, and peer checks
+tests/pty_integration.rs          end-to-end PTY tests against a real daemon
+tests/fixtures/state/             golden state files for the migration tests
+extensions/mult-status.ts         bundled pi status extension (embedded via include_str! in src/runtime.rs)
+extensions/mult-claude-status.sh  bundled Claude Code status hook script (likewise)
 ```
+
+`runtime.rs` and `terminal_guard.rs` are declared by `src/main.rs` rather than
+`src/lib.rs`, so they are private to the `mult` binary and cannot be reached from
+integration tests. Documentation lives in [docs/](docs/): the
+[roadmap](docs/ROADMAP.md), the [daemon design](docs/DAEMON.md), the
+[config reference](docs/CONFIG.md), [troubleshooting](docs/TROUBLESHOOTING.md),
+and [releasing](docs/RELEASING.md).
 
 ## Runtime server and IPC
 
@@ -193,7 +286,9 @@ By default the socket lives at `$XDG_RUNTIME_DIR/mult.sock`; without `XDG_RUNTIM
 
 ## Contributing
 
-Contributions are welcome — start with [CONTRIBUTING.md](CONTRIBUTING.md) and the detailed [AGENTS.md](AGENTS.md) guide. For security issues, see [SECURITY.md](SECURITY.md). Planned follow-up work is tracked in [docs/REMAINING_WORK.md](docs/REMAINING_WORK.md).
+Contributions are welcome — start with [CONTRIBUTING.md](CONTRIBUTING.md) and the detailed [AGENTS.md](AGENTS.md) guide. For security issues, see [SECURITY.md](SECURITY.md).
+
+Planned work is tracked in **[docs/ROADMAP.md](docs/ROADMAP.md)** — the single entry point for the item list ([docs/BACKLOG.md](docs/BACKLOG.md)), the execution order ([docs/PLAN.md](docs/PLAN.md)), and the open design decisions that are not yet items.
 
 ## License
 

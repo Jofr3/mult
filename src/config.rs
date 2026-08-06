@@ -1,15 +1,22 @@
 use std::{
-    env, fs, io,
+    env, io,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::{paths, ui::Palette};
+use crate::{
+    paths,
+    storage::{read_private_file, SecureDirectory},
+    ui::Palette,
+};
 
 const CONFIG_PATH_ENV: &str = "MULT_CONFIG_PATH";
 const CONFIG_FILE_NAME: &str = "config.json";
+/// Upper bound on a config file read into memory. Config is JSON a human
+/// writes; anything near this is not one.
+const MAX_CONFIG_FILE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -25,6 +32,15 @@ pub struct Config {
     pub auto_start_terminals: bool,
     #[serde(default = "default_mouse_capture")]
     pub mouse_capture: bool,
+    /// Whether a text selection is copied to the system clipboard with OSC 52.
+    ///
+    /// Defaults to on, which is what `mult` has always done. Turning it off
+    /// stops `mult` from ever writing an OSC 52 sequence: the escape carries
+    /// the selected text to whatever is on the other end of the terminal (an
+    /// SSH client, a multiplexer, a terminal that logs sequences), which is not
+    /// always where the user wants pane contents to go.
+    #[serde(default = "default_clipboard_osc52")]
+    pub clipboard_osc52: bool,
     #[serde(default)]
     pub projects: Vec<ConfiguredProject>,
     #[serde(default)]
@@ -182,6 +198,7 @@ impl Default for Config {
             auto_start_claude_code_agent: default_auto_start_claude_code_agent(),
             auto_start_terminals: default_auto_start_terminals(),
             mouse_capture: default_mouse_capture(),
+            clipboard_osc52: default_clipboard_osc52(),
             projects: Vec::new(),
             colorscheme: ColorSchemeConfig::default(),
         }
@@ -246,11 +263,44 @@ pub fn config_path() -> PathBuf {
     resolve_config_path().unwrap_or_else(|_| PathBuf::from("<configuration path unavailable>"))
 }
 
+/// Read the config with the same discipline as state, and for a sharper reason:
+/// `pi_agent_command` and `claude_code_command` are handed to `$SHELL -lc` and
+/// auto-started by default, so *whoever controls these bytes runs code as this
+/// user without a keystroke*. Two environment variables steer the path there
+/// (`$MULT_CONFIG_PATH`, and `$XDG_CONFIG_HOME` via [`paths::config_home`],
+/// which accepts any absolute value), so the path is treated as untrusted:
+///
+/// - every parent component is opened with `O_NOFOLLOW` and the final parent
+///   must be owned by this user and not group/other-writable (that ownership
+///   check is what makes a redirected `$XDG_CONFIG_HOME` useless to an
+///   attacker — S7);
+/// - the file itself must be a regular, singly-linked, owner-only file, opened
+///   without following a symlink, and is read under a size cap.
+///
+/// A missing file — or a missing config directory — still means "use defaults".
+/// Anything else fails loudly rather than silently running with defaults,
+/// because a rejected config is a signal, not a fallback.
 fn load_from_path(path: &Path) -> io::Result<Config> {
-    match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(invalid_data),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Config::default()),
-        Err(error) => Err(error),
+    let directory = match SecureDirectory::open_parent(path, false, false) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(error) => return Err(error),
+    };
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("config path must name a file: {}", path.display()),
+        )
+    })?;
+
+    match read_private_file(
+        &directory,
+        name,
+        &format!("config file {}", path.display()),
+        MAX_CONFIG_FILE_BYTES,
+    )? {
+        Some(bytes) => serde_json::from_slice(&bytes).map_err(invalid_data),
+        None => Ok(Config::default()),
     }
 }
 
@@ -275,6 +325,10 @@ fn default_auto_start_terminals() -> bool {
 }
 
 fn default_mouse_capture() -> bool {
+    true
+}
+
+fn default_clipboard_osc52() -> bool {
     true
 }
 
@@ -334,10 +388,14 @@ fn invalid_data(error: serde_json::Error) -> io::Error {
 mod tests {
     use std::{
         fs,
+        os::unix::fs::{symlink, PermissionsExt},
+        sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::*;
+
+    static NEXT_TEST_PATH: AtomicU64 = AtomicU64::new(1);
 
     #[test]
     fn config_defaults_to_pi_command() {
@@ -349,6 +407,7 @@ mod tests {
         assert!(config.auto_start_claude_code_agent);
         assert!(config.auto_start_terminals);
         assert!(config.mouse_capture);
+        assert!(config.clipboard_osc52);
         assert!(config.projects.is_empty());
         assert_eq!(config.colorscheme.base, "#232136");
         assert_eq!(config.colorscheme.nc, "#1f1d30");
@@ -444,6 +503,18 @@ mod tests {
         let config = load_from_path(&path).expect("load config");
 
         assert!(!config.mouse_capture);
+        assert!(config.clipboard_osc52, "unrelated keys keep their defaults");
+    }
+
+    #[test]
+    fn config_loads_clipboard_opt_out_from_json() {
+        let path = unique_temp_file();
+        fs::write(&path, r#"{"clipboard_osc52":false}"#).expect("write config");
+
+        let config = load_from_path(&path).expect("load config");
+
+        assert!(!config.clipboard_osc52);
+        assert!(config.mouse_capture);
     }
 
     #[test]
@@ -493,11 +564,88 @@ mod tests {
         assert_eq!(config, Config::default());
     }
 
+    #[test]
+    fn missing_config_directory_uses_defaults() {
+        let path = unique_temp_dir().join("absent").join(CONFIG_FILE_NAME);
+
+        let config = load_from_path(&path).expect("load config with no directory");
+
+        assert_eq!(config, Config::default());
+    }
+
+    #[test]
+    fn config_symlink_is_refused_and_its_target_is_not_read() {
+        // The planted-symlink route to shell-evaluated `pi_agent_command`.
+        let directory = unique_temp_dir();
+        let target = directory.join("planted.json");
+        fs::write(&target, r#"{"pi_agent_command":"attacker"}"#).expect("write target");
+        let path = directory.join(CONFIG_FILE_NAME);
+        symlink(&target, &path).expect("link config path");
+
+        let error = load_from_path(&path).expect_err("a symlinked config must be refused");
+
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn config_in_a_world_writable_directory_is_refused() {
+        let directory = unique_temp_dir();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777))
+            .expect("widen directory");
+        let path = directory.join(CONFIG_FILE_NAME);
+        fs::write(&path, r#"{"pi_agent_command":"attacker"}"#).expect("write config");
+
+        let error = load_from_path(&path).expect_err("a replaceable parent must be refused");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn config_read_is_size_capped_and_normalizes_the_file_mode() {
+        let path = unique_temp_file();
+        fs::write(&path, r#"{"pi_agent_command":"pi"}"#).expect("write config");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("widen config");
+
+        load_from_path(&path).expect("load config");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let oversized = format!(
+            r#"{{"pi_agent_command":"{}"}}"#,
+            "x".repeat(MAX_CONFIG_FILE_BYTES)
+        );
+        fs::write(&path, oversized).expect("write oversized config");
+
+        let error = load_from_path(&path).expect_err("an oversized config must be refused");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    /// A path inside a fresh owner-only directory.
+    ///
+    /// Config is no longer read out of a shared, world-writable directory: the
+    /// hardened read rejects a parent anyone else can write, so tests must
+    /// build the same private parent a real installation has.
     fn unique_temp_file() -> PathBuf {
+        unique_temp_dir().join("config.json")
+    }
+
+    fn unique_temp_dir() -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after Unix epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("mult-config-test-{unique}.json"))
+        let sequence = NEXT_TEST_PATH.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "mult-config-test-{}-{unique}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create private config directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .expect("restrict config directory");
+        directory
     }
 }

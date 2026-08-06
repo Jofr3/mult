@@ -21,6 +21,8 @@
         in {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "mult";
+            # Kept in step with `[workspace.package] version` in Cargo.toml by
+            # `just version-check`.
             version = "0.1.0";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
@@ -63,7 +65,11 @@
               rustfmt
 
               cargo-watch
-              cargo-audit
+              # `cargo-deny` is the supply-chain gate (`just deny`); it
+              # supersedes the standalone `cargo audit` that used to run in
+              # `just ci`. See deny.toml.
+              cargo-deny
+              cargo-llvm-cov
               just
             ];
 

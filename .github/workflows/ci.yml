@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A new RustSec advisory is a change in the world, not in the repository, so
+  # the supply-chain gate has to run without anyone pushing. Weekly, Monday
+  # 05:17 UTC.
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -27,7 +33,10 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
         with:
-          tool: just@1.57.0,cargo-audit@0.22.2
+          tool: just@1.57.0,cargo-deny@0.20.2
+      # `just ci` is version-check, fmt-check, clippy -D warnings, tests and
+      # cargo-deny. Its extension typecheck skips here (no node_modules) and is
+      # run for real by the `extension` job below.
       - name: Run local CI gate
         run: just ci
 
@@ -42,11 +51,14 @@ jobs:
         with:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # `rust-toolchain.toml` pins 1.94 and a toolchain file outranks
+      # `rustup default`, so a bare `cargo check` here would silently test the
+      # pinned toolchain instead of the MSRV. `+1.88` outranks the file.
       - name: Check MSRV
-        run: cargo check --locked --workspace --all-targets --all-features
+        run: cargo +1.88 check --locked --workspace --all-targets --all-features
 
-  deny:
-    name: cargo-deny
+  coverage:
+    name: Coverage (Linux)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -55,10 +67,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: "1.94"
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
         with:
-          tool: cargo-deny@0.20.2
-      - run: cargo deny --locked check
+          tool: cargo-llvm-cov@0.8.7
+      # Reported, not gated beyond a floor well under the measured baseline
+      # (82% lines at the time this job was added): coverage should inform
+      # review, not block work that happens to touch a well-covered file.
+      - name: Measure coverage
+        run: cargo llvm-cov --locked --workspace --all-features --summary-only --fail-under-lines 75
 
   extension:
     name: Status extension typecheck

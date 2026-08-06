@@ -1,4 +1,25 @@
-# Remaining improvement plan
+# Remaining improvement plan (HISTORICAL)
+
+> **This is no longer the roadmap.** It is the original Phase 1–7 handoff plan,
+> and its status claims below are stale — the project has been substantially
+> rewritten since, and the audit that drives current work re-derived everything
+> from the code as it now stands.
+>
+> **Start at [ROADMAP.md](ROADMAP.md).** The live item list is
+> [BACKLOG.md](BACKLOG.md) and the execution order is [PLAN.md](PLAN.md).
+>
+> Nothing here was discarded. Everything still live was carried across:
+> concrete defects became backlog items with IDs; the Phase 3 transcript
+> contract, the §6.3 open decisions about incomplete public paths, the §6.4
+> extension-dependency migration and the Phase 7 projects are preserved in
+> [ROADMAP.md](ROADMAP.md) under "Open decisions carried over" and
+> "Longer-horizon work not in the backlog"; the §6.7 release decision is
+> answered by [RELEASING.md](RELEASING.md); and the per-phase rules are
+> [ROADMAP.md](ROADMAP.md)'s "Standing rules".
+>
+> This file is retained as the record of the original phase design and its
+> completion checklists — useful when asking *why* something was built the way
+> it was, not *what to do next*.
 
 This document is the handoff plan for work remaining after the Phase 1 safety pass. It is intentionally split into reviewable phases so a new coding session can implement one phase without redesigning the whole project.
 
@@ -696,6 +717,6 @@ Copy this into a new coding session and replace `PHASE_NUMBER`:
 Read AGENTS.md, README.md, docs/DAEMON.md, and docs/REMAINING_WORK.md completely. Inspect git status and the existing Phase 1 diff; do not revert or reimplement it. Implement only Phase PHASE_NUMBER from docs/REMAINING_WORK.md, keeping the change narrow and preserving the documented shell-command semantics. Add the required regression tests and update protocol version/docs when applicable. Run cargo fmt, locked workspace tests, locked workspace clippy with -D warnings, cargo audit, cargo-deny, the Rust 1.88 check, extension typecheck, actionlint, and the Nix check. Report changed paths, design decisions, validation, and any explicitly deferred item.
 ```
 
-## Recommended next action
+## Recommended next action (as of the original handoff — see [PLAN.md](PLAN.md) for the current order)
 
 Finish the deferred **Phase 3.3 production status-bridge reconnect/finalization test and cleanup**, then the **Phase 3.4 authoritative Pi/Claude transcript event contract and restart test**. Do not proceed on the assumption that raw PTY bytes or process stdout read chunks are structured message boundaries. The other Phase 3 foundations are implemented, but the phase remains partial until these items are complete.

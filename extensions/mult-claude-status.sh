@@ -33,6 +33,13 @@ generation=${MULT_AGENT_GENERATION:-}
 # hexadecimal/numeric vocabularies. The status argument is fixed in generated
 # settings. Append atomically for these sub-PIPE_BUF records and never create a
 # missing parent/file, so a cleaned stale generation cannot be resurrected.
+#
+# `sh` has no O_NOFOLLOW, so refuse a symlink explicitly: `[ -f ]` follows one,
+# and `>>` would then append through it. This is the same check-then-use window
+# the size test already has, and it is only reachable inside a directory mult
+# has certified 0700-and-owned — but appending through a link is exactly the
+# discipline the rest of the journal path keeps.
+[ -h "$path" ] && exit 0
 [ -f "$path" ] || exit 0
 size=$(wc -c <"$path" 2>/dev/null || printf '%s' 1048577)
 [ "$size" -lt 1048576 ] 2>/dev/null || exit 0

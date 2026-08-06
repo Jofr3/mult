@@ -1,4 +1,11 @@
-# mult — improvement backlog
+# mult — improvement backlog (v1, HISTORICAL)
+
+> **Superseded. Do not read this as current work.** Every item here was
+> re-triaged against the rewritten `main`; the live list is
+> [BACKLOG.md](BACKLOG.md) and the roadmap front door is
+> [ROADMAP.md](ROADMAP.md). Several remedies proposed below are now *wrong*
+> (`F1`, `C1`, `A3`/`C12`, `F11` — see "Decisions recorded" in BACKLOG.md).
+> Retained as evidence for the items that carried over.
 
 Consolidated from a five-track audit (correctness, architecture, security, tests/perf,
 UX/docs/tooling) run on 2026-08-05 against commit `0224885`.

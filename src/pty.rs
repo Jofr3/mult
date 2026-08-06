@@ -1,8 +1,10 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     io::{self, Write},
-    os::unix::{io::AsRawFd, net::UnixStream, process::CommandExt},
+    os::unix::{net::UnixStream, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -14,13 +16,15 @@ use std::{
 };
 
 use mult_protocol::{
-    default_socket_path, read_message, write_message, AgentSessionMetadata, AgentStatusError,
-    AgentStatusOutcome, AgentStatusQuery, AgentStatusRecord, AttachError, AttachOutcome,
-    AttachmentLease, ClientMessage, ClientScopeId, CreateError, CreateOutcome,
-    ForegroundProcessInfo, LaunchSpec, LeaseRejectionReason, OutputSequence, PaneId, RequestId,
-    ServerInstanceId, ServerMessage, SessionId, SessionIdentity as WireSessionIdentity,
-    SessionInfo, StateNamespace as WireStateNamespace, StopError, StopOutcome,
-    MAX_PENDING_REQUESTS_PER_CLIENT, PROTOCOL_VERSION, SOCKET_PATH_ENV,
+    default_socket_path,
+    peer::{effective_uid, verify_peer_is_self},
+    read_message, write_message, AgentSessionMetadata, AgentStatusError, AgentStatusOutcome,
+    AgentStatusQuery, AgentStatusRecord, AttachError, AttachOutcome, AttachmentLease,
+    ClientMessage, ClientScopeId, CreateError, CreateOutcome, ForegroundProcessInfo, LaunchSpec,
+    LeaseRejectionReason, OutputSequence, PaneId, RequestId, ServerInstanceId, ServerMessage,
+    SessionId, SessionIdentity as WireSessionIdentity, SessionInfo,
+    StateNamespace as WireStateNamespace, StopError, StopOutcome, MAX_PENDING_REQUESTS_PER_CLIENT,
+    PROTOCOL_VERSION, SOCKET_PATH_ENV,
 };
 use vt100::{MouseProtocolEncoding, MouseProtocolMode, Parser};
 
@@ -134,6 +138,13 @@ pub struct PtyRuntime {
     next_request_id: Option<RequestId>,
     pending_requests: HashSet<RequestId>,
     deferred_messages: VecDeque<ServerMessage>,
+    // Escape sequences addressed to the *user's own* terminal rather than to a
+    // pane — today only OSC 52 clipboard writes. They are queued here because
+    // every input handler already carries `&mut PtyRuntime`, and the render
+    // loop (which owns the frame's writer) drains them immediately after
+    // `Terminal::draw`, so they leave through the frame's output path instead
+    // of a separate `io::stdout()` handle grabbed mid-handler.
+    host_terminal_writes: Vec<u8>,
     // The terminal currently being created by `start`, if any. It is excluded
     // from reconnect re-attach because its session does not exist on the server
     // until `start`'s own CreateSession completes.
@@ -153,6 +164,13 @@ const TERMINAL_SCROLLBACK_LINES: usize = 5_000;
 const TERMINAL_MAX_CSI_SEQUENCE_BYTES: usize = 128;
 const PRIMARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[?1;2c";
 const DEVICE_STATUS_OK_RESPONSE: &[u8] = b"\x1b[0n";
+/// Ceiling on terminal-query answers produced from one chunk of PTY output.
+/// See [`feed_parser_with_responder`].
+const MAX_TERMINAL_QUERY_RESPONSES_PER_CHUNK: usize = 8;
+/// Ceiling on the coalesced answer payload for one chunk of PTY output.
+const MAX_TERMINAL_QUERY_RESPONSE_BYTES: usize = 256;
+/// Ceiling on sequences queued for the host terminal between two frames.
+const MAX_HOST_TERMINAL_WRITE_BYTES: usize = 1024 * 1024;
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 /// xterm button bytes reported for the scroll wheel (bit 6 set marks a wheel
@@ -254,6 +272,7 @@ impl PtyRuntime {
             next_request_id: Some(RequestId::MIN),
             pending_requests: HashSet::new(),
             deferred_messages: VecDeque::new(),
+            host_terminal_writes: Vec::new(),
             starting: None,
         }
     }
@@ -438,12 +457,12 @@ impl PtyRuntime {
             return;
         }
 
-        let responses = {
+        let response = {
             let parser = self
                 .parsers
                 .entry(terminal)
                 .or_insert_with(|| Parser::new(24, 80, TERMINAL_SCROLLBACK_LINES));
-            let responses = if respond {
+            let response = if respond {
                 let responder = self.responders.entry(terminal).or_default();
                 feed_parser_with_responder(parser, responder, bytes)
             } else {
@@ -455,19 +474,40 @@ impl PtyRuntime {
                 Vec::new()
             };
             clamp_parser_scrollback(parser);
-            responses
+            response
         };
 
         self.terminals_with_output.insert(terminal);
+        if response.is_empty() {
+            return;
+        }
+        // One write per output chunk, never one per query: this runs on the
+        // render thread, where every `Input` message is a blocking socket
+        // write.
         if let Some(pane) = self.terminal_to_pane.get(&terminal).copied() {
-            for response in responses {
-                let _ = self.send_input_inner(terminal, pane, &response, false);
-            }
+            let _ = self.send_input_inner(terminal, pane, &response, false);
         }
     }
 
+    /// Queue an escape sequence for the terminal `mult` itself is drawn on.
+    ///
+    /// Bounded, so a pathological producer cannot grow the queue without limit
+    /// between two frames; an over-budget write is dropped rather than
+    /// truncated, since half an escape sequence is worse than none.
+    pub fn queue_host_terminal_write(&mut self, bytes: &[u8]) {
+        if self.host_terminal_writes.len() + bytes.len() <= MAX_HOST_TERMINAL_WRITE_BYTES {
+            self.host_terminal_writes.extend_from_slice(bytes);
+        }
+    }
+
+    /// Take everything queued for the host terminal. The render loop calls this
+    /// after drawing a frame; see [`PtyRuntime::queue_host_terminal_write`].
+    pub fn take_host_terminal_writes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.host_terminal_writes)
+    }
+
     pub fn append_terminal_system_line(&mut self, terminal: PtyKey, message: impl AsRef<str>) {
-        let line = format!("[mult] {}\r\n", message.as_ref());
+        let line = format!("[mult] {}\r\n", sanitize_system_line(message.as_ref()));
         self.process_terminal_output(terminal, line.as_bytes());
     }
 
@@ -1568,7 +1608,7 @@ impl PtyRuntime {
         } else {
             UnixStream::connect(&self.socket_path)?
         };
-        validate_peer_owner(&stream, "mult-server")?;
+        verify_peer_is_self(&stream, "mult-server")?;
         stream.set_nonblocking(false)?;
         let mut writer_stream = stream.try_clone()?;
         write_message(
@@ -1923,7 +1963,7 @@ impl TerminalResponseDetector {
         matches!(self.state, TerminalResponseState::Ground)
     }
 
-    fn advance(&mut self, byte: u8, screen: &vt100::Screen) -> Option<Vec<u8>> {
+    fn advance(&mut self, byte: u8, screen: &vt100::Screen) -> Option<TerminalQueryResponse> {
         let state = std::mem::take(&mut self.state);
         let (next, response) = match state {
             TerminalResponseState::Ground => match byte {
@@ -1938,7 +1978,9 @@ impl TerminalResponseDetector {
                 b'(' | b')' | b'*' | b'+' => (TerminalResponseState::IgnoreOne, None),
                 b'Z' => (
                     TerminalResponseState::Ground,
-                    Some(PRIMARY_DEVICE_ATTRIBUTES_RESPONSE.to_vec()),
+                    Some(TerminalQueryResponse::device(
+                        PRIMARY_DEVICE_ATTRIBUTES_RESPONSE.to_vec(),
+                    )),
                 ),
                 _ => (TerminalResponseState::Ground, None),
             },
@@ -1972,18 +2014,78 @@ impl TerminalResponseDetector {
     }
 }
 
-/// Feed `bytes` to `parser` while letting `responder` answer terminal queries.
+/// Neutralize control characters in text that did not come from the pane's own
+/// program.
+///
+/// A `[mult]` system line carries strings the daemon supplied — a
+/// `PtyEvent::Error` message, an `ExitInfo::signal` name — straight into the
+/// emulator via `parser.process`. Left raw, an escape sequence inside one could
+/// clear the screen, reposition the cursor, or repaint the pane to imitate
+/// output that never happened. Every C0/C1 control and DEL becomes U+FFFD:
+/// visible, inert, and length-preserving, so the spoof attempt shows up rather
+/// than disappearing.
+fn sanitize_system_line(message: &str) -> String {
+    message
+        .chars()
+        .map(|ch| if ch.is_control() { '\u{fffd}' } else { ch })
+        .collect()
+}
+
+/// An answer this client sends back to a program that queried the terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalQueryResponse {
+    kind: TerminalQueryKind,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalQueryKind {
+    /// A cursor position report. Its content depends on where the cursor is,
+    /// and within one chunk of output that does not change between the
+    /// queries, so repeating it conveys nothing.
+    CursorPosition,
+    /// Device attributes or device status: a fixed answer.
+    Device,
+}
+
+impl TerminalQueryResponse {
+    fn device(bytes: Vec<u8>) -> Self {
+        Self {
+            kind: TerminalQueryKind::Device,
+            bytes,
+        }
+    }
+
+    fn cursor_position(bytes: Vec<u8>) -> Self {
+        Self {
+            kind: TerminalQueryKind::CursorPosition,
+            bytes,
+        }
+    }
+}
+
+/// Feed `bytes` to `parser` while letting `responder` answer terminal queries,
+/// returning the answers coalesced into a single input payload.
+///
 /// While the responder is idle (Ground) no query can begin until an escape, so
 /// the run of bytes up to the next ESC is fed in a single `process` call; only
 /// escape sequences are stepped one byte at a time, which is what the responder
 /// needs to report state such as the cursor position at the exact query point.
 /// This is behaviourally identical to feeding every byte individually.
+///
+/// The answers are bounded, because a chunk of PTY output is chosen by whatever
+/// is running in the pane: 8 KiB of `\x1b[6n` used to become ~2048 separate
+/// `Input` messages, each a blocking socket write on the render thread. At most
+/// one cursor report and [`MAX_TERMINAL_QUERY_RESPONSES_PER_CHUNK`] answers in
+/// total are produced per chunk, and the payload itself is capped.
 fn feed_parser_with_responder(
     parser: &mut Parser,
     responder: &mut TerminalResponseDetector,
     bytes: &[u8],
-) -> Vec<Vec<u8>> {
-    let mut responses = Vec::new();
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    let mut answered = 0_usize;
+    let mut cursor_reported = false;
     let mut index = 0;
     while index < bytes.len() {
         if responder.is_ground() {
@@ -2000,32 +2102,44 @@ fn feed_parser_with_responder(
         let byte = bytes[index];
         parser.process(std::slice::from_ref(&byte));
         if let Some(response) = responder.advance(byte, parser.screen()) {
-            responses.push(response);
+            let repeated_cursor =
+                cursor_reported && response.kind == TerminalQueryKind::CursorPosition;
+            let over_budget = answered >= MAX_TERMINAL_QUERY_RESPONSES_PER_CHUNK
+                || payload.len() + response.bytes.len() > MAX_TERMINAL_QUERY_RESPONSE_BYTES;
+            if !repeated_cursor && !over_budget {
+                cursor_reported |= response.kind == TerminalQueryKind::CursorPosition;
+                answered += 1;
+                payload.extend_from_slice(&response.bytes);
+            }
         }
         index += 1;
     }
-    responses
+    payload
 }
 
 fn csi_terminal_response(
     sequence: &[u8],
     final_char: char,
     screen: &vt100::Screen,
-) -> Option<Vec<u8>> {
+) -> Option<TerminalQueryResponse> {
     let private = sequence.contains(&b'?');
     let params = parse_csi_params(sequence);
     match final_char {
-        'c' if !private && param_or_default(&params, 0, 0) == 0 => {
-            Some(PRIMARY_DEVICE_ATTRIBUTES_RESPONSE.to_vec())
-        }
+        'c' if !private && param_or_default(&params, 0, 0) == 0 => Some(
+            TerminalQueryResponse::device(PRIMARY_DEVICE_ATTRIBUTES_RESPONSE.to_vec()),
+        ),
         'n' if !private => match param_or_default(&params, 0, 0) {
-            5 => Some(DEVICE_STATUS_OK_RESPONSE.to_vec()),
-            6 => Some(cursor_position_report(screen, false)),
+            5 => Some(TerminalQueryResponse::device(
+                DEVICE_STATUS_OK_RESPONSE.to_vec(),
+            )),
+            6 => Some(TerminalQueryResponse::cursor_position(
+                cursor_position_report(screen, false),
+            )),
             _ => None,
         },
-        'n' if private && param_or_default(&params, 0, 0) == 6 => {
-            Some(cursor_position_report(screen, true))
-        }
+        'n' if private && param_or_default(&params, 0, 0) == 6 => Some(
+            TerminalQueryResponse::cursor_position(cursor_position_report(screen, true)),
+        ),
         _ => None,
     }
 }
@@ -2241,59 +2355,6 @@ fn is_reconciliation_uncertain(error: &io::Error) -> bool {
     )
 }
 
-fn validate_peer_owner(stream: &UnixStream, peer_label: &str) -> io::Result<()> {
-    let Some(peer_uid) = peer_uid(stream)? else {
-        return Ok(());
-    };
-    let current_uid = current_euid();
-    if uid_matches_peer(peer_uid, current_uid) {
-        return Ok(());
-    }
-
-    Err(io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        format!("rejecting {peer_label} uid {peer_uid}; expected current uid {current_uid}"),
-    ))
-}
-
-#[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> io::Result<Option<u32>> {
-    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            credentials.as_mut_ptr().cast(),
-            &mut length,
-        )
-    };
-    if result == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    if length < std::mem::size_of::<libc::ucred>() as libc::socklen_t {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "short SO_PEERCRED response",
-        ));
-    }
-    Ok(Some(unsafe { credentials.assume_init().uid }))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn peer_uid(_stream: &UnixStream) -> io::Result<Option<u32>> {
-    Ok(None)
-}
-
-fn current_euid() -> u32 {
-    unsafe { libc::geteuid() as u32 }
-}
-
-fn uid_matches_peer(peer_uid: u32, current_uid: u32) -> bool {
-    peer_uid == current_uid
-}
-
 fn connect_or_spawn_server(path: &Path) -> io::Result<UnixStream> {
     match UnixStream::connect(path) {
         Ok(stream) => Ok(stream),
@@ -2341,15 +2402,36 @@ fn autospawn_enabled() -> bool {
     )
 }
 
+/// Environment variables an autospawned daemon may inherit.
+///
+/// The daemon outlives the client that started it and passes its own
+/// environment to every PTY it later spawns — for *every* client that connects
+/// afterwards. Inheriting this client's full environment therefore takes
+/// whatever secrets happen to be exported in the first shell that ever ran
+/// `mult` (API keys, tokens, agent credentials) and re-exports them into every
+/// pane of every later session. Only what a daemon and its login shells
+/// genuinely need is forwarded.
+const SERVER_ENV_ALLOW_LIST: &[&str] =
+    &["PATH", "HOME", "SHELL", "USER", "LOGNAME", "TERM", "LANG"];
+/// Prefixes forwarded wholesale: locale categories, and `mult`'s own settings
+/// (including `MULT_SOCKET_PATH`, which is also set explicitly below).
+const SERVER_ENV_ALLOW_PREFIXES: &[&str] = &["LC_", "MULT_"];
+
 fn spawn_server(socket_path: &Path) -> io::Result<()> {
     let server = server_executable().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            "could not locate mult-server next to the mult executable; run `mult-server` manually",
+            "could not locate a trusted mult-server next to the mult executable; run `mult-server` manually",
         )
     })?;
 
     let mut command = Command::new(server);
+    command.env_clear();
+    for (key, value) in env::vars_os() {
+        if server_env_is_allowed(&key) {
+            command.env(key, value);
+        }
+    }
     command
         .env(SOCKET_PATH_ENV, socket_path)
         .stdin(Stdio::null())
@@ -2357,6 +2439,16 @@ fn spawn_server(socket_path: &Path) -> io::Result<()> {
         .stderr(Stdio::null());
     detach_autospawned_server(&mut command);
     command.spawn().map(|_| ())
+}
+
+fn server_env_is_allowed(key: &OsStr) -> bool {
+    let Some(key) = key.to_str() else {
+        return false;
+    };
+    SERVER_ENV_ALLOW_LIST.contains(&key)
+        || SERVER_ENV_ALLOW_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
 }
 
 fn detach_autospawned_server(command: &mut Command) {
@@ -2398,7 +2490,43 @@ fn server_executable() -> Option<PathBuf> {
     }
 
     path.set_file_name(server_executable_name());
-    Some(path)
+    is_trusted_executable(&path).then_some(path)
+}
+
+/// Whether a binary this client is about to *execute* is beyond the reach of
+/// other local users.
+///
+/// Autospawn resolves the daemon purely by filename next to `current_exe()`, so
+/// the check is on the file it will actually run: a regular file owned by this
+/// user or by root, with no group/other write bit. The parent directory is
+/// checked the same way — a writable directory means the name (or a symlink
+/// standing in for it) can simply be replaced, which is the same attack one
+/// level up. Symlinks are followed on purpose: packaged installs (Nix profiles,
+/// `cargo install` shims) legitimately link into a store, and both the link's
+/// directory and the target are validated.
+fn is_trusted_executable(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let owner_is_trusted = |uid: u32| uid == effective_uid() || uid == 0;
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file()
+        || !owner_is_trusted(metadata.uid())
+        || metadata.mode() & 0o022 != 0
+    {
+        return false;
+    }
+
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(parent_metadata) = fs::metadata(parent) else {
+        return false;
+    };
+    parent_metadata.file_type().is_dir()
+        && owner_is_trusted(parent_metadata.uid())
+        && parent_metadata.mode() & 0o022 == 0
 }
 
 fn server_executable_name() -> &'static str {
@@ -2646,6 +2774,7 @@ mod tests {
             next_request_id: Some(RequestId::MIN),
             pending_requests: HashSet::new(),
             deferred_messages: VecDeque::new(),
+            host_terminal_writes: Vec::new(),
             starting: None,
         };
         runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
@@ -2699,12 +2828,7 @@ mod tests {
     fn peer_owner_check_accepts_same_user_socket_pair() {
         let (client, _server) = UnixStream::pair().expect("create socket pair");
 
-        validate_peer_owner(&client, "test peer").expect("same uid peer is accepted");
-        assert!(uid_matches_peer(current_euid(), current_euid()));
-        assert!(!uid_matches_peer(
-            current_euid().saturating_add(1),
-            current_euid()
-        ));
+        verify_peer_is_self(&client, "test peer").expect("same uid peer is accepted");
     }
 
     #[test]
@@ -3025,6 +3149,7 @@ mod tests {
             next_request_id: Some(RequestId::MIN),
             pending_requests: HashSet::new(),
             deferred_messages: VecDeque::new(),
+            host_terminal_writes: Vec::new(),
             starting: None,
         };
         let server = thread::spawn(move || {
@@ -3333,6 +3458,7 @@ mod tests {
             next_request_id: Some(RequestId::MIN),
             pending_requests: HashSet::new(),
             deferred_messages: VecDeque::new(),
+            host_terminal_writes: Vec::new(),
             starting: None,
         };
 
@@ -3544,6 +3670,96 @@ mod tests {
                 lease: test_lease(),
                 bytes: b"\x1b[1;4R".to_vec(),
             }
+        );
+    }
+
+    #[test]
+    fn a_system_line_cannot_carry_control_sequences_into_the_emulator() {
+        let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::Terminal(TerminalId(9));
+        let mut runtime = unattached_test_runtime(client_stream, receiver);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 4, cols: 40 });
+        runtime.process_terminal_output(terminal, b"genuine pane output\r\n");
+
+        // A daemon-supplied message that tries to erase the screen and forge a
+        // line of its own.
+        runtime.append_terminal_system_line(terminal, "\x1b[2J\x1b[Hexit 0\u{7}");
+
+        let lines = runtime.terminal_lines(terminal);
+        assert_eq!(
+            lines[0], "genuine pane output",
+            "the earlier output must survive: the escape never reached the parser"
+        );
+        assert_eq!(lines[1], "[mult] \u{fffd}[2J\u{fffd}[Hexit 0\u{fffd}");
+    }
+
+    #[test]
+    fn a_flood_of_queries_produces_one_bounded_write() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::Terminal(TerminalId(9));
+        let pane = PaneId(9);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
+
+        // 8 KiB of cursor-position queries: once ~2048 separate blocking socket
+        // writes from the render thread.
+        let flood = b"\x1b[6n".repeat(2048);
+        sender
+            .send(ServerMessage::PtyOutput {
+                pane,
+                lease: test_lease(),
+                sequence: OutputSequence::ZERO,
+                bytes: flood,
+            })
+            .expect("send query flood");
+
+        let _ = runtime.drain_events();
+        let message = read_client_message(&mut server_stream, "reading coalesced response");
+
+        let ClientMessage::Input { bytes, .. } = &message else {
+            panic!("expected a single coalesced Input, got {message:?}");
+        };
+        assert_eq!(
+            bytes,
+            &b"\x1b[1;1R".to_vec(),
+            "one cursor report answers the whole chunk"
+        );
+        assert!(bytes.len() <= MAX_TERMINAL_QUERY_RESPONSE_BYTES);
+
+        // Nothing else was written: the flood cost exactly one message.
+        server_stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("set read timeout");
+        let mut extra = [0_u8; 1];
+        assert!(
+            std::io::Read::read(&mut server_stream, &mut extra).is_err(),
+            "the flood must not produce a second write"
+        );
+    }
+
+    #[test]
+    fn mixed_queries_are_coalesced_into_one_payload() {
+        let mut parser = Parser::new(2, 8, TERMINAL_SCROLLBACK_LINES);
+        let mut responder = TerminalResponseDetector::default();
+
+        // Distinct queries are all answered, in order, in one payload.
+        let payload = feed_parser_with_responder(&mut parser, &mut responder, b"\x1b[c\x1b[5n");
+
+        let mut expected = PRIMARY_DEVICE_ATTRIBUTES_RESPONSE.to_vec();
+        expected.extend_from_slice(DEVICE_STATUS_OK_RESPONSE);
+        assert_eq!(payload, expected);
+
+        // The overall cap bounds even a flood of *answerable, distinct* queries.
+        let payload = feed_parser_with_responder(
+            &mut parser,
+            &mut responder,
+            &b"\x1b[c".repeat(MAX_TERMINAL_QUERY_RESPONSES_PER_CHUNK + 4),
+        );
+        assert_eq!(
+            payload.len(),
+            PRIMARY_DEVICE_ATTRIBUTES_RESPONSE.len() * MAX_TERMINAL_QUERY_RESPONSES_PER_CHUNK
         );
     }
 
@@ -4072,6 +4288,78 @@ mod tests {
         fs::remove_file(&regular_file).expect("remove collision file");
     }
 
+    #[test]
+    fn autospawned_server_environment_is_an_allow_list() {
+        for allowed in [
+            "PATH",
+            "HOME",
+            "SHELL",
+            "USER",
+            "LOGNAME",
+            "TERM",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "MULT_SOCKET_PATH",
+            "MULT_SERVER_AUTOSPAWN",
+        ] {
+            assert!(
+                server_env_is_allowed(OsStr::new(allowed)),
+                "{allowed} is needed by the daemon"
+            );
+        }
+
+        // The whole point: secrets in the first client's shell must not become
+        // the long-lived daemon's environment, and thus every later pane's.
+        for denied in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "SSH_AUTH_SOCK",
+            "GITHUB_TOKEN",
+            "PATH_EXTRA",
+            "MULTIPASS",
+        ] {
+            assert!(
+                !server_env_is_allowed(OsStr::new(denied)),
+                "{denied} must not reach the daemon"
+            );
+        }
+    }
+
+    #[test]
+    fn only_an_unwritable_daemon_binary_is_trusted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = unique_socket_path().with_extension("bin");
+        fs::create_dir_all(&directory).expect("create binary directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))
+            .expect("restrict directory");
+        let binary = directory.join("mult-server");
+        fs::write(&binary, b"#!/bin/sh\n").expect("write binary");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("mark executable");
+
+        assert!(is_trusted_executable(&binary));
+        assert!(!is_trusted_executable(&directory));
+        assert!(!is_trusted_executable(&directory.join("absent")));
+
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o777)).expect("widen binary");
+        assert!(
+            !is_trusted_executable(&binary),
+            "a world-writable daemon binary must never be executed"
+        );
+
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("restore binary");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777))
+            .expect("widen directory");
+        assert!(
+            !is_trusted_executable(&binary),
+            "a world-writable directory lets the binary be replaced"
+        );
+
+        fs::remove_dir_all(&directory).expect("remove binary directory");
+    }
+
     fn unattached_test_runtime(
         client_stream: UnixStream,
         receiver: Receiver<ServerMessage>,
@@ -4100,6 +4388,7 @@ mod tests {
             next_request_id: Some(RequestId::MIN),
             pending_requests: HashSet::new(),
             deferred_messages: VecDeque::new(),
+            host_terminal_writes: Vec::new(),
             starting: None,
         }
     }

@@ -1,6 +1,8 @@
 # mult — improvement plan (v2, rebased)
 
 Execution plan for [BACKLOG.md](BACKLOG.md), rebased onto `main` at `2a91632`.
+Start at [ROADMAP.md](ROADMAP.md) — it is the entry point for this plan, the
+backlog, the standing rules, and the open decisions that are not yet items.
 Superseded v1 artifacts: [BACKLOG-v1.md](BACKLOG-v1.md), [PLAN-v1.md](PLAN-v1.md).
 
 ## Ground rules
@@ -209,7 +211,7 @@ tag↔version and runs tests before publishing; the docs tree has one roadmap.
 | R1 | Daemon lock discipline and pane lifecycle | done |
 | R2 | Client responsiveness | todo |
 | R3 | Idle cost and save discipline | todo |
-| R4 | Security | todo |
+| R4 | Security | done |
 | R5 | Emulator panics and fuzzing | todo |
 | R6 | Render performance | done |
 | R7 | CLI, error surfacing and config validation | todo |
@@ -217,4 +219,4 @@ tag↔version and runs tests before publishing; the docs tree has one roadmap.
 | R9 | Architecture, mechanical | todo |
 | R10 | Architecture, structural | todo |
 | R11 | Tests | todo |
-| R12 | CI, docs and release | todo |
+| R12 | CI, docs and release | done |

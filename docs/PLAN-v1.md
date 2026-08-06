@@ -1,6 +1,10 @@
-# mult — improvement plan
+# mult — improvement plan (v1, HISTORICAL)
 
-Execution plan for [BACKLOG.md](BACKLOG.md). Work proceeds in vertical slices, one at a
+> **Superseded. Do not read this as current work.** The live execution plan is
+> [PLAN.md](PLAN.md); the roadmap front door is [ROADMAP.md](ROADMAP.md).
+> Retained for provenance only.
+
+Execution plan for [BACKLOG-v1.md](BACKLOG-v1.md). Work proceeds in vertical slices, one at a
 time, each landing as an independently reviewable, buildable change.
 
 ## Ground rules

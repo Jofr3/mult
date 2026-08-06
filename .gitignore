@@ -3,3 +3,26 @@
 /.direnv
 *.log
 extensions/node_modules
+
+# Machine-local Claude Code overrides. A shared `.claude/settings.json` would
+# be tracked; this file is per-checkout and must not be.
+.claude/settings.local.json
+
+# State files moved aside by the corrupt-state recovery path (src/storage.rs).
+*.corrupt-*
+
+# `insta` writes these next to src/snapshots/*.snap when a snapshot changes;
+# they are accepted with `cargo insta accept`, never committed.
+src/snapshots/*.snap.new
+
+# cargo-fuzz builds and findings (the `fuzz/` crate is outside the workspace).
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+
+# Editor and OS scratch.
+/.idea
+/.vscode
+/.zed
+*.swp
+.DS_Store
