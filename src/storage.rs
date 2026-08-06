@@ -13,7 +13,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use mult_protocol::peer::effective_uid;
+use mult_protocol::{invalid_data, peer::effective_uid};
 use serde::Deserialize;
 
 use crate::{
@@ -190,8 +190,10 @@ impl StateStore {
         let bytes = match self.read_state_bytes()? {
             Some(bytes) => bytes,
             None => {
+                // No state file at all: this is a genuine first run, and the
+                // only path that seeds a starter project (F12).
                 return Ok(LoadedState {
-                    state: ProjectState::try_default_with(source)?,
+                    state: ProjectState::try_first_run_with(source)?,
                     needs_save: true,
                     notice: None,
                 });
@@ -224,7 +226,10 @@ impl StateStore {
             }
             Err(StateDecodeError::InvalidJson(error)) => {
                 // Construct the replacement first. Entropy failure therefore
-                // leaves the invalid source exactly where it was.
+                // leaves the invalid source exactly where it was. The
+                // replacement is *empty*, never the first-run seed: the notice
+                // below says the user's project could not be read, and demo
+                // workspaces underneath it would read as recovered data (F12).
                 let state = ProjectState::try_default_with(source)?;
                 let backup = self.backup_invalid_state(&error)?;
                 Ok(LoadedState {
@@ -927,10 +932,6 @@ fn c_string(value: &OsStr) -> io::Result<CString> {
     })
 }
 
-fn invalid_data(error: serde_json::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1025,7 +1026,7 @@ mod tests {
         let path = parent.join("state.json");
         let store =
             StateStore::acquire(StatePaths::from_explicit_path(path.clone()).unwrap()).unwrap();
-        let mut state = ProjectState::try_default().unwrap();
+        let mut state = ProjectState::try_first_run().unwrap();
         store.save(&state).unwrap();
 
         fs::rename(&parent, &moved_parent).unwrap();
@@ -1089,6 +1090,14 @@ mod tests {
         assert!(loaded.needs_save);
         assert_eq!(loaded.state.version, STATE_VERSION);
         loaded.state.validate_session_identities().unwrap();
+        // F12: an absent file is the one and only first run, so this is the one
+        // and only path that seeds a starter project — and it says nothing,
+        // because nothing went wrong.
+        assert!(loaded.notice.is_none());
+        assert!(
+            !loaded.state.workspaces.is_empty(),
+            "a first run still gets its starter workspaces"
+        );
     }
 
     #[test]
@@ -1182,17 +1191,22 @@ mod tests {
 
         assert!(loaded.needs_save);
         assert_eq!(loaded.state.version, STATE_VERSION);
-        // The whole file is discarded, not just the field that failed: what
-        // comes back is the built-in default state, workspaces and all.
-        let fresh = ProjectState::try_default().expect("fresh default state");
-        let names = |state: &ProjectState| {
-            state
+        // The whole file is discarded, not just the field that failed. What
+        // comes back is *empty* (F12): the notice says the project could not be
+        // read, and the `mult`/`website` first-run seed underneath it would
+        // have read as recovered data that no longer exists.
+        assert!(
+            loaded.state.workspaces.is_empty(),
+            "recovery must not fabricate a project: {:?}",
+            loaded.state.workspaces
+        );
+        assert!(
+            !ProjectState::try_first_run()
+                .expect("first-run project")
                 .workspaces
-                .iter()
-                .map(|workspace| workspace.name.clone())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(names(&loaded.state), names(&fresh));
+                .is_empty(),
+            "the seed still exists, it is just not on this path"
+        );
         assert!(!path.exists(), "the invalid file is moved, not rewritten");
 
         let backups = fs::read_dir(&root)

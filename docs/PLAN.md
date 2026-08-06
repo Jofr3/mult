@@ -229,7 +229,7 @@ tag↔version and runs tests before publishing; the docs tree has one roadmap.
 | R7a | CLI, config validation and state recovery | done |
 | R7b | Status surface and in-app affordances | done |
 | R8 | Interaction affordances | todo |
-| R9 | Architecture, mechanical | todo |
+| R9 | Architecture, mechanical | done |
 | R10 | Architecture, structural | todo |
 | R11 | Tests | done |
 | R12 | CI, docs and release | done |

@@ -263,6 +263,17 @@ impl AgentKind {
             Self::ClaudeCode => "Claude Code",
         }
     }
+
+    /// The `config.json` keys that select and auto-start this backend, as
+    /// `(command, auto_start)`. The chat pane names them when the agent has
+    /// not started; before F18 it named `pi`'s pair whatever the chat's kind
+    /// actually was.
+    pub fn config_keys(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Pi => ("pi_agent_command", "auto_start_pi_agent"),
+            Self::ClaudeCode => ("claude_code_command", "auto_start_claude_code_agent"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,13 +354,22 @@ impl Default for ProjectState {
 }
 
 impl ProjectState {
+    /// An empty project with a fresh namespace: no workspaces, and nothing
+    /// read from the environment.
+    ///
+    /// This is what the corrupt-state recovery path returns, which is why it
+    /// is empty (F12). A user whose state file could not be decoded is told so
+    /// by `LoadedState::notice` and starts from nothing; handing them a
+    /// fabricated `website`/`shell` demo project instead read as data recovery
+    /// that had not happened. The seed lives in [`Self::try_first_run_with`],
+    /// which only a genuinely absent state file reaches.
     pub fn try_default() -> io::Result<Self> {
         let mut source = SecureIdentitySource::new()?;
         Self::try_default_with(&mut source)
     }
 
     pub fn try_default_with(source: &mut impl IdentitySource) -> io::Result<Self> {
-        let mut state = Self {
+        Ok(Self {
             version: STATE_VERSION,
             namespace: generate_identity(source, |_| false)?,
             session_identities: SessionIdentities::default(),
@@ -358,7 +378,21 @@ impl ProjectState {
             next_chat_id: 1,
             next_terminal_id: 1,
             workspaces: Vec::new(),
-        };
+        })
+    }
+
+    /// The project a first run starts from: a workspace for the current
+    /// directory and a demo one, each with one stopped shell.
+    ///
+    /// Called only when no state file existed at all. Anything else — a
+    /// decode failure, a rejected file — is *not* a first run.
+    pub fn try_first_run() -> io::Result<Self> {
+        let mut source = SecureIdentitySource::new()?;
+        Self::try_first_run_with(&mut source)
+    }
+
+    pub fn try_first_run_with(source: &mut impl IdentitySource) -> io::Result<Self> {
+        let mut state = Self::try_default_with(source)?;
 
         let mult = state
             .add_workspace("mult".to_string(), std::env::current_dir().ok())
@@ -609,7 +643,8 @@ impl ProjectState {
     /// Startup no longer creates agent chats, so tests that need a populated
     /// project construct one explicitly via this helper.
     pub(crate) fn seeded() -> Self {
-        let mut state = Self::default();
+        let mut state =
+            Self::try_first_run().expect("secure entropy is required to create project state");
         let mult = state.workspaces[0].id;
         let _ = state
             .add_chat(
@@ -1364,7 +1399,7 @@ mod tests {
 
     #[test]
     fn project_state_round_trips_through_json() {
-        let mut state = ProjectState::default();
+        let mut state = ProjectState::try_first_run().expect("first-run project");
         let workspace = state.workspaces[0].id;
         let chat = state
             .add_chat(
@@ -1388,7 +1423,7 @@ mod tests {
     /// *and* stops reporting a change, so it also stops provoking saves.
     #[test]
     fn a_streamed_message_stops_growing_at_the_cap() {
-        let mut state = ProjectState::default();
+        let mut state = ProjectState::try_first_run().expect("first-run project");
         let workspace = state.workspaces[0].id;
         let chat = state
             .add_chat(
@@ -1451,7 +1486,7 @@ mod tests {
     /// in as well, so the cap cannot be bypassed by sending one huge message.
     #[test]
     fn a_single_oversized_message_is_capped_on_append() {
-        let mut state = ProjectState::default();
+        let mut state = ProjectState::try_first_run().expect("first-run project");
         let workspace = state.workspaces[0].id;
         let chat = state
             .add_chat(
@@ -1495,7 +1530,7 @@ mod tests {
             }
         }
 
-        let mut state = ProjectState::default();
+        let mut state = ProjectState::try_first_run().expect("first-run project");
         let workspace = state.workspaces[0].id;
         let before = state.clone();
         let error = state
@@ -1776,7 +1811,7 @@ mod tests {
 
     #[test]
     fn allocation_skips_colliding_hints() {
-        let mut state = ProjectState::default();
+        let mut state = ProjectState::try_first_run().expect("first-run project");
         state.next_workspace_id = state.workspaces[0].id.0;
         state.next_chat_id = 7;
         state.workspaces[0].chats.push(ChatSession {
@@ -1872,7 +1907,7 @@ mod tests {
     #[test]
     fn reconciling_identities_drops_stale_entries_and_mints_missing_ones() {
         let mut source = SecureIdentitySource::new().unwrap();
-        let mut state = ProjectState::default();
+        let mut state = ProjectState::try_first_run().expect("first-run project");
         let terminal = state.workspaces[0].terminals[0].id;
         let chat = state
             .add_chat(

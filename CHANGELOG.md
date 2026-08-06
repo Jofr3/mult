@@ -686,6 +686,51 @@ and the project aims to adhere to
   is asserted rather than assumed; the notice TTL and cap tests inject the clock,
   so nothing waits on wall time.
 
+### Fixed — chat pane names the right agent (R9)
+
+- An empty Claude Code chat said "Pi agent not started" and told the user to set
+  `pi_agent_command`/`auto_start_pi_agent` — the wrong backend and the wrong two
+  config keys. Both the "not started" and the "waiting for output" lines now name
+  the chat's own agent, and a new `AgentKind::config_keys()` names its own
+  `*_command`/`auto_start_*` pair (`F18`).
+- A user whose state file could not be decoded was handed a fabricated
+  `website`/`shell` demo project on top of the "your state was backed up" notice,
+  which read as data recovery that had not happened. Recovery now starts from an
+  *empty* project plus that notice; the starter workspaces are seeded only when
+  there was no state file at all, which is the only genuine first run (`F12`).
+
+### Changed — architecture, behaviour-preserving (R9)
+
+- `PtyRuntime`'s twelve parallel maps (attachment, lease, watermark, identity,
+  agent metadata, parser, responder, output flag, exit status, foreground
+  process, command tracker, and the pane→key reverse index) are one `PtyPane`
+  per key in `panes`, plus a `pane_index` maintained only by `bind_pane` and
+  `clear_attachment`. Retiring a terminal is now a single map removal, so no
+  lifecycle path can forget a field (`F2`).
+- `PtyRuntime` no longer implements `Default`. It was the production
+  constructor, so `..Default::default()` or a `#[derive(Default)]` on any struct
+  holding one would have connected a socket and forked a daemon silently; the
+  client now constructs it explicitly and the threaded `allow_spawn: bool` is a
+  `SpawnPolicy::{Autospawn, ConnectOnly}` carried through the connector thread
+  (`F3`).
+- The sidebar's render order and its navigation order come from one walk.
+  `App::sidebar_row_iter` emits `SidebarRow::{Spacer, Workspace, Nav}`; `ui`
+  renders those rows and locates the highlight by position in them instead of
+  re-deriving the order by hand, and `nav_iter` is the same walk's selectable
+  rows (`F14`).
+- `default_shell`, `shell_command_args`, `invalid_data` and shell quoting are
+  shared in `mult_protocol` rather than duplicated per crate. The two quoting
+  helpers are kept distinct — `shell::quote_argument` for a command line that is
+  executed, `shell::quote_display_argument` for one that is only shown — because
+  they disagree about `+`, `=` and the empty string, and merging them would have
+  changed both outputs (`F20`).
+- Dead surface removed: `PtyRuntime::{new, scroll_to_top, scroll_to_bottom}`,
+  `App::search_status`, the test-only focus cycle, and the no-op
+  `pane_inner`/`output_area_after_header` pair whose two header constants were
+  both `0`. The duplicate aliases `end_terminal_input`, `normalize_focus` and
+  `selected_output_terminal_id` are gone in favour of `end_pty_input`,
+  `sync_focus_to_selection` and `pty_input_target` (`F17`, `F19`).
+
 ## [0.1.0] - 2026-05-19
 
 Initial prototype: a Ratatui/Crossterm client plus a persistent `mult-server`

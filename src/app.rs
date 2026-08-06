@@ -755,6 +755,19 @@ pub struct ChatBuffer {
     partial_role: Option<ChatMessageRole>,
 }
 
+/// One row of the sidebar, in render order. Only [`SidebarRow::Nav`] rows are
+/// selectable; the others exist to be drawn and to occupy an index, which is
+/// exactly what used to have to be re-derived by hand in `ui` (F14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarRow {
+    /// The blank line separating two workspace groups.
+    Spacer,
+    /// A workspace's header line.
+    Workspace(WorkspaceId),
+    /// A selectable chat or terminal.
+    Nav(NavItem),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavItem {
     Chat {
@@ -768,8 +781,14 @@ pub enum NavItem {
 }
 
 impl Default for App {
+    /// A fresh install's app: the first-run project, not an empty one.
+    /// Production never uses this — `main` builds the `App` from the state
+    /// `storage` loaded — so it exists for tests that want a populated tree.
     fn default() -> Self {
-        Self::new(ProjectState::default())
+        Self::new(
+            ProjectState::try_first_run()
+                .expect("secure entropy is required to create project state"),
+        )
     }
 }
 
@@ -1225,16 +1244,6 @@ impl App {
             .filter(|selection| selection.terminal == terminal)
     }
 
-    pub fn search_status(&self) -> Option<String> {
-        let search = self.active_search.as_ref()?;
-        match search.scope {
-            SearchScope::Chat(_) => self.chat_search_status(),
-            SearchScope::Terminal(_) => {
-                Some(format!("search terminal: active for `{}`", search.query))
-            }
-        }
-    }
-
     /// Note (E12): the transcript this counts against is the structured one,
     /// which only the experimental process-agent backend writes and which
     /// nothing calls today, so the count is `0` for every chat a user can
@@ -1253,16 +1262,6 @@ impl App {
         ))
     }
 
-    #[cfg(test)]
-    pub fn focus_next(&mut self) {
-        self.cycle_focus(false);
-    }
-
-    #[cfg(test)]
-    pub fn focus_previous(&mut self) {
-        self.cycle_focus(true);
-    }
-
     pub fn focus_sidebar(&mut self) {
         self.focus = FocusMode::Sidebar;
     }
@@ -1276,44 +1275,11 @@ impl App {
         true
     }
 
-    #[cfg(test)]
-    fn cycle_focus(&mut self, backwards: bool) {
-        let available = self.available_focus_modes();
-        if available.is_empty() {
-            self.focus = FocusMode::Sidebar;
-            return;
-        }
-
-        let index = available
-            .iter()
-            .position(|focus| *focus == self.focus)
-            .unwrap_or(0);
-        let next = if backwards {
-            index.checked_sub(1).unwrap_or(available.len() - 1)
-        } else {
-            (index + 1) % available.len()
-        };
-        self.focus = available[next];
-    }
-
-    #[cfg(test)]
-    fn available_focus_modes(&self) -> Vec<FocusMode> {
-        let mut modes = vec![FocusMode::Sidebar];
-        if let Some(focus) = self.selected_main_focus() {
-            modes.push(focus);
-        }
-        modes
-    }
-
     fn selected_main_focus(&self) -> Option<FocusMode> {
         match self.selected_item()? {
             NavItem::Chat { .. } => Some(FocusMode::Chat),
             NavItem::Terminal { .. } => Some(FocusMode::Terminal),
         }
-    }
-
-    fn normalize_focus(&mut self) {
-        self.sync_focus_to_selection();
     }
 
     fn sync_focus_to_selection(&mut self) {
@@ -1426,28 +1392,65 @@ impl App {
         self.selected_terminal_id().map(|(_, terminal)| terminal)
     }
 
+    /// The PTY the selected nav item reads and writes: a chat's agent pane or
+    /// a terminal's pane.
     pub fn pty_input_target(&self) -> Option<PtyKey> {
-        self.selected_output_terminal_id()
+        match self.selected_item()? {
+            NavItem::Chat { chat, .. } => Some(PtyKey::ChatAgent(chat)),
+            NavItem::Terminal { terminal, .. } => Some(PtyKey::Terminal(terminal)),
+        }
     }
 
-    /// The single source of truth for sidebar navigation order: each workspace's
-    /// chats followed by its terminals, across all workspaces. Every other nav
-    /// query (`nav_items`/`nav_len`/`nav_item_at`/`nav_item_position`) is defined
-    /// in terms of this iterator so the traversal order is defined once.
-    fn nav_iter(&self) -> impl Iterator<Item = NavItem> + '_ {
-        self.project.workspaces.iter().flat_map(|workspace| {
-            let chats = workspace.chats.iter().map(move |chat| NavItem::Chat {
-                workspace: workspace.id,
-                chat: chat.id,
-            });
-            let terminals = workspace
-                .terminals
-                .iter()
-                .map(move |terminal| NavItem::Terminal {
-                    workspace: workspace.id,
-                    terminal: terminal.id,
+    /// The single source of truth for the sidebar: a blank row between
+    /// workspaces, then each workspace's header, its chats and its terminals.
+    ///
+    /// Both the render order and the navigation order come from this one walk
+    /// (F14). `ui` renders the rows it yields and finds the highlight by
+    /// position in them; every nav query
+    /// (`nav_items`/`nav_len`/`nav_item_at`/`nav_item_position`) is the same
+    /// walk with the non-selectable rows filtered out. Nothing re-derives
+    /// either order by hand, so a change here cannot move the highlight off
+    /// the row it belongs to without a compile error.
+    fn sidebar_row_iter(&self) -> impl Iterator<Item = SidebarRow> + '_ {
+        self.project
+            .workspaces
+            .iter()
+            .enumerate()
+            .flat_map(|(index, workspace)| {
+                let spacer = (index > 0).then_some(SidebarRow::Spacer);
+                let header = std::iter::once(SidebarRow::Workspace(workspace.id));
+                let chats = workspace.chats.iter().map(move |chat| {
+                    SidebarRow::Nav(NavItem::Chat {
+                        workspace: workspace.id,
+                        chat: chat.id,
+                    })
                 });
-            chats.chain(terminals)
+                let terminals = workspace.terminals.iter().map(move |terminal| {
+                    SidebarRow::Nav(NavItem::Terminal {
+                        workspace: workspace.id,
+                        terminal: terminal.id,
+                    })
+                });
+                spacer
+                    .into_iter()
+                    .chain(header)
+                    .chain(chats)
+                    .chain(terminals)
+            })
+    }
+
+    /// The sidebar's rows in render order. Collected rather than lazy because
+    /// the renderer needs both the rows and the highlight's index into them.
+    pub fn sidebar_rows(&self) -> Vec<SidebarRow> {
+        self.sidebar_row_iter().collect()
+    }
+
+    /// The selectable subset of [`Self::sidebar_row_iter`], in the same order:
+    /// each workspace's chats followed by its terminals, across all workspaces.
+    fn nav_iter(&self) -> impl Iterator<Item = NavItem> + '_ {
+        self.sidebar_row_iter().filter_map(|row| match row {
+            SidebarRow::Nav(item) => Some(item),
+            SidebarRow::Spacer | SidebarRow::Workspace(_) => None,
         })
     }
 
@@ -1615,7 +1618,7 @@ impl App {
         }
 
         self.reconcile_selection(previous_index);
-        self.normalize_focus();
+        self.sync_focus_to_selection();
         runtime_terminals
     }
 
@@ -1711,13 +1714,6 @@ impl App {
                 terminal.status = TerminalStatus::Stopped;
                 self.dirty = true;
             }
-        }
-    }
-
-    pub fn selected_output_terminal_id(&self) -> Option<PtyKey> {
-        match self.selected_item()? {
-            NavItem::Chat { chat, .. } => Some(PtyKey::ChatAgent(chat)),
-            NavItem::Terminal { terminal, .. } => Some(PtyKey::Terminal(terminal)),
         }
     }
 
@@ -1893,7 +1889,7 @@ impl App {
         if len > 0 {
             let next = self.selected_index().map_or(0, |index| (index + 1) % len);
             self.selected = self.nav_item_at(next);
-            self.normalize_focus();
+            self.sync_focus_to_selection();
         }
     }
 
@@ -1904,7 +1900,7 @@ impl App {
                 .selected_index()
                 .map_or(len - 1, |index| index.checked_sub(1).unwrap_or(len - 1));
             self.selected = self.nav_item_at(previous);
-            self.normalize_focus();
+            self.sync_focus_to_selection();
         }
     }
 
@@ -1963,10 +1959,6 @@ impl App {
 
         self.focus = FocusMode::Chat;
         true
-    }
-
-    pub fn end_terminal_input(&mut self) {
-        self.sync_focus_to_selection();
     }
 
     pub fn end_pty_input(&mut self) {
@@ -2283,13 +2275,13 @@ impl App {
         } else {
             self.reconcile_selection(self.selected_index());
         }
-        self.normalize_focus();
+        self.sync_focus_to_selection();
     }
 
     fn select_first_item_in_workspace(&mut self, workspace_id: WorkspaceId) -> bool {
         let Some(workspace) = self.project.workspace(workspace_id) else {
             self.reconcile_selection(self.selected_index());
-            self.normalize_focus();
+            self.sync_focus_to_selection();
             return false;
         };
 
@@ -2315,7 +2307,7 @@ impl App {
             true
         } else {
             self.reconcile_selection(self.selected_index());
-            self.normalize_focus();
+            self.sync_focus_to_selection();
             false
         }
     }
@@ -2788,7 +2780,7 @@ mod tests {
 
     #[test]
     fn persisted_stopped_command_requires_deliberate_recovery_until_running() {
-        let mut state = ProjectState::default();
+        let mut state = ProjectState::try_first_run().expect("first-run project");
         let terminal = state.workspaces[0].terminals[0].id;
         state.workspaces[0].terminals[0].launch =
             crate::model::TerminalLaunch::Command("cargo test".to_string());

@@ -12,7 +12,7 @@ use tui_term::widget::{
 use crate::{
     app::{
         App, CommandPaletteEntry, FocusMode, NavItem, OpenWorkspaceMatch, OpenWorkspaceMode,
-        Prompt, SearchScope, TextSelection,
+        Prompt, SearchScope, SidebarRow, TextSelection,
     },
     config::{self, ColorSchemeConfig},
     model::{
@@ -22,8 +22,6 @@ use crate::{
     pty::PtyRuntime,
 };
 
-const CHAT_AGENT_HEADER_LINES: u16 = 0;
-const TERMINAL_HEADER_LINES: u16 = 0;
 const SIDEBAR_SELECTION_SYMBOL: &str = " ";
 const WORKSPACE_ICON: &str = "▣ ";
 const GIT_BRANCH_ICON: &str = "";
@@ -366,14 +364,16 @@ pub fn selected_chat_agent_output_area(app: &App, frame_area: Rect) -> Option<(C
     Some((chat, chat_agent_output_area_for(app, frame_area)))
 }
 
+/// Terminal and chat panes are drawn with neither a border nor a header, so a
+/// pane's output area is its whole area. Until F17 this went through a
+/// `pane_inner` / `output_area_after_header` pair whose two header constants
+/// were both `0`.
 pub fn terminal_output_area_for(app: &App, frame_area: Rect) -> Rect {
-    let layout = layout_areas(app, frame_area);
-    terminal_output_area(layout.main)
+    layout_areas(app, frame_area).main
 }
 
 pub fn chat_agent_output_area_for(app: &App, frame_area: Rect) -> Rect {
-    let layout = layout_areas(app, frame_area);
-    chat_agent_output_area(layout.main)
+    layout_areas(app, frame_area).main
 }
 
 fn layout_areas(app: &App, frame_area: Rect) -> LayoutAreas {
@@ -424,30 +424,6 @@ fn prompt_height(app: &App) -> u16 {
     prompt_height + notice_height
 }
 
-fn terminal_output_area(main: Rect) -> Rect {
-    output_area_after_header(main, TERMINAL_HEADER_LINES)
-}
-
-fn chat_agent_output_area(main: Rect) -> Rect {
-    output_area_after_header(main, CHAT_AGENT_HEADER_LINES)
-}
-
-fn output_area_after_header(main: Rect, header_lines: u16) -> Rect {
-    let inner = pane_inner(main);
-    let header_height = header_lines.min(inner.height);
-
-    Rect {
-        x: inner.x,
-        y: inner.y.saturating_add(header_height),
-        width: inner.width,
-        height: inner.height.saturating_sub(header_height),
-    }
-}
-
-fn pane_inner(area: Rect) -> Rect {
-    area
-}
-
 fn draw_sidebar(
     frame: &mut Frame,
     app: &App,
@@ -455,8 +431,9 @@ fn draw_sidebar(
     area: Rect,
     palette: Palette,
 ) {
-    let items = sidebar_items(app, pty_runtime, palette, sidebar_item_width(area));
-    let selected = sidebar_selected_index(app, items.len());
+    let rows = app.sidebar_rows();
+    let items = sidebar_items(app, pty_runtime, palette, sidebar_item_width(area), &rows);
+    let selected = sidebar_highlight_row(app, &rows);
     let mut state = ListState::default();
     state.select(selected);
 
@@ -473,52 +450,78 @@ fn draw_sidebar(
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// Which of `rows` carries the selection highlight.
+///
+/// Found by position in the rows themselves, so headers and spacers cannot
+/// shift it (F14): it is the `selected_index()`-th selectable row. With no
+/// selection the first selectable row is highlighted, as it always was.
+fn sidebar_highlight_row(app: &App, rows: &[SidebarRow]) -> Option<usize> {
+    let target_nav_index = app.selected_index().unwrap_or(0);
+    rows.iter()
+        .enumerate()
+        .filter(|(_, row)| matches!(row, SidebarRow::Nav(_)))
+        .nth(target_nav_index)
+        .map(|(index, _)| index)
+}
+
+/// Render the rows `App::sidebar_rows` produced, one `ListItem` each. The
+/// order is the model's, not this function's: a row it cannot resolve still
+/// occupies its index so the highlight stays aligned.
 fn sidebar_items(
     app: &App,
     pty_runtime: &PtyRuntime,
     palette: Palette,
     item_width: usize,
+    rows: &[SidebarRow],
 ) -> Vec<ListItem<'static>> {
-    let mut items = Vec::new();
-
-    for (workspace_index, workspace) in app.project.workspaces.iter().enumerate() {
-        if workspace_index > 0 {
-            items.push(ListItem::new(Line::from("")));
-        }
-
-        items.push(ListItem::new(workspace_sidebar_line(
-            workspace,
-            app.workspace_git_branch(workspace.id),
-            palette,
-            item_width,
-        )));
-
-        items.extend(workspace.chats.iter().map(|chat| {
-            let done_seen = app.chat_done_seen(chat.id);
-            let (glyph, style) = chat_status_marker(chat.status, done_seen, palette);
-            ListItem::new(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(glyph, style),
-                Span::raw(chat_sidebar_label(chat)),
-            ]))
-        }));
-
-        items.extend(workspace.terminals.iter().map(|terminal| {
-            let focused = terminal_sidebar_item_is_focused(app, workspace.id, terminal.id);
-            let (glyph, style) = terminal_icon_marker(terminal, pty_runtime, focused, palette);
-            ListItem::new(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(glyph, style),
-                Span::raw(terminal_display_label(
-                    terminal,
-                    pty_runtime,
-                    item_width.saturating_sub(4),
+    rows.iter()
+        .map(|row| match row {
+            SidebarRow::Spacer => ListItem::new(Line::from("")),
+            SidebarRow::Workspace(workspace) => match app.project.workspace(*workspace) {
+                Some(workspace) => ListItem::new(workspace_sidebar_line(
+                    workspace,
+                    app.workspace_git_branch(workspace.id),
+                    palette,
+                    item_width,
                 )),
-            ]))
-        }));
-    }
-
-    items
+                None => ListItem::new(Line::from("")),
+            },
+            SidebarRow::Nav(NavItem::Chat { workspace, chat }) => {
+                match app.project.chat(*workspace, *chat) {
+                    Some(chat) => {
+                        let done_seen = app.chat_done_seen(chat.id);
+                        let (glyph, style) = chat_status_marker(chat.status, done_seen, palette);
+                        ListItem::new(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(glyph, style),
+                            Span::raw(chat_sidebar_label(chat)),
+                        ]))
+                    }
+                    None => ListItem::new(Line::from("")),
+                }
+            }
+            SidebarRow::Nav(NavItem::Terminal {
+                workspace,
+                terminal,
+            }) => match app.project.terminal(*workspace, *terminal) {
+                Some(terminal) => {
+                    let focused = terminal_sidebar_item_is_focused(app, *workspace, terminal.id);
+                    let (glyph, style) =
+                        terminal_icon_marker(terminal, pty_runtime, focused, palette);
+                    ListItem::new(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(glyph, style),
+                        Span::raw(terminal_display_label(
+                            terminal,
+                            pty_runtime,
+                            item_width.saturating_sub(4),
+                        )),
+                    ]))
+                }
+                None => ListItem::new(Line::from("")),
+            },
+        })
+        .collect()
 }
 
 fn terminal_sidebar_item_is_focused(
@@ -532,41 +535,6 @@ fn terminal_sidebar_item_is_focused(
                 workspace,
                 terminal,
             })
-}
-
-fn sidebar_selected_index(app: &App, item_count: usize) -> Option<usize> {
-    if item_count == 0 || app.nav_len() == 0 {
-        return None;
-    }
-
-    let target_nav_index = app.selected_index().unwrap_or(0);
-    let mut nav_index = 0;
-    let mut item_index = 0;
-
-    for (workspace_index, workspace) in app.project.workspaces.iter().enumerate() {
-        if workspace_index > 0 {
-            item_index += 1;
-        }
-        item_index += 1;
-
-        for _ in &workspace.chats {
-            if nav_index == target_nav_index {
-                return Some(item_index.min(item_count - 1));
-            }
-            nav_index += 1;
-            item_index += 1;
-        }
-
-        for _ in &workspace.terminals {
-            if nav_index == target_nav_index {
-                return Some(item_index.min(item_count - 1));
-            }
-            nav_index += 1;
-            item_index += 1;
-        }
-    }
-
-    None
 }
 
 fn sidebar_item_width(area: Rect) -> usize {
@@ -779,7 +747,7 @@ fn draw_chat_details(
     render_style: PaneRenderStyle,
 ) {
     let PaneRenderStyle { focused, palette } = render_style;
-    let output_rows = usize::from(chat_agent_output_area(area).height.max(1));
+    let output_rows = usize::from(area.height.max(1));
     if app.project.workspace(workspace_id).is_none() {
         render_lines_pane(
             frame,
@@ -848,18 +816,24 @@ fn draw_chat_details(
         }
     }
 
+    // Named per chat, never hardcoded: a Claude Code chat used to be told that
+    // "Pi agent" had not started and to set `pi`'s config keys (F18).
+    let agent_name = chat.agent.display_name();
+    let (command_key, auto_start_key) = chat.agent.config_keys();
     let lines = if matches!(chat.status, ChatStatus::Thinking | ChatStatus::Waiting) {
         vec![
             Line::from(format!(
-                "Pi agent is {}; waiting for output.",
+                "{agent_name} agent is {}; waiting for output.",
                 chat.status.label()
             )),
             Line::from("Type to send input to the selected agent PTY."),
         ]
     } else {
         let mut lines = vec![
-            Line::from("Pi agent not started. Type to start it and send input."),
-            Line::from("Set `pi_agent_command`/`auto_start_pi_agent` in:"),
+            Line::from(format!(
+                "{agent_name} agent not started. Type to start it and send input."
+            )),
+            Line::from(format!("Set `{command_key}`/`{auto_start_key}` in:")),
             Line::from(config::config_path().display().to_string()),
         ];
         let transcript = app.chat_lines(chat_id);
@@ -892,7 +866,7 @@ fn draw_terminal_details(
     render_style: PaneRenderStyle,
 ) {
     let PaneRenderStyle { focused, palette } = render_style;
-    let output_rows = usize::from(terminal_output_area(area).height.max(1));
+    let output_rows = usize::from(area.height.max(1));
     if app.project.workspace(workspace_id).is_none() {
         render_lines_pane(
             frame,
@@ -2132,6 +2106,39 @@ mod tests {
         assert_eq!(icon_cell.fg, palette.muted);
     }
 
+    /// F18: the not-started hint used to say "Pi agent" and name
+    /// `pi_agent_command`/`auto_start_pi_agent` for *every* chat, so a Claude
+    /// Code chat was told the wrong command and the wrong two config keys.
+    #[test]
+    fn the_not_started_hint_names_the_chats_own_agent_and_config_keys() {
+        let hint_for = |agent: AgentKind| {
+            let mut app = App::default();
+            let workspace = app.project.workspaces[0].id;
+            let chat = app
+                .project
+                .add_chat(workspace, "chat".to_string(), ChatStatus::Idle, agent)
+                .expect("identity")
+                .expect("chat added");
+            app.select_item(NavItem::Chat { workspace, chat });
+            draw_text(&app, &PtyRuntime::new_offline(), 100, 30)
+        };
+
+        let pi = hint_for(AgentKind::Pi);
+        assert!(pi.contains("pi agent not started"), "{pi}");
+        assert!(
+            pi.contains("`pi_agent_command`/`auto_start_pi_agent`"),
+            "{pi}"
+        );
+
+        let claude = hint_for(AgentKind::ClaudeCode);
+        assert!(claude.contains("Claude Code agent not started"), "{claude}");
+        assert!(
+            claude.contains("`claude_code_command`/`auto_start_claude_code_agent`"),
+            "{claude}"
+        );
+        assert!(!claude.contains("pi_agent_command"), "{claude}");
+    }
+
     #[test]
     fn selected_done_sidebar_agent_icon_is_a_gray_filled_circle() {
         let mut app = App::seeded();
@@ -2323,9 +2330,17 @@ mod tests {
         });
 
         let pty_runtime = PtyRuntime::new_offline();
-        let item_count = sidebar_items(&app, &pty_runtime, test_palette(), 33).len();
+        let rows = app.sidebar_rows();
+        let items = sidebar_items(&app, &pty_runtime, test_palette(), 33, &rows);
 
-        assert_eq!(sidebar_selected_index(&app, item_count), Some(6));
+        // One row per model row, and the highlight lands on the chat itself,
+        // past the first group, the spacer and the second header.
+        assert_eq!(items.len(), rows.len());
+        assert_eq!(sidebar_highlight_row(&app, &rows), Some(6));
+        assert!(matches!(
+            rows[6],
+            SidebarRow::Nav(NavItem::Chat { chat, .. }) if chat == second_chat
+        ));
     }
 
     #[test]

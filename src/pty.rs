@@ -19,13 +19,15 @@ use std::{
 use mult_protocol::{
     bounded_screen_dimensions, default_socket_path,
     peer::{effective_uid, verify_peer_is_self},
-    read_message, write_message, AgentSessionMetadata, AgentStatusError, AgentStatusOutcome,
-    AgentStatusQuery, AgentStatusRecord, AttachError, AttachOutcome, AttachmentLease,
-    ClientMessage, ClientScopeId, CreateError, CreateOutcome, ForegroundProcessInfo, LaunchSpec,
-    LeaseRejectionReason, OutputSequence, PaneId, RequestId, ServerInstanceId, ServerMessage,
-    SessionId, SessionIdentity as WireSessionIdentity, SessionInfo,
-    StateNamespace as WireStateNamespace, StopError, StopOutcome, MAX_PENDING_REQUESTS_PER_CLIENT,
-    MIN_SCREEN_COLS, MIN_SCREEN_ROWS, PROTOCOL_VERSION, SOCKET_PATH_ENV,
+    read_message,
+    shell::{default_shell, shell_command_args},
+    write_message, AgentSessionMetadata, AgentStatusError, AgentStatusOutcome, AgentStatusQuery,
+    AgentStatusRecord, AttachError, AttachOutcome, AttachmentLease, ClientMessage, ClientScopeId,
+    CreateError, CreateOutcome, ForegroundProcessInfo, LaunchSpec, LeaseRejectionReason,
+    OutputSequence, PaneId, RequestId, ServerInstanceId, ServerMessage, SessionId,
+    SessionIdentity as WireSessionIdentity, SessionInfo, StateNamespace as WireStateNamespace,
+    StopError, StopOutcome, MAX_PENDING_REQUESTS_PER_CLIENT, MIN_SCREEN_COLS, MIN_SCREEN_ROWS,
+    PROTOCOL_VERSION, SOCKET_PATH_ENV,
 };
 use vt100::{MouseProtocolEncoding, MouseProtocolMode, Parser};
 
@@ -133,18 +135,17 @@ pub enum AttachExistingResult {
 pub struct PtyRuntime {
     socket_path: PathBuf,
     connection: Option<ServerConnection>,
-    terminal_to_pane: HashMap<PtyKey, PaneId>,
-    pane_to_terminal: HashMap<PaneId, PtyKey>,
-    pane_leases: HashMap<PaneId, AttachmentLease>,
-    expected_output: HashMap<PaneId, OutputSequence>,
-    session_identities: HashMap<PtyKey, WireSessionIdentity>,
-    agent_sessions: HashMap<PtyKey, AgentSessionMetadata>,
-    parsers: HashMap<PtyKey, Parser>,
-    responders: HashMap<PtyKey, TerminalResponseDetector>,
-    terminals_with_output: HashSet<PtyKey>,
-    terminal_exit_statuses: HashMap<PtyKey, PtyExit>,
-    foreground_processes: HashMap<PtyKey, ForegroundProcessInfo>,
-    command_trackers: HashMap<PtyKey, TerminalCommandTracker>,
+    // Everything the client tracks per PTY key. This was twelve parallel maps
+    // (ten keyed by `PtyKey`, two by `PaneId`), so every lifecycle operation
+    // had to remember which subset to touch and an omission leaked state
+    // silently (F2). One entry per key means `remove_terminal` cannot forget a
+    // field and a new field is tracked everywhere by construction.
+    panes: HashMap<PtyKey, PtyPane>,
+    // Reverse index for the `PaneId`s the daemon addresses its messages to.
+    // Holds exactly the keys whose `PtyPane::attachment` is `Some`; it is
+    // maintained only by [`PtyRuntime::bind_pane`] and
+    // [`PtyRuntime::clear_attachment`], never on its own.
+    pane_index: HashMap<PaneId, PtyKey>,
     pending_events: Vec<PtyEvent>,
     client_scope: Option<ClientScopeId>,
     server_instance: Option<ServerInstanceId>,
@@ -238,6 +239,39 @@ struct ServerConnection {
     receiver: Receiver<ServerMessage>,
 }
 
+/// Everything [`PtyRuntime`] tracks for one [`PtyKey`].
+///
+/// An entry exists as soon as *any* of these is recorded — a durable identity
+/// registered before the session is started, a parser fed a system line while
+/// offline — and lives until [`PtyRuntime::remove_terminal`] drops it. The
+/// fields are deliberately independent `Option`s rather than one "attached"
+/// sum type, because they genuinely have different lifetimes: a parser
+/// outlives an attachment, `lease`/`expected_output` are cleared on a
+/// reconnect that keeps the binding, and an identity outlives both.
+#[derive(Default)]
+struct PtyPane {
+    /// The server pane this key is bound to, mirrored by
+    /// [`PtyRuntime::pane_index`].
+    attachment: Option<PaneId>,
+    /// The attachment's lease, present only once an attach replay has been
+    /// reconciled. A binding without a lease is a pane awaiting re-attachment.
+    lease: Option<AttachmentLease>,
+    /// Next output sequence expected on the attachment; set with the lease.
+    expected_output: Option<OutputSequence>,
+    /// Durable model identity, immutable once registered.
+    identity: Option<WireSessionIdentity>,
+    /// Chat-agent generation metadata; only ever set for [`PtyKey::ChatAgent`].
+    agent: Option<AgentSessionMetadata>,
+    parser: Option<Parser>,
+    responder: Option<TerminalResponseDetector>,
+    /// Whether this key has ever been fed output, so a screen that is blank
+    /// because it was cleared is distinguished from one never written to.
+    saw_output: bool,
+    exit_status: Option<PtyExit>,
+    foreground_process: Option<ForegroundProcessInfo>,
+    command_tracker: Option<TerminalCommandTracker>,
+}
+
 /// A connection attempt running on its own thread.
 ///
 /// Establishing a connection means a blocking `connect(2)`, possibly an
@@ -317,23 +351,37 @@ enum TerminalResponseState {
     IgnoreOne,
 }
 
-impl Default for PtyRuntime {
-    fn default() -> Self {
-        Self::new()
+/// Whether a connection attempt may start a daemon that is not already
+/// running.
+///
+/// Autospawning forks a process, so it is never implied: an explicit user
+/// action (startup, a keystroke, a `start`/`stop`) asks for it, and background
+/// reconnects use [`SpawnPolicy::ConnectOnly`] so a daemon the user shut down
+/// is not resurrected behind their back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnPolicy {
+    Autospawn,
+    ConnectOnly,
+}
+
+impl SpawnPolicy {
+    fn allows_spawn(self) -> bool {
+        matches!(self, Self::Autospawn)
     }
 }
 
 impl PtyRuntime {
-    pub fn new() -> Self {
-        Self::with_socket_path(default_socket_path())
-    }
-
-    pub fn new_offline() -> Self {
-        Self::disconnected(default_socket_path(), Vec::new())
-    }
-
-    pub fn with_socket_path(socket_path: PathBuf) -> Self {
-        match Self::connect_to_socket(socket_path.clone()) {
+    /// Construct a runtime bound to `socket_path` and connect to it, reporting
+    /// a failed connection as a queued [`PtyEvent::ConnectionError`] rather
+    /// than failing construction — the UI must come up and say why it is not
+    /// connected.
+    ///
+    /// There is deliberately no `Default` for this type (F3). Construction
+    /// connects a socket and, under [`SpawnPolicy::Autospawn`], forks a
+    /// daemon; a `#[derive(Default)]` or `..Default::default()` on any struct
+    /// holding a `PtyRuntime` would have done both silently.
+    pub fn with_socket_path(socket_path: PathBuf, spawn: SpawnPolicy) -> Self {
+        match Self::connect_to_socket_with(socket_path.clone(), spawn) {
             Ok(runtime) => runtime,
             Err(error) => Self::disconnected(
                 socket_path,
@@ -344,9 +392,22 @@ impl PtyRuntime {
         }
     }
 
+    /// Construct a runtime that has not connected to anything and will not try
+    /// until something asks it to. Used by tests and by the fuzz entry point,
+    /// which drive the emulator without a daemon.
+    pub fn new_offline() -> Self {
+        Self::disconnected(default_socket_path(), Vec::new())
+    }
+
+    /// As [`Self::with_socket_path`] with [`SpawnPolicy::Autospawn`], but a
+    /// connection failure fails construction instead of being queued.
     pub fn connect_to_socket(socket_path: PathBuf) -> io::Result<Self> {
+        Self::connect_to_socket_with(socket_path, SpawnPolicy::Autospawn)
+    }
+
+    fn connect_to_socket_with(socket_path: PathBuf, spawn: SpawnPolicy) -> io::Result<Self> {
         let mut runtime = Self::disconnected(socket_path, Vec::new());
-        runtime.connect()?;
+        runtime.connect_inner(spawn)?;
         Ok(runtime)
     }
 
@@ -354,18 +415,8 @@ impl PtyRuntime {
         Self {
             socket_path,
             connection: None,
-            terminal_to_pane: HashMap::new(),
-            pane_to_terminal: HashMap::new(),
-            pane_leases: HashMap::new(),
-            expected_output: HashMap::new(),
-            session_identities: HashMap::new(),
-            agent_sessions: HashMap::new(),
-            parsers: HashMap::new(),
-            responders: HashMap::new(),
-            terminals_with_output: HashSet::new(),
-            terminal_exit_statuses: HashMap::new(),
-            foreground_processes: HashMap::new(),
-            command_trackers: HashMap::new(),
+            panes: HashMap::new(),
+            pane_index: HashMap::new(),
             pending_events,
             client_scope: None,
             server_instance: None,
@@ -444,9 +495,44 @@ impl PtyDimensions {
 }
 
 impl PtyRuntime {
+    fn pane(&self, terminal: PtyKey) -> Option<&PtyPane> {
+        self.panes.get(&terminal)
+    }
+
+    fn pane_mut(&mut self, terminal: PtyKey) -> Option<&mut PtyPane> {
+        self.panes.get_mut(&terminal)
+    }
+
+    /// The entry for `terminal`, created empty if this is the first thing
+    /// recorded about it.
+    fn pane_entry(&mut self, terminal: PtyKey) -> &mut PtyPane {
+        self.panes.entry(terminal).or_default()
+    }
+
+    /// The server pane `terminal` is bound to, if it is bound at all. A
+    /// binding without a lease is a pane awaiting re-attachment, so this is
+    /// weaker than [`Self::is_running`].
+    fn attached_pane(&self, terminal: PtyKey) -> Option<PaneId> {
+        self.pane(terminal).and_then(|pane| pane.attachment)
+    }
+
+    /// Bind `terminal` to `pane`, keeping [`Self::pane_index`] in step. The
+    /// lease and watermark are not set here: they arrive with the attach
+    /// replay.
+    fn bind_pane(&mut self, terminal: PtyKey, pane: PaneId) {
+        self.pane_entry(terminal).attachment = Some(pane);
+        self.pane_index.insert(pane, terminal);
+    }
+
+    fn lease_of(&self, pane: PaneId) -> Option<AttachmentLease> {
+        self.key_for_pane(pane)
+            .and_then(|terminal| self.pane(terminal))
+            .and_then(|entry| entry.lease)
+    }
+
     pub fn is_running(&self, terminal: PtyKey) -> bool {
-        self.terminal_to_pane.get(&terminal).is_some_and(|pane| {
-            self.pane_leases.contains_key(pane) && self.expected_output.contains_key(pane)
+        self.pane(terminal).is_some_and(|pane| {
+            pane.attachment.is_some() && pane.lease.is_some() && pane.expected_output.is_some()
         })
     }
 
@@ -460,21 +546,20 @@ impl PtyRuntime {
     ) -> io::Result<()> {
         let identity = wire_session_identity(identity);
         if self
-            .session_identities
-            .get(&terminal)
-            .is_some_and(|current| *current != identity)
+            .registered_session_identity(terminal)
+            .is_some_and(|current| current != identity)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "cannot replace an immutable PTY session identity",
             ));
         }
-        self.session_identities.insert(terminal, identity);
+        self.pane_entry(terminal).identity = Some(identity);
         Ok(())
     }
 
     pub fn registered_session_identity(&self, terminal: PtyKey) -> Option<WireSessionIdentity> {
-        self.session_identities.get(&terminal).copied()
+        self.pane(terminal).and_then(|pane| pane.identity)
     }
 
     pub fn register_agent_session(
@@ -488,7 +573,7 @@ impl PtyRuntime {
                 "agent metadata may only be registered for a chat PTY",
             ));
         }
-        if !self.session_identities.contains_key(&terminal) {
+        if self.registered_session_identity(terminal).is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "register the durable session identity before agent metadata",
@@ -496,80 +581,79 @@ impl PtyRuntime {
         }
         if self.is_running(terminal)
             && self
-                .agent_sessions
-                .get(&terminal)
-                .is_some_and(|current| *current != metadata)
+                .pane(terminal)
+                .and_then(|pane| pane.agent)
+                .is_some_and(|current| current != metadata)
         {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "cannot replace agent generation while its PTY is running",
             ));
         }
-        self.agent_sessions.insert(terminal, metadata);
+        self.pane_entry(terminal).agent = Some(metadata);
         Ok(())
     }
 
     pub fn parser(&self, terminal: PtyKey) -> Option<&Parser> {
-        self.parsers.get(&terminal)
+        self.pane(terminal).and_then(|pane| pane.parser.as_ref())
     }
 
     pub fn terminal_exit_status(&self, terminal: PtyKey) -> Option<&PtyExit> {
-        self.terminal_exit_statuses.get(&terminal)
+        self.pane(terminal)
+            .and_then(|pane| pane.exit_status.as_ref())
     }
 
     pub fn terminal_last_command(&self, terminal: PtyKey) -> Option<&str> {
-        self.command_trackers
-            .get(&terminal)
+        self.pane(terminal)
+            .and_then(|pane| pane.command_tracker.as_ref())
             .and_then(TerminalCommandTracker::last_command)
     }
 
     #[cfg(test)]
     pub fn mark_running_for_test(&mut self, terminal: PtyKey) {
-        let pane = pane_for_key(terminal);
-        self.terminal_to_pane.insert(terminal, pane);
-        self.pane_to_terminal.insert(pane, terminal);
-        self.pane_leases.insert(pane, AttachmentLease::MIN);
-        self.expected_output.insert(pane, OutputSequence::ZERO);
+        self.bind_pane(terminal, pane_for_key(terminal));
+        let entry = self.pane_entry(terminal);
+        entry.lease = Some(AttachmentLease::MIN);
+        entry.expected_output = Some(OutputSequence::ZERO);
     }
 
     #[cfg(test)]
     pub fn record_exit_status_for_test(&mut self, terminal: PtyKey, status: PtyExit) {
-        self.terminal_exit_statuses.insert(terminal, status);
+        self.pane_entry(terminal).exit_status = Some(status);
     }
 
+    /// Create a parser for `terminal` if it has none, then size it. Reachable
+    /// only from tests and the fuzz entry point; the production paths all go
+    /// through [`Self::reset_parser`] or [`Self::resize_parser`], which do not
+    /// preserve an existing screen.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn ensure_parser(&mut self, terminal: PtyKey, size: PtyDimensions) {
         let size = size.clamped();
-        self.parsers
-            .entry(terminal)
-            .or_insert_with(|| Parser::new(size.rows, size.cols, TERMINAL_SCROLLBACK_LINES));
+        self.pane_entry(terminal)
+            .parser
+            .get_or_insert_with(|| Parser::new(size.rows, size.cols, TERMINAL_SCROLLBACK_LINES));
         self.resize_parser(terminal, size);
     }
 
     pub fn reset_parser(&mut self, terminal: PtyKey, size: PtyDimensions) {
         let size = size.clamped();
-        self.parsers.insert(
-            terminal,
-            Parser::new(size.rows, size.cols, TERMINAL_SCROLLBACK_LINES),
-        );
-        self.responders.remove(&terminal);
-        self.terminals_with_output.remove(&terminal);
-        self.terminal_exit_statuses.remove(&terminal);
+        let entry = self.pane_entry(terminal);
+        entry.parser = Some(Parser::new(size.rows, size.cols, TERMINAL_SCROLLBACK_LINES));
+        entry.responder = None;
+        entry.saw_output = false;
+        entry.exit_status = None;
     }
 
     pub fn remove_terminal(&mut self, terminal: PtyKey) {
-        if let Some(pane) = self.terminal_to_pane.remove(&terminal) {
-            self.pane_to_terminal.remove(&pane);
-            self.pane_leases.remove(&pane);
-            self.expected_output.remove(&pane);
+        // One entry, so nothing can be forgotten: the whole `PtyPane` goes,
+        // and the only external reference to it is the pane index.
+        if let Some(pane) = self
+            .panes
+            .remove(&terminal)
+            .and_then(|pane| pane.attachment)
+        {
+            self.pane_index.remove(&pane);
         }
-        self.parsers.remove(&terminal);
-        self.responders.remove(&terminal);
-        self.terminals_with_output.remove(&terminal);
-        self.terminal_exit_statuses.remove(&terminal);
-        self.foreground_processes.remove(&terminal);
-        self.command_trackers.remove(&terminal);
-        self.session_identities.remove(&terminal);
-        self.agent_sessions.remove(&terminal);
     }
 
     pub fn process_terminal_output(&mut self, terminal: PtyKey, bytes: &[u8]) {
@@ -582,12 +666,12 @@ impl PtyRuntime {
         }
 
         let response = {
-            let parser = self
-                .parsers
-                .entry(terminal)
-                .or_insert_with(|| Parser::new(24, 80, TERMINAL_SCROLLBACK_LINES));
+            let entry = self.panes.entry(terminal).or_default();
+            let parser = entry
+                .parser
+                .get_or_insert_with(|| Parser::new(24, 80, TERMINAL_SCROLLBACK_LINES));
             let response = if respond {
-                let responder = self.responders.entry(terminal).or_default();
+                let responder = entry.responder.get_or_insert_with(Default::default);
                 feed_parser_with_responder(parser, responder, bytes)
             } else {
                 // No terminal queries to answer on this path (scrollback replay,
@@ -601,14 +685,14 @@ impl PtyRuntime {
             response
         };
 
-        self.terminals_with_output.insert(terminal);
+        self.pane_entry(terminal).saw_output = true;
         if response.is_empty() {
             return;
         }
         // One write per output chunk, never one per query: this runs on the
         // render thread, where every `Input` message is a blocking socket
         // write.
-        if let Some(pane) = self.terminal_to_pane.get(&terminal).copied() {
+        if let Some(pane) = self.attached_pane(terminal) {
             let _ = self.send_input_inner(terminal, pane, &response, false);
         }
     }
@@ -636,7 +720,7 @@ impl PtyRuntime {
     }
 
     pub fn terminal_lines(&self, terminal: PtyKey) -> Vec<String> {
-        let Some(parser) = self.parsers.get(&terminal) else {
+        let Some(parser) = self.parser(terminal) else {
             return Vec::new();
         };
         terminal_screen_rows(parser)
@@ -647,11 +731,10 @@ impl PtyRuntime {
     }
 
     pub fn terminal_output_is_blank(&self, terminal: PtyKey) -> bool {
-        if self.terminals_with_output.contains(&terminal) {
+        if self.pane(terminal).is_some_and(|pane| pane.saw_output) {
             return false;
         }
-        self.parsers
-            .get(&terminal)
+        self.parser(terminal)
             .map(|parser| {
                 terminal_screen_rows(parser)
                     .iter()
@@ -678,12 +761,12 @@ impl PtyRuntime {
             return Ok(AttachExistingResult::Attached);
         }
         self.reset_parser(terminal, size);
-        self.foreground_processes.remove(&terminal);
-        self.command_trackers.remove(&terminal);
+        let entry = self.pane_entry(terminal);
+        entry.foreground_process = None;
+        entry.command_tracker = None;
         let session = session_for_key(terminal);
         let pane = pane_for_key(terminal);
-        self.terminal_to_pane.insert(terminal, pane);
-        self.pane_to_terminal.insert(pane, terminal);
+        self.bind_pane(terminal, pane);
 
         let request_id = self.allocate_request()?;
         let request = ClientMessage::Attach {
@@ -718,7 +801,7 @@ impl PtyRuntime {
                 "terminal already has a server attachment",
             ));
         }
-        if self.terminal_to_pane.contains_key(&spawn.terminal) {
+        if self.attached_pane(spawn.terminal).is_some() {
             match self.attach_existing(spawn.terminal, spawn.size)? {
                 AttachExistingResult::Attached => return Ok(()),
                 AttachExistingResult::Missing => {}
@@ -733,22 +816,23 @@ impl PtyRuntime {
     fn start_attached(&mut self, spawn: PtySpawn) -> io::Result<()> {
         self.ensure_connected()?;
         self.reset_parser(spawn.terminal, spawn.size);
-        self.foreground_processes.remove(&spawn.terminal);
-        self.command_trackers.remove(&spawn.terminal);
+        let entry = self.pane_entry(spawn.terminal);
+        entry.foreground_process = None;
+        entry.command_tracker = None;
+        let agent = entry.agent;
         let identity = self.identity_for_key(spawn.terminal)?;
         let session = session_for_key(spawn.terminal);
         let pane = pane_for_key(spawn.terminal);
         let launch = launch_spec(&spawn);
         let name = session_name(&spawn, &launch);
-        self.terminal_to_pane.insert(spawn.terminal, pane);
-        self.pane_to_terminal.insert(pane, spawn.terminal);
+        self.bind_pane(spawn.terminal, pane);
 
         let create_id = self.allocate_request()?;
         let create = ClientMessage::CreateSession {
             request_id: create_id,
             identity,
             requested_id: Some(session),
-            agent: self.agent_sessions.get(&spawn.terminal).copied(),
+            agent,
             name,
             cwd: spawn.cwd.clone(),
             env: spawn.env.clone(),
@@ -784,7 +868,7 @@ impl PtyRuntime {
     }
 
     pub fn stop(&mut self, terminal: PtyKey) -> io::Result<bool> {
-        let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
+        let Some(pane) = self.attached_pane(terminal) else {
             return Ok(false);
         };
         self.ensure_connected()?;
@@ -801,7 +885,7 @@ impl PtyRuntime {
         self.finish_request(request_id);
         result?;
         self.clear_attachment(pane);
-        self.terminal_exit_statuses.remove(&terminal);
+        self.pane_entry(terminal).exit_status = None;
         Ok(true)
     }
 
@@ -882,7 +966,7 @@ impl PtyRuntime {
     }
 
     pub fn send_input(&mut self, terminal: PtyKey, input: &[u8]) -> io::Result<bool> {
-        let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
+        let Some(pane) = self.attached_pane(terminal) else {
             return Ok(false);
         };
         self.send_input_inner(terminal, pane, input, true)?;
@@ -898,16 +982,15 @@ impl PtyRuntime {
     ) -> io::Result<()> {
         if !input.is_empty() {
             let alternate_screen = self
-                .parsers
-                .get(&terminal)
+                .parser(terminal)
                 .is_some_and(|parser| parser.screen().alternate_screen());
-            if let Some(parser) = self.parsers.get_mut(&terminal) {
+            if let Some(parser) = self.parser_mut(terminal) {
                 parser.set_scrollback(0);
             }
             if track_command && !alternate_screen && self.terminal_accepts_shell_input(terminal) {
-                self.command_trackers
-                    .entry(terminal)
-                    .or_default()
+                self.pane_entry(terminal)
+                    .command_tracker
+                    .get_or_insert_with(Default::default)
                     .record_input(input);
             }
         }
@@ -925,7 +1008,10 @@ impl PtyRuntime {
     }
 
     fn terminal_accepts_shell_input(&self, terminal: PtyKey) -> bool {
-        let Some(process) = self.foreground_processes.get(&terminal) else {
+        let Some(process) = self
+            .pane(terminal)
+            .and_then(|pane| pane.foreground_process.as_ref())
+        else {
             return true;
         };
         match (process.root_pid, process.foreground_pid) {
@@ -935,26 +1021,24 @@ impl PtyRuntime {
     }
 
     pub fn send_paste(&mut self, terminal: PtyKey, text: &str) -> io::Result<bool> {
-        let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
+        let Some(pane) = self.attached_pane(terminal) else {
             return Ok(false);
         };
         let use_bracketed = self
-            .parsers
-            .get(&terminal)
+            .parser(terminal)
             .is_some_and(|parser| parser.screen().bracketed_paste());
         let bytes = terminal_paste_bytes(text, use_bracketed);
         if !bytes.is_empty() {
             let alternate_screen = self
-                .parsers
-                .get(&terminal)
+                .parser(terminal)
                 .is_some_and(|parser| parser.screen().alternate_screen());
-            if let Some(parser) = self.parsers.get_mut(&terminal) {
+            if let Some(parser) = self.parser_mut(terminal) {
                 parser.set_scrollback(0);
             }
             if !alternate_screen && self.terminal_accepts_shell_input(terminal) {
-                self.command_trackers
-                    .entry(terminal)
-                    .or_default()
+                self.pane_entry(terminal)
+                    .command_tracker
+                    .get_or_insert_with(Default::default)
                     .record_input(&bytes);
             }
         }
@@ -973,8 +1057,7 @@ impl PtyRuntime {
     /// own view) rather than to our local scrollback — which for an
     /// alternate-screen app like Claude Code holds nothing to scroll anyway.
     pub fn terminal_reports_mouse(&self, terminal: PtyKey) -> bool {
-        self.parsers
-            .get(&terminal)
+        self.parser(terminal)
             .is_some_and(|parser| parser.screen().mouse_protocol_mode() != MouseProtocolMode::None)
     }
 
@@ -983,7 +1066,7 @@ impl PtyRuntime {
     /// coordinates. Returns false when the terminal has no live parser/pane or
     /// is not reporting the mouse.
     pub fn forward_wheel(&mut self, terminal: PtyKey, up: bool, col: u16, row: u16) -> bool {
-        let Some(parser) = self.parsers.get(&terminal) else {
+        let Some(parser) = self.parser(terminal) else {
             return false;
         };
         let screen = parser.screen();
@@ -997,7 +1080,7 @@ impl PtyRuntime {
             WHEEL_DOWN_BUTTON
         };
         let bytes = encode_mouse_event(encoding, button, col.max(1), row.max(1));
-        let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
+        let Some(pane) = self.attached_pane(terminal) else {
             return false;
         };
         match self.send_input_inner(terminal, pane, &bytes, false) {
@@ -1020,31 +1103,12 @@ impl PtyRuntime {
         Ok(self.scroll_parser(terminal, -(rows.min(i32::MAX as usize) as i32)))
     }
 
-    pub fn scroll_to_top(&mut self, terminal: PtyKey) -> io::Result<bool> {
-        let Some(parser) = self.parsers.get_mut(&terminal) else {
-            return Ok(false);
-        };
-        let old = parser.screen().scrollback();
-        parser.set_scrollback(TERMINAL_SCROLLBACK_LINES);
-        clamp_parser_scrollback(parser);
-        Ok(parser.screen().scrollback() != old)
-    }
-
-    pub fn scroll_to_bottom(&mut self, terminal: PtyKey) -> io::Result<bool> {
-        let Some(parser) = self.parsers.get_mut(&terminal) else {
-            return Ok(false);
-        };
-        let old = parser.screen().scrollback();
-        parser.set_scrollback(0);
-        Ok(old != 0)
-    }
-
     pub fn resize(&mut self, terminal: PtyKey, size: PtyDimensions) -> io::Result<()> {
         // Clamped once here so the parser and the daemon's PTY are driven at
         // the same size; the daemon applies the same policy independently.
         let size = size.clamped();
         self.resize_parser(terminal, size);
-        let Some(pane) = self.terminal_to_pane.get(&terminal).copied() else {
+        let Some(pane) = self.attached_pane(terminal) else {
             return Ok(());
         };
         self.ensure_connected()?;
@@ -1207,8 +1271,9 @@ impl PtyRuntime {
                 Err(error) if is_disconnected_error(&error) => {
                     self.resume_and_resend(&request)?;
                     self.reset_parser(terminal, size);
-                    self.pane_leases.remove(&pane_id);
-                    self.expected_output.remove(&pane_id);
+                    let entry = self.pane_entry(terminal);
+                    entry.lease = None;
+                    entry.expected_output = None;
                     accepted_lease = None;
                     replay_next = None;
                     replay_watermark = None;
@@ -1323,8 +1388,9 @@ impl PtyRuntime {
                             omitted_bytes: replay_omitted,
                         });
                     }
-                    self.pane_leases.insert(pane_id, lease);
-                    self.expected_output.insert(pane_id, watermark);
+                    let entry = self.pane_entry(terminal);
+                    entry.lease = Some(lease);
+                    entry.expected_output = Some(watermark);
                     // A reconnect inside this request (see `resume_and_resend`)
                     // re-queues every tracked terminal, including this one.
                     self.pending_reattach.retain(|queued| *queued != terminal);
@@ -1471,12 +1537,17 @@ impl PtyRuntime {
         self.pending_events.extend(events);
     }
 
+    fn parser_mut(&mut self, terminal: PtyKey) -> Option<&mut Parser> {
+        self.pane_mut(terminal)
+            .and_then(|pane| pane.parser.as_mut())
+    }
+
     fn resize_parser(&mut self, terminal: PtyKey, size: PtyDimensions) {
         let size = size.clamped();
         let parser = self
-            .parsers
-            .entry(terminal)
-            .or_insert_with(|| Parser::new(24, 80, TERMINAL_SCROLLBACK_LINES));
+            .pane_entry(terminal)
+            .parser
+            .get_or_insert_with(|| Parser::new(24, 80, TERMINAL_SCROLLBACK_LINES));
         repair_wide_cells_before_narrowing(parser, size);
         parser.set_size(size.rows, size.cols);
         clamp_parser_scrollback(parser);
@@ -1486,7 +1557,7 @@ impl PtyRuntime {
         if rows == 0 {
             return false;
         }
-        let Some(parser) = self.parsers.get_mut(&terminal) else {
+        let Some(parser) = self.parser_mut(terminal) else {
             return false;
         };
         let old = parser.screen().scrollback();
@@ -1517,7 +1588,7 @@ impl PtyRuntime {
                 lease,
                 process,
             } => {
-                if self.pane_leases.get(&pane) == Some(&lease) {
+                if self.lease_of(pane) == Some(lease) {
                     if let Some(terminal) = self.key_for_pane(pane) {
                         self.record_foreground_process(terminal, process);
                     }
@@ -1529,10 +1600,14 @@ impl PtyRuntime {
                 sequence,
                 bytes,
             } => {
-                if self.pane_leases.get(&pane) != Some(&lease) {
+                if self.lease_of(pane) != Some(lease) {
                     return;
                 }
-                let Some(expected) = self.expected_output.get(&pane).copied() else {
+                let Some(expected) = self
+                    .key_for_pane(pane)
+                    .and_then(|terminal| self.pane(terminal))
+                    .and_then(|entry| entry.expected_output)
+                else {
                     if let Some(terminal) = self.key_for_pane(pane) {
                         events.push(PtyEvent::Error {
                             terminal,
@@ -1562,14 +1637,14 @@ impl PtyRuntime {
                     );
                     return;
                 };
-                self.expected_output.insert(pane, next);
                 if let Some(terminal) = self.key_for_pane(pane) {
+                    self.pane_entry(terminal).expected_output = Some(next);
                     self.feed_terminal_output(terminal, &bytes, true);
                     push_output_event(events, terminal, bytes.len());
                 }
             }
             ServerMessage::PaneExited { pane, lease, exit } => {
-                if self.pane_leases.get(&pane) != Some(&lease) {
+                if self.lease_of(pane) != Some(lease) {
                     return;
                 }
                 if let Some(terminal) = self.clear_attachment(pane) {
@@ -1577,12 +1652,12 @@ impl PtyRuntime {
                         code: exit.code,
                         signal: exit.signal,
                     };
-                    self.terminal_exit_statuses.insert(terminal, status.clone());
+                    self.pane_entry(terminal).exit_status = Some(status.clone());
                     events.push(PtyEvent::Exited { terminal, status });
                 }
             }
             ServerMessage::TakenOver { pane, lease } => {
-                if self.pane_leases.get(&pane) == Some(&lease) {
+                if self.lease_of(pane) == Some(lease) {
                     if let Some(terminal) = self.clear_attachment(pane) {
                         events.push(PtyEvent::TakenOver { terminal });
                     }
@@ -1594,7 +1669,7 @@ impl PtyRuntime {
                 operation,
                 reason,
             } => {
-                if self.pane_leases.get(&pane) == Some(&lease) {
+                if self.lease_of(pane) == Some(lease) {
                     let terminal = self
                         .clear_attachment(pane)
                         .unwrap_or_else(|| key_for_pane_id(pane));
@@ -1624,24 +1699,31 @@ impl PtyRuntime {
         events: &mut Vec<PtyEvent>,
         message: String,
     ) {
-        self.pane_leases.remove(&pane);
-        self.expected_output.remove(&pane);
         if let Some(terminal) = self.key_for_pane(pane) {
+            let entry = self.pane_entry(terminal);
+            entry.lease = None;
+            entry.expected_output = None;
             events.push(PtyEvent::Error { terminal, message });
         }
     }
 
+    /// Drop the binding between a key and a server pane, along with the lease
+    /// and watermark that only make sense while it exists. Everything else the
+    /// key owns — parser, identity, exit status, trackers — survives, because
+    /// the model may still show it and a later attach may reuse it.
     fn clear_attachment(&mut self, pane: PaneId) -> Option<PtyKey> {
-        self.pane_leases.remove(&pane);
-        self.expected_output.remove(&pane);
-        let terminal = self.pane_to_terminal.remove(&pane)?;
-        self.terminal_to_pane.remove(&terminal);
+        let terminal = self.pane_index.remove(&pane)?;
+        if let Some(entry) = self.pane_mut(terminal) {
+            entry.attachment = None;
+            entry.lease = None;
+            entry.expected_output = None;
+        }
         Some(terminal)
     }
 
     fn identity_for_key(&self, terminal: PtyKey) -> io::Result<WireSessionIdentity> {
-        if let Some(identity) = self.session_identities.get(&terminal) {
-            return Ok(*identity);
+        if let Some(identity) = self.registered_session_identity(terminal) {
+            return Ok(identity);
         }
         #[cfg(test)]
         {
@@ -1657,7 +1739,7 @@ impl PtyRuntime {
     }
 
     fn lease_for_pane(&self, pane: PaneId) -> io::Result<AttachmentLease> {
-        self.pane_leases.get(&pane).copied().ok_or_else(|| {
+        self.lease_of(pane).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotConnected,
                 format!("pane {} attachment has not been reconciled", pane.0),
@@ -1666,7 +1748,7 @@ impl PtyRuntime {
     }
 
     fn key_for_pane(&self, pane: PaneId) -> Option<PtyKey> {
-        self.pane_to_terminal.get(&pane).copied()
+        self.pane_index.get(&pane).copied()
     }
 
     fn record_foreground_process(&mut self, terminal: PtyKey, process: ForegroundProcessInfo) {
@@ -1676,13 +1758,13 @@ impl PtyRuntime {
         );
         if foreground_is_child {
             if let Some(command) = process.command.as_deref() {
-                self.command_trackers
-                    .entry(terminal)
-                    .or_default()
+                self.pane_entry(terminal)
+                    .command_tracker
+                    .get_or_insert_with(Default::default)
                     .record_process_command(command);
             }
         }
-        self.foreground_processes.insert(terminal, process);
+        self.pane_entry(terminal).foreground_process = Some(process);
     }
 
     /// Guarantee a live connection for a caller that is about to send.
@@ -1698,7 +1780,7 @@ impl PtyRuntime {
         if self.connection.is_none() {
             // An explicit user action is worth an immediate attempt, so this
             // bypasses the retry backoff — but never runs two connectors at once.
-            self.start_connector(true);
+            self.start_connector(SpawnPolicy::Autospawn);
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "not connected to mult-server; a connection attempt is in progress",
@@ -1713,7 +1795,7 @@ impl PtyRuntime {
     fn reconnect_or_report(&mut self) {
         // Background reconnects never autospawn a daemon; only an explicit user
         // action may start one.
-        self.start_connector(false);
+        self.start_connector(SpawnPolicy::ConnectOnly);
         self.report_disconnect("a background reconnect is in progress".to_string());
     }
 
@@ -1737,10 +1819,12 @@ impl PtyRuntime {
     /// exist on the daemon until `start`'s own `CreateSession` completes.
     fn enqueue_reattachments(&mut self) {
         let terminals = self
-            .terminal_to_pane
-            .keys()
-            .copied()
-            .filter(|terminal| Some(*terminal) != self.starting)
+            .panes
+            .iter()
+            .filter(|(terminal, pane)| {
+                pane.attachment.is_some() && Some(**terminal) != self.starting
+            })
+            .map(|(terminal, _)| *terminal)
             .collect::<Vec<_>>();
         for terminal in terminals {
             if !self.pending_reattach.contains(&terminal) {
@@ -1777,7 +1861,7 @@ impl PtyRuntime {
             };
             // The queue is advisory: a terminal that was retired or that `start`
             // has since taken over must not be resurrected by a stale entry.
-            if !self.terminal_to_pane.contains_key(&terminal) || Some(terminal) == self.starting {
+            if self.attached_pane(terminal).is_none() || Some(terminal) == self.starting {
                 continue;
             }
             if !self.reattach_terminal(terminal) {
@@ -1828,7 +1912,7 @@ impl PtyRuntime {
                     code: 1,
                     signal: Some("server session unavailable".to_string()),
                 };
-                self.terminal_exit_statuses.insert(terminal, status.clone());
+                self.pane_entry(terminal).exit_status = Some(status.clone());
                 self.pending_events
                     .push(PtyEvent::Exited { terminal, status });
                 true
@@ -1846,7 +1930,7 @@ impl PtyRuntime {
     fn retry_connection_if_due(&mut self) {
         if self.connection.is_some()
             || self.pending_connect.is_some()
-            || self.terminal_to_pane.is_empty()
+            || !self.panes.values().any(|pane| pane.attachment.is_some())
         {
             return;
         }
@@ -1856,7 +1940,7 @@ impl PtyRuntime {
         {
             return;
         }
-        self.start_connector(false);
+        self.start_connector(SpawnPolicy::ConnectOnly);
     }
 
     fn reset_retry_backoff(&mut self) {
@@ -1870,17 +1954,12 @@ impl PtyRuntime {
     }
 
     fn parser_dimensions(&self, terminal: PtyKey) -> PtyDimensions {
-        self.parsers
-            .get(&terminal)
+        self.parser(terminal)
             .map(|parser| {
                 let (rows, cols) = parser.screen().size();
                 PtyDimensions { rows, cols }
             })
             .unwrap_or_default()
-    }
-
-    fn connect(&mut self) -> io::Result<()> {
-        self.connect_inner(true).map(|_| ())
     }
 
     /// Connect *synchronously* and return whether the daemon resumed the exact
@@ -1892,20 +1971,20 @@ impl PtyRuntime {
     /// idempotency key must be replayed on the very connection it re-establishes.
     /// Everything reachable from the render loop uses the connector thread
     /// instead.
-    fn connect_inner(&mut self, allow_spawn: bool) -> io::Result<bool> {
+    fn connect_inner(&mut self, spawn: SpawnPolicy) -> io::Result<bool> {
         let resume = self.client_scope;
-        let established = establish_connection(&self.socket_path, allow_spawn, resume)?;
+        let established = establish_connection(&self.socket_path, spawn, resume)?;
         Ok(self.install_connection(established, resume))
     }
 
     /// Start a background connection attempt, unless one is already running.
-    fn start_connector(&mut self, allow_spawn: bool) {
+    fn start_connector(&mut self, spawn: SpawnPolicy) {
         if self.pending_connect.is_some() || self.connection.is_some() {
             return;
         }
         let socket_path = self.socket_path.clone();
         let resume = self.client_scope;
-        let handle = thread::spawn(move || establish_connection(&socket_path, allow_spawn, resume));
+        let handle = thread::spawn(move || establish_connection(&socket_path, spawn, resume));
         self.pending_connect = Some(PendingConnect { handle, resume });
     }
 
@@ -1964,8 +2043,10 @@ impl PtyRuntime {
             self.pending_requests.clear();
             self.deferred_messages.clear();
             self.next_request_id = Some(RequestId::MIN);
-            self.pane_leases.clear();
-            self.expected_output.clear();
+            for pane in self.panes.values_mut() {
+                pane.lease = None;
+                pane.expected_output = None;
+            }
         }
         self.client_scope = Some(hello.client_scope);
         self.server_instance = Some(hello.server_instance);
@@ -2041,7 +2122,7 @@ impl PtyRuntime {
         let previous_scope = self.client_scope;
         let previous_instance = self.server_instance;
         self.disconnect();
-        let resumed_same = self.connect_inner(true)?;
+        let resumed_same = self.connect_inner(SpawnPolicy::Autospawn)?;
         if !resumed_same
             || self.client_scope != previous_scope
             || self.server_instance != previous_instance
@@ -2141,14 +2222,11 @@ impl Drop for PtyRuntime {
     fn drop(&mut self) {
         if let Some(connection) = &self.connection {
             if let Ok(mut writer) = connection.writer.lock() {
-                for (pane, lease) in &self.pane_leases {
-                    let _ = write_message(
-                        &mut *writer,
-                        &ClientMessage::Detach {
-                            pane: *pane,
-                            lease: *lease,
-                        },
-                    );
+                for entry in self.panes.values() {
+                    let (Some(pane), Some(lease)) = (entry.attachment, entry.lease) else {
+                        continue;
+                    };
+                    let _ = write_message(&mut *writer, &ClientMessage::Detach { pane, lease });
                 }
             }
         }
@@ -2178,10 +2256,10 @@ fn server_message_output_bytes(message: &ServerMessage) -> usize {
 /// `PtyRuntime` state: adopting the result is [`PtyRuntime::install_connection`].
 fn establish_connection(
     socket_path: &Path,
-    allow_spawn: bool,
+    spawn: SpawnPolicy,
     resume: Option<ClientScopeId>,
 ) -> io::Result<EstablishedConnection> {
-    let mut stream = if allow_spawn {
+    let mut stream = if spawn.allows_spawn() {
         connect_or_spawn_server(socket_path)?
     } else {
         UnixStream::connect(socket_path)?
@@ -2587,8 +2665,7 @@ pub fn fuzz_feed_terminal_output(sizes: &[(u16, u16)], chunks: &[&[u8]]) -> Vec<
                 runtime.resize_parser(terminal, PtyDimensions { rows, cols });
             }
             let parser = runtime
-                .parsers
-                .get_mut(&terminal)
+                .parser_mut(terminal)
                 .expect("parser was just ensured");
             let answer = feed_parser_with_responder(parser, &mut responder, chunk);
             clamp_parser_scrollback(parser);
@@ -3172,35 +3249,6 @@ fn session_name(spawn: &PtySpawn, launch: &LaunchSpec) -> String {
     }
 }
 
-fn shell_command_args(command: String) -> Vec<String> {
-    // The command string is handed to the login shell for evaluation (`-lc`),
-    // so it is fully shell-interpreted: pipelines, `$VAR` expansion, and globbing
-    // all apply. This is by design for `pi_agent_command` and
-    // `TerminalLaunch::Command`, and is the deliberate difference from
-    // `MULT_AGENT_CMD`, which `mult` splits into argv with no shell. See AGENTS.md.
-    #[cfg(windows)]
-    {
-        vec!["-NoExit".to_string(), "-Command".to_string(), command]
-    }
-
-    #[cfg(not(windows))]
-    {
-        vec!["-lc".to_string(), command]
-    }
-}
-
-fn default_shell() -> String {
-    #[cfg(windows)]
-    {
-        std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string())
-    }
-
-    #[cfg(not(windows))]
-    {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -3305,8 +3353,7 @@ mod tests {
         let terminal = PtyKey::Terminal(TerminalId(7));
         let pane = PaneId(7);
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
-        runtime.session_identities =
-            HashMap::from([(terminal, test_wire_session_identity(terminal))]);
+        runtime.pane_entry(terminal).identity = Some(test_wire_session_identity(terminal));
         runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
         runtime.process_terminal_output(terminal, b"\x1b[?2004h");
 
@@ -3613,8 +3660,8 @@ mod tests {
         )));
         assert!(runtime.terminal_lines(terminal)[0].contains("abcdef!"));
         assert_eq!(
-            runtime.expected_output.get(&pane),
-            Some(&OutputSequence::new(12))
+            runtime.pane_entry(terminal).expected_output,
+            Some(OutputSequence::new(12))
         );
     }
 
@@ -3712,7 +3759,7 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert!(!runtime.is_running(terminal));
-        assert!(!runtime.pane_to_terminal.contains_key(&pane));
+        assert_eq!(runtime.key_for_pane(pane), None);
         completed_rx
             .recv_timeout(TEST_IO_TIMEOUT)
             .expect("server thread should complete within the test timeout");
@@ -3751,7 +3798,7 @@ mod tests {
             }
         );
         assert!(!runtime.is_running(terminal));
-        assert!(!runtime.pane_to_terminal.contains_key(&pane));
+        assert_eq!(runtime.key_for_pane(pane), None);
     }
 
     #[test]
@@ -3784,7 +3831,7 @@ mod tests {
             }
         );
         assert!(runtime.is_running(terminal));
-        assert_eq!(runtime.pane_to_terminal.get(&pane), Some(&terminal));
+        assert_eq!(runtime.key_for_pane(pane), Some(terminal));
     }
 
     #[test]
@@ -3913,7 +3960,7 @@ mod tests {
         assert!(runtime.scroll_up(terminal, 1).expect("scroll up"));
         assert!(runtime.scroll_down(terminal, 1).expect("scroll down"));
         assert!(!runtime
-            .scroll_to_top(PtyKey::Terminal(TerminalId(99)))
+            .scroll_up(PtyKey::Terminal(TerminalId(99)), 1)
             .expect("missing"));
         assert!(runtime.send_paste(terminal, "one\ntwo").expect("paste"));
 
@@ -3945,18 +3992,101 @@ mod tests {
         runtime.connection = Some(ServerConnection { writer, receiver });
         runtime.client_scope = Some(test_scope());
         runtime.server_instance = Some(test_server_instance());
-        runtime.terminal_to_pane = HashMap::from([(terminal, pane)]);
-        runtime.pane_to_terminal = HashMap::from([(pane, terminal)]);
-        runtime.pane_leases = HashMap::from([(pane, test_lease())]);
-        runtime.expected_output = HashMap::from([(pane, OutputSequence::ZERO)]);
-        runtime.session_identities =
-            HashMap::from([(terminal, test_wire_session_identity(terminal))]);
+        runtime.bind_pane(terminal, pane);
+        let entry = runtime.pane_entry(terminal);
+        entry.lease = Some(test_lease());
+        entry.expected_output = Some(OutputSequence::ZERO);
+        entry.identity = Some(test_wire_session_identity(terminal));
 
         let error = runtime.stop(terminal).expect_err("stop should fail");
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert!(runtime.is_running(terminal));
-        assert_eq!(runtime.pane_to_terminal.get(&pane), Some(&terminal));
+        assert_eq!(runtime.key_for_pane(pane), Some(terminal));
+    }
+
+    /// F2: the per-key state used to be twelve parallel maps and every
+    /// lifecycle operation had to remember which subset to touch. These two
+    /// assert the two boundaries that mattered: retiring a key drops
+    /// *everything* it owned, and losing an attachment drops only what the
+    /// attachment owned.
+    #[test]
+    fn removing_a_terminal_drops_every_field_it_owned() {
+        let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::ChatAgent(ChatId(5));
+        let pane = pane_for_key(terminal);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 4, cols: 10 });
+        runtime.process_terminal_output(terminal, b"output");
+        runtime.pane_entry(terminal).identity = Some(test_wire_session_identity(terminal));
+        runtime
+            .register_agent_session(
+                terminal,
+                AgentSessionMetadata {
+                    schema_version: mult_protocol::AGENT_STATUS_SCHEMA_VERSION,
+                    chat_id: 5,
+                    agent: mult_protocol::AgentKind::Pi,
+                    generation: mult_protocol::AgentGeneration::from_bytes([7; 16]).unwrap(),
+                },
+            )
+            .expect("register agent metadata");
+        runtime.record_exit_status_for_test(
+            terminal,
+            PtyExit {
+                code: 1,
+                signal: None,
+            },
+        );
+        runtime.record_foreground_process(
+            terminal,
+            ForegroundProcessInfo {
+                root_pid: Some(1),
+                foreground_pid: Some(2),
+                command: Some("cargo test".to_string()),
+            },
+        );
+        // Every field is populated, so nothing below can pass by never having
+        // been set.
+        assert!(runtime.panes.contains_key(&terminal));
+        assert_eq!(runtime.terminal_last_command(terminal), Some("cargo test"));
+
+        runtime.remove_terminal(terminal);
+
+        assert!(!runtime.panes.contains_key(&terminal));
+        assert_eq!(runtime.key_for_pane(pane), None);
+        assert_eq!(runtime.attached_pane(terminal), None);
+        assert_eq!(runtime.lease_of(pane), None);
+        assert!(!runtime.is_running(terminal));
+        assert!(runtime.parser(terminal).is_none());
+        assert!(runtime.registered_session_identity(terminal).is_none());
+        assert!(runtime.terminal_exit_status(terminal).is_none());
+        assert!(runtime.terminal_last_command(terminal).is_none());
+        assert!(runtime.terminal_output_is_blank(terminal));
+    }
+
+    #[test]
+    fn clearing_an_attachment_keeps_everything_the_attachment_did_not_own() {
+        let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::Terminal(TerminalId(6));
+        let pane = PaneId(6);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 4, cols: 10 });
+        runtime.process_terminal_output(terminal, b"scrollback");
+        runtime.pane_entry(terminal).identity = Some(test_wire_session_identity(terminal));
+
+        assert_eq!(runtime.clear_attachment(pane), Some(terminal));
+
+        // Gone: the binding and the lease state that only exists with it.
+        assert_eq!(runtime.key_for_pane(pane), None);
+        assert_eq!(runtime.attached_pane(terminal), None);
+        assert_eq!(runtime.lease_of(pane), None);
+        assert!(!runtime.is_running(terminal));
+        // Kept: the model still shows this terminal, and a re-attach reuses it.
+        assert!(runtime.parser(terminal).is_some());
+        assert!(runtime.terminal_lines(terminal)[0].contains("scrollback"));
+        assert!(runtime.registered_session_identity(terminal).is_some());
     }
 
     #[test]
@@ -3991,7 +4121,7 @@ mod tests {
             }]
         );
         assert!(!runtime.is_running(terminal));
-        assert!(!runtime.pane_to_terminal.contains_key(&pane));
+        assert_eq!(runtime.key_for_pane(pane), None);
         assert_eq!(
             runtime.terminal_exit_status(terminal),
             Some(&PtyExit {
@@ -4690,7 +4820,7 @@ mod tests {
         // Keep the lease/mapping until a correlated attach reconciliation.
         assert!(runtime.connection.is_none());
         assert!(runtime.is_running(terminal));
-        assert_eq!(runtime.pane_to_terminal.get(&pane), Some(&terminal));
+        assert_eq!(runtime.key_for_pane(pane), Some(terminal));
         assert!(runtime.parser(terminal).is_some());
         // Losing the socket is a property of the connection, not of any one
         // pane, so it is reported without a pane rather than being blamed on
@@ -4740,7 +4870,7 @@ mod tests {
             "{events:?}"
         );
         // ...and the attachment it did not concern is untouched.
-        assert_eq!(runtime.pane_to_terminal.get(&pane), Some(&terminal));
+        assert_eq!(runtime.key_for_pane(pane), Some(terminal));
     }
 
     #[test]
@@ -4749,9 +4879,10 @@ mod tests {
         // diagnostic used to be queued against `Terminal(0)` and was therefore
         // never rendered anywhere: a user with a missing or version-mismatched
         // `mult-server` saw an inert UI (E2).
-        let mut runtime = PtyRuntime::with_socket_path(PathBuf::from(
-            "/nonexistent/mult-e2-unreachable-socket/mult.sock",
-        ));
+        let mut runtime = PtyRuntime::with_socket_path(
+            PathBuf::from("/nonexistent/mult-e2-unreachable-socket/mult.sock"),
+            SpawnPolicy::Autospawn,
+        );
 
         let events = runtime.drain_events();
 
@@ -4936,8 +5067,7 @@ mod tests {
         let terminal_b = PtyKey::Terminal(TerminalId(32));
         let pane_b = PaneId(32);
         let mut runtime = unattached_test_runtime(client_stream, receiver);
-        runtime.terminal_to_pane.insert(terminal_b, pane_b);
-        runtime.pane_to_terminal.insert(pane_b, terminal_b);
+        runtime.bind_pane(terminal_b, pane_b);
         runtime.ensure_parser(terminal_b, PtyDimensions { rows: 2, cols: 20 });
         let pane_a_request = test_request_id(1);
         let pane_b_request = test_request_id(2);
@@ -5036,16 +5166,10 @@ mod tests {
         let second_terminal = PtyKey::Terminal(TerminalId(2));
         let second_pane = PaneId(2);
         let second_lease = test_lease().checked_next().expect("second lease");
-        runtime
-            .terminal_to_pane
-            .insert(second_terminal, second_pane);
-        runtime
-            .pane_to_terminal
-            .insert(second_pane, second_terminal);
-        runtime.pane_leases.insert(second_pane, second_lease);
-        runtime
-            .expected_output
-            .insert(second_pane, OutputSequence::ZERO);
+        runtime.bind_pane(second_terminal, second_pane);
+        let second_entry = runtime.pane_entry(second_terminal);
+        second_entry.lease = Some(second_lease);
+        second_entry.expected_output = Some(OutputSequence::ZERO);
         let mut events = Vec::new();
 
         runtime.handle_server_message(
@@ -5058,7 +5182,7 @@ mod tests {
 
         assert!(!runtime.is_running(first_terminal));
         assert!(runtime.is_running(second_terminal));
-        assert_eq!(runtime.pane_leases.get(&second_pane), Some(&second_lease));
+        assert_eq!(runtime.lease_of(second_pane), Some(second_lease));
         assert_eq!(
             events,
             vec![PtyEvent::TakenOver {
@@ -5087,7 +5211,7 @@ mod tests {
         );
 
         assert!(!runtime.is_running(terminal));
-        assert_eq!(runtime.terminal_to_pane.get(&terminal), Some(&pane));
+        assert_eq!(runtime.attached_pane(terminal), Some(pane));
         assert!(events.iter().any(|event| matches!(
             event,
             PtyEvent::Error { message, .. } if message.contains("fresh attach replay")
@@ -5115,7 +5239,7 @@ mod tests {
             .is_some_and(|error| error.operation == PtyDeliveryOperation::Input));
         assert!(runtime.connection.is_none());
         assert!(runtime.is_running(terminal));
-        assert_eq!(runtime.pane_leases.get(&pane), Some(&test_lease()));
+        assert_eq!(runtime.lease_of(pane), Some(test_lease()));
     }
 
     #[test]
@@ -5287,12 +5411,7 @@ mod tests {
         let second = PtyKey::Terminal(TerminalId(22));
         let mut runtime = unattached_test_runtime(client_stream, receiver);
         for terminal in [first, second] {
-            runtime
-                .terminal_to_pane
-                .insert(terminal, pane_for_key(terminal));
-            runtime
-                .pane_to_terminal
-                .insert(pane_for_key(terminal), terminal);
+            runtime.bind_pane(terminal, pane_for_key(terminal));
             runtime.ensure_parser(terminal, PtyDimensions { rows: 4, cols: 10 });
         }
 
@@ -5330,12 +5449,7 @@ mod tests {
         ];
         let mut runtime = unattached_test_runtime(client_stream, receiver);
         for terminal in terminals {
-            runtime
-                .terminal_to_pane
-                .insert(terminal, pane_for_key(terminal));
-            runtime
-                .pane_to_terminal
-                .insert(pane_for_key(terminal), terminal);
+            runtime.bind_pane(terminal, pane_for_key(terminal));
             runtime.ensure_parser(terminal, PtyDimensions { rows: 4, cols: 10 });
         }
 
@@ -5597,10 +5711,10 @@ mod tests {
         pane: PaneId,
     ) -> PtyRuntime {
         let mut runtime = unattached_test_runtime(client_stream, receiver);
-        runtime.terminal_to_pane = HashMap::from([(terminal, pane)]);
-        runtime.pane_to_terminal = HashMap::from([(pane, terminal)]);
-        runtime.pane_leases = HashMap::from([(pane, test_lease())]);
-        runtime.expected_output = HashMap::from([(pane, OutputSequence::ZERO)]);
+        runtime.bind_pane(terminal, pane);
+        let entry = runtime.pane_entry(terminal);
+        entry.lease = Some(test_lease());
+        entry.expected_output = Some(OutputSequence::ZERO);
         runtime
     }
 

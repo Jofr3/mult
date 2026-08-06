@@ -34,6 +34,7 @@ use std::{
     path::PathBuf,
 };
 
+use mult_protocol::invalid_data;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -272,10 +273,6 @@ fn read_and_recover(
     Ok((records, last_complete))
 }
 
-fn invalid_data(error: serde_json::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -367,7 +364,7 @@ mod tests {
         let path = unique_test_path();
         let identity = identity();
         let other = {
-            let state = ProjectState::try_default().unwrap();
+            let state = ProjectState::try_first_run().unwrap();
             let terminal = state.workspaces[1].terminals[0].id;
             state.session_identity(PtyKey::Terminal(terminal)).unwrap()
         };
@@ -435,7 +432,7 @@ mod tests {
     }
 
     fn identity() -> SessionIdentity {
-        let state = ProjectState::try_default().unwrap();
+        let state = ProjectState::try_first_run().unwrap();
         let terminal = state.workspaces[0].terminals[0].id;
         state.session_identity(PtyKey::Terminal(terminal)).unwrap()
     }

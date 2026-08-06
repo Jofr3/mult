@@ -45,15 +45,18 @@ use std::{
 use mult::cli::{self, Binary, Invocation};
 
 use mult_protocol::{
-    bounded_screen_dimensions, default_socket_path, ensure_private_dir, peer::verify_peer_is_self,
-    read_message, write_message, AgentSessionMetadata, AgentStatus, AgentStatusError,
-    AgentStatusOutcome, AgentStatusQuery, AgentStatusRecord, AttachError, AttachOutcome,
-    AttachmentLease, ClientMessage, ClientScopeId, CreateError, CreateOutcome, ExitInfo,
-    ForegroundProcessInfo, IdentityMismatch, LaunchSpec, LeaseOperation, LeaseRejectionReason,
-    OutputSequence, PaneId, PaneInfo, RequestId, ServerInstanceId, ServerMessage, SessionId,
-    SessionIdentity, SessionInfo, StateNamespace, StopError, StopOutcome,
-    AGENT_STATUS_SCHEMA_VERSION, MAX_CACHED_REQUEST_RESULTS_PER_SCOPE, MAX_MESSAGE_BYTES,
-    MAX_PENDING_REQUESTS_PER_CLIENT, PROTOCOL_VERSION,
+    bounded_screen_dimensions, default_socket_path, ensure_private_dir,
+    peer::verify_peer_is_self,
+    read_message,
+    shell::{default_shell, quote_display_argument, shell_command_args},
+    write_message, AgentSessionMetadata, AgentStatus, AgentStatusError, AgentStatusOutcome,
+    AgentStatusQuery, AgentStatusRecord, AttachError, AttachOutcome, AttachmentLease,
+    ClientMessage, ClientScopeId, CreateError, CreateOutcome, ExitInfo, ForegroundProcessInfo,
+    IdentityMismatch, LaunchSpec, LeaseOperation, LeaseRejectionReason, OutputSequence, PaneId,
+    PaneInfo, RequestId, ServerInstanceId, ServerMessage, SessionId, SessionIdentity, SessionInfo,
+    StateNamespace, StopError, StopOutcome, AGENT_STATUS_SCHEMA_VERSION,
+    MAX_CACHED_REQUEST_RESULTS_PER_SCOPE, MAX_MESSAGE_BYTES, MAX_PENDING_REQUESTS_PER_CLIENT,
+    PROTOCOL_VERSION,
 };
 use portable_pty::{native_pty_system, Child, CommandBuilder, ExitStatus, MasterPty, PtySize};
 use signal_hook::{
@@ -3217,28 +3220,10 @@ fn command_line_from_cmdline_bytes(bytes: &[u8]) -> Option<String> {
     }
     Some(
         args.into_iter()
-            .map(shell_display_arg)
+            .map(|arg| quote_display_argument(&arg))
             .collect::<Vec<_>>()
             .join(" "),
     )
-}
-
-fn shell_display_arg(arg: String) -> String {
-    if arg
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '='))
-    {
-        arg
-    } else {
-        format!("'{}'", arg.replace('\'', "'\\''"))
-    }
-}
-
-fn shell_command_args(command: String) -> Vec<String> {
-    // TerminalLaunch::Command and both chat-agent commands are intentionally
-    // evaluated by the login shell. Keep this distinct from MULT_AGENT_CMD's
-    // client-side argv parser.
-    vec!["-lc".to_string(), command]
 }
 
 fn pane_title(shell: &str, launch: &LaunchSpec) -> String {
@@ -3246,10 +3231,6 @@ fn pane_title(shell: &str, launch: &LaunchSpec) -> String {
         LaunchSpec::Shell => shell.to_string(),
         LaunchSpec::Command(command) => command.clone(),
     }
-}
-
-fn default_shell() -> String {
-    env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
 
 fn lock_error<T>(_: std::sync::PoisonError<T>) -> io::Error {

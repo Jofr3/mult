@@ -270,11 +270,11 @@ Because the command goes through a **login** shell, it also sees your `~/.profil
 exists on the `PATH` set in `~/.bashrc` will not be found. See
 [CONFIG.md](CONFIG.md).
 
-**Known cosmetic bug.** The idle placeholder in an *empty* chat pane reads
-"Pi agent not started. Type to start it and send input." and points at
-`pi_agent_command`/`auto_start_pi_agent` **for Claude Code chats too**. The chat
-is a Claude Code chat (the sidebar shows `agent: cc`) and the keys you actually
-want are `claude_code_command`/`auto_start_claude_code_agent`. Tracked as `F18`.
+The idle placeholder in an *empty* chat pane names the chat's own agent and its
+own two config keys — `pi_agent_command`/`auto_start_pi_agent` for a pi chat,
+`claude_code_command`/`auto_start_claude_code_agent` for a Claude Code one (the
+sidebar shows which with `agent: pi` or `agent: cc`). It used to say "Pi agent"
+and name pi's keys for every chat; that was `F18`.
 
 ---
 

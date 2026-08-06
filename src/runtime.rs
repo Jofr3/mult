@@ -26,13 +26,13 @@ use mult::{
     config::{self, Config},
     git,
     model::{self, AgentKind, ChatStatus, PtyKey, TerminalLaunch, TerminalStatus},
-    pty::{AttachExistingResult, PtyDimensions, PtyEvent, PtyRuntime, PtySpawn},
+    pty::{AttachExistingResult, PtyDimensions, PtyEvent, PtyRuntime, PtySpawn, SpawnPolicy},
     storage, ui,
 };
 use mult_protocol::{
-    peer::effective_uid, AgentGeneration as WireAgentGeneration, AgentKind as WireAgentKind,
-    AgentSessionMetadata, AgentStatus, AgentStatusQuery, AgentStatusRecord,
-    AGENT_STATUS_SCHEMA_VERSION,
+    peer::effective_uid, shell::quote_argument, AgentGeneration as WireAgentGeneration,
+    AgentKind as WireAgentKind, AgentSessionMetadata, AgentStatus, AgentStatusQuery,
+    AgentStatusRecord, AGENT_STATUS_SCHEMA_VERSION,
 };
 use ratatui::{layout::Rect, DefaultTerminal};
 use serde::Deserialize;
@@ -270,7 +270,10 @@ pub fn run(
     store: &storage::StateStore,
 ) -> io::Result<()> {
     let save = |state: &model::ProjectState| store.save(state);
-    let mut pty_runtime = PtyRuntime::default();
+    // Explicitly, never `Default`: this connects a socket and may fork a
+    // daemon (F3).
+    let mut pty_runtime =
+        PtyRuntime::with_socket_path(mult_protocol::default_socket_path(), SpawnPolicy::Autospawn);
     let mut agent_backend = RuntimeAgentBackend::from_env();
     let mut agent_status_bridges = AgentStatusBridgeState::default();
     let mut save_schedule = SaveSchedule::default();
@@ -2045,7 +2048,7 @@ fn pi_command_with_mult_status_extension(config: &Config) -> String {
 
     format!(
         "{command} -e {}",
-        shell_quote(&extension.display().to_string())
+        quote_argument(&extension.display().to_string())
     )
 }
 
@@ -2062,7 +2065,7 @@ fn claude_code_command_with_mult_status_hooks(config: &Config) -> String {
 
     format!(
         "{command} --settings {}",
-        shell_quote(&settings.display().to_string())
+        quote_argument(&settings.display().to_string())
     )
 }
 
@@ -2096,7 +2099,7 @@ fn write_mult_claude_status_files() -> Option<PathBuf> {
 /// argument. Built with `serde_json` so the script path is correctly escaped
 /// into the embedded shell command.
 fn mult_claude_status_settings_json(script: &Path) -> String {
-    let script = shell_quote(&script.display().to_string());
+    let script = quote_argument(&script.display().to_string());
     let hook = |status: &str| {
         serde_json::json!({
             "matcher": "",
@@ -2243,20 +2246,6 @@ fn rotate_legacy_runtime_artifacts(
         let _ = fs::remove_file(path);
     }
     Ok(())
-}
-
-fn shell_quote(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
-    if value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '+'))
-    {
-        return value.to_string();
-    }
-
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn focus_selected_input(
@@ -2424,7 +2413,7 @@ fn apply_pty_event(app: &mut App, pty_runtime: &mut PtyRuntime, event: PtyEvent)
                 PtyKey::Terminal(terminal_id) => {
                     app.mark_terminal_stopped(terminal_id);
                     if app.terminal_input_target() == Some(terminal_id) {
-                        app.end_terminal_input();
+                        app.end_pty_input();
                     }
                     let exit_message = format!("PTY exited: {}", status.label());
                     pty_runtime.append_terminal_system_line(terminal, exit_message.as_str());
@@ -3250,7 +3239,7 @@ mod tests {
     }
 
     fn running_command_app(command: String) -> (App, model::WorkspaceId, model::TerminalId) {
-        let mut state = model::ProjectState::default();
+        let mut state = model::ProjectState::try_first_run().expect("first-run project");
         let workspace = state.workspaces[0].id;
         let terminal = state.workspaces[0].terminals[0].id;
         let session = state
@@ -3301,7 +3290,7 @@ mod tests {
         let _ = fs::remove_file(&side_effect);
         let command = format!(
             "printf launched > {}",
-            shell_quote(&side_effect.display().to_string())
+            quote_argument(&side_effect.display().to_string())
         );
         let (mut app, workspace, terminal) = running_command_app(command);
         let (mut runtime, observed, server, socket_path) =
@@ -3338,7 +3327,7 @@ mod tests {
             terminal,
         });
         let offline_socket = unique_status_path("offline-restore").with_extension("sock");
-        let mut offline = PtyRuntime::with_socket_path(offline_socket);
+        let mut offline = PtyRuntime::with_socket_path(offline_socket, SpawnPolicy::Autospawn);
         assert!(!auto_start_selected_terminal(
             &mut reloaded,
             &mut offline,
@@ -3365,7 +3354,7 @@ mod tests {
         let side_effect = root.join("must-not-run");
         let command = format!(
             "printf launched > {}",
-            shell_quote(&side_effect.display().to_string())
+            quote_argument(&side_effect.display().to_string())
         );
         let v1 = serde_json::json!({
             "version": 1,
@@ -3443,11 +3432,11 @@ mod tests {
         let _ = fs::remove_file(&side_effect);
         let command = format!(
             "printf launched > {}",
-            shell_quote(&side_effect.display().to_string())
+            quote_argument(&side_effect.display().to_string())
         );
         let (mut app, workspace, terminal) = running_command_app(command);
         let socket = unique_status_path("unreachable-daemon").with_extension("sock");
-        let mut runtime = PtyRuntime::with_socket_path(socket);
+        let mut runtime = PtyRuntime::with_socket_path(socket, SpawnPolicy::Autospawn);
 
         restore_persisted_sessions(
             &mut app,
@@ -3512,7 +3501,8 @@ mod tests {
         // The cache is keyed by the agent session, so a restart (new
         // generation) re-derives the path and starts reading from zero again.
         let chat = model::ChatId(7);
-        let identity = model::ProjectState::default()
+        let identity = model::ProjectState::try_first_run()
+            .expect("first-run project")
             .session_identity(PtyKey::Terminal(model::TerminalId(1)))
             .expect("the default project has a terminal identity");
         let first_generation = model::AgentGeneration::from_bytes([3; 16]).unwrap();
@@ -4134,15 +4124,8 @@ mod tests {
     }
 
     #[test]
-    fn shell_quote_handles_paths_with_spaces() {
-        assert_eq!(shell_quote("/tmp/no-spaces.ts"), "/tmp/no-spaces.ts");
-        assert_eq!(shell_quote("/tmp/has space.ts"), "'/tmp/has space.ts'");
-        assert_eq!(shell_quote("/tmp/it's.ts"), "'/tmp/it'\\''s.ts'");
-    }
-
-    #[test]
     fn status_record_validation_binds_every_identity_field_and_generation() {
-        let mut state = model::ProjectState::default();
+        let mut state = model::ProjectState::try_first_run().expect("first-run project");
         let workspace = state.workspaces[0].id;
         let chat = state
             .add_chat(

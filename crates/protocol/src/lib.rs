@@ -13,6 +13,7 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 #[cfg(unix)]
 pub mod peer;
+pub mod shell;
 
 pub const PROTOCOL_VERSION: u16 = 10;
 pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 1;
@@ -844,7 +845,11 @@ fn message_too_large(kind: io::ErrorKind, len: u64) -> io::Error {
     )
 }
 
-fn invalid_data(error: impl std::fmt::Display) -> io::Error {
+/// An `InvalidData` error carrying `error`'s message.
+///
+/// Shared rather than redefined per module: `storage` and `transcript` each had
+/// their own copy over `serde_json::Error` (F20).
+pub fn invalid_data(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
