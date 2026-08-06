@@ -6,7 +6,8 @@ from [`src/config.rs`](../src/config.rs); the palette defaults come from the
 and the renderer's fallback colours are both derived from.
 
 The file is optional. A missing config means "use the defaults" — it is not an
-error.
+error, *at the default location*. A path you named yourself (`--config` or
+`$MULT_CONFIG_PATH`) has to exist: see [How the file is read](#how-the-file-is-read).
 
 ## Where the file is read from
 
@@ -29,8 +30,15 @@ The read is correspondingly strict — the file must be:
 - **not writable by group or others**;
 - **at most 1 MiB** (`MAX_CONFIG_BYTES`).
 
-Anything else is refused with `config error at <path>: …`. Only "not found" is
-treated as "use the defaults".
+Anything else is refused with `config error at <path>: …`.
+
+"Not found" is treated as "use the defaults" **only for the default location**
+(3 and 4 above). A path you gave explicitly with `--config` or
+`$MULT_CONFIG_PATH` must exist; a missing one stops startup with
+`config error at <path>: no such file (it was named explicitly, so the defaults
+are not used)` and exit status 2. Falling back there is not neutral: the
+built-in defaults auto-start `pi` and `claude` through your login shell, so one
+mistyped character would run command lines your real config had turned off.
 
 ## Validation policy
 

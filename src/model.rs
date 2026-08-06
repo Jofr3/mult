@@ -25,6 +25,14 @@ pub const DEFAULT_AGENT_CHAT_TITLE: &str = "agent";
 /// decode at all still fails the load, because dropping it here would lose it
 /// silently on the next save, whereas failing keeps the timestamped backup and
 /// now says where it went.
+///
+/// It stops at the *containers* for the same reason (F6). `workspaces`, `chats`
+/// and `terminals` are the sessions themselves, so a `null` or a renamed key
+/// there is not a field that can carry a default — it is the whole project, and
+/// defaulting it to an empty list hands the user a healthy-looking but empty
+/// session, no backup, no notice, and a first save that overwrites the bytes
+/// that still held everything. Those three fail the decode, which is what routes
+/// the file to `backup_invalid_state_and_reset`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectState {
     #[serde(default, deserialize_with = "null_as_default")]
@@ -39,7 +47,7 @@ pub struct ProjectState {
     /// then persisted. See [`ProjectState::ensure_instance`].
     #[serde(default, deserialize_with = "null_as_default")]
     pub instance: u64,
-    #[serde(default, deserialize_with = "null_as_default")]
+    /// Deliberately not lenient: see the note on this struct (F6).
     pub workspaces: Vec<Workspace>,
 }
 
@@ -53,9 +61,9 @@ pub struct Workspace {
     pub cwd: Option<PathBuf>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub environment: BTreeMap<String, String>,
-    #[serde(default, deserialize_with = "null_as_default")]
+    /// Deliberately not lenient: see the note on [`ProjectState`] (F6).
     pub chats: Vec<ChatSession>,
-    #[serde(default, deserialize_with = "null_as_default")]
+    /// Deliberately not lenient: see the note on [`ProjectState`] (F6).
     pub terminals: Vec<TerminalSession>,
 }
 
@@ -806,10 +814,23 @@ impl ProjectState {
             .find(|terminal| terminal.id == terminal_id)
     }
 
+    /// Allocate an unused workspace id.
+    ///
+    /// Workspace ids are not bounded by the session-id space, so the counter
+    /// only wraps at `u64::MAX` — but a state file that already carries that id
+    /// saturates `next_unbounded_after`, and the bare `WorkspaceId(next)` this
+    /// replaced then handed out a *duplicate*: `workspace_mut` resolved to the
+    /// wrong entry and `remove_workspace` deleted the wrong one. The `+= 1` that
+    /// followed it overflowed on top (a panic in debug, the reserved `0` in
+    /// release). Consulting the used ids is what `allocate_chat_id` and
+    /// `allocate_terminal_id` already do (F5).
     fn allocate_workspace_id(&mut self) -> WorkspaceId {
-        let id = WorkspaceId(self.next_workspace_id);
-        self.next_workspace_id += 1;
-        id
+        let used = self
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.0)
+            .collect::<BTreeSet<_>>();
+        WorkspaceId(take_next_unbounded_id(&used, &mut self.next_workspace_id))
     }
 
     /// Allocate an unused chat id. The counter wraps back to 1 at
@@ -848,12 +869,22 @@ fn next_durable_candidate(candidate: u64) -> u64 {
     }
 }
 
+/// Take the next unused id from an unbounded counter, wrapping past the end.
+///
+/// `wrapping_add`, never `saturating_add`: at `u64::MAX` a saturating bump is a
+/// no-op, so a counter parked there with that id already in use spun here
+/// forever. `normalize_existing_ids` reaches exactly that state from a state
+/// file with two workspaces both carrying `"id": 18446744073709551615`, and
+/// `App::new` runs it before the first frame — so `mult` hung at 100% CPU on
+/// every launch, with nothing on screen and no key to press (F4). The wrap
+/// terminates because `used` is finite; `0` is reserved for "unallocated" and is
+/// skipped on the way past.
 fn take_next_unbounded_id(used: &BTreeSet<u64>, next: &mut u64) -> u64 {
     while *next == 0 || used.contains(next) {
-        *next = next.saturating_add(1).max(1);
+        *next = next.wrapping_add(1);
     }
     let id = *next;
-    *next = next.saturating_add(1);
+    *next = next.wrapping_add(1);
     id
 }
 
@@ -1193,6 +1224,109 @@ mod tests {
         assert_eq!(last, ChatId(MAX_DURABLE_SESSION_ID));
         assert_ne!(wrapped, first);
         assert_eq!(wrapped, ChatId(2));
+    }
+
+    /// F4: `mult` hung at 100% CPU on every launch, before the first frame, for
+    /// any state file carrying two workspaces with `"id": 18446744073709551615`
+    /// — `saturating_add(1).max(1)` at `u64::MAX` is a no-op, so the search for
+    /// a free id never advanced. `WorkspaceId` accepts the value, `App::new`
+    /// runs the repair, and there was no key to press.
+    #[test]
+    fn two_maximal_workspace_ids_are_renumbered_instead_of_spinning_forever() {
+        let json = format!(
+            r#"{{"version":1,"next_workspace_id":{max},"next_chat_id":1,"next_terminal_id":1,
+                 "workspaces":[
+                   {{"id":{max},"name":"one","chats":[],"terminals":[]}},
+                   {{"id":{max},"name":"two","chats":[],"terminals":[]}}]}}"#,
+            max = u64::MAX
+        );
+        let mut state: ProjectState = serde_json::from_str(&json).expect("deserialize state");
+
+        assert!(state.normalize_next_ids());
+
+        let ids = state
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.0)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), 2, "a duplicate id has to be renumbered");
+        assert!(!ids.contains(&0), "0 is the unallocated id");
+    }
+
+    /// F5: `allocate_workspace_id` handed out `next_workspace_id` unchecked, so
+    /// an existing workspace at `u64::MAX` (where the counter saturates) made
+    /// the next workspace a *duplicate* of it — `workspace_mut` then resolved to
+    /// the wrong entry and `remove_workspace` deleted the wrong one — and the
+    /// `+= 1` behind it overflowed: a panic in debug, the reserved `0` in
+    /// release.
+    #[test]
+    fn a_maximal_workspace_id_yields_neither_a_duplicate_nor_an_overflow() {
+        let mut state = ProjectState::default();
+        let existing = WorkspaceId(u64::MAX);
+        state.workspaces.push(Workspace {
+            id: existing,
+            name: "existing".to_string(),
+            cwd: None,
+            environment: BTreeMap::new(),
+            chats: Vec::new(),
+            terminals: Vec::new(),
+        });
+        state.next_workspace_id = u64::MAX;
+
+        let added = state.add_workspace("new".to_string(), None);
+        let after = state.add_workspace("newer".to_string(), None);
+
+        assert_ne!(added, existing);
+        assert_ne!(added, WorkspaceId(0));
+        assert_ne!(after, added);
+        assert_eq!(
+            state
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3
+        );
+        // The entry each id names is still the one it was given to.
+        assert_eq!(state.workspace(added).map(|w| w.name.as_str()), Some("new"));
+        assert_eq!(
+            state.remove_workspace(existing).map(|w| w.name),
+            Some("existing".to_string())
+        );
+    }
+
+    /// F6: the sessions themselves are not a defaultable field. A `null` (or a
+    /// renamed key) where they belong is damage, and decoding it as an empty
+    /// list hands the user a healthy-looking workspace with everything gone, no
+    /// backup and no notice — see the storage tests for the other half.
+    #[test]
+    fn a_null_or_missing_session_container_fails_the_decode() {
+        let head = r#""version":1,"next_workspace_id":1,"next_chat_id":1,"next_terminal_id":1"#;
+        for state in [
+            format!(r#"{{{head},"workspaces":null}}"#),
+            format!(r#"{{{head}}}"#),
+            format!(
+                r#"{{{head},"workspaces":[{{"id":1,"name":"orbit","chats":null,"terminals":[]}}]}}"#
+            ),
+            format!(
+                r#"{{{head},"workspaces":[{{"id":1,"name":"orbit","chats":[],"terminals":null}}]}}"#
+            ),
+            format!(r#"{{{head},"workspaces":[{{"id":1,"name":"orbit","chats":[]}}]}}"#),
+        ] {
+            assert!(
+                serde_json::from_str::<ProjectState>(&state).is_err(),
+                "must not decode: {state}"
+            );
+        }
+
+        // The scalars around them stay lenient: that is what E11 was about.
+        let lenient = r#"{"version":null,"next_workspace_id":null,"next_chat_id":null,
+             "next_terminal_id":null,
+             "workspaces":[{"id":null,"name":null,"cwd":null,"environment":null,
+               "chats":[],"terminals":[]}]}"#;
+        let state: ProjectState = serde_json::from_str(lenient).expect("scalars stay lenient");
+        assert_eq!(state.workspaces.len(), 1);
     }
 
     #[test]

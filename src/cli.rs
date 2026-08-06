@@ -274,7 +274,10 @@ mod tests {
                 Some(std::ffi::OsStr::new("/tmp/from-env.json")),
                 std::path::Path::new("/home/example/.config"),
             ),
-            PathBuf::from("/tmp/from-flag.json")
+            (
+                PathBuf::from("/tmp/from-flag.json"),
+                crate::config::ConfigSource::Explicit
+            )
         );
         assert_eq!(
             crate::config::config_path_from(
@@ -282,7 +285,10 @@ mod tests {
                 Some(std::ffi::OsStr::new("/tmp/from-env.json")),
                 std::path::Path::new("/home/example/.config"),
             ),
-            PathBuf::from("/tmp/from-env.json")
+            (
+                PathBuf::from("/tmp/from-env.json"),
+                crate::config::ConfigSource::Explicit
+            )
         );
     }
 

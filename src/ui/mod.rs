@@ -118,12 +118,10 @@ mod tests {
         let frame_area = Rect::new(0, 0, 100, 10);
         let output_area = AppLayout::compute(&app, frame_area).terminal_output;
         let mut pty_runtime = PtyRuntime::new_offline();
-        pty_runtime
-            .resize(
-                terminal_id,
-                crate::pty::PtyDimensions::new(output_area.height, output_area.width),
-            )
-            .expect("resize parser");
+        pty_runtime.reset_parser(
+            terminal_id,
+            crate::pty::PtyDimensions::new(output_area.height, output_area.width),
+        );
         for line in 0..16 {
             pty_runtime.process_pty_output(terminal_id, format!("line {line}\r\n").as_bytes());
         }
@@ -185,6 +183,81 @@ mod tests {
         select_snapshot_terminal(&mut app);
 
         insta::assert_snapshot!(draw_grid(&app, &PtyRuntime::new_offline(), 80, 24));
+    }
+    /// A frame with a drag selection and a live cursor, drawn with the terminal
+    /// scrolled to the bottom so both affordances are on screen at once.
+    fn no_color_frame(width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut app = snapshot_app();
+        let terminal_id = select_snapshot_terminal(&mut app);
+
+        let frame_area = Rect::new(0, 0, width, height);
+        let output_area = AppLayout::compute(&app, frame_area).terminal_output;
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime.reset_parser(
+            terminal_id,
+            crate::pty::PtyDimensions::new(output_area.height, output_area.width),
+        );
+        // The trailing `\r` parks the child's cursor back on the `s` of "second"
+        // — a cell with contents, which is what the *overlay* style paints. On a
+        // blank cell the cursor is a `█` glyph instead and says nothing about
+        // the overlay.
+        pty_runtime.process_pty_output(terminal_id, b"selected text\r\nsecond line\r");
+        app.begin_text_selection(terminal_id, SelectionCell { row: 0, col: 0 });
+        app.update_text_selection(terminal_id, SelectionCell { row: 0, col: 7 });
+
+        let config = config::Config {
+            color_output: config::ColorOutput::Disabled,
+            ..config::Config::default()
+        };
+        test_support::draw_buffer_with_config(&app, &pty_runtime, &config, width, height)
+    }
+
+    /// F15: under `NO_COLOR` the selection and the cursor overlay used to be a
+    /// `readable_fg` pair on a `Color::Reset` background — a contrast ratio of
+    /// 1.0, so the fallback hard-coded `Color::Rgb(255, 255, 255)`. That made a
+    /// drag selection indistinguishable from unselected text *and* emitted
+    /// truecolor from the one mode whose whole point is not to.
+    #[test]
+    fn no_color_keeps_the_selection_and_cursor_visible_without_emitting_truecolor() {
+        let buffer = no_color_frame(100, 10);
+        let area = *buffer.area();
+
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                let cell = buffer.cell((x, y)).expect("cell is in bounds");
+                assert!(
+                    !matches!(cell.fg, ratatui::style::Color::Rgb(..))
+                        && !matches!(cell.bg, ratatui::style::Color::Rgb(..)),
+                    "cell ({x}, {y}) emits truecolor under NO_COLOR: {cell:?}"
+                );
+            }
+        }
+
+        let reversed = |x: u16, y: u16| {
+            buffer
+                .cell((x, y))
+                .expect("cell is in bounds")
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        };
+        let output = AppLayout::compute(&snapshot_app(), Rect::new(0, 0, 100, 10)).terminal_output;
+        // The eight selected cells of "selected" are reversed; the text after
+        // the selection on the same row is not.
+        assert!(reversed(output.x, output.y), "the selection stands out");
+        assert!(reversed(output.x + 7, output.y));
+        assert!(!reversed(output.x + 9, output.y), "and stops where it ends");
+        // The child's cursor is parked on the `s` of "second" on the row below.
+        assert!(
+            reversed(output.x, output.y + 1),
+            "the cursor overlay stands out"
+        );
+        assert!(!reversed(output.x + 1, output.y + 1));
+    }
+    /// Nothing pinned the `NO_COLOR` frame before, so a fourth site drawing a
+    /// background nobody can see would have gone unnoticed.
+    #[test]
+    fn snapshot_no_color_frame() {
+        insta::assert_snapshot!(test_support::monochrome_grid(&no_color_frame(100, 10)));
     }
     #[test]
     fn extreme_terminal_sizes_render_without_panicking() {

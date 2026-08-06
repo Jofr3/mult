@@ -22,7 +22,7 @@ use crate::layout::output_area;
 use super::{
     focus_is_active,
     selection::render_text_selection,
-    theme::{pane_style, readable_fg, Palette},
+    theme::{pane_style, Palette},
     vt_screen::TerminalScreen,
 };
 
@@ -322,9 +322,9 @@ pub(super) fn render_terminal_parser(
     }
 
     let cursor_style = Style::default().fg(palette.cursor).bg(palette.base);
-    let cursor_overlay_style = Style::default()
-        .fg(readable_fg(palette.nc, palette.cursor))
-        .bg(palette.cursor);
+    // The overlay is what marks the cell the child's cursor is on; under
+    // `NO_COLOR` it is a reversed modifier, not a colour pair (F15).
+    let cursor_overlay_style = palette.emphasis_style(palette.cursor, palette.nc);
     let cursor = Cursor::default()
         .symbol("█")
         .style(cursor_style)
@@ -472,9 +472,7 @@ mod tests {
     fn a_pane_too_small_for_a_screen_says_so_instead_of_drawing_a_corner() {
         let mut pty_runtime = PtyRuntime::new_offline();
         let pty = PtyKey::Terminal(crate::model::TerminalId::new(9).unwrap());
-        pty_runtime
-            .resize(pty, crate::pty::PtyDimensions::new(1, 1))
-            .expect("resize parser");
+        pty_runtime.reset_parser(pty, crate::pty::PtyDimensions::new(1, 1));
         pty_runtime.process_pty_output(pty, b"abcdefgh");
         let parser = pty_runtime.parser(pty).expect("pane has a screen");
 
@@ -516,9 +514,7 @@ mod tests {
             .expect("seed state has a terminal");
         app.select_nav_index(selected);
         let mut pty_runtime = PtyRuntime::new_offline();
-        pty_runtime
-            .resize(terminal_id, crate::pty::PtyDimensions::new(2, 8))
-            .expect("resize parser");
+        pty_runtime.reset_parser(terminal_id, crate::pty::PtyDimensions::new(2, 8));
         pty_runtime.process_pty_output(terminal_id, b"one\r\ntwo\r\nthree");
         assert!(pty_runtime.scroll_up(terminal_id, 1));
 
@@ -545,12 +541,10 @@ mod tests {
             .selected_terminal_output()
             .expect("terminal selection has output area");
         let mut pty_runtime = PtyRuntime::new_offline();
-        pty_runtime
-            .resize(
-                terminal_id,
-                crate::pty::PtyDimensions::new(output_area.height, output_area.width),
-            )
-            .expect("resize parser");
+        pty_runtime.reset_parser(
+            terminal_id,
+            crate::pty::PtyDimensions::new(output_area.height, output_area.width),
+        );
         pty_runtime.process_pty_output(terminal_id, b"x");
 
         let backend = TestBackend::new(frame_area.width, frame_area.height);
@@ -599,12 +593,10 @@ mod tests {
             .selected_terminal_output()
             .expect("terminal selection has output area");
         let mut pty_runtime = PtyRuntime::new_offline();
-        pty_runtime
-            .resize(
-                terminal_id,
-                crate::pty::PtyDimensions::new(output_area.height, output_area.width),
-            )
-            .expect("resize parser");
+        pty_runtime.reset_parser(
+            terminal_id,
+            crate::pty::PtyDimensions::new(output_area.height, output_area.width),
+        );
         let spaces = " ".repeat(usize::from(output_area.width));
         pty_runtime.process_pty_output(
             terminal_id,

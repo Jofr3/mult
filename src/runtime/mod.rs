@@ -19,7 +19,7 @@ mod session;
 
 use std::{
     fs, io,
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -74,8 +74,9 @@ const MAX_CONSECUTIVE_DRAW_ERRORS: u32 = 3;
 /// lives, and which daemon socket to use.
 pub struct RuntimeOptions {
     /// The config file in force, so "Reload config" re-reads the same file the
-    /// session started from — including one named by `--config` (E1/E9).
-    pub config_path: PathBuf,
+    /// session started from — including one named by `--config` (E1/E9), and
+    /// with the same rule about a file that is not there (F7).
+    pub config_location: config::ConfigLocation,
     /// `--socket`, or `None` to let `$MULT_SOCKET_PATH` and the default decide.
     pub socket_path: Option<PathBuf>,
 }
@@ -140,6 +141,13 @@ pub fn run(
         needs_redraw |= auto_start_selected_terminal(&mut app, &mut pty_runtime, &config, &layout);
         needs_redraw |=
             auto_start_selected_chat_agent(&mut app, &mut pty_runtime, &config, &layout);
+        // Every notice queued anywhere — including by the failed save above, and
+        // by whatever the previous iteration did after this point — asks for a
+        // frame here. It used to be each producer's job, and the two that
+        // forgot (the save and the clipboard) meant a disk that filled while the
+        // user was idle reported once a second into a status line nothing
+        // redrew, until an unrelated keypress happened to (F11).
+        needs_redraw |= app.take_redraw_request();
 
         // Anything that asks for a redraw counts as activity, so the loop only
         // backs off once nothing at all is happening.
@@ -184,33 +192,83 @@ pub fn run(
             app.set_last_error(format!("failed to copy to the clipboard: {error}"));
         }
 
-        if event::poll(idle.poll_interval())? {
-            handle_event(&mut app, &mut pty_runtime, &config, event::read()?, &layout);
-            needs_redraw = true;
-            idle.record_activity();
-            while !app.should_quit && event::poll(READY_EVENT_POLL_INTERVAL)? {
-                handle_event(&mut app, &mut pty_runtime, &config, event::read()?, &layout);
+        // An input failure ends the session through `fatal`, exactly like a
+        // draw that will not complete, rather than returning from here. The `?`
+        // this replaced jumped straight past the forced exit save and the agent
+        // status cleanup below, so a host terminal that went away — a closed
+        // window, a dropped ssh session, `EIO` out of `event::read` — lost
+        // everything edited since the last periodic save and left this pid's
+        // `mult-agent-status-*.json` files behind (F10).
+        match drain_input_events(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &layout,
+            idle.poll_interval(),
+        ) {
+            Ok(false) => {}
+            Ok(true) => {
+                needs_redraw = true;
+                idle.record_activity();
+                if let Err(error) =
+                    save_if_dirty(&mut app, store, &mut last_save, Instant::now(), false)
+                {
+                    app.set_last_error(format!("failed to save state: {error}"));
+                }
+                // Outside the borrow of `config` that the handlers hold. A failed
+                // reload reports through the status line and keeps the config that
+                // is already running, rather than ending the session (E9).
+                if app.take_config_reload_request() {
+                    reload_config(&mut app, &mut config, &options.config_location);
+                }
             }
-            if let Err(error) =
-                save_if_dirty(&mut app, store, &mut last_save, Instant::now(), false)
-            {
-                app.set_last_error(format!("failed to save state: {error}"));
-            }
-            // Outside the borrow of `config` that the handlers hold. A failed
-            // reload reports through the status line and keeps the config that
-            // is already running, rather than ending the session (E9).
-            if app.take_config_reload_request() {
-                reload_config(&mut app, &mut config, &options.config_path);
+            Err(error) => {
+                fatal = Some(error);
+                break;
             }
         }
     }
 
-    // The exit save is forced past the rate limit, and runs even when the loop
-    // ended on a fatal draw error, so nothing edited since the last periodic
-    // save is lost. Only here is a save failure worth reporting as an error:
-    // there is no later retry.
-    let save_result = save_if_dirty(&mut app, store, &mut last_save, Instant::now(), true);
-    remove_agent_status_files(&app);
+    finish_session(&mut app, store, &mut last_save, fatal)
+}
+
+/// Handle every input event that is ready, reporting whether any arrived.
+///
+/// Waits up to `timeout` for the first one and then drains what is already
+/// queued, so a burst (a paste, a fast key repeat) is handled in one tick
+/// instead of one event per frame.
+fn drain_input_events(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    config: &Config,
+    layout: &AppLayout,
+    timeout: Duration,
+) -> io::Result<bool> {
+    if !event::poll(timeout)? {
+        return Ok(false);
+    }
+    handle_event(app, pty_runtime, config, event::read()?, layout);
+    while !app.should_quit && event::poll(READY_EVENT_POLL_INTERVAL)? {
+        handle_event(app, pty_runtime, config, event::read()?, layout);
+    }
+    Ok(true)
+}
+
+/// The one exit path out of [`run`] (F10).
+///
+/// The exit save is forced past the rate limit and runs whatever ended the
+/// session — a clean quit, a draw that would not complete, an input error —
+/// so nothing edited since the last periodic save is lost and no status file
+/// named after this pid is left behind. Only here is a save failure worth
+/// reporting as an error: there is no later retry.
+fn finish_session(
+    app: &mut App,
+    store: &mut dyn StateStore,
+    last_save: &mut Instant,
+    fatal: Option<io::Error>,
+) -> io::Result<()> {
+    let save_result = save_if_dirty(app, store, last_save, Instant::now(), true);
+    remove_agent_status_files(app);
     match fatal {
         Some(error) => Err(error),
         // The boundary: `run` reports to `main` in `io::Result`, so the typed
@@ -237,8 +295,9 @@ fn terminal_frame_area(terminal: &DefaultTerminal, last: Rect) -> Rect {
 /// is the exception, because it was pushed to the host terminal at startup and
 /// only the next start can change it. A reload that fails leaves the running
 /// config exactly as it was.
-fn reload_config(app: &mut App, config: &mut Config, path: &Path) {
-    match config::load_from(path) {
+fn reload_config(app: &mut App, config: &mut Config, location: &config::ConfigLocation) {
+    let path = &location.path;
+    match config::load_from(location) {
         Ok(reloaded) => {
             let mouse_capture_changed = reloaded.mouse_capture != config.mouse_capture;
             *config = reloaded;
@@ -412,6 +471,8 @@ fn save_is_due(dirty: bool, urgent: bool, force: bool, since_last_save: Duration
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::model::{self, ProjectState};
 
@@ -481,7 +542,7 @@ mod tests {
         let mut app = App::two_workspaces();
         let mut config = Config::default();
 
-        reload_config(&mut app, &mut config, &path);
+        reload_config(&mut app, &mut config, &default_location(&path));
 
         assert_eq!(
             config.colors().base,
@@ -509,7 +570,7 @@ mod tests {
             ..Config::default()
         };
 
-        reload_config(&mut app, &mut config, &path);
+        reload_config(&mut app, &mut config, &default_location(&path));
 
         assert_eq!(config.pi_agent_command, "pi --keep-me");
         let notice = app
@@ -525,6 +586,136 @@ mod tests {
         );
         let _ = fs::remove_file(&path);
     }
+    /// A store whose saves always fail, standing in for the failures the loop
+    /// has to survive rather than exit on: a full disk, a read-only data
+    /// directory.
+    #[derive(Debug, Default)]
+    struct FailingStateStore {
+        attempts: usize,
+    }
+
+    impl FailingStateStore {
+        fn error() -> storage::StateError {
+            storage::StateError::Io {
+                path: PathBuf::from("/full/state.json"),
+                source: io::Error::other("No space left on device"),
+            }
+        }
+    }
+
+    impl StateStore for FailingStateStore {
+        fn load(&self) -> Result<storage::LoadedState, storage::StateError> {
+            Err(Self::error())
+        }
+
+        fn save(&mut self, _state: &ProjectState) -> Result<(), storage::StateError> {
+            self.attempts += 1;
+            Err(Self::error())
+        }
+    }
+
+    /// F11: a notice nothing redraws is a notice nobody reads.
+    ///
+    /// The disk fills while the user is idle: the save fails once a second and
+    /// the status line used to stay unpainted until an unrelated keypress
+    /// happened to redraw it, because `set_last_error` mutated the queue without
+    /// touching `needs_redraw` and the layout is only recomputed inside the
+    /// redraw branch. Queuing the notice now asks for the frame itself — once,
+    /// since the repeat is deduplicated.
+    #[test]
+    fn a_failed_save_queues_a_notice_and_asks_for_the_frame_that_shows_it() {
+        let mut app = App::two_workspaces();
+        let terminal = app.project.workspaces[0].terminals[0].id;
+        app.set_terminal_restore_on_launch(terminal, true);
+        let mut store = FailingStateStore::default();
+        let start = Instant::now();
+        let mut last_save = start;
+        assert!(!app.take_redraw_request(), "nothing to draw yet");
+
+        let error = save_if_dirty(&mut app, &mut store, &mut last_save, start, true)
+            .expect_err("the store fails");
+        app.set_last_error(format!("failed to save state: {error}"));
+
+        assert!(
+            app.take_redraw_request(),
+            "the loop has to be told to paint the status line"
+        );
+        assert!(app
+            .current_status_notice()
+            .is_some_and(|notice| notice.message.contains("No space left on device")));
+
+        // The same failure on the next tick is already on screen, so it neither
+        // grows the queue nor forces a frame a second, forever.
+        let error = save_if_dirty(
+            &mut app,
+            &mut store,
+            &mut last_save,
+            start + SAVE_INTERVAL,
+            true,
+        )
+        .expect_err("the store still fails");
+        app.set_last_error(format!("failed to save state: {error}"));
+        assert!(!app.take_redraw_request());
+        assert_eq!(app.queued_status_notice_count(), 0);
+    }
+
+    /// F10: every exit runs the same cleanup.
+    ///
+    /// `event::poll`/`event::read` used to leave `run` with `?`, jumping past
+    /// the forced exit save and `remove_agent_status_files` — so a host terminal
+    /// that disappeared (a closed window, a dropped ssh session) lost everything
+    /// since the last periodic save and orphaned this pid's status files. They
+    /// now end the loop through `fatal`, which lands here.
+    #[test]
+    fn a_fatal_error_still_flushes_the_exit_save() {
+        let mut app = App::two_workspaces();
+        let terminal = app.project.workspaces[0].terminals[0].id;
+        app.set_terminal_restore_on_launch(terminal, true);
+        assert!(app.is_dirty());
+        let mut store = storage::MemoryStateStore::default();
+        let mut last_save = Instant::now();
+
+        let error = finish_session(
+            &mut app,
+            &mut store,
+            &mut last_save,
+            Some(io::Error::from(io::ErrorKind::BrokenPipe)),
+        )
+        .expect_err("the failure that ended the session is reported");
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(store.save_count(), 1, "the exit save is not skipped");
+        assert_eq!(store.saved(), Some(&app.project));
+        assert!(!app.is_dirty());
+    }
+
+    /// The clean exit still reports a save that could not be written: there is
+    /// no later retry for it.
+    #[test]
+    fn a_clean_exit_reports_a_failed_exit_save() {
+        let mut app = App::two_workspaces();
+        let terminal = app.project.workspaces[0].terminals[0].id;
+        app.set_terminal_restore_on_launch(terminal, true);
+        let mut store = FailingStateStore::default();
+        let mut last_save = Instant::now();
+
+        let error = finish_session(&mut app, &mut store, &mut last_save, None)
+            .expect_err("a failed exit save is the session's result");
+
+        assert_eq!(store.attempts, 1);
+        assert!(error.to_string().contains("No space left on device"));
+    }
+
+    /// The config this session started from, at the default location: the tests
+    /// below are about reloading a file that exists, not about F7's rule for a
+    /// path the user named.
+    fn default_location(path: &Path) -> config::ConfigLocation {
+        config::ConfigLocation {
+            path: path.to_path_buf(),
+            source: config::ConfigSource::Default,
+        }
+    }
+
     fn unique_temp_config() -> PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

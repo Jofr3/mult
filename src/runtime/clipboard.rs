@@ -148,9 +148,7 @@ mod tests {
     fn terminal_text_selection_extracts_visible_pane_text() {
         let terminal = PtyKey::Terminal(model::TerminalId::new(77).unwrap());
         let mut pty_runtime = PtyRuntime::new_offline();
-        pty_runtime
-            .resize(terminal, PtyDimensions::new(2, 8))
-            .expect("resize parser");
+        pty_runtime.reset_parser(terminal, PtyDimensions::new(2, 8));
         pty_runtime.process_pty_output(terminal, b"abc\r\ndef");
 
         let selection = TextSelection {
@@ -169,9 +167,7 @@ mod tests {
     fn wide_char_text_selection_extracts_expected_cells() {
         let terminal = PtyKey::Terminal(model::TerminalId::new(78).unwrap());
         let mut pty_runtime = PtyRuntime::new_offline();
-        pty_runtime
-            .resize(terminal, PtyDimensions::new(1, 8))
-            .expect("resize parser");
+        pty_runtime.reset_parser(terminal, PtyDimensions::new(1, 8));
         // 'a' at col 0; the wide '你' occupies cols 1-2 (glyph at 1, continuation
         // at 2); 'b' at col 3.
         pty_runtime.process_pty_output(terminal, "a你b".as_bytes());
@@ -198,9 +194,7 @@ mod tests {
     fn osc52_clipboard_writes_are_queued_and_can_be_turned_off() {
         let terminal = PtyKey::Terminal(model::TerminalId::new(79).unwrap());
         let mut pty_runtime = PtyRuntime::new_offline();
-        pty_runtime
-            .resize(terminal, PtyDimensions::new(1, 8))
-            .expect("resize parser");
+        pty_runtime.reset_parser(terminal, PtyDimensions::new(1, 8));
         pty_runtime.process_pty_output(terminal, b"secret");
         let selection = TextSelection {
             pty: terminal,

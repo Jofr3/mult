@@ -57,6 +57,16 @@ pub fn current_branch(cwd: &Path) -> Option<String> {
 /// The repository directory governing `cwd`: the nearest ancestor with a `.git`
 /// entry, resolved through the `gitdir:` pointer file that worktrees and
 /// submodules use in place of a directory.
+///
+/// A `.git` symlink is resolved deliberately, once (F13). `symlink_metadata`
+/// alone reports a symlink as neither a directory nor a file, so the walk
+/// carried on to the parent: a vendored checkout at `/repo/vendor/libfoo` whose
+/// `.git` points at a gitdir on another disk, nested under a repository on
+/// `main`, quietly showed `main` — the wrong branch, which is worse than none.
+/// The security property `symlink_metadata` was introduced for is kept: the walk
+/// never *follows* a link implicitly, `canonicalize` bounds the chain (the
+/// kernel refuses past `ELOOP`), and `HEAD` and the `gitdir:` pointer are still
+/// read `O_NOFOLLOW`, regular-files-only and under a size cap.
 fn git_dir_for(cwd: &Path) -> Option<PathBuf> {
     for ancestor in cwd.ancestors() {
         let dot_git = ancestor.join(".git");
@@ -64,10 +74,21 @@ fn git_dir_for(cwd: &Path) -> Option<PathBuf> {
         let Some(metadata) = metadata else {
             continue;
         };
-        if metadata.file_type().is_dir() {
+        // A `.git` that exists but cannot be resolved answers `None` rather
+        // than deferring to the parent: something is there, so this is the
+        // repository, and reporting an ancestor's branch for it would be a
+        // wrong answer rather than a missing one.
+        let (dot_git, file_type) = if metadata.file_type().is_symlink() {
+            let resolved = std::fs::canonicalize(&dot_git).ok()?;
+            let file_type = std::fs::symlink_metadata(&resolved).ok()?.file_type();
+            (resolved, file_type)
+        } else {
+            (dot_git, metadata.file_type())
+        };
+        if file_type.is_dir() {
             return Some(dot_git);
         }
-        if metadata.file_type().is_file() {
+        if file_type.is_file() {
             let pointer = read_git_pointer(&dot_git).ok()?;
             let target = pointer.strip_prefix("gitdir:")?.trim();
             if target.is_empty() {
@@ -320,6 +341,75 @@ mod tests {
         assert_eq!(current_branch(&worktree), Some("main".to_string()));
 
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// F13: a `.git` symlink is a real layout — a vendored checkout whose gitdir
+    /// lives on another disk — and `symlink_metadata` calls it neither a
+    /// directory nor a file, so discovery walked straight past it to the
+    /// enclosing repository and showed *its* branch. A wrong branch is worse
+    /// than no branch: the `git symbolic-ref` call this replaced got it right.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_dot_git_reports_its_own_branch_not_the_enclosing_repositorys() {
+        let outer = temp_repo("symlinked", Some("ref: refs/heads/main\n"));
+        let gitdir = outer.join("gitdirs").join("libfoo.git");
+        std::fs::create_dir_all(&gitdir).expect("create the real gitdir");
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/vendor/topic\n").expect("write HEAD");
+        let vendored = outer.join("vendor").join("libfoo");
+        std::fs::create_dir_all(vendored.join("src")).expect("create the vendored checkout");
+        std::os::unix::fs::symlink(&gitdir, vendored.join(".git")).expect("symlink .git");
+
+        assert_eq!(
+            current_branch(&vendored),
+            Some("vendor/topic".to_string()),
+            "the symlinked repository reports its own branch"
+        );
+        assert_eq!(
+            current_branch(&vendored.join("src")),
+            Some("vendor/topic".to_string())
+        );
+        // The enclosing repository is unaffected, and is what the vendored
+        // checkout used to be reported as.
+        assert_eq!(current_branch(&outer), Some("main".to_string()));
+
+        let _ = std::fs::remove_dir_all(&outer);
+    }
+
+    /// The same, one indirection further out: a `.git` symlink pointing at a
+    /// `gitdir:` pointer file.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_gitdir_pointer_file_is_followed_too() {
+        let repo = temp_repo("symlinked-pointer", Some("ref: refs/heads/main\n"));
+        let pointer = repo.join("pointers-libfoo");
+        std::fs::write(
+            &pointer,
+            format!("gitdir: {}\n", repo.join(".git").display()),
+        )
+        .expect("write pointer");
+        let vendored = repo.join("vendor").join("libfoo");
+        std::fs::create_dir_all(&vendored).expect("create the vendored checkout");
+        std::os::unix::fs::symlink(&pointer, vendored.join(".git")).expect("symlink .git");
+
+        assert_eq!(current_branch(&vendored), Some("main".to_string()));
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A `.git` that is there but cannot be resolved is answered with "no
+    /// branch", never with the enclosing repository's.
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_dot_git_symlink_reports_no_branch() {
+        let outer = temp_repo("broken-link", Some("ref: refs/heads/main\n"));
+        let vendored = outer.join("vendor").join("libfoo");
+        std::fs::create_dir_all(&vendored).expect("create the vendored checkout");
+        std::os::unix::fs::symlink(outer.join("gone"), vendored.join(".git"))
+            .expect("symlink .git");
+
+        assert_eq!(current_branch(&vendored), None);
+
+        let _ = std::fs::remove_dir_all(&outer);
     }
 
     #[test]

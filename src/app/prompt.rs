@@ -110,21 +110,45 @@ impl App {
     }
 
     /// Approve the open restore prompt, returning what the caller should start.
+    ///
+    /// This is the user seeing each command verbatim and saying yes, so it is
+    /// also what lifts the automatic-start block those terminals carry (C1).
     pub fn confirm_restore(&mut self) -> Vec<PendingRestore> {
         let Some(Prompt::ConfirmRestore(prompt)) = self.take_prompt() else {
             return Vec::new();
         };
+        for entry in &prompt.entries {
+            self.approve_command_terminal(entry.terminal);
+        }
         prompt.entries
     }
 
     /// Decline the open restore prompt. Returns how many terminals were left
     /// stopped, so the caller can say so rather than leaving the user guessing
     /// why their terminals are idle.
+    ///
+    /// Declining is a refusal that has to *stick*: dropping the prompt was all
+    /// this used to do, so the next loop tick auto-started the very command the
+    /// user had just refused, and a key pressed at the pane did the same
+    /// (C1/F1). The terminals stay in `unapproved_command_terminals`, which
+    /// every automatic start path consults.
     pub fn decline_restore(&mut self) -> usize {
         let Some(Prompt::ConfirmRestore(prompt)) = self.take_prompt() else {
             return 0;
         };
         prompt.entries.len()
+    }
+
+    /// Whether `terminal` holds a command line out of `state.json` that no
+    /// automatic path may run yet (C1). See `unapproved_command_terminals`.
+    pub fn command_terminal_needs_approval(&self, terminal: TerminalId) -> bool {
+        self.unapproved_command_terminals.contains(&terminal)
+    }
+
+    /// Record that the user has explicitly asked for `terminal` to run, so the
+    /// automatic paths stop refusing it for the rest of the session.
+    pub fn approve_command_terminal(&mut self, terminal: TerminalId) {
+        self.unapproved_command_terminals.remove(&terminal);
     }
 
     pub fn begin_command_palette(&mut self) {

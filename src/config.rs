@@ -355,47 +355,71 @@ impl Default for ColorSchemeConfig {
     }
 }
 
-/// Load the config the client will run with, from `path`.
+/// Where the config path came from, which is what decides whether a missing
+/// file is an error (F7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// The XDG default location. `mult` runs perfectly well without a config
+    /// file, so a missing one means "use the defaults".
+    Default,
+    /// A path the user named, through `--config` or `$MULT_CONFIG_PATH`. A
+    /// missing file there is a typo, not an absent config.
+    Explicit,
+}
+
+/// The config file in force, and where its path came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigLocation {
+    pub path: PathBuf,
+    pub source: ConfigSource,
+}
+
+/// Load the config the client will run with, from `location`.
 ///
 /// This is the entry point every real load goes through: it is what applies
 /// `$NO_COLOR`, which is deliberately *not* part of deserialization so a
 /// `Config` built in a test never depends on the environment it runs in.
-pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
-    let mut config = load_from_path(path)?;
+pub fn load_from(location: &ConfigLocation) -> Result<Config, ConfigError> {
+    let mut config = load_from_path(&location.path, location.source)?;
     config.color_output = color_output_from(env::var_os(NO_COLOR_ENV).as_deref());
     Ok(config)
 }
 
 pub fn load_or_default() -> Result<Config, ConfigError> {
-    load_from(&config_path())
+    load_from(&config_location_with_override(None))
 }
 
-/// The config path in force, given a `--config` flag (E1).
-pub fn config_path_with_override(flag: Option<&Path>) -> PathBuf {
-    config_path_from(
+/// The config location in force, given a `--config` flag (E1/F7).
+pub fn config_location_with_override(flag: Option<&Path>) -> ConfigLocation {
+    let (path, source) = config_path_from(
         flag,
         env::var_os(CONFIG_PATH_ENV).as_deref(),
         &config_home(),
-    )
+    );
+    ConfigLocation { path, source }
 }
 
 pub fn config_path() -> PathBuf {
-    config_path_with_override(None)
+    config_location_with_override(None).path
 }
 
-/// Pure core of [`config_path_with_override`]: both the flag and the
+/// Pure core of [`config_location_with_override`]: both the flag and the
 /// environment arrive as arguments so the precedence rule can be tested without
 /// mutating a process global. `--config` beats `$MULT_CONFIG_PATH`, which beats
-/// the XDG default.
+/// the XDG default — and only the last of the three may fall back to the
+/// built-in configuration when it does not exist.
 pub(crate) fn config_path_from(
     flag: Option<&Path>,
     override_path: Option<&OsStr>,
     config_home: &Path,
-) -> PathBuf {
+) -> (PathBuf, ConfigSource) {
     match (flag, override_path) {
-        (Some(path), _) => path.to_path_buf(),
-        (None, Some(path)) => PathBuf::from(path),
-        (None, None) => config_home.join("mult").join(CONFIG_FILE_NAME),
+        (Some(path), _) => (path.to_path_buf(), ConfigSource::Explicit),
+        (None, Some(path)) => (PathBuf::from(path), ConfigSource::Explicit),
+        (None, None) => (
+            config_home.join("mult").join(CONFIG_FILE_NAME),
+            ConfigSource::Default,
+        ),
     }
 }
 
@@ -417,9 +441,15 @@ fn color_output_from(no_color: Option<&OsStr>) -> ColorOutput {
 #[derive(Debug)]
 pub enum ConfigError {
     /// The bytes could not be read: refused by the private-file check, wrong
-    /// owner or mode, or an I/O failure. Never "not found" — a missing config
-    /// means "use the defaults".
+    /// owner or mode, or an I/O failure. Never "not found" — that is
+    /// [`ConfigError::Missing`] for a path the user named, and not an error at
+    /// all for the default location.
     Read { path: PathBuf, source: io::Error },
+    /// A config path the user named does not exist (F7). Distinct from `Read`
+    /// so the message can say what actually happened, and distinct from "use
+    /// the defaults" so a mistyped `--config` cannot silently start a session on
+    /// settings the real file overrides.
+    Missing { path: PathBuf },
     /// The bytes were read but do not decode: malformed JSON, an unknown key,
     /// or a value of the wrong type.
     Parse {
@@ -436,6 +466,11 @@ impl fmt::Display for ConfigError {
             Self::Read { path, source } => {
                 write!(formatter, "config error at {}: {source}", path.display())
             }
+            Self::Missing { path } => write!(
+                formatter,
+                "config error at {}: no such file (it was named explicitly, so the defaults are not used)",
+                path.display()
+            ),
             Self::Parse {
                 path,
                 line,
@@ -454,7 +489,7 @@ impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Read { source, .. } => Some(source),
-            Self::Parse { .. } => None,
+            Self::Missing { .. } | Self::Parse { .. } => None,
         }
     }
 }
@@ -492,14 +527,25 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 /// `$MULT_CONFIG_PATH`-overridable, so it proves nothing on its own:
 /// [`mult_protocol::read_private_file`] is what establishes that the file is a
 /// regular file, not reached through a symlink, owned by this user, not
-/// writable by anyone else, and bounded. A missing file still means "use the
-/// defaults"; anything else is refused rather than trusted.
-fn load_from_path(path: &Path) -> Result<Config, ConfigError> {
+/// writable by anyone else, and bounded. Anything that is not a clean read is
+/// refused rather than trusted.
+///
+/// A missing file means "use the defaults" only at the *default* location
+/// (F7). `mult --config ~/.config/mult/confg.json` — one letter out — used to
+/// start with exit 0 on the built-in configuration, which auto-runs the default
+/// `pi` and `claude` command lines even when the real config turned them off.
+/// The same hole was reachable through `$MULT_CONFIG_PATH`.
+fn load_from_path(path: &Path, source: ConfigSource) -> Result<Config, ConfigError> {
     match mult_protocol::read_private_file(path, MAX_CONFIG_BYTES) {
         Ok(bytes) => {
             serde_json::from_slice(&bytes).map_err(|error| ConfigError::parse(path, &error))
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Config::default()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => match source {
+            ConfigSource::Default => Ok(Config::default()),
+            ConfigSource::Explicit => Err(ConfigError::Missing {
+                path: path.to_path_buf(),
+            }),
+        },
         Err(source) => Err(ConfigError::Read {
             path: path.to_path_buf(),
             source,
@@ -699,13 +745,15 @@ mod tests {
     fn config_path_prefers_the_flag_then_the_env_then_the_config_home() {
         let config_home = Path::new("/home/example/.config");
 
+        // Both overrides are paths the user named, so a missing file there is an
+        // error rather than a silent fall back to the defaults (F7).
         assert_eq!(
             config_path_from(
                 Some(Path::new("/tmp/from-flag.json")),
                 Some(OsStr::new("/tmp/mult-test-config.json")),
                 config_home
             ),
-            PathBuf::from("/tmp/from-flag.json")
+            (PathBuf::from("/tmp/from-flag.json"), ConfigSource::Explicit)
         );
         assert_eq!(
             config_path_from(
@@ -713,11 +761,17 @@ mod tests {
                 Some(OsStr::new("/tmp/mult-test-config.json")),
                 config_home
             ),
-            PathBuf::from("/tmp/mult-test-config.json")
+            (
+                PathBuf::from("/tmp/mult-test-config.json"),
+                ConfigSource::Explicit
+            )
         );
         assert_eq!(
             config_path_from(None, None, config_home),
-            PathBuf::from("/home/example/.config/mult/config.json")
+            (
+                PathBuf::from("/home/example/.config/mult/config.json"),
+                ConfigSource::Default
+            )
         );
     }
 
@@ -749,7 +803,8 @@ mod tests {
         let path = unique_temp_file();
         fs::write(&path, "{\n  \"mouse_capture\": true,\n}\n").expect("write config");
 
-        let error = load_from_path(&path).expect_err("malformed config must fail");
+        let error =
+            load_from_path(&path, ConfigSource::Default).expect_err("malformed config must fail");
 
         let ConfigError::Parse {
             line,
@@ -777,7 +832,8 @@ mod tests {
         let path = unique_temp_file();
         fs::write(&path, r#"{"auto_start_terminal":false}"#).expect("write config");
 
-        let error = load_from_path(&path).expect_err("an unknown key must fail");
+        let error =
+            load_from_path(&path, ConfigSource::Default).expect_err("an unknown key must fail");
 
         let rendered = error.to_string();
         assert!(rendered.contains("auto_start_terminal"), "{rendered}");
@@ -785,7 +841,7 @@ mod tests {
         assert!(rendered.contains("unknown field"), "{rendered}");
         // The same rule applies one level down, inside `colorscheme`.
         fs::write(&path, r##"{"colorscheme":{"iriss":"#c4a7e7"}}"##).expect("write config");
-        let nested = load_from_path(&path)
+        let nested = load_from_path(&path, ConfigSource::Default)
             .expect_err("an unknown colorscheme key must fail")
             .to_string();
         assert!(nested.contains("iriss"), "{nested}");
@@ -804,7 +860,8 @@ mod tests {
         )
         .expect("write config");
 
-        let config = load_from_path(&path).expect("a bad color must not fail the load");
+        let config = load_from_path(&path, ConfigSource::Default)
+            .expect("a bad color must not fail the load");
 
         assert_eq!(config.colors().love, DEFAULT_COLOR_SCHEME.love);
         assert_eq!(config.colors().gold, DEFAULT_COLOR_SCHEME.gold);
@@ -836,7 +893,7 @@ mod tests {
         let path = unique_temp_file();
         fs::write(&path, r#"{"pi_agent_command":"pi -c"}"#).expect("write config");
 
-        let config = load_from_path(&path).expect("load config");
+        let config = load_from_path(&path, ConfigSource::Default).expect("load config");
 
         assert_eq!(config.pi_agent_command, "pi -c");
         assert!(config.auto_start_pi_agent);
@@ -855,7 +912,7 @@ mod tests {
         )
         .expect("write config");
 
-        let config = load_from_path(&path).expect("load config");
+        let config = load_from_path(&path, ConfigSource::Default).expect("load config");
 
         assert_eq!(
             config.projects,
@@ -881,7 +938,7 @@ mod tests {
         )
         .expect("write config");
 
-        let config = load_from_path(&path).expect("load config");
+        let config = load_from_path(&path, ConfigSource::Default).expect("load config");
 
         assert_eq!(config.pi_agent_command, "pi");
         assert!(!config.auto_start_pi_agent);
@@ -894,7 +951,7 @@ mod tests {
         let path = unique_temp_file();
         fs::write(&path, r#"{"claude_code_command":"claude --resume"}"#).expect("write config");
 
-        let config = load_from_path(&path).expect("load config");
+        let config = load_from_path(&path, ConfigSource::Default).expect("load config");
 
         // The pi command keeps its default while the cc command is overridden.
         assert_eq!(config.pi_agent_command, "pi");
@@ -907,7 +964,7 @@ mod tests {
         let path = unique_temp_file();
         fs::write(&path, r#"{"clipboard_osc52":false}"#).expect("write config");
 
-        let config = load_from_path(&path).expect("load config");
+        let config = load_from_path(&path, ConfigSource::Default).expect("load config");
 
         assert!(!config.clipboard_osc52);
         let _ = fs::remove_file(&path);
@@ -918,7 +975,7 @@ mod tests {
         let path = unique_temp_file();
         fs::write(&path, r#"{"mouse_capture":false}"#).expect("write config");
 
-        let config = load_from_path(&path).expect("load config");
+        let config = load_from_path(&path, ConfigSource::Default).expect("load config");
 
         assert!(!config.mouse_capture);
     }
@@ -932,7 +989,7 @@ mod tests {
         )
         .expect("write config");
 
-        let config = load_from_path(&path).expect("load config");
+        let config = load_from_path(&path, ConfigSource::Default).expect("load config");
 
         assert_eq!(config.colorscheme.nc, "#000001");
         assert_eq!(config.colorscheme.text, "#ffffff");
@@ -951,7 +1008,8 @@ mod tests {
         let link = dir.join("config.json");
         std::os::unix::fs::symlink(&target, &link).expect("create symlink");
 
-        let error = load_from_path(&link).expect_err("a symlinked config must be refused");
+        let error = load_from_path(&link, ConfigSource::Default)
+            .expect_err("a symlinked config must be refused");
 
         // Never silently downgraded to "missing, use defaults": the difference
         // between "no config" and "a config someone else can aim" must be loud.
@@ -975,7 +1033,8 @@ mod tests {
         fs::write(&path, r#"{"pi_agent_command":"touch /tmp/pwned"}"#).expect("write config");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).expect("chmod");
 
-        let error = load_from_path(&path).expect_err("a world-writable config must be refused");
+        let error = load_from_path(&path, ConfigSource::Default)
+            .expect_err("a world-writable config must be refused");
 
         let ConfigError::Read { ref source, .. } = error else {
             panic!("expected a read error, got {error:?}");
@@ -986,9 +1045,50 @@ mod tests {
 
     #[test]
     fn missing_config_uses_defaults() {
-        let config = load_from_path(&unique_temp_file()).expect("load missing config");
+        let config = load_from_path(&unique_temp_file(), ConfigSource::Default)
+            .expect("load missing config");
 
         assert_eq!(config, Config::default());
+    }
+
+    /// F7: a path the user typed is not a place where "absent" can mean "use
+    /// the built-in configuration".
+    ///
+    /// `mult --config ~/.config/mult/confg.json` used to start with exit 0 on
+    /// the defaults — which auto-run `pi` and `claude` — even though the real
+    /// config had `auto_start_pi_agent: false`. `$MULT_CONFIG_PATH` had the same
+    /// hole.
+    #[test]
+    fn a_missing_config_named_by_the_user_is_an_error_not_the_defaults() {
+        let path = unique_temp_file();
+
+        let error = load_from_path(&path, ConfigSource::Explicit)
+            .expect_err("an explicitly named config must exist");
+
+        assert!(matches!(error, ConfigError::Missing { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        // The defaults it would have fallen back to are exactly the ones that
+        // auto-start a shell command line.
+        assert!(Config::default().auto_start_pi_agent);
+    }
+
+    /// The other half of F7: `load_from` carries the source through, so the same
+    /// missing file is fatal for `--config` and fine for the default location.
+    #[test]
+    fn load_from_honours_the_source_of_the_path() {
+        let path = unique_temp_file();
+
+        assert!(load_from(&ConfigLocation {
+            path: path.clone(),
+            source: ConfigSource::Default,
+        })
+        .is_ok());
+        assert!(load_from(&ConfigLocation {
+            path,
+            source: ConfigSource::Explicit,
+        })
+        .is_err());
     }
 
     fn unique_temp_file() -> PathBuf {

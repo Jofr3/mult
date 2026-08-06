@@ -1,9 +1,9 @@
 //! Shared helpers for the renderer's tests: draw a frame into a `TestBackend`
 //! and read it back.
 
-use ratatui::{backend::TestBackend, Terminal};
+use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
 
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier};
 
 use crate::{
     app::{App, NavItem},
@@ -40,6 +40,20 @@ pub(super) fn draw_text_with_config(
     width: u16,
     height: u16,
 ) -> String {
+    format!(
+        "{:?}",
+        draw_buffer_with_config(app, pty_runtime, config, width, height)
+    )
+}
+
+/// The whole rendered buffer, for tests that read cells rather than text.
+pub(super) fn draw_buffer_with_config(
+    app: &App,
+    pty_runtime: &PtyRuntime,
+    config: &config::Config,
+    width: u16,
+    height: u16,
+) -> Buffer {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("create test terminal");
     terminal
@@ -48,7 +62,7 @@ pub(super) fn draw_text_with_config(
             draw(frame, &layout, app, pty_runtime, config)
         })
         .expect("draw app");
-    format!("{:?}", terminal.backend().buffer())
+    terminal.backend().buffer().clone()
 }
 pub(super) fn test_palette() -> Palette {
     Palette::from_colors(config::Config::default().colors())
@@ -128,6 +142,45 @@ pub(super) fn buffer_grid(backend: &TestBackend) -> String {
         for x in area.left()..area.right() {
             let background = buffer.cell((x, y)).expect("cell is in bounds").bg;
             grid.push(background_symbol(background, palette));
+        }
+        grid.push_str("|\n");
+    }
+    grid
+}
+
+/// One character naming a cell's attributes, for the `NO_COLOR` grid.
+fn attribute_symbol(modifier: Modifier) -> char {
+    match modifier {
+        m if m.contains(Modifier::REVERSED) => 'R',
+        m if m.contains(Modifier::BOLD) => 'B',
+        m if m.contains(Modifier::DIM) => 'D',
+        m if m.contains(Modifier::UNDERLINED) => 'U',
+        m if m.is_empty() => '-',
+        _ => '?',
+    }
+}
+
+/// The `NO_COLOR` frame as a grid of symbols followed by a grid of attributes.
+///
+/// With every colour `Color::Reset`, a background grid says nothing at all —
+/// the attributes *are* the affordance, so they are what has to be pinned (F15).
+pub(super) fn monochrome_grid(buffer: &Buffer) -> String {
+    let area = *buffer.area();
+    let mut grid = String::from("symbols:\n");
+    for y in area.top()..area.bottom() {
+        grid.push('|');
+        for x in area.left()..area.right() {
+            grid.push_str(buffer.cell((x, y)).expect("cell is in bounds").symbol());
+        }
+        grid.push_str("|\n");
+    }
+
+    grid.push_str("\nattributes (R reversed  B bold  D dim  U underlined  - none):\n");
+    for y in area.top()..area.bottom() {
+        grid.push('|');
+        for x in area.left()..area.right() {
+            let cell = buffer.cell((x, y)).expect("cell is in bounds");
+            grid.push(attribute_symbol(cell.modifier));
         }
         grid.push_str("|\n");
     }

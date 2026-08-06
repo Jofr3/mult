@@ -67,6 +67,12 @@ impl App {
     /// here are mostly per-tick (a save that keeps failing, a frame that keeps
     /// not drawing), and a queue that grew one entry per tick would be a memory
     /// leak the user has to press a key 60 times a second to drain.
+    ///
+    /// Queuing one asks the loop for a frame, here rather than at each call
+    /// site: a notice nothing redraws is a notice nobody reads, and the two
+    /// producers that forgot were the ones that fire while the user is idle
+    /// (F11). Deduplication means the repeat costs nothing — the first of a
+    /// per-tick burst asks for the frame, the rest do not.
     pub fn push_status_notice(&mut self, level: StatusLevel, message: impl Into<String>) {
         let notice = StatusNotice {
             level,
@@ -79,6 +85,7 @@ impl App {
             self.status_notices.pop_front();
         }
         self.status_notices.push_back(notice);
+        self.request_redraw();
     }
 
     /// Report a non-fatal runtime failure (a save that could not be written, a

@@ -706,6 +706,30 @@ Both are round-trip tested, and both are invisible in normal use.
   always applied to `mult`'s local scrollback, which is empty for an
   alternate-screen app, so Claude Code agent tabs could not be scrolled at all.
 - Completed the truncated `LICENSE-APACHE` (added the standard appendix).
+- The prompt cursor no longer splits a grapheme cluster. The cursor is drawn
+  inside the text by cutting it into three spans, and the cut used to fall on a
+  Unicode *scalar* boundary: with the cursor on the combining mark of NFD `josé`
+  — which is what `current_dir()` hands back on APFS, so the open-workspace
+  prompt is pre-filled with it — the middle span held nothing but the mark. A
+  span of zero display width is dropped by ratatui, so the row rendered as
+  `jose` while the value actually imported still carried the accent, and no cell
+  carried the cursor at all. The three slices are cut on grapheme cluster
+  boundaries now and concatenate back to the stored text exactly, so the cursor
+  always lands on a cell with a column of its own. The cursor also *moves* and
+  deletes by cluster: under cluster-aware rendering a scalar step would have
+  taken two presses to cross NFD `é`, the first of which moved the cursor
+  nowhere on screen. The clustering is derived from display width (a scalar that
+  occupies no column cannot be given a cell, so it belongs to the cluster before
+  it) plus the zero-width joiner, which needs no Unicode tables and so no new
+  dependency.
+- `NO_COLOR` is honoured by the drag selection and the terminal cursor overlay.
+  Both asked `readable_fg` for a foreground on a `Color::Reset` background,
+  whose contrast ratio is 1.0 — so both fell through to a hard-coded
+  `Color::Rgb(255, 255, 255)`, which made a selection indistinguishable from
+  unselected text *and* emitted truecolor from the one mode whose point is not
+  to. Both now use a reversed attribute, as the prompt cursor already did. The
+  decision lives in one `Palette::emphasis_style` helper that all three sites go
+  through, and a new snapshot pins the whole monochrome frame.
 
 ### Known issues
 
@@ -802,6 +826,106 @@ Both are round-trip tested, and both are invisible in normal use.
 - Documented that `pi_agent_command` (and `TerminalLaunch::Command`) are run
   through the login shell (`$SHELL -lc`) and are therefore shell-evaluated,
   unlike the argv-split `MULT_AGENT_CMD`.
+- **Attaching to a busy pane no longer leaves a permanently mis-ordered
+  screen** (R2). `Attach` registered the client in the pane's list and snapshotted
+  its history under the pane lock, then queued `Attached` and the scrollback with
+  that lock released — and the pane's reader thread was typically already blocked
+  on it. It won the race, appended a chunk that was not in the snapshot and sent
+  it straight to the client, which then fed `PtyOutput(new)` and
+  `PtyScrollback(old)` into one parser with no reset. Each attach now installs a
+  replay gate alongside the client, under the same lock hold that takes the
+  snapshot: every byte is either in the replay or held by the gate, and the gate
+  is released, in arrival order, once the replay has been queued. A pane never
+  holds more than 5 MiB for one client; past that the client is dropped exactly
+  as a client that cannot keep up with the live broadcast is.
+- **A daemon that runs out of file descriptors no longer leaks connection slots**
+  (R8). `handle_client` registered the connection before two `try_clone` calls —
+  `dup(2)`, which fails on `EMFILE` — and released it only far below them, so a
+  transient fd-exhaustion burst permanently leaked up to `MAX_CLIENTS` slots,
+  after which every connection was refused with `ConnectionLimit` until the
+  daemon was restarted, destroying all live panes. The slot is now held by a
+  guard whose `Drop` releases it on every exit path.
+- **One pane on a hung mount can no longer freeze all 256** (R9). The
+  foreground-process poll held the `PaneState` mutex across a
+  `/proc/<pid>/cmdline` read, which blocks indefinitely for a process in
+  uninterruptible sleep on a hung NFS or FUSE mount. Since `remove_client` and
+  `session_infos` take pane locks *while holding the server mutex*, the next
+  `ListSessions` blocked on the server lock and every other connection's `Input`,
+  `Resize` and `Attach` blocked behind it. The read now happens with no pane lock
+  held and is reconciled under a second, brief hold. The lock *order* (server ->
+  pane -> master, replay gates as leaves) is unchanged and acyclic; the new,
+  documented invariant is one of lock *duration* — no server or pane lock is held
+  across a filesystem read or any other unbounded operation.
+- The per-pane PTY input queue is bounded in bytes (4 MiB) as well as in messages
+  (64). One `Input` may carry a whole 16 MiB protocol frame, so the message bound
+  alone allowed ~1 GiB of resident input per pane, on every one of 256 panes, in
+  any pane whose child had stopped reading its stdin. A chunk arriving at an
+  empty queue is still admitted whatever its size, so a large paste into a
+  healthy pane is never refused for being large.
+- A scrollback replay's 5 s deadline covers the whole replay rather than each
+  chunk. A full 5 MiB history is 80 chunks, so one attach to a backlogged client
+  could hold the connection's reader thread for around 400 s, during which that
+  client's input, resizes and pings went unread.
+- The startup confirmation in front of persisted command terminals is now
+  enforced rather than merely displayed. Declining it recorded nothing, so the
+  next loop tick auto-started the command that had just been refused, and a key
+  pressed at the pane did the same — which is also why turning
+  `auto_start_terminals` off closed nothing. A command terminal that came out of
+  `state.json` is now refused by every automatic start path until the user
+  approves it, at the prompt or through the explicit "Start selected PTY"
+  command; the refusal says which command it is and how to run it. This also
+  closes the case the prompt never covered at all: a planted terminal stored
+  `restore_on_launch: false` was never asked about and auto-started on the first
+  tick. Shell terminals are unaffected — their program comes from `$SHELL`, not
+  from the file.
+- A `config.json` path the user named — `--config` or `$MULT_CONFIG_PATH` — that
+  does not exist is an error instead of a silent fall back to the built-in
+  defaults. `mult --config ~/.config/mult/confg.json` started with exit 0 and
+  auto-ran the default `pi` and `claude` command lines even when the real config
+  had turned them off. Only the default location may be absent.
+- `state.json` leniency no longer extends to the containers that hold the
+  sessions. `"workspaces": null`, `"chats": null` or `"terminals": null` decoded
+  as empty lists, so the load succeeded, nothing was copied aside, nothing was
+  said, and the first save overwrote the bytes that still held the user's
+  workspaces. Those three are damage: the file is moved to
+  `state.json.corrupt-<timestamp>-<random>` and the status line says where, as it
+  did before. The leniency for scalars and renamed keys, which is what E11 was
+  about, is unchanged.
+
+### Fixed (audit remediation)
+
+- `mult` no longer hangs at 100% CPU on launch for a `state.json` carrying two
+  workspaces with `"id": 18446744073709551615`. The search for a free id bumped
+  the counter with `saturating_add`, which is a no-op at `u64::MAX`, and it ran
+  inside `App::new` — before the first frame, with no key to press.
+- A new workspace can no longer be handed an id an existing workspace already
+  holds. With a workspace at `u64::MAX` the allocator skipped the used-set check
+  its chat and terminal counterparts have, so `workspace_mut` resolved to the
+  wrong entry and `remove_workspace` deleted the wrong one; the counter behind it
+  overflowed as well (a panic in debug, the reserved `0` in release).
+- Every exit from the event loop runs the exit save and removes this process's
+  agent status files. An input failure — a closed window, a dropped ssh session,
+  `EIO` out of `event::read` — returned from the loop early, so everything since
+  the last periodic save was lost and the pid-named
+  `mult-agent-status-*.json` files were left behind.
+- Queuing a status notice asks for the frame that shows it. A save failing while
+  the user was idle (a full disk) reported once a second into a status line that
+  nothing redrew until an unrelated keypress.
+- Resizing no longer creates a pane. The resize runs before the layout is
+  recomputed, so for one tick after a delete it still named the removed terminal
+  and allocated it a fresh 5000-line screen buffer — one leak per deleted pane,
+  for the life of the session.
+- The branch shown for a workspace whose `.git` is a symlink is its own, not the
+  enclosing repository's. `.git` was classified with `symlink_metadata`, which
+  reports a symlink as neither a directory nor a file, so discovery walked past
+  it; a vendored checkout nested under a repository on `main` silently showed
+  `main`. The link is now resolved deliberately, and `HEAD` is still read
+  `O_NOFOLLOW`, regular-files-only and under a size cap.
+- The release workflow verifies before it publishes: the tag must match
+  `[workspace.package] version`, `just version-check` must pass, and the test
+  suite must be green. Pushing `v0.2.0` against a `0.1.0` crate published
+  `mult-0.2.0-*.tar.gz` containing a binary whose `--version` printed `0.1.0`,
+  with a `SHA256SUMS` attesting to it.
 
 ## [0.1.0] - 2026-05-19
 

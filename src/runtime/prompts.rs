@@ -297,10 +297,11 @@ mod tests {
 
     #[test]
     fn declining_the_restore_prompt_starts_nothing_and_reports_it() {
-        let mut app = App::two_workspaces();
-        let workspace = app.project.workspaces[0].id;
-        let terminal = app
-            .project
+        // Built as a project first, because that is where a `Command` terminal
+        // can only have come from: `state.json` (C1).
+        let mut project = crate::model::ProjectState::two_workspaces();
+        let workspace = project.workspaces[0].id;
+        let terminal = project
             .add_command_terminal(
                 workspace,
                 "planted".to_string(),
@@ -308,6 +309,7 @@ mod tests {
                 "rm -rf ~".to_string(),
             )
             .expect("add command terminal");
+        let mut app = App::new(project);
         app.request_restore_confirmation(vec![PendingRestore {
             workspace,
             terminal,
@@ -326,6 +328,9 @@ mod tests {
 
         assert!(app.prompt().is_none());
         assert!(!pty_runtime.is_running(PtyKey::Terminal(terminal)));
+        // And the refusal is recorded, not just the prompt dropped: every
+        // automatic start path consults this (C1/F1).
+        assert!(app.command_terminal_needs_approval(terminal));
         let notice = app
             .current_status_notice()
             .expect("declining is reported, not silent");

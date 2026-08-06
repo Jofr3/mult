@@ -222,8 +222,12 @@ session started empty:
 
 Decoding is lenient field by field — a missing, `null` or unrecognised key costs
 you that field, not the file — so reaching this means a whole workspace or chat
-entry had the wrong shape. The backup is your original bytes, untouched; it is
-worth keeping and worth an issue, because well-formed state should not get here.
+entry had the wrong shape, or one of the lists that hold your sessions
+(`workspaces`, `chats`, `terminals`) was missing or `null`. Those three are
+deliberately *not* lenient: defaulting one to an empty list would hand you a
+healthy-looking but empty session and let the next save overwrite the bytes that
+still held everything. The backup is your original bytes, untouched; it is worth
+keeping and worth an issue, because well-formed state should not get here.
 
 If the rename itself fails, startup stops with
 `mult: state JSON is invalid (<reason>); failed to move <path> to <path>: <reason>`
@@ -320,6 +324,23 @@ Set `pi_agent_command`/`auto_start_pi_agent` in:
 
 ---
 
+## A terminal will not start when you type at it
+
+```
+· `<name>` holds a saved command line and was not started; run "Start selected PTY" from the command palette (Ctrl+p) to run it
+```
+
+Not a failure. That terminal's command line came out of `state.json`, which is
+an execution boundary: nothing it names runs until you have seen it and asked
+for it. You get this after declining the startup restore prompt, and for a
+command terminal the prompt never covered (one stored as not-to-be-restored).
+The pane shows the exact command under `Command:`; **Start selected PTY** from
+the command palette runs it, and the terminal behaves normally from then on for
+the rest of the session. Shell terminals are never affected — their program
+comes from `$SHELL`, not from the file.
+
+---
+
 ## Config problems
 
 ### `mult: config error at <path>:<line>:<col>: <message>` (exit 2)
@@ -335,6 +356,14 @@ executed.
 The file could not be read at all: it is a symlink, not a regular file, owned by
 someone else, writable by group or others, or over 1 MiB. See
 [CONFIG.md](CONFIG.md#how-the-file-is-read).
+
+### `mult: config error at <path>: no such file (it was named explicitly, so the defaults are not used)` (exit 2)
+
+You passed `--config` (or set `$MULT_CONFIG_PATH`) to a path that is not there —
+usually a typo. Startup stops instead of falling back to the built-in defaults,
+which auto-start `pi` and `claude` through your login shell and would therefore
+run command lines your real config may have turned off. A missing config at the
+*default* location is still fine and means "use the defaults".
 
 ### ``config: colorscheme.<key> is not a #rrggbb color (`<value>`); using the default``
 

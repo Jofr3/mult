@@ -18,10 +18,7 @@ use crate::{
     layout::MAX_LISTED_RESTORE_COMMANDS,
 };
 
-use super::{
-    text::truncate_text,
-    theme::{readable_fg, Palette},
-};
+use super::{text::truncate_text, theme::Palette};
 
 pub(super) fn draw_prompt_area(
     frame: &mut Frame,
@@ -188,25 +185,24 @@ pub(super) fn draw_confirm_restore_prompt(
 
 /// A prompt's label, its text, and the cursor drawn *inside* the text (E7).
 ///
-/// The cursor cell is the character it sits on, reversed; a block only when it
-/// is past the end. Splitting on character boundaries keeps multi-byte text
-/// intact, and giving each side its own span means a wide character before the
-/// cursor moves it two columns, as it should.
+/// The cursor cell is the grapheme cluster it sits on; a block only when it is
+/// past the end. Giving each side its own span means a wide character before the
+/// cursor moves it two columns, as it should — but the split has to fall on a
+/// *cluster* boundary, not a scalar one (F3): a span holding nothing but a
+/// combining mark has zero display width and ratatui drops it, so NFD `josé`
+/// rendered as `jose` while the stored value kept the accent, and with the
+/// cursor on the mark no cell carried the cursor at all. `PromptInput` cuts the
+/// three slices below at cluster boundaries, so concatenating them reproduces
+/// the stored text exactly whatever the cursor is on.
 pub(super) fn prompt_input_line(
     label: &str,
     input: &PromptInput,
     palette: Palette,
 ) -> Line<'static> {
-    let (cursor_text, cursor_style) = match input.char_at_cursor() {
-        Some(ch) if palette.monochrome => (
-            ch.to_string(),
-            Style::default().add_modifier(Modifier::REVERSED),
-        ),
-        Some(ch) => (
-            ch.to_string(),
-            Style::default()
-                .bg(palette.cursor)
-                .fg(readable_fg(palette.base, palette.cursor)),
+    let (cursor_text, cursor_style) = match input.cluster_at_cursor() {
+        Some(cluster) => (
+            cluster.to_string(),
+            palette.emphasis_style(palette.cursor, palette.base),
         ),
         None => ("▌".to_string(), Style::default().fg(palette.cursor)),
     };
@@ -394,7 +390,7 @@ mod tests {
 
     use crate::{app::App, pty::PtyRuntime};
 
-    use super::super::{draw, test_support::test_palette};
+    use super::super::{draw, test_support::test_palette, text::text_width};
 
     #[test]
     fn the_prompt_cursor_sits_on_the_character_it_is_on() {
@@ -436,6 +432,108 @@ mod tests {
         assert_eq!(cursor_cell.symbol(), "z");
         assert_eq!(cursor_cell.bg, palette.cursor);
     }
+    /// F3: the three spans are cut on grapheme cluster boundaries, so they
+    /// concatenate back to the stored value and the cursor cell is always
+    /// something with a column of its own. Splitting on scalars left a bare
+    /// combining mark in a zero-width span, which ratatui drops.
+    #[test]
+    fn the_prompt_input_line_splits_on_grapheme_clusters() {
+        let palette = test_palette();
+        // (stored text, cursor steps from the start, cursor cell, cursor column)
+        let cases = [
+            // NFD `josé/x` — what `current_dir()` returns on APFS — with the
+            // cursor on the accented cluster, then past it.
+            ("jose\u{301}/x", 3, "e\u{301}", 9),
+            ("jose\u{301}/x", 4, "/", 10),
+            // A base carrying two stacked marks is still one cell.
+            ("a\u{300}\u{301}b", 0, "a\u{300}\u{301}", 6),
+            // A zero-width joiner sequence: one cluster, two columns wide.
+            ("👩\u{200d}💻 ok", 0, "👩\u{200d}💻", 6),
+            ("👩\u{200d}💻 ok", 1, " ", 8),
+            // A wide character before the cursor moves it two columns.
+            ("漢z", 1, "z", 8),
+        ];
+
+        for (text, steps, cell, column) in cases {
+            let mut input = PromptInput::new(text);
+            input.move_to_start();
+            for _ in 0..steps {
+                input.move_right();
+            }
+
+            let line = prompt_input_line("Path: ", &input, palette);
+            let rendered = line
+                .spans
+                .iter()
+                .skip(1)
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert_eq!(rendered, text, "spans must reproduce {text:?}");
+            assert_eq!(
+                line.spans[2].content.as_ref(),
+                cell,
+                "cursor cell of {text:?}"
+            );
+            assert_eq!(
+                text_width("Path: ") + text_width(input.before_cursor()),
+                column,
+                "cursor column of {text:?}"
+            );
+        }
+    }
+
+    /// The same fix at the buffer level: the accent survives the split and the
+    /// cell under the cursor is the one that carries the cursor background.
+    #[test]
+    fn the_prompt_cursor_lands_on_a_visible_cell_in_nfd_text() {
+        let mut app = App::two_workspaces();
+        app.begin_open_workspace(&[]);
+        if let Some(Prompt::OpenWorkspace(prompt)) = app.prompt_mut() {
+            prompt.input = PromptInput::default();
+        }
+        for ch in "jose\u{301}/x".chars() {
+            app.push_prompt_char(ch);
+        }
+        // Back over `x` and `/` onto the accented cluster.
+        app.move_prompt_cursor_left();
+        app.move_prompt_cursor_left();
+        app.move_prompt_cursor_left();
+
+        let backend = TestBackend::new(40, 6);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                let layout = AppLayout::compute(&app, frame.area());
+                draw(
+                    frame,
+                    &layout,
+                    &app,
+                    &PtyRuntime::new_offline(),
+                    &config::Config::default(),
+                )
+            })
+            .expect("draw app");
+
+        let palette = test_palette();
+        let buffer = terminal.backend().buffer();
+        let symbol = |x: u16| {
+            buffer
+                .cell((x, 3))
+                .expect("prompt cell is in bounds")
+                .symbol()
+                .to_string()
+        };
+        // "Path: " is 6 columns, then `j o s` and the accented `e` on column 9.
+        assert_eq!(
+            (6..10).map(symbol).collect::<String>(),
+            "jose\u{301}",
+            "the accent must reach the screen"
+        );
+        let cursor_cell = buffer.cell((9, 3)).expect("cursor cell is in bounds");
+        assert_eq!(cursor_cell.symbol(), "e\u{301}");
+        assert_eq!(cursor_cell.bg, palette.cursor);
+    }
+
     #[test]
     fn a_missing_configured_project_is_marked_in_the_prompt() {
         let entry = OpenWorkspaceMatch {

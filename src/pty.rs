@@ -1333,8 +1333,25 @@ impl PtyRuntime {
         }
     }
 
+    /// Whether this PTY has an entry at all — a screen, an attachment, a
+    /// history. A resize for a pane that has none is a resize of nothing; see
+    /// [`PtyRuntime::resize_parser`].
+    pub fn has_pane(&self, pty: PtyKey) -> bool {
+        self.panes.contains_key(&pty)
+    }
+
+    /// Resize an existing pane's screen. A pane with no entry is left alone.
+    ///
+    /// Deliberately not `pane_mut`: the resize the loop sends names whatever the
+    /// last layout selected, which is one tick stale after a delete, so
+    /// `or_default` allocated a fresh 5000-line vt100 parser for a `TerminalId`
+    /// that no longer exists and could never be selected again — one leaked
+    /// screen buffer per deleted pane, for the life of the session (F12).
     fn resize_parser(&mut self, pty: PtyKey, size: PtyDimensions) {
-        let parser = self.pane_mut(pty).parser_mut();
+        let Some(pane) = self.panes.get_mut(&pty) else {
+            return;
+        };
+        let parser = pane.parser_mut();
         parser.set_size(size.rows(), size.cols());
         clamp_parser_scrollback(parser);
     }
@@ -2390,12 +2407,36 @@ mod tests {
     fn parser_resize_updates_screen_size() {
         let mut runtime = PtyRuntime::new_offline();
         let pty = PtyKey::Terminal(TerminalId::new(9).unwrap());
+        runtime.reset_parser(pty, PtyDimensions::new(2, 8));
 
         runtime
             .resize(pty, PtyDimensions::new(5, 12))
             .expect("resize parser");
 
         assert_eq!(runtime.parser(pty).unwrap().screen().size(), (5, 12));
+    }
+
+    /// F12: a resize is not a way to bring a pane into existence.
+    ///
+    /// `resize_visible_terminal` runs before the layout is recomputed, so for
+    /// one tick after a delete it still names the removed terminal — and
+    /// `pane_mut`'s `or_default` then allocated a fresh 5000-line screen for a
+    /// `TerminalId` that no longer exists and can never be selected again. One
+    /// leaked buffer per deleted pane, for the life of the session.
+    #[test]
+    fn resizing_a_pane_that_does_not_exist_creates_nothing() {
+        let mut runtime = PtyRuntime::new_offline();
+        let pty = PtyKey::Terminal(TerminalId::new(9).unwrap());
+        runtime.reset_parser(pty, PtyDimensions::new(2, 8));
+        assert!(runtime.has_pane(pty));
+
+        runtime.remove_pty(pty);
+        runtime
+            .resize(pty, PtyDimensions::new(40, 120))
+            .expect("resizing a deleted pane is not an error");
+
+        assert!(!runtime.has_pane(pty));
+        assert!(runtime.parser(pty).is_none());
     }
 
     /// A13. Every byte class the upstream overflow was reachable with, at every
@@ -2543,9 +2584,7 @@ mod tests {
 
         let pty = PtyKey::Terminal(TerminalId::new(11).unwrap());
         let mut runtime = PtyRuntime::new_offline();
-        runtime
-            .resize(pty, PtyDimensions::new(3, 40))
-            .expect("resize parser");
+        runtime.reset_parser(pty, PtyDimensions::new(3, 40));
         runtime.process_pty_output(pty, b"first line\r\n");
         runtime.append_pty_system_line(pty, "terminated by \x1b[2J\x1b[HSIGKILL");
 

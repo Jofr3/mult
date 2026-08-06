@@ -256,9 +256,7 @@ mod tests {
             .expect("seed state has a terminal");
         app.select_nav_index(selected);
         let mut pty_runtime = PtyRuntime::new_offline();
-        pty_runtime
-            .resize(terminal_id, PtyDimensions::new(2, 8))
-            .expect("resize parser");
+        pty_runtime.reset_parser(terminal_id, PtyDimensions::new(2, 8));
         pty_runtime.process_pty_output(terminal_id, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
         let config = Config {
             mouse_capture: true,
@@ -319,9 +317,7 @@ mod tests {
             .expect("seed state has a terminal");
         app.select_nav_index(selected);
         let mut pty_runtime = PtyRuntime::new_offline();
-        pty_runtime
-            .resize(terminal_id, PtyDimensions::new(2, 8))
-            .expect("resize parser");
+        pty_runtime.reset_parser(terminal_id, PtyDimensions::new(2, 8));
         pty_runtime.process_pty_output(terminal_id, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
         // The program turns on mouse reporting: the wheel is now its input, so
         // our local scrollback must stay pinned to the bottom.
@@ -380,9 +376,7 @@ mod tests {
         app.update_text_selection(terminal_id, SelectionCell { row: 0, col: 2 });
 
         let mut pty_runtime = PtyRuntime::new_offline();
-        pty_runtime
-            .resize(terminal_id, PtyDimensions::new(2, 8))
-            .expect("resize parser");
+        pty_runtime.reset_parser(terminal_id, PtyDimensions::new(2, 8));
         pty_runtime.process_pty_output(terminal_id, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
         let config = Config {
             mouse_capture: true,

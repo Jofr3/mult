@@ -72,6 +72,29 @@ impl Palette {
         }
     }
 
+    /// How a cell is made to stand out from the text around it: the mouse
+    /// selection, the prompt cursor, the terminal cursor overlay (F15).
+    ///
+    /// A `bg`/`fg` pair normally, the foreground kept legible on the background
+    /// by [`readable_fg`]. Under `NO_COLOR` every palette entry is
+    /// `Color::Reset`, so that pair is `Reset` on `Reset` — and `readable_fg`,
+    /// seeing a contrast ratio of 1.0, would fall through to a hard-coded
+    /// truecolor white: the affordance disappears *and* the frame emits the very
+    /// escape `NO_COLOR` exists to suppress. A reversed modifier says the same
+    /// thing with no colour at all.
+    ///
+    /// Every site that wants "make this cell stand out" goes through here, so a
+    /// fourth one cannot get it wrong.
+    pub(super) fn emphasis_style(self, background: Color, preferred_fg: Color) -> Style {
+        if self.monochrome {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+                .bg(background)
+                .fg(readable_fg(preferred_fg, background))
+        }
+    }
+
     /// Adapt an already-resolved colorscheme to ratatui colors.
     ///
     /// The hex parsing (and the fallback for a key that does not parse) lives in
@@ -194,6 +217,40 @@ mod tests {
             Palette::from_colors(&config::DEFAULT_COLOR_SCHEME).selection_style(),
             monochrome.selection_style()
         );
+    }
+    /// F15: the one decision "how do I make this cell stand out" — the mouse
+    /// selection, the prompt cursor, the terminal cursor overlay all route
+    /// through it, so a fourth site cannot re-derive it wrongly.
+    #[test]
+    fn emphasis_is_an_attribute_under_no_color_and_a_color_pair_otherwise() {
+        let monochrome = Palette::monochrome();
+        let colored = Palette::from_colors(&config::DEFAULT_COLOR_SCHEME);
+
+        // Every emphasised site collapses to the same reversed attribute, and
+        // none of them names a colour — `readable_fg` on a `Reset` background
+        // sees a contrast ratio of 1.0 and would have returned truecolor white.
+        for (background, preferred) in [
+            (monochrome.foam, monochrome.nc),
+            (monochrome.cursor, monochrome.nc),
+            (monochrome.cursor, monochrome.base),
+        ] {
+            let style = monochrome.emphasis_style(background, preferred);
+            assert_eq!(style, Style::default().add_modifier(Modifier::REVERSED));
+            assert_eq!(style.fg, None);
+            assert_eq!(style.bg, None);
+        }
+        assert_eq!(contrast_ratio(Color::Reset, Color::Reset), 1.0);
+        assert_eq!(
+            readable_fg(Color::Reset, Color::Reset),
+            Color::Rgb(255, 255, 255)
+        );
+
+        // With colour on, the pair is unchanged: the preferred foreground where
+        // it stays legible, on the requested background.
+        let selection = colored.emphasis_style(colored.foam, colored.nc);
+        assert_eq!(selection.bg, Some(colored.foam));
+        assert_eq!(selection.fg, Some(readable_fg(colored.nc, colored.foam)));
+        assert!(!selection.add_modifier.contains(Modifier::REVERSED));
     }
     #[test]
     fn readable_fg_keeps_legible_preferred_but_swaps_when_washed_out() {

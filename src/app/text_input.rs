@@ -6,8 +6,18 @@
 //! index, never a byte offset: the open-workspace prompt is pre-filled with the
 //! working directory, and a path holding one multi-byte character would
 //! otherwise split a `String` mid-character on the first edit.
+//!
+//! The cursor also never rests *inside* a grapheme cluster (F3). It moves and
+//! deletes by cluster, and the three rendering slices below are cut at cluster
+//! boundaries, because a span holding a bare combining mark has zero display
+//! width and ratatui drops it: NFD `josé` used to render as `jose` while the
+//! stored value kept the accent, and with the cursor on the mark no cell
+//! carried the cursor at all. Stepping by scalar under cluster-aware rendering
+//! would be just as wrong the other way — crossing NFD `é` would take two
+//! presses, the first of which moves the cursor nowhere on screen.
 
 use super::{App, Prompt};
+use crate::ui::text::{cluster_range, previous_cluster_start};
 
 /// A wrap-around cursor into a prompt's result list (F13).
 ///
@@ -94,24 +104,32 @@ impl PromptInput {
         self.cursor
     }
 
-    /// Text left of the cursor. Rendering measures its *display* width, so a
-    /// wide character before the cursor moves the cursor two columns.
+    /// Text left of the cursor cell. Rendering measures its *display* width, so
+    /// a wide character before the cursor moves the cursor two columns.
     pub fn before_cursor(&self) -> &str {
-        &self.text[..self.byte_offset(self.cursor)]
+        &self.text[..self.cursor_cluster().0]
     }
 
-    /// The character the cursor sits on, or `None` at the end of the input.
-    pub fn char_at_cursor(&self) -> Option<char> {
-        self.text[self.byte_offset(self.cursor)..].chars().next()
+    /// The grapheme cluster the cursor sits on, or `None` at the end of the
+    /// input. This is the cell the cursor is drawn on, so it is never a bare
+    /// combining mark — see the module docs.
+    pub fn cluster_at_cursor(&self) -> Option<&str> {
+        let (start, end) = self.cursor_cluster();
+        (start < end).then(|| &self.text[start..end])
     }
 
-    /// Text right of the cursor cell (excluding the character under it).
+    /// Text right of the cursor cell (excluding the cluster under it).
+    ///
+    /// [`Self::before_cursor`], this and [`Self::cluster_at_cursor`] partition
+    /// the input: concatenated in that order they reproduce [`Self::as_str`]
+    /// exactly, whatever the cursor is on.
     pub fn after_cursor(&self) -> &str {
-        let start = self.byte_offset(self.cursor);
-        match self.text[start..].chars().next() {
-            Some(ch) => &self.text[start + ch.len_utf8()..],
-            None => "",
-        }
+        &self.text[self.cursor_cluster().1..]
+    }
+
+    /// Byte range of the grapheme cluster the cursor is on, empty at the end.
+    fn cursor_cluster(&self) -> (usize, usize) {
+        cluster_range(&self.text, self.byte_offset(self.cursor))
     }
 
     pub fn clear(&mut self) {
@@ -125,21 +143,28 @@ impl PromptInput {
         self.cursor += 1;
     }
 
-    /// Backspace. Returns whether anything was removed.
+    /// Backspace: the whole grapheme cluster before the cursor, so backspacing
+    /// over NFD `é` cannot leave a bare `e` behind. Returns whether anything
+    /// was removed.
     pub fn delete_before_cursor(&mut self) -> bool {
         if self.cursor == 0 {
             return false;
         }
-        self.replace_range(self.cursor - 1, self.cursor);
+        let offset = self.byte_offset(self.cursor);
+        let start = self.char_index(previous_cluster_start(&self.text, offset));
+        self.replace_range(start, self.cursor);
         true
     }
 
-    /// Forward delete (the `Delete` key). Returns whether anything was removed.
+    /// Forward delete (the `Delete` key): the cluster the cursor is drawn on,
+    /// which is what the user sees under it. Returns whether anything was
+    /// removed.
     pub fn delete_at_cursor(&mut self) -> bool {
-        if self.cursor >= self.char_count() {
+        let (start, end) = self.cursor_cluster();
+        if start >= end {
             return false;
         }
-        self.replace_range(self.cursor, self.cursor + 1);
+        self.replace_range(self.char_index(start), self.char_index(end));
         true
     }
 
@@ -181,11 +206,12 @@ impl PromptInput {
     }
 
     pub fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        let offset = self.byte_offset(self.cursor);
+        self.cursor = self.char_index(previous_cluster_start(&self.text, offset));
     }
 
     pub fn move_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.char_count());
+        self.cursor = self.char_index(self.cursor_cluster().1);
     }
 
     pub fn move_to_start(&mut self) {
@@ -198,6 +224,11 @@ impl PromptInput {
 
     fn char_count(&self) -> usize {
         self.text.chars().count()
+    }
+
+    /// Character index of byte offset `offset`, the inverse of `byte_offset`.
+    fn char_index(&self, offset: usize) -> usize {
+        self.text[..offset].chars().count()
     }
 
     /// Byte offset of character index `cursor`, clamped to the end of the text.
@@ -358,7 +389,7 @@ mod tests {
         input.move_right();
         input.move_right();
         // The cursor sits on `é`; forward delete removes the whole character.
-        assert_eq!(input.char_at_cursor(), Some('é'));
+        assert_eq!(input.cluster_at_cursor(), Some("é"));
         assert!(input.delete_at_cursor());
         assert_eq!(input.as_str(), "caf 漢字 dir");
 
@@ -369,14 +400,54 @@ mod tests {
         assert_eq!(input.as_str(), "caf ");
         assert_eq!(input.cursor(), 4);
 
-        // Splitting for rendering is on character boundaries too, so a wide
-        // character before the cursor counts two display columns and one index.
+        // Splitting for rendering is on cluster boundaries, so a wide character
+        // before the cursor counts two display columns and one index.
         let mut input = PromptInput::new("漢z");
         input.move_to_start();
         input.move_right();
         assert_eq!(input.before_cursor(), "漢");
-        assert_eq!(input.char_at_cursor(), Some('z'));
+        assert_eq!(input.cluster_at_cursor(), Some("z"));
         assert_eq!(input.after_cursor(), "");
+    }
+
+    /// F3: the cursor moves and deletes by grapheme cluster, so it never rests
+    /// inside one — where the rendering split would orphan a zero-width scalar
+    /// and a keypress would move it nowhere on screen.
+    #[test]
+    fn the_prompt_cursor_steps_over_whole_grapheme_clusters() {
+        // NFD `josé/x`, which is what `current_dir()` hands back on APFS.
+        let mut input = PromptInput::new("jose\u{301}/x");
+        input.move_to_start();
+        input.move_right();
+        input.move_right();
+        input.move_right();
+        // One press crosses the whole `e` + combining acute, not just the `e`.
+        assert_eq!(input.before_cursor(), "jos");
+        assert_eq!(input.cluster_at_cursor(), Some("e\u{301}"));
+        input.move_right();
+        assert_eq!(input.before_cursor(), "jose\u{301}");
+        input.move_left();
+        assert_eq!(input.before_cursor(), "jos");
+
+        // A joiner sequence is one cell in both directions.
+        let mut input = PromptInput::new("👩\u{200d}💻!");
+        input.move_to_start();
+        assert_eq!(input.cluster_at_cursor(), Some("👩\u{200d}💻"));
+        input.move_right();
+        assert_eq!(input.cluster_at_cursor(), Some("!"));
+        input.move_left();
+        assert_eq!(input.before_cursor(), "");
+
+        // Backspace takes the mark with the letter it belongs to rather than
+        // leaving a bare `e` under an accent the user never typed separately.
+        let mut input = PromptInput::new("jose\u{301}");
+        assert!(input.delete_before_cursor());
+        assert_eq!(input.as_str(), "jos");
+        // Forward delete removes exactly the cell the cursor is drawn on.
+        let mut input = PromptInput::new("a\u{300}\u{301}b");
+        input.move_to_start();
+        assert!(input.delete_at_cursor());
+        assert_eq!(input.as_str(), "b");
     }
 
     #[test]

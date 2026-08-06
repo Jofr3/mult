@@ -4,11 +4,11 @@
 //! cells of a short line are not painted as selected — matching the text that
 //! `contents_between` actually copies.
 
-use ratatui::{layout::Rect, style::Style, Frame};
+use ratatui::{layout::Rect, Frame};
 
 use crate::app::TextSelection;
 
-use super::theme::{readable_fg, Palette};
+use super::theme::Palette;
 
 pub(super) fn render_text_selection(
     frame: &mut Frame,
@@ -33,9 +33,9 @@ pub(super) fn render_text_selection(
     let end_row = range.end.row.min(visible_last_row);
     let start_col = range.start.col.min(area.width.saturating_sub(1));
     let end_col = range.end.col.min(area.width.saturating_sub(1));
-    let style = Style::default()
-        .fg(readable_fg(palette.nc, palette.foam))
-        .bg(palette.foam);
+    // Under `NO_COLOR` this is a reversed modifier rather than a colour pair, so
+    // a drag selection stays visible where every colour is `Color::Reset` (F15).
+    let style = palette.emphasis_style(palette.foam, palette.nc);
 
     for row in start_row..=end_row {
         // Clip the highlight to the row's glyph extent so trailing blank cells
@@ -109,12 +109,10 @@ mod tests {
             .selected_terminal_output()
             .expect("terminal selection has output area");
         let mut pty_runtime = PtyRuntime::new_offline();
-        pty_runtime
-            .resize(
-                terminal_id,
-                crate::pty::PtyDimensions::new(output_area.height, output_area.width),
-            )
-            .expect("resize parser");
+        pty_runtime.reset_parser(
+            terminal_id,
+            crate::pty::PtyDimensions::new(output_area.height, output_area.width),
+        );
         pty_runtime.process_pty_output(terminal_id, b"xy");
 
         let backend = TestBackend::new(frame_area.width, frame_area.height);
@@ -165,12 +163,10 @@ mod tests {
             .selected_terminal_output()
             .expect("terminal selection has output area");
         let mut pty_runtime = PtyRuntime::new_offline();
-        pty_runtime
-            .resize(
-                terminal_id,
-                crate::pty::PtyDimensions::new(output_area.height, output_area.width),
-            )
-            .expect("resize parser");
+        pty_runtime.reset_parser(
+            terminal_id,
+            crate::pty::PtyDimensions::new(output_area.height, output_area.width),
+        );
         pty_runtime.process_pty_output(terminal_id, "a你b".as_bytes());
 
         let backend = TestBackend::new(frame_area.width, frame_area.height);
@@ -226,12 +222,10 @@ mod tests {
             .selected_terminal_output()
             .expect("terminal selection has output area");
         let mut pty_runtime = PtyRuntime::new_offline();
-        pty_runtime
-            .resize(
-                terminal_id,
-                crate::pty::PtyDimensions::new(output_area.height, output_area.width),
-            )
-            .expect("resize parser");
+        pty_runtime.reset_parser(
+            terminal_id,
+            crate::pty::PtyDimensions::new(output_area.height, output_area.width),
+        );
         pty_runtime.process_pty_output(terminal_id, b"xxxxx\r\nab\r\nyyyyy");
 
         let backend = TestBackend::new(frame_area.width, frame_area.height);
@@ -289,12 +283,10 @@ mod tests {
             .selected_terminal_output()
             .expect("terminal selection has output area");
         let mut pty_runtime = PtyRuntime::new_offline();
-        pty_runtime
-            .resize(
-                terminal_id,
-                crate::pty::PtyDimensions::new(output_area.height, output_area.width),
-            )
-            .expect("resize parser");
+        pty_runtime.reset_parser(
+            terminal_id,
+            crate::pty::PtyDimensions::new(output_area.height, output_area.width),
+        );
         pty_runtime.process_pty_output(terminal_id, b"xy");
 
         let backend = TestBackend::new(frame_area.width, frame_area.height);

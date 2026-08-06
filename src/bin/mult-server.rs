@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc, Mutex,
     },
     thread,
@@ -63,6 +63,29 @@ const CLIENT_QUEUE_CAPACITY: usize = 1_024;
 /// writer thread, and this bounded queue is the only thing the socket reader
 /// ever touches.
 const PTY_INPUT_QUEUE_CAPACITY: usize = 64;
+/// Bytes queued in front of one pane's PTY master before input is refused.
+///
+/// [`PTY_INPUT_QUEUE_CAPACITY`] bounds the queue in *messages*, and a message
+/// carries whatever fits in one protocol frame — up to `MAX_MESSAGE_BYTES`
+/// (16 MiB). 64 of those is ~1 GiB of resident input per pane, which a same-uid
+/// client can park in a pane whose child never reads its stdin, on every one of
+/// `MAX_SESSIONS` panes . The byte bound is what actually caps the
+/// memory; the message bound stays because it is what keeps a burst of tiny
+/// keystrokes from queueing without limit.
+///
+/// A chunk is admitted unconditionally when the queue is empty, so a legitimate
+/// large paste into a healthy pane is never refused for being large — only for
+/// arriving on top of input the child has not taken yet. The resident worst case
+/// is therefore this cap plus one frame.
+const PTY_INPUT_QUEUE_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// Live PTY bytes one [`ReplayGate`] may hold while a scrollback replay is still
+/// being queued.
+///
+/// The gate exists to order the replay ahead of live output, not to become a
+/// second unbounded history: a pane that produces more than this while its
+/// replay is in flight has a client that is not draining its queue, which is the
+/// case the live broadcast already handles by dropping the client.
+const REPLAY_HOLD_MAX_BYTES: usize = RAW_HISTORY_MAX_BYTES;
 /// Concurrent client connections. One connection is one thread pair plus a
 /// queue, and nothing but the peer-uid check gates who may open one, so a
 /// same-uid loop could otherwise exhaust threads and memory (A10).
@@ -115,6 +138,147 @@ impl ClientHandle {
 
     fn disconnect(&self) {
         let _ = self.stream.shutdown(Shutdown::Both);
+    }
+}
+
+/// A client attached to one pane, together with the ordering gate for *that*
+/// attach. A connection attaches many panes, so the gate belongs here and not on
+/// the shared [`ClientHandle`]: one pane's replay must not hold up another's
+/// live output.
+#[derive(Clone)]
+struct PaneClient {
+    handle: ClientHandle,
+    gate: Arc<ReplayGate>,
+}
+
+impl PaneClient {
+    fn id(&self) -> ClientId {
+        self.handle.id
+    }
+
+    /// Deliver a pane-scoped message, or hold it until this client's scrollback
+    /// replay has been queued. Never blocks. Returns `false` when the client
+    /// must be dropped, exactly as [`ClientHandle::try_deliver`] does.
+    fn try_deliver(&self, message: ServerMessage) -> bool {
+        self.gate.deliver(&self.handle, message)
+    }
+
+    fn disconnect(&self) {
+        self.handle.disconnect();
+    }
+}
+
+/// Orders one client's scrollback replay ahead of the pane's live output (R2).
+///
+/// `Attach` snapshots the history and registers the client under the pane lock,
+/// then queues `Attached` and the replay with that lock *released* — and the
+/// pane's reader thread is typically already blocked on it. Without a gate the
+/// reader wins the race the moment the lock is dropped: it appends a chunk that
+/// is not in the snapshot and `try_send`s it to the just-registered client, so
+/// the client reads `PtyOutput(new)`, `Attached`, `PtyScrollback(old)` and feeds
+/// both into one parser with no reset (`src/pty.rs`). Attaching to a busy pane —
+/// `tail -f`, a running build — then left a permanently mis-ordered screen.
+///
+/// The gate is installed in `pane.clients` under the same lock hold that takes
+/// the snapshot, so every byte is either *in* the snapshot or held here, with no
+/// gap and no duplication. Releasing it flushes what it holds in arrival order.
+///
+/// Concurrency invariants:
+/// - The gate mutex is a leaf: it is only ever taken with no pane and no server
+///   lock held (every broadcast clones the client list under the pane lock and
+///   delivers outside it), and nothing is called under it but non-blocking
+///   `try_send`s.
+/// - The pane's reader thread is the only producer, so holding the gate mutex
+///   across the hold-or-send decision is what makes "held, then live" a total
+///   order rather than a race with [`ReplayGate::release`].
+struct ReplayGate {
+    state: Mutex<ReplayGateState>,
+}
+
+enum ReplayGateState {
+    /// The replay is not fully queued yet; live messages wait here, in order.
+    Pending {
+        held: VecDeque<ServerMessage>,
+        bytes: usize,
+    },
+    /// The replay is queued (or was given up on): deliver straight through.
+    Open,
+}
+
+impl ReplayGate {
+    fn pending() -> Self {
+        Self {
+            state: Mutex::new(ReplayGateState::Pending {
+                held: VecDeque::new(),
+                bytes: 0,
+            }),
+        }
+    }
+
+    /// A gate that never holds anything, for a client that is not replaying.
+    #[cfg(test)]
+    fn open() -> Self {
+        Self {
+            state: Mutex::new(ReplayGateState::Open),
+        }
+    }
+
+    fn deliver(&self, client: &ClientHandle, message: ServerMessage) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        match &mut *state {
+            ReplayGateState::Open => client.try_deliver(message),
+            ReplayGateState::Pending { held, bytes } => {
+                let payload = message_payload_len(&message);
+                if held.len() >= CLIENT_QUEUE_CAPACITY
+                    || bytes.saturating_add(payload) > REPLAY_HOLD_MAX_BYTES
+                {
+                    // Same verdict as a full client queue: this client cannot
+                    // keep up, and the pane must not grow a buffer for it.
+                    return false;
+                }
+                *bytes += payload;
+                held.push_back(message);
+                true
+            }
+        }
+    }
+
+    /// Queue everything the gate held, then let later messages through.
+    ///
+    /// Called once per attach, by the connection's own thread, after the replay
+    /// has been queued — including when the replay gave up part-way, so a pane
+    /// never holds messages for a client whose replay will never finish.
+    fn release(&self, client: &ClientHandle) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let ReplayGateState::Pending { held, .. } =
+            std::mem::replace(&mut *state, ReplayGateState::Open)
+        else {
+            return true;
+        };
+        // Still under the gate mutex: a chunk the reader thread is delivering
+        // right now lands after these, never between them.
+        for message in held {
+            if !client.try_deliver(message) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// The payload a message will occupy in a client's queue. Only the two byte-
+/// carrying variants are worth counting; everything else is a fixed handful of
+/// bytes and is bounded by the message count instead.
+fn message_payload_len(message: &ServerMessage) -> usize {
+    match message {
+        ServerMessage::PtyOutput { bytes, .. } | ServerMessage::PtyScrollback { bytes, .. } => {
+            bytes.len()
+        }
+        _ => 0,
     }
 }
 
@@ -186,6 +350,12 @@ struct HistorySnapshot {
 /// the deadlock this exists to prevent (A2).
 struct PtyInputQueue {
     sender: mpsc::SyncSender<Vec<u8>>,
+    /// Bytes handed to the queue and not yet written to the master. The writer
+    /// thread subtracts a chunk only once its `write_all` has returned, so a
+    /// chunk stuck in a blocking write still counts against the cap — it is
+    /// still resident. Shared with that thread, and deliberately only
+    /// approximate under concurrent writers: it is a bound, not an accounting.
+    queued_bytes: Arc<AtomicUsize>,
 }
 
 struct PaneState {
@@ -202,7 +372,7 @@ struct PaneState {
     child_pid: Option<u32>,
     foreground_process: ForegroundProcessInfo,
     child: Option<Box<dyn Child + Send + Sync>>,
-    clients: Vec<ClientHandle>,
+    clients: Vec<PaneClient>,
     // Set while a foreground-process poll is already scheduled for this pane so
     // a burst of input coalesces into a single in-flight poller thread instead
     // of spawning one thread per keystroke.
@@ -517,11 +687,16 @@ impl ServerState {
         matches
     }
 
+    /// Release a connection's slot and detach it from every pane.
+    ///
+    /// Takes pane locks while holding the server lock, which is why nothing may
+    /// hold a pane lock across an unbounded operation — see
+    /// [`current_foreground_process`] (R9).
     fn remove_client(&mut self, client_id: ClientId) {
         self.live_clients.remove(&client_id);
         for pane in self.sessions.values() {
             if let Ok(mut pane) = pane.lock() {
-                pane.clients.retain(|client| client.id != client_id);
+                pane.clients.retain(|client| client.id() != client_id);
             }
         }
     }
@@ -690,21 +865,71 @@ fn spawn_pane(key: SessionKey, spec: PaneSpawnSpec) -> io::Result<SpawnedPane> {
 /// a pane exits while a child was still not reading.
 fn spawn_pty_writer(mut writer: Box<dyn Write + Send>) -> SharedPtyInput {
     let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(PTY_INPUT_QUEUE_CAPACITY);
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    let written = Arc::clone(&queued_bytes);
     thread::spawn(move || {
         for bytes in receiver {
-            if writer
-                .write_all(&bytes)
-                .and_then(|()| writer.flush())
-                .is_err()
-            {
+            let len = bytes.len();
+            let result = writer.write_all(&bytes).and_then(|()| writer.flush());
+            // After the write, not before: bytes blocked in `write_all` are
+            // still resident and must still count against the byte cap.
+            written.fetch_sub(len, Ordering::AcqRel);
+            if result.is_err() {
                 break;
             }
         }
     });
-    Arc::new(PtyInputQueue { sender })
+    Arc::new(PtyInputQueue {
+        sender,
+        queued_bytes,
+    })
 }
 
-fn handle_client(mut stream: UnixStream, server: SharedServer) -> io::Result<()> {
+/// A registered connection slot, released when this value is dropped.
+///
+/// `register_client` used to be paired with a `remove_client` at the far end of
+/// `handle_client`, below two fallible `try_clone`s. `try_clone` is `dup(2)` and
+/// fails on `EMFILE`, so a transient fd-exhaustion burst returned early and
+/// leaked a slot per connection — permanently, until the cap refused every new
+/// connection with `ConnectionLimit` and the only cure was restarting the
+/// daemon, which destroys every live pane (R8). Registration and release are now
+/// symmetric on every exit path by construction.
+struct ClientSlot {
+    id: ClientId,
+    server: SharedServer,
+}
+
+impl ClientSlot {
+    fn new(id: ClientId, server: &SharedServer) -> Self {
+        Self {
+            id,
+            server: Arc::clone(server),
+        }
+    }
+}
+
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        // Idempotent: the writer thread releases the same slot when its socket
+        // dies, so that a dead connection stops being broadcast to promptly.
+        if let Ok(mut server) = self.server.lock() {
+            server.remove_client(self.id);
+        }
+    }
+}
+
+fn handle_client(stream: UnixStream, server: SharedServer) -> io::Result<()> {
+    handle_client_with_cloner(stream, server, UnixStream::try_clone)
+}
+
+/// `clone_stream` is [`UnixStream::try_clone`] in production, and an injected
+/// failure in the R8 regression test: it is `dup(2)`, it fails on `EMFILE`, and
+/// the connection slot taken just above it must be released even then.
+fn handle_client_with_cloner(
+    mut stream: UnixStream,
+    server: SharedServer,
+    clone_stream: impl Fn(&UnixStream) -> io::Result<UnixStream>,
+) -> io::Result<()> {
     verify_peer_is_self(&stream, "client")?;
     let (sender, receiver) = mpsc::sync_channel(CLIENT_QUEUE_CAPACITY);
     let client_id = match server.lock().map_err(lock_error)?.register_client() {
@@ -724,14 +949,17 @@ fn handle_client(mut stream: UnixStream, server: SharedServer) -> io::Result<()>
             return Ok(());
         }
     };
-    let shutdown_handle = Arc::new(stream.try_clone()?);
+    // Taken immediately after registration and before anything that can fail, so
+    // the slot is released on every path out of this function (R8).
+    let _slot = ClientSlot::new(client_id, &server);
+    let shutdown_handle = Arc::new(clone_stream(&stream)?);
     let client = ClientHandle {
         id: client_id,
         sender: sender.clone(),
         stream: Arc::clone(&shutdown_handle),
     };
 
-    let mut writer_stream = stream.try_clone()?;
+    let mut writer_stream = clone_stream(&stream)?;
     let writer_server = Arc::clone(&server);
     // Detached: it exits on its own when its write fails or the channel closes.
     let _writer = thread::spawn(move || {
@@ -750,10 +978,9 @@ fn handle_client(mut stream: UnixStream, server: SharedServer) -> io::Result<()>
     });
 
     let result = handle_client_messages(stream, &server, client);
-    if let Ok(mut server) = server.lock() {
-        server.remove_client(client_id);
-    }
     drop(sender);
+    // `_slot` releases the connection slot and detaches this client from every
+    // pane as it goes out of scope here.
     result
 }
 
@@ -901,48 +1128,15 @@ fn handle_client_messages(
                     continue;
                 };
 
-                let attached = {
-                    let mut pane = pane.lock().map_err(lock_error)?;
-                    pane.resize(rows, cols).map(|()| {
-                        let evicted = pane.attach_client(client.clone());
-                        let foreground_process = pane.refresh_foreground_process();
-                        (
-                            pane.pane_info(),
-                            pane.session,
-                            // Sealed history chunks are shared by refcount, so
-                            // the replay snapshot costs a handful of pointer
-                            // clones instead of a multi-megabyte memcpy held
-                            // under the pane mutex.
-                            pane.raw_history.snapshot(),
-                            foreground_process,
-                            evicted,
-                        )
-                    })
-                };
-                let (pane_info, pane_id, history, foreground_process, evicted) = match attached {
-                    Ok(attached) => attached,
-                    Err(error) => {
-                        // The pane's master is gone or poisoned. That is this
-                        // pane's problem, not the connection's.
-                        let _ = client.sender.try_send(ServerMessage::Error {
-                            pane: Some(session),
-                            code: RejectCode::PaneOperationFailed,
-                            message: format!("failed to attach session {}: {error}", session.0),
-                        });
-                        continue;
-                    }
-                };
-                notify_evicted_clients(&evicted, pane_id);
-
-                let _ = client.sender.try_send(ServerMessage::Attached {
-                    session,
-                    panes: vec![pane_info],
-                });
-                let _ = client.sender.try_send(ServerMessage::ForegroundProcess {
-                    pane: pane_id,
-                    process: foreground_process,
-                });
-                send_pty_scrollback(&client, pane_id, &history);
+                if let Err(error) = attach_pane(&client, &pane, session, rows, cols, || {}) {
+                    // The pane's master is gone or poisoned. That is this
+                    // pane's problem, not the connection's.
+                    let _ = client.sender.try_send(ServerMessage::Error {
+                        pane: Some(session),
+                        code: RejectCode::PaneOperationFailed,
+                        message: format!("failed to attach session {}: {error}", session.0),
+                    });
+                }
             }
             ClientMessage::Input { pane, bytes } => {
                 let target = {
@@ -1183,7 +1377,7 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, pane: SharedPane, server: Shar
         let mut buffer = [0; 8192];
         // Reused across reads: the client snapshot has to leave the pane lock,
         // but it does not have to allocate a fresh Vec per 8 KiB of output.
-        let mut clients: Vec<ClientHandle> = Vec::new();
+        let mut clients: Vec<PaneClient> = Vec::new();
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
@@ -1230,7 +1424,7 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, pane: SharedPane, server: Shar
     });
 }
 
-fn pane_exit(pane: &SharedPane) -> Option<(SessionKey, SessionId, Vec<ClientHandle>, ExitInfo)> {
+fn pane_exit(pane: &SharedPane) -> Option<(SessionKey, SessionId, Vec<PaneClient>, ExitInfo)> {
     let (session, pane_id, clients, mut child) = {
         let mut pane = pane.lock().ok()?;
         let child = pane.child.take()?;
@@ -1273,6 +1467,85 @@ fn exit_info(status: ExitStatus) -> ExitInfo {
     }
 }
 
+/// Attach `client` to `pane`: take over the pane, confirm, and replay its
+/// history — in that order, and with nothing of the pane's live output allowed
+/// to overtake the replay (R2).
+///
+/// The ordering is the whole point of this function. Under one hold of the pane
+/// lock it resizes, installs the client behind a *pending* [`ReplayGate`] and
+/// snapshots the history; every byte the pane produces from then on is either
+/// already in that snapshot or held by the gate. The lock is then released — it
+/// must be, because the replay can wait seconds for a backlogged client and the
+/// pane's reader thread needs the lock to keep draining — and the gate is
+/// released once the replay has been queued.
+///
+/// `after_register` runs in exactly the window the reader thread used to win:
+/// the pane lock released, the client registered, the replay not yet queued. It
+/// is `|| {}` in production and the interleaving point the regression test
+/// drives.
+fn attach_pane(
+    client: &ClientHandle,
+    pane: &SharedPane,
+    session: SessionId,
+    rows: u16,
+    cols: u16,
+    after_register: impl FnOnce(),
+) -> io::Result<()> {
+    let gate = Arc::new(ReplayGate::pending());
+    let attached = {
+        let mut locked = pane
+            .lock()
+            .map_err(|_| io::Error::other("pane lock poisoned"))?;
+        locked.resize(rows, cols).map(|()| {
+            let evicted = locked.attach_client(PaneClient {
+                handle: client.clone(),
+                gate: Arc::clone(&gate),
+            });
+            (
+                locked.pane_info(),
+                locked.session,
+                // Sealed history chunks are shared by refcount, so the replay
+                // snapshot costs a handful of pointer clones instead of a
+                // multi-megabyte memcpy held under the pane mutex.
+                locked.raw_history.snapshot(),
+                Arc::clone(&locked.master),
+                locked.child_pid,
+                evicted,
+            )
+        })?
+    };
+    let (pane_info, pane_id, history, master, child_pid, evicted) = attached;
+    after_register();
+
+    notify_evicted_clients(&evicted, pane_id);
+    let _ = client.sender.try_send(ServerMessage::Attached {
+        session,
+        panes: vec![pane_info],
+    });
+
+    // Read with the pane lock released, and record the result under a second,
+    // brief hold: this reads `/proc` (R9, see `current_foreground_process`).
+    let process = current_foreground_process(&master, child_pid);
+    if let Ok(mut locked) = pane.lock() {
+        locked.foreground_process = process.clone();
+    }
+    let _ = client.sender.try_send(ServerMessage::ForegroundProcess {
+        pane: pane_id,
+        process,
+    });
+
+    send_pty_scrollback(client, pane_id, &history);
+    // Released even when the replay gave up part-way, so a pane never holds
+    // output for a client whose replay will never finish. A client that cannot
+    // take what the gate held is treated exactly as a client that cannot keep up
+    // with the live broadcast: dropped from the pane and disconnected.
+    if !gate.release(client) {
+        client.disconnect();
+        remove_pane_clients(pane, &[client.id]);
+    }
+    Ok(())
+}
+
 /// Replay a pane's retained history to the client that just attached.
 ///
 /// Deliberately not the eviction path the live broadcast uses. A replay is many
@@ -1282,11 +1555,30 @@ fn exit_info(status: ExitStatus) -> ExitInfo {
 /// re-attach and overflow again. Instead the replay waits for the writer thread
 /// to drain, and gives up on the replay alone (never on the connection) if the
 /// client has not moved a single message within the deadline.
+///
+/// The deadline is for the whole replay, not for each chunk: a full 5 MiB
+/// history is 80 chunks, and a per-chunk deadline let one attach hold the
+/// connection's reader thread for 80 x `SCROLLBACK_SEND_TIMEOUT` — around 400 s,
+/// during which that client's input, resizes and pings go unread .
 fn send_pty_scrollback(client: &ClientHandle, pane: SessionId, history: &HistorySnapshot) {
+    send_pty_scrollback_until(
+        client,
+        pane,
+        history,
+        Instant::now() + SCROLLBACK_SEND_TIMEOUT,
+    );
+}
+
+fn send_pty_scrollback_until(
+    client: &ClientHandle,
+    pane: SessionId,
+    history: &HistorySnapshot,
+    deadline: Instant,
+) {
     let mut sent_any = false;
     for chunk in history.chunks() {
         sent_any = true;
-        if !deliver_scrollback_chunk(client, pane, chunk.to_vec()) {
+        if !deliver_scrollback_chunk(client, pane, chunk.to_vec(), deadline) {
             return;
         }
     }
@@ -1294,12 +1586,16 @@ fn send_pty_scrollback(client: &ClientHandle, pane: SessionId, history: &History
     if !sent_any {
         // A pane with no history still gets exactly one scrollback message, so a
         // client can tell "replay finished" from "replay still coming".
-        deliver_scrollback_chunk(client, pane, Vec::new());
+        deliver_scrollback_chunk(client, pane, Vec::new(), deadline);
     }
 }
 
-fn deliver_scrollback_chunk(client: &ClientHandle, pane: SessionId, bytes: Vec<u8>) -> bool {
-    let deadline = Instant::now() + SCROLLBACK_SEND_TIMEOUT;
+fn deliver_scrollback_chunk(
+    client: &ClientHandle,
+    pane: SessionId,
+    bytes: Vec<u8>,
+    deadline: Instant,
+) -> bool {
     let mut message = ServerMessage::PtyScrollback { pane, bytes };
     loop {
         match client.sender.try_send(message) {
@@ -1326,7 +1622,7 @@ fn deliver_scrollback_chunk(client: &ClientHandle, pane: SessionId, bytes: Vec<u
 /// receiver is gone) is disconnected so its threads and fds are reclaimed;
 /// one that takes the message keeps its *other* panes, which are unaffected by
 /// this takeover.
-fn notify_evicted_clients(evicted: &[ClientHandle], pane: SessionId) {
+fn notify_evicted_clients(evicted: &[PaneClient], pane: SessionId) {
     for client in evicted {
         let notified = client.try_deliver(ServerMessage::Error {
             pane: Some(pane),
@@ -1359,12 +1655,28 @@ fn broadcast_foreground_process_if_changed(pane: &SharedPane) {
     remove_pane_clients(pane, &dropped);
 }
 
+/// Poll a pane's foreground process, and report it plus the clients to tell when
+/// it has changed.
+///
+/// Two brief pane-lock holds with the poll *between* them, never one hold across
+/// it: the poll reads `/proc` and a filesystem read is not bounded in time (R9,
+/// see [`current_foreground_process`]). Two concurrent pollers can therefore
+/// interleave and store the older reading; the next poll corrects it, and the
+/// staged poller already coalesces bursts into one in-flight thread per pane.
 fn foreground_process_update(
     pane: &SharedPane,
-) -> Option<(SessionId, ForegroundProcessInfo, Vec<ClientHandle>)> {
-    let mut pane = pane.lock().ok()?;
-    let process = pane.refresh_foreground_process_if_changed()?;
-    Some((pane.session, process, pane.clients.clone()))
+) -> Option<(SessionId, ForegroundProcessInfo, Vec<PaneClient>)> {
+    let (master, child_pid) = {
+        let locked = pane.lock().ok()?;
+        (Arc::clone(&locked.master), locked.child_pid)
+    };
+    let process = current_foreground_process(&master, child_pid);
+    let mut locked = pane.lock().ok()?;
+    if process == locked.foreground_process {
+        return None;
+    }
+    locked.foreground_process = process.clone();
+    Some((locked.session, process, locked.clients.clone()))
 }
 
 fn schedule_foreground_process_poll(pane: SharedPane) {
@@ -1405,14 +1717,14 @@ fn input_may_change_foreground(bytes: &[u8]) -> bool {
 /// and the connection is reclaimed; the caller is responsible for removing the
 /// returned ids from the pane's client list.
 fn deliver_to_clients(
-    clients: &[ClientHandle],
-    mut deliver: impl FnMut(&ClientHandle) -> bool,
+    clients: &[PaneClient],
+    mut deliver: impl FnMut(&PaneClient) -> bool,
 ) -> Vec<ClientId> {
     let mut dropped = Vec::new();
     for client in clients {
         if !deliver(client) {
             client.disconnect();
-            dropped.push(client.id);
+            dropped.push(client.id());
         }
     }
     dropped
@@ -1434,11 +1746,12 @@ fn remove_pane_clients(pane: &SharedPane, dropped: &[ClientId]) {
         return;
     }
     if let Ok(mut pane) = pane.lock() {
-        pane.clients.retain(|client| !dropped.contains(&client.id));
+        pane.clients
+            .retain(|client| !dropped.contains(&client.id()));
     }
 }
 
-fn broadcast_exit(pane: SessionId, exit: ExitInfo, clients: &[ClientHandle]) -> Vec<ClientId> {
+fn broadcast_exit(pane: SessionId, exit: ExitInfo, clients: &[PaneClient]) -> Vec<ClientId> {
     deliver_to_clients(clients, |client| {
         client.try_deliver(ServerMessage::PaneExited {
             pane,
@@ -1453,7 +1766,7 @@ fn broadcast_exit(pane: SessionId, exit: ExitInfo, clients: &[ClientHandle]) -> 
 fn broadcast_pty_output(
     pane: SessionId,
     mut bytes: Vec<u8>,
-    clients: &[ClientHandle],
+    clients: &[PaneClient],
 ) -> Vec<ClientId> {
     let last = clients.len().saturating_sub(1);
     let mut dropped = Vec::new();
@@ -1468,7 +1781,7 @@ fn broadcast_pty_output(
             bytes: payload,
         }) {
             client.disconnect();
-            dropped.push(client.id);
+            dropped.push(client.id());
         }
     }
     dropped
@@ -1499,37 +1812,6 @@ impl PaneState {
         }
     }
 
-    fn refresh_foreground_process(&mut self) -> ForegroundProcessInfo {
-        let process = self.current_foreground_process();
-        self.foreground_process = process.clone();
-        process
-    }
-
-    fn refresh_foreground_process_if_changed(&mut self) -> Option<ForegroundProcessInfo> {
-        let process = self.current_foreground_process();
-        if process == self.foreground_process {
-            None
-        } else {
-            self.foreground_process = process.clone();
-            Some(process)
-        }
-    }
-
-    fn current_foreground_process(&self) -> ForegroundProcessInfo {
-        let foreground_pid = self
-            .master
-            .lock()
-            .ok()
-            .and_then(|master| master.process_group_leader())
-            .and_then(|pid| u32::try_from(pid).ok());
-        let command = foreground_pid.and_then(command_line_for_pid);
-        ForegroundProcessInfo {
-            root_pid: self.child_pid,
-            foreground_pid,
-            command,
-        }
-    }
-
     fn resize(&mut self, rows: u16, cols: u16) -> io::Result<()> {
         let (rows, cols) = bounded_pty_dimensions(rows, cols);
         self.rows = rows;
@@ -1557,16 +1839,23 @@ impl PaneState {
     ///
     /// Returns the handles that were evicted; the caller must tell them (see
     /// [`notify_evicted_clients`]) rather than drop them in silence.
-    fn attach_client(&mut self, client: ClientHandle) -> Vec<ClientHandle> {
+    fn attach_client(&mut self, client: PaneClient) -> Vec<PaneClient> {
         let mut evicted = Vec::new();
+        let id = client.id();
         self.clients.retain(|existing| {
-            if existing.id == client.id {
+            if existing.id() == id {
                 return true;
             }
             evicted.push(existing.clone());
             false
         });
-        if !self.clients.iter().any(|existing| existing.id == client.id) {
+        // A re-attach on a connection that is already here replaces its entry,
+        // so the gate in the list is always the one the *current* attach will
+        // release; leaving the old one would hold the pane's output for a replay
+        // that has already finished.
+        if let Some(existing) = self.clients.iter_mut().find(|existing| existing.id() == id) {
+            *existing = client;
+        } else {
             self.clients.push(client);
         }
         evicted
@@ -1694,6 +1983,43 @@ fn bounded_pty_dimensions(rows: u16, cols: u16) -> (u16, u16) {
     bounded_screen_dimensions(rows, cols)
 }
 
+/// A pane's current foreground process, read with **no pane lock held** (R9).
+///
+/// This takes the master lock for one `tcgetpgrp` and then reads
+/// `/proc/<pid>/cmdline`, and a filesystem read is not bounded in time: a
+/// foreground process wedged in uninterruptible sleep on a hung NFS or FUSE
+/// mount blocks it indefinitely. Holding the `PaneState` mutex across that — as
+/// this used to, being a `&self` method — froze far more than the pane, because
+/// [`ServerState::remove_client`] and [`ServerState::session_infos`] take pane
+/// locks *while holding the server mutex*: the next `ListSessions` blocked on
+/// the server lock and every other connection's `Input`, `Resize` and `Attach`
+/// blocked behind it. One wedged pane froze all 256.
+///
+/// The lock *order* is unchanged and remains acyclic (server -> pane -> master,
+/// with the replay gates as leaves). What this establishes is a lock *duration*
+/// invariant: no server lock and no pane lock is held across a filesystem read,
+/// a `wait`, a sleep, or any other unbounded operation. The master lock is
+/// released here before the `/proc` read for the same reason — `resize` takes it
+/// under the pane lock.
+fn current_foreground_process(
+    master: &SharedMasterPty,
+    child_pid: Option<u32>,
+) -> ForegroundProcessInfo {
+    // The guard's scope ends with this statement, so the master lock is not held
+    // across the read below.
+    let foreground_pid = master
+        .lock()
+        .ok()
+        .and_then(|master| master.process_group_leader())
+        .and_then(|pid| u32::try_from(pid).ok());
+    let command = foreground_pid.and_then(command_line_for_pid);
+    ForegroundProcessInfo {
+        root_pid: child_pid,
+        foreground_pid,
+        command,
+    }
+}
+
 fn command_line_for_pid(pid: u32) -> Option<String> {
     let bytes = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     command_line_from_cmdline_bytes(&bytes)
@@ -1732,19 +2058,44 @@ fn command_line_from_cmdline_bytes(bytes: &[u8]) -> Option<String> {
 /// that `PTY_INPUT_QUEUE_CAPACITY` chunks are already waiting; the input is
 /// refused with an error the client renders into that pane, rather than dropped
 /// in silence (indistinguishable from a broken terminal) or held (a deadlock).
+///
+/// The queue is bounded twice over: in messages by `PTY_INPUT_QUEUE_CAPACITY`,
+/// and in bytes by `PTY_INPUT_QUEUE_MAX_BYTES`, because one message may carry a
+/// whole 16 MiB protocol frame . A chunk arriving at an empty queue is
+/// always admitted, so a large paste into a pane that *is* reading is never
+/// refused for its size.
 fn write_pty_input(writer: &SharedPtyInput, bytes: &[u8]) -> Result<(), Rejection> {
-    match writer.sender.try_send(bytes.to_vec()) {
-        Ok(()) => Ok(()),
-        Err(mpsc::TrySendError::Full(_)) => Err(Rejection::new(
+    let queued = writer.queued_bytes.load(Ordering::Acquire);
+    if queued > 0 && queued.saturating_add(bytes.len()) > PTY_INPUT_QUEUE_MAX_BYTES {
+        return Err(Rejection::new(
             RejectCode::InputRefused,
             io::ErrorKind::WouldBlock,
             "input dropped: the program in this pane is not reading its input",
-        )),
-        Err(mpsc::TrySendError::Disconnected(_)) => Err(Rejection::new(
+        ));
+    }
+    writer.queued_bytes.fetch_add(bytes.len(), Ordering::AcqRel);
+    match writer.sender.try_send(bytes.to_vec()) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Nothing took the chunk, so nothing will subtract it.
+            writer.queued_bytes.fetch_sub(bytes.len(), Ordering::AcqRel);
+            Err(pty_input_rejection(error))
+        }
+    }
+}
+
+fn pty_input_rejection(error: mpsc::TrySendError<Vec<u8>>) -> Rejection {
+    match error {
+        mpsc::TrySendError::Full(_) => Rejection::new(
+            RejectCode::InputRefused,
+            io::ErrorKind::WouldBlock,
+            "input dropped: the program in this pane is not reading its input",
+        ),
+        mpsc::TrySendError::Disconnected(_) => Rejection::new(
             RejectCode::PaneOperationFailed,
             io::ErrorKind::BrokenPipe,
             "the pane is no longer accepting input",
-        )),
+        ),
     }
 }
 
@@ -2738,7 +3089,7 @@ mod tests {
         let dropped = broadcast_pty_output(
             SessionId(1),
             b"more".to_vec(),
-            std::slice::from_ref(&client),
+            std::slice::from_ref(&open_pane_client(client)),
         );
 
         assert_eq!(dropped, vec![1]);
@@ -2757,7 +3108,7 @@ mod tests {
         let dropped = broadcast_pty_output(
             SessionId(3),
             b"data".to_vec(),
-            std::slice::from_ref(&client),
+            std::slice::from_ref(&open_pane_client(client)),
         );
 
         assert!(dropped.is_empty());
@@ -2771,25 +3122,29 @@ mod tests {
     fn attaching_a_new_client_takes_over_from_the_previous_one() {
         let mut pane = test_pane_state();
 
-        assert!(pane.attach_client(test_client(1)).is_empty());
+        assert!(pane
+            .attach_client(open_pane_client(test_client(1)))
+            .is_empty());
         assert_eq!(pane.clients.len(), 1);
-        assert_eq!(pane.clients[0].id, 1);
+        assert_eq!(pane.clients[0].id(), 1);
 
         // A second client takes over: the previous one is evicted and handed
         // back so it can be told, not dropped in silence.
-        let evicted = pane.attach_client(test_client(2));
+        let evicted = pane.attach_client(open_pane_client(test_client(2)));
         assert_eq!(
-            evicted.iter().map(|client| client.id).collect::<Vec<_>>(),
+            evicted.iter().map(PaneClient::id).collect::<Vec<_>>(),
             vec![1]
         );
         assert_eq!(pane.clients.len(), 1);
-        assert_eq!(pane.clients[0].id, 2);
+        assert_eq!(pane.clients[0].id(), 2);
 
         // Re-attaching the same id is idempotent (no duplicate entry, nothing
         // evicted).
-        assert!(pane.attach_client(test_client(2)).is_empty());
+        assert!(pane
+            .attach_client(open_pane_client(test_client(2)))
+            .is_empty());
         assert_eq!(pane.clients.len(), 1);
-        assert_eq!(pane.clients[0].id, 2);
+        assert_eq!(pane.clients[0].id(), 2);
     }
 
     #[test]
@@ -2802,6 +3157,7 @@ mod tests {
             stream: Arc::new(stream),
         };
 
+        let evicted = open_pane_client(evicted);
         notify_evicted_clients(std::slice::from_ref(&evicted), SessionId(12));
 
         assert!(matches!(
@@ -2843,6 +3199,7 @@ mod tests {
             .try_send(ServerMessage::Sessions(Vec::new()))
             .expect("prime the client queue");
 
+        let evicted = open_pane_client(evicted);
         notify_evicted_clients(std::slice::from_ref(&evicted), SessionId(1));
 
         let mut probe = [0; 1];
@@ -2967,6 +3324,265 @@ mod tests {
         );
     }
 
+    /// R2: attaching to a *busy* pane.
+    ///
+    /// The pane's reader thread is typically already blocked on the pane lock
+    /// when `Attach` releases it, so before the replay gate it appended a chunk
+    /// that was not in the replay snapshot and `try_send`'d it straight to the
+    /// client the attach had just registered. The client then fed
+    /// `PtyOutput(new)` and `PtyScrollback(old)` into one parser with no reset
+    /// and kept a permanently mis-ordered screen.
+    ///
+    /// The hook runs in exactly that window, and does exactly what the reader
+    /// thread does there.
+    #[test]
+    fn attach_holds_live_output_until_the_scrollback_replay_is_queued() {
+        if pty_backed_tests_are_opted_out() {
+            return;
+        }
+
+        let mut state = test_pane_state();
+        state.raw_history.append(b"old-history");
+        let pane: SharedPane = Arc::new(Mutex::new(state));
+        let (client, receiver, _peer) = queued_test_client(CLIENT_QUEUE_CAPACITY);
+
+        attach_pane(&client, &pane, SessionId(1), 24, 80, || {
+            let clients = {
+                // Bounded, so an attach that (wrongly) kept the pane lock across
+                // its replay fails this test instead of hanging it.
+                let mut locked = lock_pane_within(&pane, DISPATCH_TIMEOUT);
+                locked.raw_history.append(b"live-output");
+                locked.clients.clone()
+            };
+            assert!(
+                broadcast_pty_output(SessionId(1), b"live-output".to_vec(), &clients).is_empty(),
+                "the live chunk must be held for the client, not refused"
+            );
+        })
+        .expect("attach the client");
+
+        let mut replayed = Vec::new();
+        let mut live = Vec::new();
+        while let Ok(message) = receiver.try_recv() {
+            match message {
+                ServerMessage::PtyScrollback { bytes, .. } => {
+                    assert!(
+                        live.is_empty(),
+                        "live output reached the client before its scrollback replay"
+                    );
+                    replayed.extend_from_slice(&bytes);
+                }
+                ServerMessage::PtyOutput { bytes, .. } => live.extend_from_slice(&bytes),
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            replayed, b"old-history",
+            "the replay must carry the history as it was at attach time"
+        );
+        assert_eq!(
+            live, b"live-output",
+            "the live chunk must be delivered exactly once, after the replay"
+        );
+    }
+
+    /// R2: the gate orders, it does not buffer without limit. A pane must never
+    /// grow a second history for a client that is not draining its queue, so an
+    /// over-full gate reports the client for eviction exactly as a full client
+    /// queue does.
+    #[test]
+    fn a_replay_gate_that_fills_up_reports_the_client_for_eviction() {
+        let (client, _receiver, _peer) = queued_test_client(CLIENT_QUEUE_CAPACITY);
+        let gate = ReplayGate::pending();
+        let chunk = vec![b'x'; 1024 * 1024];
+
+        let mut held = 0;
+        while gate.deliver(
+            &client,
+            ServerMessage::PtyOutput {
+                pane: SessionId(1),
+                bytes: chunk.clone(),
+            },
+        ) {
+            held += 1;
+            assert!(
+                held <= REPLAY_HOLD_MAX_BYTES / chunk.len(),
+                "the gate held more than its byte cap"
+            );
+        }
+
+        assert_eq!(held, REPLAY_HOLD_MAX_BYTES / chunk.len());
+    }
+
+    /// R8: `try_clone` is `dup(2)` and fails on `EMFILE`. Both of the ones in
+    /// `handle_client` sit *below* the registration and *above* the release, so
+    /// a transient fd-exhaustion burst used to leak a connection slot per
+    /// attempt — permanently, until the cap refused every new connection and the
+    /// only cure was restarting the daemon, which destroys every live pane.
+    #[test]
+    fn a_connection_that_fails_after_registering_releases_its_slot() {
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let (_client_stream, server_stream) = UnixStream::pair().expect("create socket pair");
+
+        let error = handle_client_with_cloner(server_stream, Arc::clone(&server), |_| {
+            Err(io::Error::from_raw_os_error(libc::EMFILE))
+        })
+        .expect_err("a connection whose fd clone fails must fail");
+
+        assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+        assert!(
+            server.lock().expect("server lock").live_clients.is_empty(),
+            "a connection that failed after registering must release its slot"
+        );
+    }
+
+    /// R9: a foreground-process poll must not hold the pane lock across the part
+    /// of it that has no time bound.
+    ///
+    /// The unbounded part in production is the `/proc/<pid>/cmdline` read, which
+    /// blocks indefinitely for a process wedged in uninterruptible sleep on a
+    /// hung NFS or FUSE mount, and which cannot be injected here. The master
+    /// lock, taken immediately before it and released by the same helper, is the
+    /// stand-in: holding it stalls the poll at the same point. With the poll
+    /// under the pane lock — as it used to be — the pane is then unreachable,
+    /// and since `remove_client` and `session_infos` take pane locks *while
+    /// holding the server lock*, so is every other pane on the daemon.
+    #[test]
+    fn a_stalled_foreground_poll_does_not_hold_the_pane_lock() {
+        if pty_backed_tests_are_opted_out() {
+            return;
+        }
+
+        let state = test_pane_state();
+        let master = Arc::clone(&state.master);
+        let pane: SharedPane = Arc::new(Mutex::new(state));
+        let stall = master.lock().expect("hold the master lock");
+
+        let (finished, polled) = mpsc::channel();
+        let polling = Arc::clone(&pane);
+        let poller = thread::spawn(move || {
+            broadcast_foreground_process_if_changed(&polling);
+            let _ = finished.send(());
+        });
+        // Give the poller time to reach the stalled master lock. It is a floor,
+        // not a synchronisation point: the assertion below is what decides the
+        // test, and it is retried for far longer than this.
+        thread::sleep(Duration::from_millis(50));
+
+        drop(lock_pane_within(&pane, DISPATCH_TIMEOUT));
+
+        drop(stall);
+        polled
+            .recv_timeout(DISPATCH_TIMEOUT)
+            .expect("the poll must finish once the master lock is free");
+        poller.join().expect("poller thread should not panic");
+    }
+
+    /// Replay deadline, review follow-up: the replay deadline covers the whole replay, not each chunk. A
+    /// full 5 MiB history is 80 chunks, so a per-chunk deadline let one attach
+    /// hold the connection's reader thread for ~400 s while that client's input,
+    /// resizes and pings went unread.
+    #[test]
+    fn a_replay_deadline_covers_the_whole_replay_not_each_chunk() {
+        let mut history = RawHistory::new();
+        history.append(&history_bytes(3 * RAW_HISTORY_CHUNK_BYTES));
+        // One slot, already full, and nothing draining it: every chunk waits out
+        // the deadline.
+        let (client, _receiver, _peer) = queued_test_client(1);
+        client
+            .sender
+            .try_send(ServerMessage::Sessions(Vec::new()))
+            .expect("prime the client queue");
+
+        let budget = Duration::from_millis(200);
+        let started = Instant::now();
+        send_pty_scrollback_until(&client, SessionId(3), &history.snapshot(), started + budget);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < 3 * budget,
+            "a three-chunk replay took {elapsed:?}, which is per-chunk rather than per-replay"
+        );
+    }
+
+    /// Bounded input, review follow-up: the PTY input queue is bounded in bytes as well as in messages.
+    /// One `Input` may carry a whole 16 MiB protocol frame, so 64 of them is
+    /// ~1 GiB of resident input per pane that a same-uid client can park in any
+    /// pane whose child has stopped reading its stdin.
+    #[test]
+    fn pty_input_is_bounded_in_bytes_not_only_in_messages() {
+        // A writer whose `write` blocks until the test releases it: the pane's
+        // child that never reads its stdin, without a real PTY.
+        struct BlockingWriter {
+            release: mpsc::Receiver<()>,
+        }
+
+        impl Write for BlockingWriter {
+            fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+                // Returns as soon as the test drops its sender, so the thread is
+                // not left parked when the test ends.
+                let _ = self.release.recv();
+                Ok(buffer.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (release, blocked) = mpsc::channel();
+        let queue = spawn_pty_writer(Box::new(BlockingWriter { release: blocked }));
+        let chunk = vec![b'x'; 1024 * 1024];
+
+        let mut accepted = 0;
+        let rejection = loop {
+            match write_pty_input(&queue, &chunk) {
+                Ok(()) => {
+                    accepted += 1;
+                    assert!(
+                        accepted <= PTY_INPUT_QUEUE_CAPACITY,
+                        "the byte cap never bit: {accepted} MiB queued"
+                    );
+                }
+                Err(rejection) => break rejection,
+            }
+        };
+
+        assert_eq!(rejection.code, RejectCode::InputRefused);
+        assert_eq!(
+            accepted,
+            PTY_INPUT_QUEUE_MAX_BYTES / chunk.len(),
+            "the queue must fill by bytes, not by message count"
+        );
+        // Unblock the writer thread so it drains and exits with the test.
+        drop(release);
+    }
+
+    /// Take `pane`'s lock within `timeout`, failing the test rather than hanging
+    /// it if something else is holding the lock it should not be holding.
+    fn lock_pane_within(
+        pane: &SharedPane,
+        timeout: Duration,
+    ) -> std::sync::MutexGuard<'_, PaneState> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match pane.try_lock() {
+                Ok(locked) => return locked,
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    panic!("pane lock poisoned: {error}")
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the pane lock was still held after {timeout:?}"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
     fn history_bytes(size: usize) -> Vec<u8> {
         (0..size).map(|index| (index % 251) as u8).collect()
     }
@@ -2989,6 +3605,15 @@ mod tests {
             receiver,
             peer,
         )
+    }
+
+    /// A pane entry whose replay has already finished: the steady state, and
+    /// what every test that is not about attach ordering wants.
+    fn open_pane_client(handle: ClientHandle) -> PaneClient {
+        PaneClient {
+            handle,
+            gate: Arc::new(ReplayGate::open()),
+        }
     }
 
     fn test_client(id: ClientId) -> ClientHandle {

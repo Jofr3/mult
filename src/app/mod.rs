@@ -18,7 +18,7 @@ pub mod selection;
 pub mod status;
 pub mod text_input;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub use self::{
     bindings::{
@@ -39,8 +39,8 @@ pub use self::{
 };
 
 use crate::model::{
-    AgentKind, ChatId, ChatStatus, ProjectState, TerminalId, WorkspaceId, DEFAULT_AGENT_CHAT_TITLE,
-    STATE_VERSION,
+    AgentKind, ChatId, ChatStatus, ProjectState, TerminalId, TerminalLaunch, WorkspaceId,
+    DEFAULT_AGENT_CHAT_TITLE, STATE_VERSION,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +86,30 @@ pub struct App {
     /// Set by the "Reload config" command; the event loop owns the `Config`, so
     /// it does the swap and clears this (E9).
     config_reload_requested: bool,
+    /// Something the user would see has changed, so the loop owes them a frame.
+    ///
+    /// Queuing a status notice sets this, which is why it exists: the loop only
+    /// recomputes the layout and redraws inside its `needs_redraw` branch, and
+    /// the two producers that mutated the notice queue without asking for a
+    /// frame — the failed save and the failed clipboard write — left a status
+    /// line that was never drawn until an unrelated keypress happened to trigger
+    /// one (F11). The loop drains it once per tick, so a new notice producer
+    /// cannot forget.
+    redraw_requested: bool,
+    /// Command terminals whose command line came out of `state.json` and has
+    /// not been approved to run in this session (C1).
+    ///
+    /// `state.json` is an execution boundary: for a `Command` terminal the
+    /// program is the *file's* choice, not `$SHELL`, so no automatic path may
+    /// launch one — not the auto-start tick, not a key pressed at a focused
+    /// pane. Declining the restore prompt used to only drop the prompt, so the
+    /// very next tick auto-started exactly what the user had just refused; a
+    /// planted terminal with `restore_on_launch: false` was never even asked
+    /// about and auto-started with no prompt at all. Approval is the prompt's
+    /// `y` or the explicit "Start selected PTY" command, and both clear the
+    /// entry. Terminals created in this session are the user's own typing and
+    /// are never in here.
+    unapproved_command_terminals: BTreeSet<TerminalId>,
     /// Text a copy action has queued for the system clipboard, waiting to be
     /// emitted as OSC 52.
     ///
@@ -194,6 +218,16 @@ impl App {
         let ids_normalized = project.normalize_next_ids();
         let titles_normalized = normalize_agent_chat_titles(&mut project);
         let chat_statuses_normalized = normalize_transient_chat_statuses(&mut project);
+        // Every command terminal that arrives with the project came out of
+        // `state.json`, so none of them may run before the user has said so
+        // (C1). See `unapproved_command_terminals`.
+        let unapproved_command_terminals = project
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.terminals.iter())
+            .filter(|terminal| matches!(terminal.launch, TerminalLaunch::Command(_)))
+            .map(|terminal| terminal.id)
+            .collect();
         let mut app = Self {
             project,
             selected: None,
@@ -214,6 +248,8 @@ impl App {
                 || chat_statuses_normalized,
             status_notices: VecDeque::new(),
             config_reload_requested: false,
+            redraw_requested: false,
+            unapproved_command_terminals,
             pending_clipboard: None,
         };
         app.reconcile_selection(None);
@@ -264,6 +300,18 @@ impl App {
     /// Take a pending reload request, if one was made since the last call.
     pub fn take_config_reload_request(&mut self) -> bool {
         std::mem::take(&mut self.config_reload_requested)
+    }
+
+    /// Ask the loop for a frame. Set by anything that changes what is on screen
+    /// without going through the event handler — a queued status notice, today
+    /// (F11).
+    fn request_redraw(&mut self) {
+        self.redraw_requested = true;
+    }
+
+    /// Take a pending redraw request, if one was made since the last call.
+    pub fn take_redraw_request(&mut self) -> bool {
+        std::mem::take(&mut self.redraw_requested)
     }
 
     /// Queue `text` for the system clipboard, replacing anything not yet

@@ -14,8 +14,53 @@ permissions:
   contents: read
 
 jobs:
+  # Nothing is published from a tree that was not tested, and nothing is
+  # published under a version that is not the crate's (H14). The Package step
+  # derives the archive name from the *tag*, so pushing `v0.2.0` with
+  # `[workspace.package] version = "0.1.0"` used to publish `mult-0.2.0-*.tar.gz`
+  # holding a binary whose `--version` says `0.1.0`, plus a `SHA256SUMS`
+  # attesting to it. `build` and `release` both wait for this.
+  verify:
+    name: Verify the release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: verify
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Check the tag matches the crate version
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          cargo_version="$(sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml \
+              | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$cargo_version" != "$tag_version" ]; then
+            echo "tag $GITHUB_REF_NAME is version '$tag_version', but Cargo.toml has '$cargo_version'" >&2
+            echo "see docs/RELEASING.md for the full checklist" >&2
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME matches the crate version"
+
+      - name: Version consistency across the tree
+        run: just version-check
+
+      - name: Test suite
+        run: cargo test --locked --workspace --all-targets --all-features
+
   build:
     name: ${{ matrix.target }}
+    needs: verify
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

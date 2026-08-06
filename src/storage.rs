@@ -966,8 +966,8 @@ mod tests {
         // string. Dropping just that element would lose it silently on the next
         // save, so the file is still moved aside — but the notice now says
         // where to, which is the difference between "recoverable" and "gone"
-        // (E11). `workspaces: null` used to land here too and no longer does;
-        // see `a_partially_unknown_state_keeps_everything_it_can_decode`.
+        // (E11). `workspaces: null` lands here too, for the same reason: see
+        // `a_null_session_container_is_damage_not_an_empty_project`.
         let path = unique_temp_file();
         let original = format!(
             r#"{{"version":{STATE_VERSION},"next_workspace_id":2,"next_chat_id":1,"next_terminal_id":1,"workspaces":[{{"id":"one"}}]}}"#
@@ -991,6 +991,50 @@ mod tests {
         );
         for backup in backups {
             let _ = fs::remove_file(backup);
+        }
+    }
+
+    /// F6: `null` where the sessions belong is damage, not a defaultable field.
+    ///
+    /// Decoding it leniently was worse than failing: the load succeeded, so
+    /// nothing was copied aside and nothing was said, the user was shown a
+    /// workspace with every chat gone, and the first save — a second later —
+    /// rewrote the file without them. The whole point of the E11 backup is that
+    /// the bytes survive whatever this build cannot read.
+    #[test]
+    fn a_null_session_container_is_damage_not_an_empty_project() {
+        for container in ["workspaces", "chats", "terminals"] {
+            let path = unique_temp_file();
+            let original = format!(
+                r#"{{"version":{STATE_VERSION},"next_workspace_id":2,"next_chat_id":2,"next_terminal_id":2,
+                     "workspaces":[{{"id":1,"name":"orbit","cwd":null,"environment":{{}},
+                       "chats":[{{"id":1,"name":"agent","status":"Idle"}}],
+                       "terminals":[{{"id":1,"name":"shell","restore_on_launch":false}}]}}]}}"#
+            )
+            .replace(
+                &format!(r#""{container}":["#),
+                &format!(r#""{container}":null,"unused":["#),
+            );
+            fs::write(&path, &original).expect("write nulled state");
+
+            let loaded = load_from_path(&path).expect("recover a nulled container");
+
+            assert_eq!(loaded.state, ProjectState::default());
+            assert!(!loaded.first_run, "a damaged file is not a fresh install");
+            let notice = loaded
+                .notice
+                .unwrap_or_else(|| panic!("a reset must be reported for {container}"));
+            assert!(notice.contains(".json.corrupt-"), "{notice}");
+            let backups = corrupt_backups_of(&path);
+            assert_eq!(backups.len(), 1, "expected one backup: {backups:?}");
+            assert_eq!(
+                fs::read_to_string(&backups[0]).expect("read backup"),
+                original,
+                "the user's bytes must survive verbatim"
+            );
+            for backup in backups {
+                let _ = fs::remove_file(backup);
+            }
         }
     }
 

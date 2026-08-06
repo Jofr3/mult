@@ -43,13 +43,15 @@ fn main() -> ExitCode {
     // function that re-derived its path from the environment on every call
     // (F11).
     let mut store = FileStateStore::new(storage::state_path_with_override(options.state_path));
-    let config_path = config::config_path_with_override(options.config_path.as_deref());
-    let config = match config::load_from(&config_path) {
+    let config_location = config::config_location_with_override(options.config_path.as_deref());
+    let config = match config::load_from(&config_location) {
         Ok(config) => config,
         Err(error) => {
             // Hard failure by policy: this file names commands that are run
             // through a login shell and auto-started, so quietly falling back
             // to the defaults would run something the user did not ask for.
+            // That includes a `--config` (or `$MULT_CONFIG_PATH`) that is not
+            // there: only the default location may be absent (F7).
             eprintln!("mult: {error}");
             return ExitCode::from(EXIT_USAGE);
         }
@@ -80,7 +82,13 @@ fn main() -> ExitCode {
         app.push_status_notice(StatusLevel::Warning, warning);
     }
 
-    match run_session(app, config, config_path, options.socket_path, &mut store) {
+    match run_session(
+        app,
+        config,
+        config_location,
+        options.socket_path,
+        &mut store,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("mult: {error}");
@@ -92,7 +100,7 @@ fn main() -> ExitCode {
 fn run_session(
     app: App,
     config: config::Config,
-    config_path: std::path::PathBuf,
+    config_location: config::ConfigLocation,
     socket_path: Option<std::path::PathBuf>,
     store: &mut dyn StateStore,
 ) -> io::Result<()> {
@@ -109,7 +117,7 @@ fn run_session(
         config,
         store,
         runtime::RuntimeOptions {
-            config_path,
+            config_location,
             socket_path,
         },
     );

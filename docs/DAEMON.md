@@ -88,7 +88,9 @@ The daemon is bounded so that one runaway or hostile same-uid client cannot take
 
 ## PTY input
 
-Each pane owns a writer thread fed by a bounded queue (64 chunks). The daemon's socket reader only ever enqueues, and never writes to a PTY master itself.
+Each pane owns a writer thread fed by a queue bounded both in messages (64 chunks) and in bytes (4 MiB). The daemon's socket reader only ever enqueues, and never writes to a PTY master itself.
+
+The byte bound matters because one `Input` may carry a whole 16 MiB protocol frame, so the message bound alone allowed about 1 GiB of resident input per pane. A chunk that arrives at an empty queue is always admitted whatever its size, so a large paste into a pane that is reading is never refused for being large.
 
 This is a correctness requirement, not a performance one. Writing to a master blocks with no upper bound when the child stops reading its stdin, so doing it on the reader thread stopped the daemon reading the socket, the socket buffer then filled, and the client's render thread blocked in its own `write_all` — both ends hung indefinitely, reproducibly, by pasting a large buffer into such a pane.
 
@@ -103,6 +105,10 @@ Stopping a pane signals the whole terminal — the pane shell's process group an
 Panes are single-attach with takeover *within an instance*: when a connection attaches to a session another connection of the same instance already holds, the previous one is told (an error plus `PaneExited` for that pane) instead of being dropped in silence. That is what lets a reconnecting client re-attach while its previous, not-yet-reaped connection is still listed. A connection presenting a different instance token cannot reach the session at all, so it cannot take it over.
 
 Each pane retains a bounded window of raw PTY output (5 MiB) for replay on attach. The history is stored in chunks, so trimming it costs time proportional to the bytes dropped rather than to the bytes kept, and a replay shares those chunks instead of copying the history under the pane lock.
+
+A client never receives live output for a pane before that pane's replay. The attach installs a replay gate alongside the client, under the same pane-lock hold that snapshots the history, so every byte is either in the replay or held by the gate until the replay has been queued; the gate then releases what it held, in arrival order. Without it, attaching to a busy pane (`tail -f`, a running build) left the client feeding new output into its parser ahead of the history it belongs after, and the screen stayed wrong. A pane holds at most 5 MiB for one client this way; a client that makes it hold more is dropped exactly as a client that cannot keep up with the live broadcast is.
+
+The whole replay shares one 5 s deadline, not one per chunk.
 
 ## Operational notes
 

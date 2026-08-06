@@ -19,8 +19,14 @@ run the same implementation, in `mult-protocol::peer`.
 group/other write bit, and are read under a size cap. This matters because their
 paths are environment-overridable and their contents are executed or replayed:
 the config holds shell command lines that auto-start, the state file replays
-terminals. A file that fails any check is refused; only a genuinely missing file
-falls back to defaults.
+terminals. A file that fails any check is refused.
+
+A missing `config.json` falls back to the built-in defaults **only at the
+default location**. A path the user named — `--config`, or `$MULT_CONFIG_PATH` —
+that does not exist is an error, because the fallback is not neutral: the
+built-in defaults auto-start `pi` and `claude` through the login shell, so one
+mistyped character in a `--config` path would otherwise start command lines the
+real config had turned off.
 
 The per-chat agent status files are opened `O_NOFOLLOW`, must be regular files,
 and are read under a 64 KiB cap, but are **not** individually owner- or
@@ -42,6 +48,15 @@ any same-uid process — so it is treated as untrusted input:
 - a terminal with a stored command line is **not** replayed at startup. It is
   left stopped, and a confirmation prompt shows each command verbatim before
   anything runs. Declining leaves the terminals stopped and says so.
+
+The refusal is recorded, not merely displayed. A command terminal that came out
+of `state.json` cannot be started by *any* automatic path — neither the
+auto-start tick nor a key pressed at its focused pane — until the user has
+approved it, either at that prompt or through the explicit "Start selected PTY"
+command, which names the terminal and shows its command line in the pane.
+Declining and then pressing a key therefore runs nothing, and neither does a
+planted terminal stored `restore_on_launch: false`, which the prompt never
+covers.
 
 Chat agents are unaffected: their command lines come from `config.json`, which
 is the user's own configuration and is ownership-checked when read.
@@ -66,7 +81,10 @@ every later PTY.
 **Repositories.** The branch shown per workspace is read from `.git/HEAD`
 directly. `mult` runs no `git` subprocess, so opening a hostile repository does
 not cause its `.git/config` (`include.path`, `core.fsmonitor`, `core.hooksPath`)
-to be parsed.
+to be parsed. A `.git` symlink — a legitimate layout for a vendored checkout —
+is resolved once and deliberately, and `HEAD` and the `gitdir:` pointer are then
+read `O_NOFOLLOW`, regular-files-only and under a 4 KiB cap, so the repository
+cannot aim the probe at a device, a FIFO or an unbounded file.
 
 **Daemon sessions are namespaced per client instance.** Every session on
 `mult-server` belongs to the instance token its creator presented, and a
