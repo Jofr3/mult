@@ -1,6 +1,8 @@
 [package]
 name = "mult"
 description = "A terminal UI prototype for multiplexing AI agent workspaces, chats, and terminals."
+# Two binaries ship from this package; a bare `cargo run` means the client.
+default-run = "mult"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

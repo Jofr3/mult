@@ -78,6 +78,18 @@ pub enum PtyEvent {
         terminal: PtyKey,
         message: String,
     },
+    /// A failure that belongs to the *connection*, not to any one pane: the
+    /// daemon could not be reached, its protocol version does not match, the
+    /// socket went away, or it sent a connection-wide `ServerMessage::Error`
+    /// (the protocol reserves `LeaseRejected` for per-pane failures, so this
+    /// carries no pane and must not invent one — B8).
+    ///
+    /// These used to be attributed to `PtyKey::Terminal(TerminalId(0))`, an id
+    /// that cannot exist, so the diagnostic was written into a pane nobody
+    /// could open. The render loop routes them to the status surface (E2).
+    ConnectionError {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,8 +337,7 @@ impl PtyRuntime {
             Ok(runtime) => runtime,
             Err(error) => Self::disconnected(
                 socket_path,
-                vec![PtyEvent::Error {
-                    terminal: PtyKey::Terminal(TerminalId(0)),
+                vec![PtyEvent::ConnectionError {
                     message: format!("failed to connect to mult-server: {error}"),
                 }],
             ),
@@ -1596,14 +1607,13 @@ impl PtyRuntime {
                     });
                 }
             }
+            // Connection-wide by protocol definition; a per-pane failure
+            // arrives as `LeaseRejected` above. Picking an arbitrary attached
+            // pane (or `Terminal(0)`) to blame was wrong in both directions —
+            // it hid the error when nothing was attached and slandered an
+            // unrelated pane when something was (B8).
             ServerMessage::Error { message } => {
-                let terminal = self
-                    .pane_to_terminal
-                    .values()
-                    .next()
-                    .copied()
-                    .unwrap_or(PtyKey::Terminal(TerminalId(0)));
-                events.push(PtyEvent::Error { terminal, message });
+                events.push(PtyEvent::ConnectionError { message });
             }
         }
     }
@@ -1714,14 +1724,7 @@ impl PtyRuntime {
             return;
         }
         self.disconnect_reported = true;
-        let terminal = self
-            .terminal_to_pane
-            .keys()
-            .next()
-            .copied()
-            .unwrap_or(PtyKey::Terminal(TerminalId(0)));
-        self.pending_events.push(PtyEvent::Error {
-            terminal,
+        self.pending_events.push(PtyEvent::ConnectionError {
             message: format!(
                 "mult-server connection lost; attachment state is retained pending reconciliation: {reason}"
             ),
@@ -4689,11 +4692,77 @@ mod tests {
         assert!(runtime.is_running(terminal));
         assert_eq!(runtime.pane_to_terminal.get(&pane), Some(&terminal));
         assert!(runtime.parser(terminal).is_some());
+        // Losing the socket is a property of the connection, not of any one
+        // pane, so it is reported without a pane rather than being blamed on
+        // an arbitrary attached terminal or on `Terminal(0)` (E2/B8).
         assert!(events.iter().any(|event| matches!(
             event,
-            PtyEvent::Error { terminal: event_terminal, message }
-                if *event_terminal == terminal && message.contains("retained pending reconciliation")
+            PtyEvent::ConnectionError { message }
+                if message.contains("retained pending reconciliation")
         )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PtyEvent::Error { .. })),
+            "transport loss must not be attributed to a pane: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_connection_wide_server_error_is_not_attributed_to_a_pane() {
+        // The protocol reserves `ServerMessage::Error` for the connection and
+        // `LeaseRejected` for one pane, so `Error` must never be pinned to a
+        // pane — neither an arbitrary attached one nor `Terminal(0)`, which
+        // cannot exist because terminal ids start at 1 (B8).
+        let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
+        let (sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::Terminal(TerminalId(11));
+        let pane = PaneId(11);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        sender
+            .send(ServerMessage::Error {
+                message: "daemon is at capacity".to_string(),
+            })
+            .expect("queue a connection-wide error");
+
+        let events = runtime.drain_events();
+
+        assert!(
+            events.contains(&PtyEvent::ConnectionError {
+                message: "daemon is at capacity".to_string(),
+            }),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PtyEvent::Error { .. })),
+            "{events:?}"
+        );
+        // ...and the attachment it did not concern is untouched.
+        assert_eq!(runtime.pane_to_terminal.get(&pane), Some(&terminal));
+    }
+
+    #[test]
+    fn a_daemon_that_cannot_be_reached_reports_without_a_pane() {
+        // The startup path is the one that had nothing attached at all, so its
+        // diagnostic used to be queued against `Terminal(0)` and was therefore
+        // never rendered anywhere: a user with a missing or version-mismatched
+        // `mult-server` saw an inert UI (E2).
+        let mut runtime = PtyRuntime::with_socket_path(PathBuf::from(
+            "/nonexistent/mult-e2-unreachable-socket/mult.sock",
+        ));
+
+        let events = runtime.drain_events();
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                PtyEvent::ConnectionError { message }
+                    if message.contains("failed to connect to mult-server")
+            )),
+            "{events:?}"
+        );
     }
 
     #[test]

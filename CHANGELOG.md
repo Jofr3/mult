@@ -505,6 +505,187 @@ and the project aims to adhere to
   classes on every public route into a parser, and the narrowing panic is pinned
   across two glyph widths and every shrink step down to the floor.
 
+### Added — CLI, config validation and state recovery (R7a)
+
+- **Both binaries parse their arguments.** `mult --help`, `mult --version`,
+  `mult -h` and `mult -V` used to start the TUI, and a mistyped `--socekt` used
+  to start it too, silently talking to the wrong daemon. A new `src/cli.rs`
+  parses `--help`/`-h`, `--version`/`-V`, and `--config`/`--state`/`--socket`
+  (both `--flag value` and `--flag=value`; values are split on bytes, so a path
+  that is not valid UTF-8 survives). An unrecognized option, a stray positional,
+  a missing value or a repeated flag prints a message plus a `--help` pointer and
+  exits `2`. `mult-server` accepts `--socket` and **rejects** `--config` and
+  `--state` rather than accepting a flag it would ignore. Hand-rolled rather than
+  adding `clap`, per the workspace's no-new-dependencies rule. `default-run` is
+  set, so a bare `cargo run` means the client (E1).
+- **Every path option has one precedence rule: flag > environment > default.**
+  Implemented through the existing pure path seams — `config_path_from` gained a
+  flag argument, `StatePaths::resolve_with` was added, and `default_socket_path`
+  consults a set-once `OnceLock` the CLI installs before any thread exists (the
+  client resolves its socket deep inside `PtyRuntime`, and mutating
+  `$MULT_SOCKET_PATH` at runtime was not an option). Documented in `README.md`,
+  `docs/CONFIG.md` and both `--help` texts (E1).
+- **`Config::warnings() -> &[String]`** and **`LoadedState::notice:
+  Option<String>`**: the two seams through which non-fatal configuration
+  problems and state recovery reach the user. Both are printed to stderr at
+  startup — where they are legible before the alternate screen opens — and both
+  feed the in-app notice surface (E6, E11).
+
+### Changed — configuration is validated (R7a)
+
+- **Unknown config keys are now a startup error.** `deny_unknown_fields` applies
+  to the top-level object, to `colorscheme`, and to a `projects` entry, so a typo
+  like `auto_start_terminal` (no `s`) or `colorscheme.foreground` fails with the
+  list of accepted keys instead of being accepted and doing nothing. A `projects`
+  entry is deserialized by a hand-written visitor rather than an `#[serde(untagged)]`
+  enum, which reported every failure as "data did not match any variant" and lost
+  the position (E6).
+- **A colour that does not parse, and a `projects` path that is not a directory,
+  are warnings rather than errors.** The colour keeps its built-in default and
+  the shortcut stays in the list; both are reported by key and by value. The
+  policy — anything that means the file cannot be understood is an error,
+  anything with a safe fallback is a warning — is written into `docs/CONFIG.md`
+  (E6).
+- **State decoding is lenient about what it can rebuild.** A file that lost part
+  of itself — a renamed key, a `null` where an array belonged, missing
+  `next_*_id` hints, an identity table that no longer matches the sessions — now
+  loads everything that decoded. The allocator hints and the identity and
+  generation tables are reconciled against the sessions that survived: stale
+  entries are dropped and missing tokens are minted fresh, which is the fail-safe
+  direction because a fresh token cannot claim an existing daemon session (the
+  pane comes back stopped). IDs, names and the state namespace stay required, and
+  a value of the wrong *type* is still an error rather than data silently
+  discarded. The V1→V2 migration and the future-version byte-preservation
+  guarantee are unchanged and pinned by a new test (E11).
+
+### Fixed — error surfacing (R7a)
+
+- **A bad config no longer `Debug`-dumps.** Both binaries return `ExitCode` and
+  print errors with `Display`. A parse failure reads
+  `config error at <path>:<line>:<col>: <message>`, with serde's redundant
+  trailing " at line N column M" stripped (E5).
+- **A symlinked config says so.** The hardened `O_NOFOLLOW` read introduced in
+  R4 failed inside `openat`, before any of `mult`'s own descriptions applied, so
+  the user saw a bare
+  `Error: Os { code: 40, kind: FilesystemLoop, message: "Too many levels of symbolic links" }`
+  that never mentioned the config file. `ELOOP`/`ENOTDIR` now produce a message
+  naming the path, stating that symlinked config files are not supported and why,
+  and giving the workaround (copy the file, or point `--config` /
+  `$MULT_CONFIG_PATH` at a real file) — the layout most dotfile managers produce
+  (E5).
+- **Config directory failures say "config".** The reader shared with state
+  emitted `state parent …` and `private state directory …` even when it was the
+  config directory that failed; the messages are parameterized by purpose now
+  (E5).
+- **A state reset is no longer silent.** When a decode failure genuinely forces
+  backup-and-reset, the notice names the file, the decode error and the
+  `.corrupt-*` backup, instead of leaving a file nobody was told about as the
+  only evidence that every workspace was discarded (E11).
+- Config is loaded **before** the state lock is taken, so `mult --config
+  <broken>` reports the config error rather than whatever the state path had to
+  say (E5).
+
+### Tested — CLI and configuration (R7a)
+
+- 12 tests for the argument parser, driving the pure `parse` function rather than
+  spawning processes: separated and inline values, a non-UTF-8 value, help and
+  version for both binaries, unknown flags, stray positionals, `--`, missing and
+  repeated values, and the daemon's rejection of client-only options (E1).
+- `config.rs` grew from 9 tests to 23, covering malformed JSON, unknown keys at
+  all three levels, invalid colour strings, a project path that does not exist, a
+  symlinked config, a config directory rejection naming "config", and flag >
+  environment > default precedence (G13).
+- `storage.rs` gained `a_partially_unknown_state_keeps_everything_it_can_decode`
+  and `leniency_does_not_weaken_the_version_boundary`;
+  `a_shape_error_backs_the_file_up_and_resets_to_a_fresh_state` became
+  `…_and_reports_where_the_backup_went` and asserts the notice. The
+  backup-rename-failure test is unchanged — that path correctly aborts and
+  preserves the original bytes. `model.rs` pins the reconciliation of the
+  identity tables and the missing/`null`/wrong-type decode boundary (E11).
+
+### Added — status surface and in-app affordances (R7b)
+
+- **A dismissible status surface.** Errors that belong to no pane had nowhere to
+  go: a daemon that would not connect, a protocol mismatch, a failed state save
+  and the connection-wide `ServerMessage::Error` were all attributed to
+  `PtyKey::Terminal(TerminalId(0))` — an id that cannot exist — so the
+  explanation was written into a pane nobody could open and the user got an inert
+  UI with no reason for it. `App` now carries up to four notices with a 12-second
+  lifetime, de-duplicated so a failure that repeats every frame refreshes its row
+  instead of stacking copies, and dropped oldest-first. The surface occupies rows
+  only while it has something to say. `Ctrl+n` (and a "Dismiss notices" palette
+  entry) clears it; `Ctrl+n` is only consumed when there is something to dismiss,
+  so it still reaches a PTY on a quiet session. A save failure is sticky, because
+  it describes a condition that is still true, and is retracted by the next
+  successful save (E2, B8).
+- **`?` / `F1` opens a keybinding overlay** generated from the same
+  `app::BINDINGS` table the command palette filters, so a binding cannot be added
+  to one and forgotten in the other. `?` only opens it when no pane would have
+  received the key — a selected chat or terminal takes every ordinary character,
+  which is how a PTY is started and typed at — while `F1` and the palette entry
+  are unconditional. Any key closes it, and it is drawn over the frame rather
+  than in the layout, so it costs nothing while it is down (E4).
+- **"Reload config" in the command palette.** `config.json` is re-read in place;
+  the colorscheme, `projects`, agent commands and auto-start apply to the next
+  frame. The notice states what did *not* change — `mouse_capture` is a terminal
+  mode set once per session, and an already-running PTY keeps the command it was
+  started with — so an applied reload never looks like a no-op. A config that
+  fails to load leaves the running one in place and reports the error rather than
+  ending a session holding live PTYs over a colorscheme typo (E9).
+- **`NO_COLOR` is honoured.** Set to any non-empty value, every colour becomes
+  `Color::Reset`; emphasis that would have been a background colour becomes
+  reverse video (E10).
+
+### Changed — prompts and status glyphs (R7b)
+
+- **Prompts have a cursor.** Text entry was append-only, in four duplicated
+  copies. One `PromptInput` now owns the text for every prompt and supports
+  `Left`/`Right`, `Home`/`End`, `Ctrl+a`/`Ctrl+e`, `Backspace`, `Delete`,
+  `Ctrl+w` and `Ctrl+u`. The cursor is counted in characters with byte offsets
+  derived on demand, so no edit can land on a non-char boundary, and the renderer
+  styles the character under the cursor rather than replacing it — a wide or
+  combining character keeps its own display column (E7, F13).
+- **Chat state is carried by shape, not only by hue.** Every chat rendered the
+  identical `"● "`, so a red-green colourblind user could not tell a finished
+  agent from a failed one, and under `NO_COLOR` nobody could. Six single-width,
+  long-standing Unicode glyphs now carry the state — no Nerd Font or emoji font
+  needed — and the sidebar's selected-row highlight sets a background only, never
+  a foreground, so selecting a row cannot put its state back on colour alone
+  (E8).
+- **Chat search says it is not wired up.** `Ctrl+s` on a chat searches the
+  structured transcript, which only the experimental process-agent backend writes
+  and which has no call path, so it is empty for every chat that can be created
+  and "No matches." read as "your text is not in this chat". The pane now says
+  the transcript is not populated and that chats run in a PTY. Nothing was
+  deleted: `src/transcript.rs` builds on those types (E12).
+- **The list selection wraps modularly.** `index.checked_sub(delta).unwrap_or(len
+  - delta)` was only right for `delta == 1` and underflowed for `delta > len`; a
+  single `ListSelection` using `rem_euclid` replaces four copies of it (F21,
+  F13).
+
+### Fixed — help overlay legibility (R7b, finishing pass)
+
+- The overlay was capped at 64 columns whatever the terminal was, so its longest
+  labels were clipped mid-word by the renderer — "Move through results (palette,
+  projec" — with nothing on screen marking the cut, and being borderless it ran
+  straight into the pane it covered ("▣ websKeybindings"). It is now a bordered
+  panel sized to its widest row and no wider than the frame, with any label that
+  still will not fit ellipsized. Vertical truncation is unchanged: rows past the
+  bottom are dropped and the last row says so.
+
+### Tested — status surface and affordances (R7b)
+
+- Three new `insta` snapshots pin whole frames as a glyph grid plus a per-cell
+  style grid: `snapshot_help_overlay`, `snapshot_status_surface_with_an_error`
+  (an error, a warning and a sticky save failure at once) and
+  `snapshot_no_color_frame`, whose style legend — every entry `Color::Reset` — is
+  the assertion. `snapshot_command_palette_prompt` gained the "Show keybindings"
+  row at the head of the list.
+- `prompt_motions_and_kills_work_in_every_text_prompt` drives each prompt through
+  its own handler exactly as `handle_key` dispatches it, so the shared classifier
+  is asserted rather than assumed; the notice TTL and cap tests inject the clock,
+  so nothing waits on wall time.
+
 ## [0.1.0] - 2026-05-19
 
 Initial prototype: a Ratatui/Crossterm client plus a persistent `mult-server`

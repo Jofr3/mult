@@ -1,0 +1,80 @@
+---
+source: src/ui.rs
+expression: "buffer_snapshot(&render_buffer(&app, &PtyRuntime::new_offline(),\n&config::Config::default(), 100, 30,))"
+---
+size: 100x30
+
+symbols:
+| ▣ mult                           Terminal is stopped. Type to start it and send input.             |
+|   $ terminal                                                                                       |
+|                                                                                                    |
+| ▣ website                                                                                          |
+|   $ terminal                                                                                       |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|                                                                                                    |
+|✗ failed to connect to mult-server: No such file or directory (os error 2)                          |
+|! config.json: colorscheme.gold is not a #rrggbb color                                              |
+|✗ State save failed: Read-only file system (os error 30) — edit or quit to retry                    |
+
+styles:
+|abbccccaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|eeeffeeeeeeeeeeeeeeeeeeeeeeeeeeeeedddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|abbcccccccaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaggaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
+|hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhdddddddddddddddddddddddddd|
+|iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiidddddddddddddddddddddddddddddddddddddddddddddd|
+|hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhdddddddddddddddddddd|
+
+legend:
+  a = Style::new().fg(Color::Rgb(224, 222, 244)).bg(Color::Rgb(31, 29, 48)).underline_color(Color::Reset)
+  b = Style::new().fg(Color::Rgb(156, 207, 216)).bg(Color::Rgb(31, 29, 48)).underline_color(Color::Reset)
+  c = Style::new().fg(Color::Rgb(156, 207, 216)).bg(Color::Rgb(31, 29, 48)).underline_color(Color::Reset).bold()
+  d = Style::new().fg(Color::Rgb(224, 222, 244)).bg(Color::Rgb(35, 33, 54)).underline_color(Color::Reset)
+  e = Style::new().fg(Color::Rgb(224, 222, 244)).bg(Color::Rgb(68, 65, 90)).underline_color(Color::Reset).bold()
+  f = Style::new().fg(Color::Rgb(110, 106, 134)).bg(Color::Rgb(68, 65, 90)).underline_color(Color::Reset).bold()
+  g = Style::new().fg(Color::Rgb(110, 106, 134)).bg(Color::Rgb(31, 29, 48)).underline_color(Color::Reset)
+  h = Style::new().fg(Color::Rgb(235, 111, 146)).bg(Color::Rgb(35, 33, 54)).underline_color(Color::Reset)
+  i = Style::new().fg(Color::Rgb(246, 193, 119)).bg(Color::Rgb(35, 33, 54)).underline_color(Color::Reset)

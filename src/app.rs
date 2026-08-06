@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -45,7 +46,69 @@ pub struct App {
     structural_dirty: bool,
     recoverable_terminals: BTreeSet<TerminalId>,
     save_error: Option<String>,
-    operation_error: Option<String>,
+    /// The transient status surface (E2). Everything that has no pane to be
+    /// reported into — a daemon that will not connect, a protocol mismatch, a
+    /// connection-wide `ServerMessage::Error` (B8), a rejected config, a state
+    /// file that had to be reset — lands here instead of being attributed to a
+    /// terminal that may not exist.
+    notices: Vec<Notice>,
+    /// Whether the keybinding overlay is up. Rendered over the frame, so it
+    /// steals no space when it is down.
+    help_visible: bool,
+    /// Set by the "Reload config" palette action and taken by the event loop,
+    /// which owns the `Config` (E9). The action itself cannot swap it: the
+    /// handler only has `&Config`.
+    config_reload_requested: bool,
+}
+
+/// How long a transient notice stays on screen. Long enough to read a sentence
+/// without looking for it, short enough that a burst of them during a daemon
+/// outage does not permanently occupy rows.
+pub const NOTICE_TTL: Duration = Duration::from_secs(12);
+
+/// The most notices kept at once. Older ones are dropped rather than growing
+/// the surface without bound.
+pub const MAX_NOTICES: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeLevel {
+    Info,
+    Warning,
+    Error,
+}
+
+/// Where a notice came from, so a condition that has ended can retract exactly
+/// its own message without touching unrelated ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeSource {
+    /// The state file could not be written. Sticky: it describes a condition
+    /// that is still true, and it is retracted by a successful save.
+    SaveFailure,
+    /// A workspace/chat/terminal mutation failed. Retracted by the next one
+    /// that succeeds.
+    Operation,
+    /// Everything else — connection, protocol, config, state recovery.
+    Report,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    level: NoticeLevel,
+    source: NoticeSource,
+    text: String,
+    /// When the notice stops being rendered, or `None` for a notice describing
+    /// a condition that is still true (only [`NoticeSource::SaveFailure`]).
+    expires_at: Option<Instant>,
+}
+
+impl Notice {
+    pub fn level(&self) -> NoticeLevel {
+        self.level
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,11 +128,231 @@ pub enum FocusMode {
     Terminal,
 }
 
+/// A prompt's text together with its cursor.
+///
+/// The cursor is a **character** offset, never a byte offset: prompts hold
+/// paths and shell commands, so multi-byte characters are ordinary input, and
+/// slicing those by byte either panics or splits a character in half. Byte
+/// offsets are derived from the character offset on demand (E7).
+///
+/// Grapheme clusters are deliberately out of scope here — a combining mark is
+/// its own `char`, so the cursor can sit between a base character and its mark.
+/// Cluster-aware motion is parked in `docs/ROADMAP.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PromptInput {
+    text: String,
+    /// Invariant: `0 ..= text.chars().count()`.
+    cursor: usize,
+}
+
+/// One editing operation on a [`PromptInput`]. The four prompt key handlers all
+/// translate their keys into these and hand them to [`App::apply_prompt_edit`],
+/// so the cursor logic exists once (F13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptEdit {
+    Insert(char),
+    Backspace,
+    DeleteForward,
+    MoveLeft,
+    MoveRight,
+    MoveHome,
+    MoveEnd,
+    /// `Ctrl+w`: delete the whitespace-delimited word before the cursor.
+    DeleteWordBefore,
+    /// `Ctrl+u`: delete everything before the cursor.
+    DeleteToStart,
+}
+
+impl PromptEdit {
+    /// Whether the edit changes the text (as opposed to only moving the
+    /// cursor). Only a change clears a prompt's error and resets its list
+    /// selection; moving the cursor must not throw the user's selection away.
+    fn mutates_text(self) -> bool {
+        !matches!(
+            self,
+            Self::MoveLeft | Self::MoveRight | Self::MoveHome | Self::MoveEnd
+        )
+    }
+}
+
+impl PromptInput {
+    pub fn new(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let cursor = text.chars().count();
+        Self { text, cursor }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// The cursor's position in characters.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    fn char_count(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    /// Byte offset of character `index`, or the end of the string when `index`
+    /// is past the last character.
+    fn byte_offset(&self, index: usize) -> usize {
+        self.text
+            .char_indices()
+            .nth(index)
+            .map_or(self.text.len(), |(offset, _)| offset)
+    }
+
+    /// `(before, at, after)`: the text before the cursor, the single character
+    /// the cursor sits on (empty past the end), and the text after it.
+    /// Concatenating the three reproduces [`Self::as_str`] exactly, which is
+    /// what lets the renderer style the cursor cell without rewriting the text.
+    pub fn split_at_cursor(&self) -> (&str, &str, &str) {
+        let start = self.byte_offset(self.cursor);
+        let end = self.byte_offset(self.cursor.saturating_add(1));
+        (
+            &self.text[..start],
+            &self.text[start..end],
+            &self.text[end..],
+        )
+    }
+
+    /// `pub(crate)` for the renderer's cursor tests; the app-level entry
+    /// point is [`App::apply_prompt_edit`].
+    pub(crate) fn apply(&mut self, edit: PromptEdit) -> bool {
+        match edit {
+            PromptEdit::Insert(ch) => {
+                let at = self.byte_offset(self.cursor);
+                self.text.insert(at, ch);
+                self.cursor += 1;
+                true
+            }
+            PromptEdit::Backspace => {
+                if self.cursor == 0 {
+                    return false;
+                }
+                let end = self.byte_offset(self.cursor);
+                let start = self.byte_offset(self.cursor - 1);
+                self.text.replace_range(start..end, "");
+                self.cursor -= 1;
+                true
+            }
+            PromptEdit::DeleteForward => {
+                let start = self.byte_offset(self.cursor);
+                let end = self.byte_offset(self.cursor.saturating_add(1));
+                if start == end {
+                    return false;
+                }
+                self.text.replace_range(start..end, "");
+                true
+            }
+            PromptEdit::MoveLeft => {
+                if self.cursor == 0 {
+                    return false;
+                }
+                self.cursor -= 1;
+                true
+            }
+            PromptEdit::MoveRight => {
+                if self.cursor >= self.char_count() {
+                    return false;
+                }
+                self.cursor += 1;
+                true
+            }
+            PromptEdit::MoveHome => {
+                let moved = self.cursor != 0;
+                self.cursor = 0;
+                moved
+            }
+            PromptEdit::MoveEnd => {
+                let end = self.char_count();
+                let moved = self.cursor != end;
+                self.cursor = end;
+                moved
+            }
+            PromptEdit::DeleteWordBefore => {
+                if self.cursor == 0 {
+                    return false;
+                }
+                let chars = self.text.chars().collect::<Vec<_>>();
+                let mut index = self.cursor;
+                while index > 0 && chars[index - 1].is_whitespace() {
+                    index -= 1;
+                }
+                while index > 0 && !chars[index - 1].is_whitespace() {
+                    index -= 1;
+                }
+                let start = self.byte_offset(index);
+                let end = self.byte_offset(self.cursor);
+                self.text.replace_range(start..end, "");
+                self.cursor = index;
+                true
+            }
+            PromptEdit::DeleteToStart => {
+                if self.cursor == 0 {
+                    return false;
+                }
+                let end = self.byte_offset(self.cursor);
+                self.text.replace_range(..end, "");
+                self.cursor = 0;
+                true
+            }
+        }
+    }
+}
+
+/// A wrap-around selection index over a list whose length is supplied by the
+/// caller (the entries are recomputed from the filter on every keystroke, so
+/// the selection cannot cache them).
+///
+/// This replaces four copies of the same body in the prompt handlers (F13), and
+/// its backwards step is a real modular wrap rather than
+/// `index.checked_sub(delta).unwrap_or(len - delta)`, which only happened to be
+/// right for `delta == 1` and underflowed for `delta > len` (F21).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListSelection {
+    index: usize,
+}
+
+impl ListSelection {
+    pub fn index(self) -> usize {
+        self.index
+    }
+
+    pub fn reset(&mut self) {
+        self.index = 0;
+    }
+
+    /// Keep the selection inside `0..len`, or at 0 for an empty list.
+    pub fn clamp(&mut self, len: usize) {
+        self.index = self.index.min(len.saturating_sub(1));
+    }
+
+    /// Move `delta` entries, wrapping in both directions.
+    pub fn step(&mut self, delta: isize, len: usize) {
+        if len == 0 {
+            self.index = 0;
+            return;
+        }
+        let modulus = isize::try_from(len).unwrap_or(isize::MAX);
+        let current = isize::try_from(self.index % len).unwrap_or(0);
+        let offset = delta.rem_euclid(modulus);
+        let next = current.saturating_add(offset).rem_euclid(modulus);
+        self.index = usize::try_from(next).unwrap_or(0);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenWorkspacePrompt {
-    pub input: String,
+    pub input: PromptInput,
     pub error: Option<String>,
-    pub selected: usize,
+    pub selected: ListSelection,
     pub mode: OpenWorkspaceMode,
 }
 
@@ -87,19 +370,19 @@ pub struct OpenWorkspaceMatch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalCommandPrompt {
-    pub input: String,
+    pub input: PromptInput,
     pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandPalettePrompt {
-    pub input: String,
-    pub selected: usize,
+    pub input: PromptInput,
+    pub selected: ListSelection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchPrompt {
-    pub input: String,
+    pub input: PromptInput,
     pub scope: SearchScope,
     pub error: Option<String>,
 }
@@ -163,6 +446,7 @@ pub enum SearchScope {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandAction {
+    ShowKeybindings,
     FocusSidebar,
     FocusSelectedPane,
     StartInput,
@@ -174,6 +458,8 @@ pub enum CommandAction {
     DeleteSelected,
     SearchSelectedPane,
     ClearSearch,
+    DismissNotices,
+    ReloadConfig,
     Quit,
 }
 
@@ -183,6 +469,271 @@ pub struct CommandPaletteEntry {
     pub label: &'static str,
     pub help: &'static str,
 }
+
+/// Which part of the overlay a binding is listed under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingScope {
+    /// Available when no prompt is open.
+    Global,
+    /// Available while a prompt or the command palette is open.
+    Prompt,
+    /// Not a key at all.
+    Mouse,
+}
+
+impl BindingScope {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Global => "Global",
+            Self::Prompt => "Prompts and the command palette",
+            Self::Mouse => "Mouse",
+        }
+    }
+}
+
+/// What must hold for a binding's action to be offered by the command palette.
+/// Bindings the palette cannot run (`action: None`) ignore this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindingAvailability {
+    Always,
+    SelectedPane,
+    SelectedWorkspace,
+    DeletableSelection,
+    ActiveSearch,
+    PendingNotices,
+}
+
+/// One row of the single binding table.
+///
+/// The command palette and the help overlay are both generated from
+/// [`BINDINGS`] so they cannot drift (E4): a row with an `action` is offered by
+/// the palette, a row with `keys` is listed by the overlay, and most rows have
+/// both. Rows with only `keys` are the bindings the palette has no action for
+/// (navigation, scrolling, prompt editing); rows with only an `action` are
+/// palette-only commands with no dedicated key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingEntry {
+    /// The key or keys, or `None` for a palette-only command.
+    pub keys: Option<&'static str>,
+    pub label: &'static str,
+    pub help: &'static str,
+    /// The palette action, or `None` for a binding the palette cannot run.
+    pub action: Option<CommandAction>,
+    pub scope: BindingScope,
+    availability: BindingAvailability,
+}
+
+impl BindingEntry {
+    const fn global(
+        keys: Option<&'static str>,
+        label: &'static str,
+        help: &'static str,
+        action: Option<CommandAction>,
+        availability: BindingAvailability,
+    ) -> Self {
+        Self {
+            keys,
+            label,
+            help,
+            action,
+            scope: BindingScope::Global,
+            availability,
+        }
+    }
+
+    const fn reference(keys: &'static str, label: &'static str, scope: BindingScope) -> Self {
+        Self {
+            keys: Some(keys),
+            label,
+            help: "",
+            action: None,
+            scope,
+            availability: BindingAvailability::Always,
+        }
+    }
+}
+
+/// Every binding and every command, in one place.
+///
+/// The order of the rows carrying an `action` is the order the command palette
+/// shows them in, so this is also the palette's ordering.
+pub const BINDINGS: &[BindingEntry] = &[
+    BindingEntry::global(
+        // `?` is conditional (see `App::help_key_opens_help`), `F1` is not.
+        Some("? or F1"),
+        "Show keybindings",
+        "list every key and command in an overlay",
+        Some(CommandAction::ShowKeybindings),
+        BindingAvailability::Always,
+    ),
+    BindingEntry::global(
+        None,
+        "Focus sidebar",
+        "return keyboard focus to workspace navigation",
+        Some(CommandAction::FocusSidebar),
+        BindingAvailability::Always,
+    ),
+    BindingEntry::global(
+        None,
+        "Focus selected pane",
+        "move keyboard focus from sidebar to the selected chat or terminal",
+        Some(CommandAction::FocusSelectedPane),
+        BindingAvailability::SelectedPane,
+    ),
+    BindingEntry::global(
+        None,
+        "Start selected PTY",
+        "start the selected chat/terminal PTY for immediate input",
+        Some(CommandAction::StartInput),
+        BindingAvailability::SelectedPane,
+    ),
+    BindingEntry::global(
+        Some("Ctrl+s"),
+        "Search selected pane",
+        "filter terminal output or chat transcript lines",
+        Some(CommandAction::SearchSelectedPane),
+        BindingAvailability::SelectedPane,
+    ),
+    BindingEntry::global(
+        Some("Ctrl+a"),
+        "New pi agent chat",
+        "add a pi agent chat to the selected workspace",
+        Some(CommandAction::AddAgentChat),
+        BindingAvailability::SelectedWorkspace,
+    ),
+    BindingEntry::global(
+        Some("Ctrl+x"),
+        "New Claude Code chat",
+        "add a Claude Code agent chat to the selected workspace",
+        Some(CommandAction::AddClaudeCodeChat),
+        BindingAvailability::SelectedWorkspace,
+    ),
+    BindingEntry::global(
+        Some("Ctrl+t"),
+        "New shell terminal",
+        "add a shell terminal to the selected workspace",
+        Some(CommandAction::AddShellTerminal),
+        BindingAvailability::SelectedWorkspace,
+    ),
+    BindingEntry::global(
+        None,
+        "New command terminal",
+        "add a command/dev-server terminal to the selected workspace",
+        Some(CommandAction::AddCommandTerminal),
+        BindingAvailability::SelectedWorkspace,
+    ),
+    BindingEntry::global(
+        Some("Ctrl+f"),
+        "Open workspace",
+        "import a workspace directory",
+        Some(CommandAction::OpenWorkspace),
+        BindingAvailability::Always,
+    ),
+    BindingEntry::global(
+        Some("Ctrl+q"),
+        "Delete selected item",
+        "delete the selected chat/terminal or an empty workspace",
+        Some(CommandAction::DeleteSelected),
+        BindingAvailability::DeletableSelection,
+    ),
+    BindingEntry::global(
+        None,
+        "Clear search",
+        "clear the active search/filter",
+        Some(CommandAction::ClearSearch),
+        BindingAvailability::ActiveSearch,
+    ),
+    BindingEntry::global(
+        Some("Ctrl+n"),
+        "Dismiss notices",
+        "clear the status notices without waiting for them to expire",
+        Some(CommandAction::DismissNotices),
+        BindingAvailability::PendingNotices,
+    ),
+    BindingEntry::global(
+        None,
+        "Reload config",
+        "re-read config.json and apply it without restarting",
+        Some(CommandAction::ReloadConfig),
+        BindingAvailability::Always,
+    ),
+    BindingEntry::global(
+        Some("Ctrl+Esc"),
+        "Quit mult",
+        "save state and exit",
+        Some(CommandAction::Quit),
+        BindingAvailability::Always,
+    ),
+    // Bindings the palette has no action for. They are listed here rather than
+    // in a second hardcoded list so the overlay covers everything (E4).
+    BindingEntry::reference(
+        "Ctrl+j or Ctrl+Enter",
+        "Select next sidebar item",
+        BindingScope::Global,
+    ),
+    BindingEntry::reference(
+        "Ctrl+k",
+        "Select previous sidebar item",
+        BindingScope::Global,
+    ),
+    BindingEntry::reference("Ctrl+p", "Open the command palette", BindingScope::Global),
+    BindingEntry::reference(
+        "any other key",
+        "start the selected chat/terminal PTY and send the key to it",
+        BindingScope::Global,
+    ),
+    BindingEntry::reference(
+        "Enter",
+        "Submit, or confirm a deletion",
+        BindingScope::Prompt,
+    ),
+    BindingEntry::reference("Esc or Ctrl+c", "Cancel", BindingScope::Prompt),
+    BindingEntry::reference(
+        "Left/Right",
+        "Move the cursor one character",
+        BindingScope::Prompt,
+    ),
+    BindingEntry::reference(
+        "Home/End or Ctrl+a/Ctrl+e",
+        "Move the cursor to the start/end",
+        BindingScope::Prompt,
+    ),
+    BindingEntry::reference(
+        "Backspace/Delete",
+        "Delete the character before/after the cursor",
+        BindingScope::Prompt,
+    ),
+    BindingEntry::reference(
+        "Ctrl+w",
+        "Delete the word before the cursor",
+        BindingScope::Prompt,
+    ),
+    BindingEntry::reference(
+        "Ctrl+u",
+        "Delete everything before the cursor",
+        BindingScope::Prompt,
+    ),
+    BindingEntry::reference(
+        "Up/Down or Ctrl+k/Ctrl+j",
+        "Move through results (palette, project list)",
+        BindingScope::Prompt,
+    ),
+    BindingEntry::reference(
+        "wheel",
+        "Scroll the selected output pane",
+        BindingScope::Mouse,
+    ),
+    BindingEntry::reference(
+        "drag",
+        "Select visible text and copy it with OSC 52",
+        BindingScope::Mouse,
+    ),
+    BindingEntry::reference(
+        "Ctrl+Shift+C",
+        "Copy the active mult selection",
+        BindingScope::Mouse,
+    ),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteTarget {
@@ -273,7 +824,9 @@ impl App {
             structural_dirty: false,
             recoverable_terminals,
             save_error: None,
-            operation_error: None,
+            notices: Vec::new(),
+            help_visible: false,
+            config_reload_requested: false,
         };
         app.reconcile_selection(None);
         app.sync_focus_to_selection();
@@ -312,26 +865,155 @@ impl App {
         self.dirty = false;
         self.structural_dirty = false;
         self.save_error = None;
+        // The save-failure notice describes a condition that has just ended.
+        self.notices
+            .retain(|notice| notice.source != NoticeSource::SaveFailure);
     }
 
     pub fn record_save_failure(&mut self, message: impl Into<String>) {
-        self.save_error = Some(message.into());
+        let message = message.into();
+        // Sticky, because it describes a condition that is still true: state is
+        // unsaved until a later save succeeds, and `mark_saved` retracts it.
+        self.push_sticky_notice(
+            NoticeLevel::Error,
+            NoticeSource::SaveFailure,
+            format!("State save failed: {message} — edit or quit to retry"),
+        );
+        self.save_error = Some(message);
     }
 
     pub fn save_error(&self) -> Option<&str> {
         self.save_error.as_deref()
     }
 
-    pub fn operation_error(&self) -> Option<&str> {
-        self.operation_error.as_deref()
-    }
-
     fn record_operation_failure(&mut self, message: impl Into<String>) {
-        self.operation_error = Some(message.into());
+        self.clear_operation_error();
+        self.push_notice(
+            NoticeLevel::Error,
+            NoticeSource::Operation,
+            format!("Operation failed: {}", message.into()),
+        );
     }
 
     fn clear_operation_error(&mut self) {
-        self.operation_error = None;
+        self.notices
+            .retain(|notice| notice.source != NoticeSource::Operation);
+    }
+
+    /// The transient status surface's current contents, oldest first.
+    pub fn notices(&self) -> &[Notice] {
+        &self.notices
+    }
+
+    /// Report something that has no pane to be reported into (E2).
+    pub fn push_notice(
+        &mut self,
+        level: NoticeLevel,
+        source: NoticeSource,
+        text: impl Into<String>,
+    ) -> bool {
+        self.push_notice_at(Instant::now(), level, source, text)
+    }
+
+    /// [`Self::push_notice`] with the clock supplied, so tests are deterministic.
+    pub fn push_notice_at(
+        &mut self,
+        now: Instant,
+        level: NoticeLevel,
+        source: NoticeSource,
+        text: impl Into<String>,
+    ) -> bool {
+        self.insert_notice(Notice {
+            level,
+            source,
+            text: text.into(),
+            expires_at: Some(now + NOTICE_TTL),
+        })
+    }
+
+    fn push_sticky_notice(
+        &mut self,
+        level: NoticeLevel,
+        source: NoticeSource,
+        text: impl Into<String>,
+    ) -> bool {
+        self.insert_notice(Notice {
+            level,
+            source,
+            text: text.into(),
+            expires_at: None,
+        })
+    }
+
+    fn insert_notice(&mut self, notice: Notice) -> bool {
+        // A failure that repeats every frame — a retrying reconnect, a save that
+        // keeps failing — refreshes the row it already has instead of pushing a
+        // fresh copy of the same sentence.
+        if let Some(existing) = self
+            .notices
+            .iter_mut()
+            .find(|existing| existing.text == notice.text && existing.level == notice.level)
+        {
+            existing.expires_at = notice.expires_at;
+            existing.source = notice.source;
+            // Nothing new is on screen, so this is not a reason to redraw.
+            return false;
+        }
+
+        self.notices.push(notice);
+        let overflow = self.notices.len().saturating_sub(MAX_NOTICES);
+        self.notices.drain(..overflow);
+        true
+    }
+
+    /// Drop notices whose time is up. Returns whether anything went away, so
+    /// the render loop only rebuilds a frame when the surface actually changed.
+    pub fn expire_notices(&mut self, now: Instant) -> bool {
+        let before = self.notices.len();
+        self.notices
+            .retain(|notice| notice.expires_at.is_none_or(|deadline| deadline > now));
+        self.notices.len() != before
+    }
+
+    /// Clear the surface on the user's request (`Ctrl+n` / the palette).
+    pub fn dismiss_notices(&mut self) -> bool {
+        let had_notices = !self.notices.is_empty();
+        self.notices.clear();
+        had_notices
+    }
+
+    pub fn is_help_visible(&self) -> bool {
+        self.help_visible
+    }
+
+    pub fn show_help(&mut self) {
+        self.help_visible = true;
+    }
+
+    pub fn hide_help(&mut self) -> bool {
+        let was_visible = self.help_visible;
+        self.help_visible = false;
+        was_visible
+    }
+
+    /// Whether a bare `?` should open the overlay rather than being typed.
+    ///
+    /// Input reaches a selected chat/terminal by being typed at it — there is no
+    /// input mode to leave — so a global `?` would swallow a character every
+    /// running PTY has a use for. It therefore only opens help when no pane
+    /// would receive it; `F1` is unconditional because no shell binds it.
+    pub fn help_key_opens_help(&self) -> bool {
+        self.pty_input_target().is_none()
+    }
+
+    /// Ask the event loop to re-read `config.json` (E9). The palette handler
+    /// only holds `&Config`, so the swap happens where the `Config` is owned.
+    pub fn request_config_reload(&mut self) {
+        self.config_reload_requested = true;
+    }
+
+    pub fn take_config_reload_request(&mut self) -> bool {
+        std::mem::take(&mut self.config_reload_requested)
     }
 
     pub fn is_prompt_active(&self) -> bool {
@@ -366,8 +1048,8 @@ impl App {
 
     pub fn begin_command_palette(&mut self) {
         self.prompt = Some(Prompt::CommandPalette(CommandPalettePrompt {
-            input: String::new(),
-            selected: 0,
+            input: PromptInput::default(),
+            selected: ListSelection::default(),
         }));
     }
 
@@ -390,7 +1072,9 @@ impl App {
 
     pub fn active_command_palette_entries(&self) -> Vec<CommandPaletteEntry> {
         match &self.prompt {
-            Some(Prompt::CommandPalette(prompt)) => self.command_palette_entries_for(&prompt.input),
+            Some(Prompt::CommandPalette(prompt)) => {
+                self.command_palette_entries_for(prompt.input.as_str())
+            }
             _ => Vec::new(),
         }
     }
@@ -401,7 +1085,7 @@ impl App {
     ) -> Vec<OpenWorkspaceMatch> {
         if let Some(Prompt::OpenWorkspace(prompt)) = &self.prompt {
             if prompt.mode == OpenWorkspaceMode::ConfiguredProjects {
-                return open_workspace_matches_for(&prompt.input, projects);
+                return open_workspace_matches_for(prompt.input.as_str(), projects);
             }
         }
 
@@ -428,9 +1112,9 @@ impl App {
         let Some(Prompt::CommandPalette(prompt)) = &self.prompt else {
             return None;
         };
-        let entries = self.command_palette_entries_for(&prompt.input);
+        let entries = self.command_palette_entries_for(prompt.input.as_str());
         let action = entries
-            .get(prompt.selected.min(entries.len().saturating_sub(1)))
+            .get(prompt.selected.index().min(entries.len().saturating_sub(1)))
             .map(|entry| entry.action);
         self.prompt = None;
         action
@@ -447,7 +1131,7 @@ impl App {
             .map(|search| search.query.clone())
             .unwrap_or_default();
         self.prompt = Some(Prompt::Search(SearchPrompt {
-            input,
+            input: PromptInput::new(input),
             scope,
             error: None,
         }));
@@ -458,7 +1142,7 @@ impl App {
         let Some(Prompt::Search(prompt)) = &self.prompt else {
             return;
         };
-        let query = prompt.input.trim().to_string();
+        let query = prompt.input.as_str().trim().to_string();
         if query.is_empty() {
             self.active_search = None;
         } else {
@@ -551,6 +1235,11 @@ impl App {
         }
     }
 
+    /// Note (E12): the transcript this counts against is the structured one,
+    /// which only the experimental process-agent backend writes and which
+    /// nothing calls today, so the count is `0` for every chat a user can
+    /// create. The chat pane says so where the user can see it; this helper is
+    /// kept for the backend being wired up, not removed.
     pub fn chat_search_status(&self) -> Option<String> {
         let search = self.active_search.as_ref()?;
         let SearchScope::Chat(chat) = search.scope else {
@@ -672,76 +1361,28 @@ impl App {
     }
 
     fn available_command_palette_entries(&self) -> Vec<CommandPaletteEntry> {
-        let mut entries = Vec::new();
-        entries.push(CommandPaletteEntry {
-            action: CommandAction::FocusSidebar,
-            label: "Focus sidebar",
-            help: "return keyboard focus to workspace navigation",
-        });
-        if self.selected_main_focus().is_some() {
-            entries.push(CommandPaletteEntry {
-                action: CommandAction::FocusSelectedPane,
-                label: "Focus selected pane",
-                help: "move keyboard focus from sidebar to the selected chat or terminal",
-            });
-            entries.push(CommandPaletteEntry {
-                action: CommandAction::StartInput,
-                label: "Start selected PTY",
-                help: "start the selected chat/terminal PTY for immediate input",
-            });
-            entries.push(CommandPaletteEntry {
-                action: CommandAction::SearchSelectedPane,
-                label: "Search selected pane",
-                help: "filter terminal output or chat transcript lines",
-            });
+        BINDINGS
+            .iter()
+            .filter(|binding| self.binding_is_available(binding.availability))
+            .filter_map(|binding| {
+                Some(CommandPaletteEntry {
+                    action: binding.action?,
+                    label: binding.label,
+                    help: binding.help,
+                })
+            })
+            .collect()
+    }
+
+    fn binding_is_available(&self, availability: BindingAvailability) -> bool {
+        match availability {
+            BindingAvailability::Always => true,
+            BindingAvailability::SelectedPane => self.selected_main_focus().is_some(),
+            BindingAvailability::SelectedWorkspace => self.selected_workspace_id().is_some(),
+            BindingAvailability::DeletableSelection => self.selected_item_can_be_deleted(),
+            BindingAvailability::ActiveSearch => self.active_search.is_some(),
+            BindingAvailability::PendingNotices => !self.notices.is_empty(),
         }
-        if self.selected_workspace_id().is_some() {
-            entries.push(CommandPaletteEntry {
-                action: CommandAction::AddAgentChat,
-                label: "New pi agent chat",
-                help: "add a pi agent chat to the selected workspace",
-            });
-            entries.push(CommandPaletteEntry {
-                action: CommandAction::AddClaudeCodeChat,
-                label: "New Claude Code chat",
-                help: "add a Claude Code agent chat to the selected workspace",
-            });
-            entries.push(CommandPaletteEntry {
-                action: CommandAction::AddShellTerminal,
-                label: "New shell terminal",
-                help: "add a shell terminal to the selected workspace",
-            });
-            entries.push(CommandPaletteEntry {
-                action: CommandAction::AddCommandTerminal,
-                label: "New command terminal",
-                help: "add a command/dev-server terminal to the selected workspace",
-            });
-        }
-        entries.push(CommandPaletteEntry {
-            action: CommandAction::OpenWorkspace,
-            label: "Open workspace",
-            help: "import a workspace directory",
-        });
-        if self.selected_item_can_be_deleted() {
-            entries.push(CommandPaletteEntry {
-                action: CommandAction::DeleteSelected,
-                label: "Delete selected item",
-                help: "delete the selected chat/terminal or an empty workspace",
-            });
-        }
-        if self.active_search.is_some() {
-            entries.push(CommandPaletteEntry {
-                action: CommandAction::ClearSearch,
-                label: "Clear search",
-                help: "clear the active search/filter",
-            });
-        }
-        entries.push(CommandPaletteEntry {
-            action: CommandAction::Quit,
-            label: "Quit mult",
-            help: "save state and exit",
-        });
-        entries
     }
 
     fn move_open_workspace_selection(&mut self, delta: isize, projects: &[ConfiguredProject]) {
@@ -751,21 +1392,9 @@ impl App {
         if prompt.mode != OpenWorkspaceMode::ConfiguredProjects {
             return;
         }
-        let len = open_workspace_matches_for(&prompt.input, projects).len();
-        if len == 0 {
-            if let Some(Prompt::OpenWorkspace(prompt)) = &mut self.prompt {
-                prompt.selected = 0;
-            }
-            return;
-        }
-
+        let len = open_workspace_matches_for(prompt.input.as_str(), projects).len();
         if let Some(Prompt::OpenWorkspace(prompt)) = &mut self.prompt {
-            if delta.is_negative() {
-                let delta = delta.unsigned_abs() % len;
-                prompt.selected = prompt.selected.checked_sub(delta).unwrap_or(len - delta);
-            } else {
-                prompt.selected = (prompt.selected + delta as usize) % len;
-            }
+            prompt.selected.step(delta, len);
         }
     }
 
@@ -773,21 +1402,11 @@ impl App {
         let Some(Prompt::CommandPalette(prompt)) = &self.prompt else {
             return;
         };
-        let len = self.command_palette_entries_for(&prompt.input).len();
-        if len == 0 {
-            if let Some(Prompt::CommandPalette(prompt)) = &mut self.prompt {
-                prompt.selected = 0;
-            }
-            return;
-        }
-
+        let len = self
+            .command_palette_entries_for(prompt.input.as_str())
+            .len();
         if let Some(Prompt::CommandPalette(prompt)) = &mut self.prompt {
-            if delta.is_negative() {
-                let delta = delta.unsigned_abs() % len;
-                prompt.selected = prompt.selected.checked_sub(delta).unwrap_or(len - delta);
-            } else {
-                prompt.selected = (prompt.selected + delta as usize) % len;
-            }
+            prompt.selected.step(delta, len);
         }
     }
 
@@ -795,9 +1414,11 @@ impl App {
         let Some(Prompt::CommandPalette(prompt)) = &self.prompt else {
             return;
         };
-        let len = self.command_palette_entries_for(&prompt.input).len();
+        let len = self
+            .command_palette_entries_for(prompt.input.as_str())
+            .len();
         if let Some(Prompt::CommandPalette(prompt)) = &mut self.prompt {
-            prompt.selected = prompt.selected.min(len.saturating_sub(1));
+            prompt.selected.clamp(len);
         }
     }
 
@@ -1299,9 +1920,9 @@ impl App {
         };
 
         self.prompt = Some(Prompt::OpenWorkspace(OpenWorkspacePrompt {
-            input,
+            input: PromptInput::new(input),
             error: None,
-            selected: 0,
+            selected: ListSelection::default(),
             mode: if has_configured_projects {
                 OpenWorkspaceMode::ConfiguredProjects
             } else {
@@ -1316,7 +1937,7 @@ impl App {
         }
 
         self.prompt = Some(Prompt::NewTerminalCommand(TerminalCommandPrompt {
-            input: String::new(),
+            input: PromptInput::default(),
             error: None,
         }));
         true
@@ -1394,60 +2015,77 @@ impl App {
         changed
     }
 
-    pub fn push_prompt_char(&mut self, c: char) {
-        match &mut self.prompt {
+    /// The one place prompt text is edited (E7/F13).
+    ///
+    /// Every prompt variant that carries text shares this body, so the cursor,
+    /// the motions and the kill commands exist once rather than four times.
+    /// Only edits that *change* the text clear the prompt's error and reset its
+    /// list selection: moving the cursor must not throw away the entry the user
+    /// had picked, and the fuzzy filter keys off the whole input, not the part
+    /// before the cursor.
+    pub fn apply_prompt_edit(&mut self, edit: PromptEdit) -> bool {
+        let mutated = match &mut self.prompt {
             Some(Prompt::OpenWorkspace(prompt)) => {
-                prompt.input.push(c);
-                prompt.error = None;
-                prompt.selected = 0;
+                let changed = prompt.input.apply(edit);
+                if changed && edit.mutates_text() {
+                    prompt.error = None;
+                    prompt.selected.reset();
+                }
+                changed
             }
             Some(Prompt::NewTerminalCommand(prompt)) => {
-                prompt.input.push(c);
-                prompt.error = None;
+                let changed = prompt.input.apply(edit);
+                if changed && edit.mutates_text() {
+                    prompt.error = None;
+                }
+                changed
             }
             Some(Prompt::CommandPalette(prompt)) => {
-                prompt.input.push(c);
-                prompt.selected = 0;
+                let changed = prompt.input.apply(edit);
+                if changed && edit.mutates_text() {
+                    prompt.selected.reset();
+                }
+                changed
             }
             Some(Prompt::Search(prompt)) => {
-                prompt.input.push(c);
-                prompt.error = None;
+                let changed = prompt.input.apply(edit);
+                if changed && edit.mutates_text() {
+                    prompt.error = None;
+                }
+                changed
             }
-            _ => {}
-        }
+            _ => false,
+        };
         self.clamp_command_palette_selection();
+        mutated
     }
 
-    pub fn pop_prompt_char(&mut self) {
-        match &mut self.prompt {
-            Some(Prompt::OpenWorkspace(prompt)) => {
-                prompt.input.pop();
-                prompt.error = None;
-                prompt.selected = 0;
-            }
-            Some(Prompt::NewTerminalCommand(prompt)) => {
-                prompt.input.pop();
-                prompt.error = None;
-            }
-            Some(Prompt::CommandPalette(prompt)) => {
-                prompt.input.pop();
-                prompt.selected = 0;
-            }
-            Some(Prompt::Search(prompt)) => {
-                prompt.input.pop();
-                prompt.error = None;
-            }
-            _ => {}
+    pub fn push_prompt_char(&mut self, c: char) {
+        self.apply_prompt_edit(PromptEdit::Insert(c));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pop_prompt_char(&mut self) {
+        self.apply_prompt_edit(PromptEdit::Backspace);
+    }
+
+    /// The active prompt's text and cursor, for the renderer.
+    pub fn prompt_input(&self) -> Option<&PromptInput> {
+        match &self.prompt {
+            Some(Prompt::OpenWorkspace(prompt)) => Some(&prompt.input),
+            Some(Prompt::NewTerminalCommand(prompt)) => Some(&prompt.input),
+            Some(Prompt::CommandPalette(prompt)) => Some(&prompt.input),
+            Some(Prompt::Search(prompt)) => Some(&prompt.input),
+            Some(Prompt::ConfirmDelete(_)) | None => None,
         }
-        self.clamp_command_palette_selection();
     }
 
     pub fn submit_open_workspace(&mut self, projects: &[ConfiguredProject]) {
         let Some(Prompt::OpenWorkspace(prompt)) = &self.prompt else {
             return;
         };
-        let raw_input = prompt.input.trim().to_string();
-        let selected = prompt.selected;
+        let raw_input = prompt.input.as_str().trim().to_string();
+        let selected = prompt.selected.index();
         let mode = prompt.mode;
 
         if mode == OpenWorkspaceMode::ConfiguredProjects {
@@ -1535,7 +2173,7 @@ impl App {
         let Some(Prompt::NewTerminalCommand(prompt)) = &self.prompt else {
             return;
         };
-        let command = prompt.input.trim().to_string();
+        let command = prompt.input.as_str().trim().to_string();
         if command.is_empty() {
             self.set_terminal_command_error("enter a command to run");
             return;
@@ -2552,7 +3190,7 @@ mod tests {
         let mut app = App::default();
         app.begin_open_workspace(&[]);
         if let Some(Prompt::OpenWorkspace(prompt)) = &mut app.prompt {
-            prompt.input.clear();
+            prompt.input = PromptInput::default();
         }
 
         app.push_prompt_char('/');
@@ -2562,9 +3200,9 @@ mod tests {
         assert_eq!(
             app.prompt,
             Some(Prompt::OpenWorkspace(OpenWorkspacePrompt {
-                input: "/".to_string(),
+                input: PromptInput::new("/"),
                 error: None,
-                selected: 0,
+                selected: ListSelection::default(),
                 mode: OpenWorkspaceMode::Path,
             }))
         );
@@ -2576,7 +3214,7 @@ mod tests {
         let mut app = App::default();
         app.begin_open_workspace(&[]);
         if let Some(Prompt::OpenWorkspace(prompt)) = &mut app.prompt {
-            prompt.input = path.display().to_string();
+            prompt.input = PromptInput::new(path.display().to_string());
         }
 
         app.submit_open_workspace(&[]);
@@ -2667,7 +3305,7 @@ mod tests {
         let mut app = App::default();
         app.begin_open_workspace(&[]);
         if let Some(Prompt::OpenWorkspace(prompt)) = &mut app.prompt {
-            prompt.input = "/this/path/should/not/exist".to_string();
+            prompt.input = PromptInput::new("/this/path/should/not/exist");
         }
 
         app.submit_open_workspace(&[]);
@@ -2687,5 +3325,392 @@ mod tests {
         let path = std::env::temp_dir().join(format!("mult-test-{unique}"));
         fs::create_dir(&path).expect("create temp workspace");
         path.canonicalize().expect("canonicalize temp workspace")
+    }
+
+    // ---- E7: the prompt cursor -------------------------------------------
+
+    /// The prompt cursor indexes characters, not bytes. A byte index into
+    /// "café/日本" either panics or splits a character, and the Open-Workspace
+    /// prompt pre-fills the working directory, so long paths with non-ASCII in
+    /// them are the ordinary case rather than an exotic one.
+    #[test]
+    fn prompt_editing_is_on_character_boundaries_for_multibyte_and_wide_text() {
+        let mut input = PromptInput::new("café/日本");
+        assert_eq!(
+            input.cursor(),
+            7,
+            "the cursor starts past the last character"
+        );
+
+        // Left twice lands between the two wide characters, not inside one.
+        assert!(input.apply(PromptEdit::MoveLeft));
+        assert!(input.apply(PromptEdit::MoveLeft));
+        let (before, at, after) = input.split_at_cursor();
+        assert_eq!((before, at, after), ("café/", "日", "本"));
+        assert_eq!(format!("{before}{at}{after}"), "café/日本");
+
+        // Backspace removes the whole `/`, and the accented character before it
+        // survives intact.
+        assert!(input.apply(PromptEdit::Backspace));
+        assert_eq!(input.as_str(), "café日本");
+        assert!(input.apply(PromptEdit::Backspace));
+        assert_eq!(input.as_str(), "caf日本");
+        assert_eq!(input.cursor(), 3);
+
+        // Inserting at the cursor puts the character between the two halves,
+        // not at a byte offset that happens to be there.
+        assert!(input.apply(PromptEdit::Insert('é')));
+        assert_eq!(input.as_str(), "café日本");
+
+        // Forward delete removes one whole wide character.
+        assert!(input.apply(PromptEdit::DeleteForward));
+        assert_eq!(input.as_str(), "café本");
+
+        // Home/End are the ends of the *string*, and the cursor past the end
+        // reports an empty character under it.
+        assert!(input.apply(PromptEdit::MoveHome));
+        assert_eq!(input.split_at_cursor(), ("", "c", "afé本"));
+        assert!(input.apply(PromptEdit::MoveEnd));
+        assert_eq!(input.split_at_cursor(), ("café本", "", ""));
+        assert!(!input.apply(PromptEdit::MoveRight));
+        assert!(!input.apply(PromptEdit::DeleteForward));
+    }
+
+    #[test]
+    fn prompt_word_and_line_kills_stop_at_the_cursor() {
+        let mut input = PromptInput::new("/home/user/my project/src");
+        for _ in 0..4 {
+            assert!(input.apply(PromptEdit::MoveLeft));
+        }
+        assert_eq!(input.split_at_cursor().0, "/home/user/my project");
+
+        // Ctrl+w takes the whitespace-delimited word before the cursor and
+        // nothing after it.
+        assert!(input.apply(PromptEdit::DeleteWordBefore));
+        assert_eq!(input.as_str(), "/home/user/my /src");
+        assert_eq!(input.cursor(), 14);
+
+        // Ctrl+u takes everything before the cursor, again leaving the tail.
+        assert!(input.apply(PromptEdit::DeleteToStart));
+        assert_eq!(input.as_str(), "/src");
+        assert_eq!(input.cursor(), 0);
+        assert!(!input.apply(PromptEdit::DeleteToStart));
+        assert!(!input.apply(PromptEdit::Backspace));
+    }
+
+    #[test]
+    fn prompt_filtering_keys_off_the_whole_input_not_the_text_before_the_cursor() {
+        let mut app = App::default();
+        app.begin_command_palette();
+        for ch in "quit".chars() {
+            app.push_prompt_char(ch);
+        }
+        assert_eq!(
+            app.active_command_palette_entries()
+                .iter()
+                .map(|entry| entry.action)
+                .collect::<Vec<_>>(),
+            vec![CommandAction::Quit]
+        );
+
+        // Moving the cursor into the middle of the query must not narrow the
+        // filter to "qu" — the user is about to fix a typo, not re-search.
+        app.apply_prompt_edit(PromptEdit::MoveLeft);
+        app.apply_prompt_edit(PromptEdit::MoveLeft);
+        assert_eq!(
+            app.active_command_palette_entries()
+                .iter()
+                .map(|entry| entry.action)
+                .collect::<Vec<_>>(),
+            vec![CommandAction::Quit]
+        );
+    }
+
+    #[test]
+    fn a_cursor_move_keeps_the_selected_entry_but_an_edit_resets_it() {
+        let mut app = App::default();
+        app.begin_command_palette();
+        app.select_next_command_palette_entry();
+        app.select_next_command_palette_entry();
+        let Some(Prompt::CommandPalette(prompt)) = &app.prompt else {
+            panic!("palette is open");
+        };
+        assert_eq!(prompt.selected.index(), 2);
+
+        app.apply_prompt_edit(PromptEdit::MoveHome);
+        let Some(Prompt::CommandPalette(prompt)) = &app.prompt else {
+            panic!("palette is open");
+        };
+        assert_eq!(prompt.selected.index(), 2, "a motion is not a new query");
+
+        app.push_prompt_char('f');
+        let Some(Prompt::CommandPalette(prompt)) = &app.prompt else {
+            panic!("palette is open");
+        };
+        assert_eq!(
+            prompt.selected.index(),
+            0,
+            "a new query selects the best match"
+        );
+    }
+
+    // ---- F21: modular wrap ------------------------------------------------
+
+    #[test]
+    fn list_selection_wraps_modularly_in_both_directions() {
+        let mut selection = ListSelection::default();
+
+        // Forwards past the end wraps.
+        selection.step(3, 5);
+        assert_eq!(selection.index(), 3);
+        selection.step(4, 5);
+        assert_eq!(selection.index(), 2);
+
+        // Backwards by more than one — the case the old
+        // `checked_sub(delta).unwrap_or(len - delta)` body got wrong. From 2,
+        // -4 over 5 entries is 3, not `len - delta`.
+        selection.step(-4, 5);
+        assert_eq!(selection.index(), 3);
+        selection.step(-3, 5);
+        assert_eq!(selection.index(), 0);
+        selection.step(-1, 5);
+        assert_eq!(selection.index(), 4);
+
+        // A delta larger than the list is reduced, in both directions, instead
+        // of underflowing.
+        selection.step(12, 5);
+        assert_eq!(selection.index(), 1);
+        selection.step(-12, 5);
+        assert_eq!(selection.index(), 4);
+        // A stale index from a longer list is reduced first, then stepped.
+        selection.step(-7, 3);
+        assert_eq!(selection.index(), 0);
+
+        // Extremes must not panic.
+        selection.step(isize::MIN, 5);
+        selection.step(isize::MAX, 5);
+        assert!(selection.index() < 5);
+
+        // An empty list has no position to be in.
+        selection.step(-3, 0);
+        assert_eq!(selection.index(), 0);
+        selection.step(3, 0);
+        assert_eq!(selection.index(), 0);
+    }
+
+    #[test]
+    fn list_selection_clamps_into_a_shrinking_list() {
+        let mut selection = ListSelection::default();
+        selection.step(4, 5);
+        selection.clamp(2);
+        assert_eq!(selection.index(), 1);
+        selection.clamp(0);
+        assert_eq!(selection.index(), 0);
+    }
+
+    // ---- E2: the status surface -------------------------------------------
+
+    #[test]
+    fn notices_are_transient_deduplicated_and_dismissible() {
+        let mut app = App::default();
+        let now = Instant::now();
+
+        assert!(app.push_notice_at(now, NoticeLevel::Error, NoticeSource::Report, "daemon gone"));
+        // A failure that repeats every retry frame refreshes its row rather
+        // than filling the surface with copies of one sentence.
+        assert!(!app.push_notice_at(now, NoticeLevel::Error, NoticeSource::Report, "daemon gone"));
+        assert_eq!(app.notices().len(), 1);
+        assert_eq!(app.notices()[0].text(), "daemon gone");
+        assert_eq!(app.notices()[0].level(), NoticeLevel::Error);
+
+        // Still there just before the deadline, gone at it: the surface does
+        // not permanently steal a row.
+        assert!(!app.expire_notices(now + NOTICE_TTL - Duration::from_millis(1)));
+        assert_eq!(app.notices().len(), 1);
+        assert!(app.expire_notices(now + NOTICE_TTL));
+        assert!(app.notices().is_empty());
+        assert!(!app.expire_notices(now + NOTICE_TTL));
+
+        // Dismissal does not wait for the deadline.
+        app.push_notice_at(
+            now,
+            NoticeLevel::Info,
+            NoticeSource::Report,
+            "config reloaded",
+        );
+        assert!(app.dismiss_notices());
+        assert!(app.notices().is_empty());
+        assert!(!app.dismiss_notices());
+    }
+
+    #[test]
+    fn the_notice_surface_is_bounded() {
+        let mut app = App::default();
+        let now = Instant::now();
+        for index in 0..MAX_NOTICES + 3 {
+            app.push_notice_at(
+                now,
+                NoticeLevel::Warning,
+                NoticeSource::Report,
+                format!("notice {index}"),
+            );
+        }
+
+        assert_eq!(app.notices().len(), MAX_NOTICES);
+        // The oldest are the ones dropped.
+        assert_eq!(app.notices()[0].text(), "notice 3");
+    }
+
+    #[test]
+    fn a_save_failure_notice_sticks_until_a_save_succeeds() {
+        let mut app = App::default();
+        let now = Instant::now();
+        app.record_save_failure("disk full");
+
+        assert_eq!(app.save_error(), Some("disk full"));
+        assert_eq!(app.notices().len(), 1);
+        assert!(app.notices()[0]
+            .text()
+            .contains("State save failed: disk full"));
+        // It describes a condition that is still true, so time does not clear
+        // it the way it clears an event.
+        assert!(!app.expire_notices(now + NOTICE_TTL * 100));
+        assert_eq!(app.notices().len(), 1);
+
+        app.mark_saved();
+        assert_eq!(app.save_error(), None);
+        assert!(app.notices().is_empty());
+    }
+
+    #[test]
+    fn a_failed_operation_is_reported_and_retracted_by_the_next_success() {
+        let mut app = App::default();
+        app.project.workspaces.clear();
+        app.select_nav_index(0);
+
+        // No workspace to add a terminal to.
+        app.add_terminal_to_selected_workspace();
+        assert_eq!(app.notices().len(), 0, "no workspace means no attempt");
+
+        let mut app = App::default();
+        app.record_operation_failure("selected workspace no longer exists");
+        assert_eq!(app.notices().len(), 1);
+        assert!(app.notices()[0]
+            .text()
+            .starts_with("Operation failed: selected workspace"));
+
+        app.add_terminal_to_selected_workspace();
+        assert!(
+            app.notices().is_empty(),
+            "a successful mutation retracts the previous failure"
+        );
+    }
+
+    // ---- E4: one binding table --------------------------------------------
+
+    #[test]
+    fn the_command_palette_is_generated_from_the_binding_table() {
+        let app = App::default();
+        let offered = app
+            .command_palette_entries_for("")
+            .into_iter()
+            .map(|entry| (entry.action, entry.label, entry.help))
+            .collect::<Vec<_>>();
+        let from_table = BINDINGS
+            .iter()
+            .filter(|binding| binding.action.is_some())
+            .filter(|binding| app.binding_is_available(binding.availability))
+            .map(|binding| (binding.action.unwrap(), binding.label, binding.help))
+            .collect::<Vec<_>>();
+
+        assert_eq!(offered, from_table);
+        assert!(!offered.is_empty());
+    }
+
+    #[test]
+    fn every_binding_is_reachable_from_the_table_and_nothing_is_half_declared() {
+        for binding in BINDINGS {
+            assert!(
+                binding.keys.is_some() || binding.action.is_some(),
+                "{} declares neither a key nor an action",
+                binding.label
+            );
+            assert!(!binding.label.is_empty());
+        }
+
+        // The overlay's job is the keys, so every key `mult` binds outside a
+        // PTY must appear; these are the ones the README documented and the
+        // palette does not cover.
+        let keys = BINDINGS
+            .iter()
+            .filter_map(|binding| binding.keys)
+            .collect::<Vec<_>>();
+        for expected in [
+            "Ctrl+p",
+            "Ctrl+j or Ctrl+Enter",
+            "Ctrl+k",
+            "Ctrl+Esc",
+            "Ctrl+s",
+            "Ctrl+a",
+            "Ctrl+x",
+            "Ctrl+t",
+            "Ctrl+f",
+            "Ctrl+q",
+            "? or F1",
+        ] {
+            assert!(keys.contains(&expected), "{expected} is not in the table");
+        }
+    }
+
+    #[test]
+    fn the_help_overlay_opens_and_closes() {
+        let mut app = App::default();
+        assert!(!app.is_help_visible());
+
+        app.show_help();
+        assert!(app.is_help_visible());
+        assert!(app.hide_help());
+        assert!(!app.hide_help());
+    }
+
+    #[test]
+    fn a_bare_question_mark_only_opens_help_when_no_pane_would_receive_it() {
+        let mut app = App::default();
+        // The seed state selects a terminal, which takes every ordinary key.
+        assert!(app.pty_input_target().is_some());
+        assert!(!app.help_key_opens_help());
+
+        app.project.workspaces.clear();
+        app.select_nav_index(0);
+        assert!(app.pty_input_target().is_none());
+        assert!(app.help_key_opens_help());
+    }
+
+    #[test]
+    fn dismiss_notices_is_only_offered_while_there_is_something_to_dismiss() {
+        let mut app = App::default();
+        let has_dismiss = |app: &App| {
+            app.command_palette_entries_for("")
+                .iter()
+                .any(|entry| entry.action == CommandAction::DismissNotices)
+        };
+
+        assert!(!has_dismiss(&app));
+        app.push_notice(
+            NoticeLevel::Info,
+            NoticeSource::Report,
+            "something happened",
+        );
+        assert!(has_dismiss(&app));
+    }
+
+    #[test]
+    fn a_config_reload_request_is_taken_exactly_once() {
+        let mut app = App::default();
+        assert!(!app.take_config_reload_request());
+
+        app.request_config_reload();
+        assert!(app.take_config_reload_request());
+        assert!(!app.take_config_reload_request());
     }
 }

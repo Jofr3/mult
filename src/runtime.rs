@@ -19,8 +19,11 @@ use mult::{
     agent::{
         self, AgentBackend, AgentEvent, NoopAgentBackend, ProcessAgentBackend, ProcessAgentCommand,
     },
-    app::{App, CommandAction, NavItem, Prompt, SelectionCell, TextSelection},
-    config::Config,
+    app::{
+        App, CommandAction, NavItem, NoticeLevel, NoticeSource, Prompt, PromptEdit, SelectionCell,
+        TextSelection,
+    },
+    config::{self, Config},
     git,
     model::{self, AgentKind, ChatStatus, PtyKey, TerminalLaunch, TerminalStatus},
     pty::{AttachExistingResult, PtyDimensions, PtyEvent, PtyRuntime, PtySpawn},
@@ -262,7 +265,7 @@ fn split_process_agent_command(raw: &str) -> Result<Vec<String>, &'static str> {
 pub fn run(
     terminal: &mut DefaultTerminal,
     mut app: App,
-    config: Config,
+    mut config: Config,
     shutdown: &AtomicBool,
     store: &storage::StateStore,
 ) -> io::Result<()> {
@@ -273,6 +276,9 @@ pub fn run(
     let mut save_schedule = SaveSchedule::default();
     let size = terminal.size()?;
     let mut frame_area = Rect::new(0, 0, size.width, size.height);
+    // A rejected colour or an unusable project path is a real problem the user
+    // cannot see once the alternate screen is open (E2/E6).
+    report_config_warnings(&mut app, &config);
     register_project_session_identities(&app, &mut pty_runtime);
     restore_persisted_sessions(&mut app, &mut pty_runtime, &config, frame_area);
     refresh_workspace_git_branches(&mut app);
@@ -323,6 +329,10 @@ pub fn run(
             needs_redraw |= refresh_workspace_git_branches(&mut app);
             last_git_branch_refresh = now;
         }
+        // A transient notice that has run out of time is a reason to redraw and
+        // nothing else; a quiet session never gets here with anything pending.
+        needs_redraw |= app.expire_notices(now);
+        needs_redraw |= reload_config_if_requested(&mut app, &mut config);
         needs_redraw |= drain_pty_events(&mut app, &mut pty_runtime);
         needs_redraw |= drain_agent_events(&mut app, &mut agent_backend);
         needs_redraw |= drain_mult_agent_status_events(
@@ -391,6 +401,74 @@ pub fn run(
     }
 
     Ok(())
+}
+
+/// Re-read `config.json` and swap it in place when the user asked for it (E9).
+///
+/// A failure is reported through the status surface and the old config is kept:
+/// a typo in a colorscheme must not end a session that is holding live PTYs.
+/// Returns whether the frame needs rebuilding.
+fn reload_config_if_requested(app: &mut App, config: &mut Config) -> bool {
+    if !app.take_config_reload_request() {
+        return false;
+    }
+
+    // No `--config` here on purpose: the flag is `main`'s, and re-resolving it
+    // would need it threaded through the whole event loop. `$MULT_CONFIG_PATH`
+    // and the default path still apply, which is where a reloadable config
+    // realistically lives.
+    match config::load_or_default(None) {
+        Ok(reloaded) => {
+            report_config_warnings(app, &reloaded);
+            if reloaded == *config {
+                app.push_notice(
+                    NoticeLevel::Info,
+                    NoticeSource::Report,
+                    "Config reloaded; nothing changed.",
+                );
+            } else {
+                let mouse_capture_changed = reloaded.mouse_capture != config.mouse_capture;
+                *config = reloaded;
+                // Everything read per frame (colorscheme, projects, agent
+                // commands, auto-start) applies immediately. Mouse capture is
+                // a terminal mode `main` sets once around the whole session,
+                // and a PTY already running keeps the command it was started
+                // with — say so rather than let it look like a no-op.
+                let caveat = if mouse_capture_changed {
+                    " mouse_capture needs a restart; already-running PTYs keep their command."
+                } else {
+                    " Already-running PTYs keep the command they were started with."
+                };
+                app.push_notice(
+                    NoticeLevel::Info,
+                    NoticeSource::Report,
+                    format!("Config reloaded.{caveat}"),
+                );
+            }
+        }
+        Err(error) => {
+            app.push_notice(
+                NoticeLevel::Error,
+                NoticeSource::Report,
+                format!(
+                    "Config reload failed; keeping the previous config: {error} ({})",
+                    config::config_path().display()
+                ),
+            );
+        }
+    }
+    true
+}
+
+/// Put the config loader's non-fatal complaints on the status surface (E2).
+///
+/// They are already complete sentences naming the file, so they are shown
+/// verbatim; `main` also prints them to stderr, which is what a user sees
+/// before the alternate screen opens and after it closes.
+fn report_config_warnings(app: &mut App, config: &Config) {
+    for warning in config.warnings() {
+        app.push_notice(NoticeLevel::Warning, NoticeSource::Report, warning.clone());
+    }
 }
 
 /// What the render loop should do about a failed host-terminal operation.
@@ -601,6 +679,13 @@ fn handle_key(
 ) {
     if is_quit_key(key) {
         app.quit();
+        return;
+    }
+
+    // The overlay is modal: while it is up it owns the keyboard, so no key can
+    // reach a PTY behind it. Anything that is not a shortcut closes it.
+    if app.is_help_visible() {
+        handle_help_overlay_key(app, key);
         return;
     }
 
@@ -953,11 +1038,41 @@ fn handle_unprompted_key(
     key: KeyEvent,
     frame_area: Rect,
 ) {
+    if opens_help(app, key) {
+        app.show_help();
+        return;
+    }
     if handle_control_key(app, pty_runtime, config, store, key, frame_area) {
         return;
     }
 
     handle_selected_pty_input_key(app, pty_runtime, config, store, key, frame_area);
+}
+
+/// `F1` always opens the overlay; `?` only when no pane would have received it.
+///
+/// A selected chat or terminal takes every ordinary key — that is how a PTY is
+/// started and typed at, there is no input mode to leave — so a global `?`
+/// would steal a character from every shell, pager and editor running in a
+/// pane. `F1` is safe to take unconditionally: nothing in `mult` sent it
+/// anywhere useful before, and it is the one key a full-screen program is
+/// unlikely to need. `Ctrl+p` → "Show keybindings" reaches the overlay from
+/// anywhere.
+fn opens_help(app: &App, key: KeyEvent) -> bool {
+    if matches!(key.code, KeyCode::F(1)) {
+        return true;
+    }
+    matches!(key.code, KeyCode::Char('?'))
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && app.help_key_opens_help()
+}
+
+/// Any key closes the overlay. It carries no state of its own, so there is
+/// nothing to navigate and nothing a stray keystroke can damage — and a user
+/// who cannot find the dismissal key is stuck in a modal screen.
+fn handle_help_overlay_key(app: &mut App, _key: KeyEvent) {
+    app.hide_help();
 }
 
 fn handle_control_key(
@@ -1013,6 +1128,11 @@ fn handle_control_key(
     }
     if is_unshifted_control_char(key, 'f') {
         app.begin_open_workspace(&config.projects);
+        return true;
+    }
+    // Only consumed when there is something to dismiss, so `Ctrl+n` still
+    // reaches a PTY on a quiet session.
+    if is_unshifted_control_char(key, 'n') && app.dismiss_notices() {
         return true;
     }
 
@@ -1247,37 +1367,84 @@ fn start_selected_pty_if_needed(
     }
 }
 
-fn handle_open_workspace_key(app: &mut App, config: &Config, key: KeyEvent) {
+/// What a key means inside a prompt, independent of which prompt it is.
+///
+/// The four prompt handlers used to repeat the same Esc/Enter/Backspace/Char
+/// skeleton with slightly different holes in it (F13). They now share this
+/// classifier and differ only in what "submit" and "move" mean for them, so a
+/// prompt cannot silently be missing an editing key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptKey {
+    Cancel,
+    Submit,
+    /// Move the list selection, where the prompt has a list.
+    Previous,
+    Next,
+    Edit(PromptEdit),
+    Ignored,
+}
+
+/// `Ctrl+k` is deliberately **not** readline's kill-to-end-of-line here.
+///
+/// It is `mult`'s global "previous item" (the pair of `Ctrl+j`), and two of the
+/// five prompts show a list it moves through. Rebinding it to a kill inside the
+/// other prompts would make one key mean two things depending on which prompt
+/// happened to be open, which is worse than lacking a kill: `Ctrl+u` (delete to
+/// start) and `Ctrl+w` (delete the previous word) cover the same ground, and
+/// `Delete` removes the character after the cursor. So `Ctrl+k` means
+/// "previous" in every prompt, and does nothing in the prompts with no list.
+fn classify_prompt_key(key: KeyEvent) -> PromptKey {
     match key.code {
-        KeyCode::Esc => app.cancel_prompt(),
-        KeyCode::Enter => app.submit_open_workspace(&config.projects),
-        KeyCode::Up => app.select_previous_open_workspace_match(&config.projects),
-        KeyCode::Down => app.select_next_open_workspace_match(&config.projects),
-        _ if is_unshifted_control_char(key, 'k') => {
-            app.select_previous_open_workspace_match(&config.projects);
-        }
-        _ if is_unshifted_control_char(key, 'j') => {
-            app.select_next_open_workspace_match(&config.projects);
-        }
-        KeyCode::Backspace => app.pop_prompt_char(),
-        _ if is_unshifted_control_char(key, 'c') => app.cancel_prompt(),
+        KeyCode::Esc => PromptKey::Cancel,
+        KeyCode::Enter => PromptKey::Submit,
+        KeyCode::Up => PromptKey::Previous,
+        KeyCode::Down => PromptKey::Next,
+        KeyCode::Left => PromptKey::Edit(PromptEdit::MoveLeft),
+        KeyCode::Right => PromptKey::Edit(PromptEdit::MoveRight),
+        KeyCode::Home => PromptKey::Edit(PromptEdit::MoveHome),
+        KeyCode::End => PromptKey::Edit(PromptEdit::MoveEnd),
+        KeyCode::Backspace => PromptKey::Edit(PromptEdit::Backspace),
+        KeyCode::Delete => PromptKey::Edit(PromptEdit::DeleteForward),
+        _ if is_unshifted_control_char(key, 'c') => PromptKey::Cancel,
+        _ if is_unshifted_control_char(key, 'k') => PromptKey::Previous,
+        _ if is_unshifted_control_char(key, 'j') => PromptKey::Next,
+        _ if is_unshifted_control_char(key, 'a') => PromptKey::Edit(PromptEdit::MoveHome),
+        _ if is_unshifted_control_char(key, 'e') => PromptKey::Edit(PromptEdit::MoveEnd),
+        _ if is_unshifted_control_char(key, 'w') => PromptKey::Edit(PromptEdit::DeleteWordBefore),
+        _ if is_unshifted_control_char(key, 'u') => PromptKey::Edit(PromptEdit::DeleteToStart),
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.push_prompt_char(c);
+            PromptKey::Edit(PromptEdit::Insert(c))
         }
-        _ => {}
+        _ => PromptKey::Ignored,
+    }
+}
+
+/// Handle everything about a prompt key that does not depend on the prompt, and
+/// report what is left for the caller.
+fn apply_shared_prompt_key(app: &mut App, key: KeyEvent) -> PromptKey {
+    let classified = classify_prompt_key(key);
+    match classified {
+        PromptKey::Cancel => app.cancel_prompt(),
+        PromptKey::Edit(edit) => {
+            app.apply_prompt_edit(edit);
+        }
+        PromptKey::Submit | PromptKey::Previous | PromptKey::Next | PromptKey::Ignored => {}
+    }
+    classified
+}
+
+fn handle_open_workspace_key(app: &mut App, config: &Config, key: KeyEvent) {
+    match apply_shared_prompt_key(app, key) {
+        PromptKey::Submit => app.submit_open_workspace(&config.projects),
+        PromptKey::Previous => app.select_previous_open_workspace_match(&config.projects),
+        PromptKey::Next => app.select_next_open_workspace_match(&config.projects),
+        PromptKey::Cancel | PromptKey::Edit(_) | PromptKey::Ignored => {}
     }
 }
 
 fn handle_terminal_command_key(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc => app.cancel_prompt(),
-        KeyCode::Enter => app.submit_new_terminal_command(),
-        KeyCode::Backspace => app.pop_prompt_char(),
-        _ if is_unshifted_control_char(key, 'c') => app.cancel_prompt(),
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.push_prompt_char(c);
-        }
-        _ => {}
+    if apply_shared_prompt_key(app, key) == PromptKey::Submit {
+        app.submit_new_terminal_command();
     }
 }
 
@@ -1289,36 +1456,21 @@ fn handle_command_palette_key(
     key: KeyEvent,
     frame_area: Rect,
 ) {
-    match key.code {
-        KeyCode::Esc => app.cancel_prompt(),
-        KeyCode::Enter => {
+    match apply_shared_prompt_key(app, key) {
+        PromptKey::Submit => {
             if let Some(action) = app.submit_command_palette() {
                 execute_command_action(app, pty_runtime, config, store, action, frame_area);
             }
         }
-        KeyCode::Up => app.select_previous_command_palette_entry(),
-        KeyCode::Down => app.select_next_command_palette_entry(),
-        _ if is_unshifted_control_char(key, 'k') => app.select_previous_command_palette_entry(),
-        _ if is_unshifted_control_char(key, 'j') => app.select_next_command_palette_entry(),
-        KeyCode::Backspace => app.pop_prompt_char(),
-        _ if is_unshifted_control_char(key, 'c') => app.cancel_prompt(),
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.push_prompt_char(c);
-        }
-        _ => {}
+        PromptKey::Previous => app.select_previous_command_palette_entry(),
+        PromptKey::Next => app.select_next_command_palette_entry(),
+        PromptKey::Cancel | PromptKey::Edit(_) | PromptKey::Ignored => {}
     }
 }
 
 fn handle_search_key(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc => app.cancel_prompt(),
-        KeyCode::Enter => app.submit_search(),
-        KeyCode::Backspace => app.pop_prompt_char(),
-        _ if is_unshifted_control_char(key, 'c') => app.cancel_prompt(),
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.push_prompt_char(c);
-        }
-        _ => {}
+    if apply_shared_prompt_key(app, key) == PromptKey::Submit {
+        app.submit_search();
     }
 }
 
@@ -1340,6 +1492,11 @@ fn execute_command_action(
     frame_area: Rect,
 ) {
     match action {
+        CommandAction::ShowKeybindings => app.show_help(),
+        CommandAction::DismissNotices => {
+            app.dismiss_notices();
+        }
+        CommandAction::ReloadConfig => app.request_config_reload(),
         CommandAction::FocusSidebar => app.focus_sidebar(),
         CommandAction::FocusSelectedPane => {
             app.focus_selected_main();
@@ -2208,6 +2365,16 @@ fn drain_pty_events(app: &mut App, pty_runtime: &mut PtyRuntime) -> bool {
     let mut changed = false;
     for event in pty_runtime.drain_events() {
         changed = true;
+        apply_pty_event(app, pty_runtime, event);
+    }
+    // `drain_events` stops at a per-frame budget, so a busy pane can leave
+    // traffic (or queued re-attachments) behind. Asking for a redraw keeps the
+    // loop coming back for the rest instead of parking on a stale frame.
+    changed || pty_runtime.has_pending_work()
+}
+
+fn apply_pty_event(app: &mut App, pty_runtime: &mut PtyRuntime, event: PtyEvent) {
+    {
         match event {
             PtyEvent::Scrollback { .. } | PtyEvent::Output { .. } => {}
             // Truncation is metadata, not terminal output. Injecting a notice
@@ -2266,12 +2433,15 @@ fn drain_pty_events(app: &mut App, pty_runtime: &mut PtyRuntime) -> bool {
             PtyEvent::Error { terminal, message } => {
                 pty_runtime.append_terminal_system_line(terminal, message.as_str());
             }
+            // No pane owns this, so there is no pane to write it into: a
+            // missing or protocol-incompatible daemon otherwise left the user
+            // with an inert UI and the explanation queued against a terminal
+            // id that cannot exist (E2/B8).
+            PtyEvent::ConnectionError { message } => {
+                app.push_notice(NoticeLevel::Error, NoticeSource::Report, message);
+            }
         }
     }
-    // `drain_events` stops at a per-frame budget, so a busy pane can leave
-    // traffic (or queued re-attachments) behind. Asking for a redraw keeps the
-    // loop coming back for the rest instead of parking on a stale frame.
-    changed || pty_runtime.has_pending_work()
 }
 
 #[cfg(test)]
@@ -2787,6 +2957,14 @@ mod tests {
 
     use super::*;
 
+    /// `Config` carries a private `warnings` list, so its fields cannot be
+    /// filled with functional-update syntax from here.
+    fn config_with(mutate: impl FnOnce(&mut Config)) -> Config {
+        let mut config = Config::default();
+        mutate(&mut config);
+        config
+    }
+
     #[derive(Clone, Copy)]
     enum RestorationReply {
         Attached,
@@ -2950,10 +3128,7 @@ mod tests {
             "taking the queue drains it"
         );
 
-        let opted_out = Config {
-            clipboard_osc52: false,
-            ..Config::default()
-        };
+        let opted_out = config_with(|config| config.clipboard_osc52 = false);
         assert!(!copy_text_to_clipboard(
             &mut pty_runtime,
             &opted_out,
@@ -3819,17 +3994,15 @@ mod tests {
     #[test]
     fn pi_command_comes_from_config_with_default_fallback() {
         assert_eq!(
-            pi_command(&Config {
-                pi_agent_command: "pi -c".to_string(),
-                ..Config::default()
-            }),
+            pi_command(&config_with(|config| {
+                config.pi_agent_command = "pi -c".to_string()
+            })),
             "pi -c"
         );
         assert_eq!(
-            pi_command(&Config {
-                pi_agent_command: "   ".to_string(),
-                ..Config::default()
-            }),
+            pi_command(&config_with(|config| {
+                config.pi_agent_command = "   ".to_string()
+            })),
             "pi"
         );
     }
@@ -3837,27 +4010,24 @@ mod tests {
     #[test]
     fn claude_code_command_comes_from_config_with_default_fallback() {
         assert_eq!(
-            claude_code_command(&Config {
-                claude_code_command: "claude --resume".to_string(),
-                ..Config::default()
-            }),
+            claude_code_command(&config_with(|config| {
+                config.claude_code_command = "claude --resume".to_string()
+            })),
             "claude --resume"
         );
         assert_eq!(
-            claude_code_command(&Config {
-                claude_code_command: "   ".to_string(),
-                ..Config::default()
-            }),
+            claude_code_command(&config_with(|config| {
+                config.claude_code_command = "   ".to_string()
+            })),
             "claude"
         );
     }
 
     #[test]
     fn pi_command_appends_mult_status_extension_when_available() {
-        let command = pi_command_with_mult_status_extension(&Config {
-            pi_agent_command: "pi --model test".to_string(),
-            ..Config::default()
-        });
+        let command = pi_command_with_mult_status_extension(&config_with(|config| {
+            config.pi_agent_command = "pi --model test".to_string()
+        }));
 
         assert!(command.starts_with("pi --model test"));
         assert!(command.contains(" -e "));
@@ -3866,11 +4036,10 @@ mod tests {
 
     #[test]
     fn agent_command_routes_by_kind() {
-        let config = Config {
-            pi_agent_command: "pi".to_string(),
-            claude_code_command: "claude --here".to_string(),
-            ..Config::default()
-        };
+        let config = config_with(|config| {
+            config.pi_agent_command = "pi".to_string();
+            config.claude_code_command = "claude --here".to_string();
+        });
 
         // Pi takes the bundled status extension (`-e`); Claude Code takes a
         // generated hooks settings file (`--settings`). Neither borrows the
@@ -3888,10 +4057,9 @@ mod tests {
 
     #[test]
     fn claude_code_command_appends_mult_status_hooks_when_available() {
-        let command = claude_code_command_with_mult_status_hooks(&Config {
-            claude_code_command: "claude --model test".to_string(),
-            ..Config::default()
-        });
+        let command = claude_code_command_with_mult_status_hooks(&config_with(|config| {
+            config.claude_code_command = "claude --model test".to_string()
+        }));
 
         assert!(command.starts_with("claude --model test"));
         assert!(command.contains(" --settings "));
@@ -4133,10 +4301,7 @@ mod tests {
             .resize(terminal_id, PtyDimensions { rows: 2, cols: 8 })
             .expect("resize parser");
         pty_runtime.process_terminal_output(terminal_id, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
-        let config = Config {
-            mouse_capture: true,
-            ..Config::default()
-        };
+        let config = config_with(|config| config.mouse_capture = true);
         let frame_area = Rect::new(0, 0, 120, 40);
         let (_, output_area) = ui::selected_terminal_output_area(&app, frame_area)
             .expect("terminal selection has output area");
@@ -4202,10 +4367,7 @@ mod tests {
         // The program turns on mouse reporting: the wheel is now its input, so
         // our local scrollback must stay pinned to the bottom.
         pty_runtime.process_terminal_output(terminal_id, b"\x1b[?1000h\x1b[?1006h");
-        let config = Config {
-            mouse_capture: true,
-            ..Config::default()
-        };
+        let config = config_with(|config| config.mouse_capture = true);
         let frame_area = Rect::new(0, 0, 120, 40);
         let (_, output_area) = ui::selected_terminal_output_area(&app, frame_area)
             .expect("terminal selection has output area");
@@ -4262,10 +4424,7 @@ mod tests {
             .resize(terminal_id, PtyDimensions { rows: 2, cols: 8 })
             .expect("resize parser");
         pty_runtime.process_terminal_output(terminal_id, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
-        let config = Config {
-            mouse_capture: true,
-            ..Config::default()
-        };
+        let config = config_with(|config| config.mouse_capture = true);
         let frame_area = Rect::new(0, 0, 120, 40);
         let (_, output_area) = ui::selected_terminal_output_area(&app, frame_area)
             .expect("terminal selection has output area");
@@ -4569,8 +4728,8 @@ mod tests {
     #[test]
     fn open_workspace_prompt_ctrl_j_and_ctrl_k_select_matches() {
         let mut app = App::default();
-        let config = Config {
-            projects: vec![
+        let config = config_with(|config| {
+            config.projects = vec![
                 mult::config::ConfiguredProject {
                     name: "first".to_string(),
                     path: "/tmp/first".into(),
@@ -4579,9 +4738,8 @@ mod tests {
                     name: "second".to_string(),
                     path: "/tmp/second".into(),
                 },
-            ],
-            ..Config::default()
-        };
+            ];
+        });
 
         app.begin_open_workspace(&config.projects);
         handle_open_workspace_key(
@@ -4591,7 +4749,7 @@ mod tests {
         );
         assert!(matches!(
             app.prompt,
-            Some(Prompt::OpenWorkspace(ref prompt)) if prompt.selected == 1
+            Some(Prompt::OpenWorkspace(ref prompt)) if prompt.selected.index() == 1
         ));
 
         handle_open_workspace_key(
@@ -4601,7 +4759,294 @@ mod tests {
         );
         assert!(matches!(
             app.prompt,
-            Some(Prompt::OpenWorkspace(ref prompt)) if prompt.selected == 0
+            Some(Prompt::OpenWorkspace(ref prompt)) if prompt.selected.index() == 0
+        ));
+    }
+
+    // ---- E7 / F13: one prompt-key path ---------------------------------
+
+    /// One prompt's key handler, boxed so several of them can be driven by a
+    /// single loop. Named because the tuple it sits in is otherwise too dense
+    /// to read (and `clippy::type_complexity` says so).
+    type PromptDrive = Box<dyn FnMut(&mut App, KeyEvent)>;
+
+    /// Every text prompt shares one classifier, so the motions and kills are
+    /// present in all of them rather than in whichever one was edited last.
+    #[test]
+    fn prompt_motions_and_kills_work_in_every_text_prompt() {
+        let config = Config::default();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let ctrl = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
+
+        // Two prompts with a list and two without, driven through their own
+        // handlers exactly as `handle_key` dispatches them.
+        let mut drives: Vec<(&str, PromptDrive)> = vec![
+            (
+                "open workspace",
+                Box::new(move |app: &mut App, event| {
+                    handle_open_workspace_key(app, &Config::default(), event)
+                }),
+            ),
+            (
+                "new terminal command",
+                Box::new(|app: &mut App, event| handle_terminal_command_key(app, event)),
+            ),
+            (
+                "search",
+                Box::new(|app: &mut App, event| handle_search_key(app, event)),
+            ),
+        ];
+
+        for (name, drive) in &mut drives {
+            let mut app = App::default();
+            match *name {
+                "open workspace" => app.begin_open_workspace(&config.projects),
+                "new terminal command" => {
+                    assert!(app.begin_new_terminal_command(), "{name}");
+                }
+                _ => assert!(app.begin_search(), "{name}"),
+            }
+            // Start from a known state: the Open-Workspace prompt pre-fills the
+            // working directory.
+            while app.prompt_input().is_some_and(|input| !input.is_empty()) {
+                drive(&mut app, ctrl('u'));
+                drive(&mut app, key(KeyCode::Delete));
+            }
+
+            for ch in "cargo test".chars() {
+                drive(&mut app, key(KeyCode::Char(ch)));
+            }
+            assert_eq!(app.prompt_input().unwrap().as_str(), "cargo test", "{name}");
+
+            drive(&mut app, key(KeyCode::Home));
+            assert_eq!(app.prompt_input().unwrap().cursor(), 0, "{name}");
+            drive(&mut app, key(KeyCode::Delete));
+            assert_eq!(app.prompt_input().unwrap().as_str(), "argo test", "{name}");
+            drive(&mut app, key(KeyCode::End));
+            drive(&mut app, ctrl('w'));
+            assert_eq!(app.prompt_input().unwrap().as_str(), "argo ", "{name}");
+            drive(&mut app, key(KeyCode::Left));
+            drive(&mut app, key(KeyCode::Char('X')));
+            assert_eq!(app.prompt_input().unwrap().as_str(), "argoX ", "{name}");
+            drive(&mut app, ctrl('a'));
+            assert_eq!(app.prompt_input().unwrap().cursor(), 0, "{name}");
+            drive(&mut app, ctrl('e'));
+            assert_eq!(app.prompt_input().unwrap().cursor(), 6, "{name}");
+            drive(&mut app, ctrl('u'));
+            assert_eq!(app.prompt_input().unwrap().as_str(), "", "{name}");
+
+            // ...and cancelling is the same key everywhere.
+            drive(&mut app, ctrl('c'));
+            assert!(app.prompt.is_none(), "{name}");
+        }
+    }
+
+    /// `Ctrl+k` keeps meaning "previous", not readline's kill-to-end-of-line.
+    /// See `classify_prompt_key` for why: one key, one meaning, across every
+    /// prompt — `Ctrl+u`/`Ctrl+w`/`Delete` are the deletions.
+    #[test]
+    fn ctrl_k_moves_the_selection_and_never_kills_the_line() {
+        let mut app = App::default();
+        app.begin_command_palette();
+        for ch in "focus".chars() {
+            app.push_prompt_char(ch);
+        }
+        let store = test_state_store("ctrl-k");
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let config = Config::default();
+        let frame_area = Rect::new(0, 0, 120, 40);
+
+        handle_command_palette_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &store,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            frame_area,
+        );
+
+        assert_eq!(
+            app.prompt_input().unwrap().as_str(),
+            "focus",
+            "ctrl-k must not delete anything"
+        );
+        let Some(Prompt::CommandPalette(prompt)) = &app.prompt else {
+            panic!("palette is open");
+        };
+        let len = app.active_command_palette_entries().len();
+        assert_eq!(
+            prompt.selected.index(),
+            len - 1,
+            "ctrl-k wraps to the last entry"
+        );
+
+        // ...and it means the same nothing-destructive thing in a prompt with
+        // no list at all.
+        let mut app = App::default();
+        assert!(app.begin_search());
+        for ch in "needle".chars() {
+            app.push_prompt_char(ch);
+        }
+        handle_search_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.prompt_input().unwrap().as_str(), "needle");
+    }
+
+    // ---- E4: the help overlay ---------------------------------------------
+
+    #[test]
+    fn f1_opens_help_over_a_selected_pty_but_a_bare_question_mark_does_not() {
+        let store = test_state_store("help-f1");
+        let config = Config::default();
+        let frame_area = Rect::new(0, 0, 120, 40);
+        let mut app = App::default();
+        let mut pty_runtime = PtyRuntime::new_offline();
+
+        // The seed state has a terminal selected, so `?` belongs to it.
+        assert!(app.pty_input_target().is_some());
+        handle_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &store,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+            frame_area,
+        );
+        assert!(!app.is_help_visible(), "? must reach a pane that wants it");
+
+        handle_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &store,
+            KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
+            frame_area,
+        );
+        assert!(app.is_help_visible());
+    }
+
+    #[test]
+    fn the_help_overlay_swallows_keys_and_closes_on_the_next_one() {
+        let store = test_state_store("help-modal");
+        let config = Config::default();
+        let frame_area = Rect::new(0, 0, 120, 40);
+        let mut app = App::default();
+        let mut pty_runtime = PtyRuntime::new_offline();
+        app.show_help();
+
+        // A key aimed at the overlay must not start or type at a PTY behind it.
+        handle_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &store,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            frame_area,
+        );
+        assert!(!app.is_help_visible());
+        assert!(!pty_runtime.is_running(app.pty_input_target().expect("a pane is selected")));
+
+        // Quit still works from the overlay: it is checked before the overlay.
+        app.show_help();
+        handle_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &store,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL),
+            frame_area,
+        );
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn the_palette_can_open_the_overlay_and_ask_for_a_config_reload() {
+        let store = test_state_store("help-palette");
+        let config = Config::default();
+        let frame_area = Rect::new(0, 0, 120, 40);
+        let mut app = App::default();
+        let mut pty_runtime = PtyRuntime::new_offline();
+
+        execute_command_action(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &store,
+            CommandAction::ShowKeybindings,
+            frame_area,
+        );
+        assert!(app.is_help_visible());
+
+        execute_command_action(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &store,
+            CommandAction::ReloadConfig,
+            frame_area,
+        );
+        // The action only records the request; the loop, which owns the
+        // `Config`, performs the swap (E9).
+        assert!(app.take_config_reload_request());
+    }
+
+    // ---- E2 / B8: connection failures reach the user ----------------------
+
+    #[test]
+    fn a_connection_wide_failure_is_reported_on_the_status_surface() {
+        // A daemon that will not connect used to queue its (good) diagnostic
+        // against `PtyKey::Terminal(TerminalId(0))`, a pane that cannot exist,
+        // so the user saw an inert UI and no explanation at all.
+        let mut app = App::default();
+        let mut pty_runtime = PtyRuntime::new_offline();
+
+        apply_pty_event(
+            &mut app,
+            &mut pty_runtime,
+            PtyEvent::ConnectionError {
+                message: "protocol version 9 is not supported".to_string(),
+            },
+        );
+
+        assert_eq!(app.notices().len(), 1);
+        assert_eq!(app.notices()[0].level(), NoticeLevel::Error);
+        assert!(app.notices()[0].text().contains("protocol version 9"));
+    }
+
+    #[test]
+    fn ctrl_n_dismisses_notices_but_otherwise_reaches_the_pty() {
+        let store = test_state_store("notice-dismiss");
+        let config = Config::default();
+        let frame_area = Rect::new(0, 0, 120, 40);
+        let mut app = App::default();
+        let mut pty_runtime = PtyRuntime::new_offline();
+        app.push_notice(
+            NoticeLevel::Error,
+            NoticeSource::Report,
+            "daemon unreachable",
+        );
+
+        assert!(handle_control_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &store,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            frame_area,
+        ));
+        assert!(app.notices().is_empty());
+
+        // With nothing to dismiss the key is not consumed, so a shell behind
+        // the surface keeps its `Ctrl+n`.
+        assert!(!handle_control_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &store,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            frame_area,
         ));
     }
 

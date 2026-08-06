@@ -61,10 +61,31 @@ pub struct StatePaths {
 pub struct LoadedState {
     pub state: ProjectState,
     pub needs_save: bool,
+    /// What the user needs to be told about how this state was loaded, if
+    /// anything: today, that the file could not be decoded and where its backup
+    /// went.
+    ///
+    /// Loading used to discard every workspace, chat and terminal on a decode
+    /// failure and report it nowhere — the only evidence was a `.corrupt-*`
+    /// file nobody was told about (E11). `main` prints this to stderr; it is a
+    /// plain string so the in-app status surface (E2) can show it unchanged.
+    pub notice: Option<String>,
 }
 
 impl StatePaths {
     pub fn resolve() -> io::Result<Self> {
+        Self::resolve_with(None)
+    }
+
+    /// The state-path policy: `--state`, then `$MULT_STATE_PATH`, then
+    /// `<data home>/mult/state.json`.
+    ///
+    /// Only the last of those is `mult`'s own directory, and only it has its
+    /// mode normalized; a path the user named is used exactly as given.
+    pub fn resolve_with(flag: Option<&Path>) -> io::Result<Self> {
+        if let Some(path) = flag {
+            return Self::from_explicit_path(path.to_path_buf());
+        }
         if let Some(path) = env::var_os(STATE_PATH_ENV) {
             return Self::from_explicit_path(PathBuf::from(path));
         }
@@ -172,6 +193,7 @@ impl StateStore {
                 return Ok(LoadedState {
                     state: ProjectState::try_default_with(source)?,
                     needs_save: true,
+                    notice: None,
                 });
             }
         };
@@ -180,27 +202,39 @@ impl StateStore {
             Ok(DecodedState::V1(old)) => Ok(LoadedState {
                 state: migrate_v1_to_v2(old, source)?,
                 needs_save: true,
+                notice: None,
             }),
             Ok(DecodedState::V2(mut state)) => {
-                validate_current_state(&state)?;
+                // Repair before validating, not after: a lenient decode can
+                // leave the ID allocators and the identity table describing a
+                // slightly different set of sessions than actually decoded, and
+                // that is exactly the case worth recovering rather than
+                // failing on.
                 let ids_normalized = state
                     .normalize_next_ids()
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                let identities_normalized = state.normalize_session_identities(source)?;
                 let statuses_normalized = normalize_unowned_agent_statuses(&mut state);
                 validate_current_state(&state)?;
                 Ok(LoadedState {
                     state,
-                    needs_save: ids_normalized || statuses_normalized,
+                    needs_save: ids_normalized || identities_normalized || statuses_normalized,
+                    notice: None,
                 })
             }
             Err(StateDecodeError::InvalidJson(error)) => {
                 // Construct the replacement first. Entropy failure therefore
                 // leaves the invalid source exactly where it was.
                 let state = ProjectState::try_default_with(source)?;
-                self.backup_invalid_state(error)?;
+                let backup = self.backup_invalid_state(&error)?;
                 Ok(LoadedState {
                     state,
                     needs_save: true,
+                    notice: Some(format!(
+                        "state file {} could not be decoded ({error}); it was moved to {} and this session started from defaults",
+                        self.paths.state.display(),
+                        self.paths.state.with_file_name(&backup).display()
+                    )),
                 })
             }
             Err(StateDecodeError::UnsupportedVersion(version)) => Err(io::Error::new(
@@ -222,7 +256,9 @@ impl StateStore {
         )
     }
 
-    fn backup_invalid_state(&self, decode_error: serde_json::Error) -> io::Result<()> {
+    /// Moves an undecodable state file aside, returning the name it now has so
+    /// the caller can tell the user where their data went.
+    fn backup_invalid_state(&self, decode_error: &serde_json::Error) -> io::Result<OsString> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
@@ -257,7 +293,7 @@ impl StateStore {
                     .open_file(&backup_name, libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
             secure_private_regular_file(&backup, "corrupt state backup")?;
             self.directory.sync()?;
-            return Ok(());
+            return Ok(backup_name);
         }
 
         Err(io::Error::new(
@@ -538,11 +574,44 @@ pub(crate) struct SecureDirectory {
     file: File,
 }
 
+/// Which file's parent directory is being opened, so a rejection says so.
+///
+/// The checks are identical for state and config, but the messages were not:
+/// every one of them said "state", including when it was the *config* directory
+/// that failed, which sent users looking at the wrong file (E5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectoryPurpose {
+    /// The noun in `… parent is not a directory` and `private … directory`.
+    noun: &'static str,
+    /// What a group- or other-writable parent puts within reach, phrased for
+    /// this particular file.
+    at_risk: &'static str,
+}
+
+pub(crate) const STATE_DIRECTORY: DirectoryPurpose = DirectoryPurpose {
+    noun: "state",
+    at_risk: "its lock inode is replaceable",
+};
+
+pub(crate) const CONFIG_DIRECTORY: DirectoryPurpose = DirectoryPurpose {
+    noun: "config",
+    at_risk: "the config it holds is replaceable, and its commands are shell-evaluated",
+};
+
 impl SecureDirectory {
     pub(crate) fn open_parent(
         path: &Path,
         create: bool,
         normalize_parent: bool,
+    ) -> io::Result<Self> {
+        Self::open_parent_for(path, create, normalize_parent, STATE_DIRECTORY)
+    }
+
+    pub(crate) fn open_parent_for(
+        path: &Path,
+        create: bool,
+        normalize_parent: bool,
+        purpose: DirectoryPurpose,
     ) -> io::Result<Self> {
         let parent = path
             .parent()
@@ -562,7 +631,7 @@ impl SecureDirectory {
                 Component::Prefix(_) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "unsupported state path prefix",
+                        format!("unsupported {} path prefix", purpose.noun),
                     ));
                 }
             };
@@ -578,8 +647,8 @@ impl SecureDirectory {
             current = next;
         }
 
-        validate_directory(&current, parent)?;
-        validate_authority_directory(&current, parent)?;
+        validate_directory(&current, parent, purpose)?;
+        validate_authority_directory(&current, parent, purpose)?;
         if normalize_parent {
             set_file_mode(&current, 0o700)?;
         }
@@ -706,24 +775,14 @@ fn mkdir_at(parent: RawFd, name: &OsStr, mode: u32) -> io::Result<()> {
     }
 }
 
-fn validate_directory(file: &File, path: &Path) -> io::Result<()> {
+fn validate_directory(file: &File, path: &Path, purpose: DirectoryPurpose) -> io::Result<()> {
     let metadata = file.metadata()?;
     if !metadata.file_type().is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("state parent is not a directory: {}", path.display()),
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_owned_directory(file: &File, path: &Path) -> io::Result<()> {
-    let metadata = file.metadata()?;
-    if metadata.uid() != effective_uid() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
             format!(
-                "private state directory is not owned by the effective user: {}",
+                "{} parent is not a directory: {}",
+                purpose.noun,
                 path.display()
             ),
         ));
@@ -731,14 +790,39 @@ pub(crate) fn validate_owned_directory(file: &File, path: &Path) -> io::Result<(
     Ok(())
 }
 
-fn validate_authority_directory(file: &File, path: &Path) -> io::Result<()> {
-    validate_owned_directory(file, path)?;
+pub(crate) fn validate_owned_directory(
+    file: &File,
+    path: &Path,
+    purpose: DirectoryPurpose,
+) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if metadata.uid() != effective_uid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "private {} directory is not owned by the effective user: {}",
+                purpose.noun,
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_authority_directory(
+    file: &File,
+    path: &Path,
+    purpose: DirectoryPurpose,
+) -> io::Result<()> {
+    validate_owned_directory(file, path, purpose)?;
     let metadata = file.metadata()?;
     if metadata.mode() & 0o022 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "state parent is writable by group or others, so its lock inode is replaceable: {}",
+                "{} parent is writable by group or others, so {}: {}",
+                purpose.noun,
+                purpose.at_risk,
                 path.display()
             ),
         ));
@@ -1072,18 +1156,17 @@ mod tests {
         assert_eq!(fs::read(path).unwrap(), original);
     }
 
-    /// G5: a *shape* error — well-formed JSON whose fields have the wrong types
-    /// — is currently indistinguishable from a truncated or garbled file. Both
-    /// are `serde_json::Error`, so both take the corrupt-backup-and-reset path
-    /// and the user loses every workspace in exchange for a backup file nobody
-    /// tells them about.
+    /// E11: a *shape* error the decoder genuinely cannot interpret —
+    /// `"workspaces"` holding a string — still resets, because there is nothing
+    /// in those bytes this code can turn into workspaces. What changed is that
+    /// the reset is no longer silent: `LoadedState` now carries a notice naming
+    /// the backup, so the user can be told where their data went instead of
+    /// discovering a `.corrupt-*` file by accident.
     ///
-    /// This pins that behaviour rather than endorsing it: leniency and user
-    /// notification are R7/E11's problem. What matters here is that the reset
-    /// is not silent on disk — the original bytes survive under a
-    /// `.corrupt-<timestamp>-<random>` name, owner-only.
+    /// (This test previously pinned the *unannounced* reset, per G5's note that
+    /// the policy was the questionable part.)
     #[test]
-    fn a_shape_error_backs_the_file_up_and_resets_to_a_fresh_state() {
+    fn a_shape_error_backs_the_file_up_and_reports_where_the_backup_went() {
         let root = unique_test_dir();
         fs::create_dir_all(&root).unwrap();
         let path = root.join("state.json");
@@ -1124,6 +1207,115 @@ mod tests {
             fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
             0o600
         );
+
+        let notice = loaded.notice.expect("a reset must be reported to the user");
+        assert!(notice.contains(&path.display().to_string()), "{notice}");
+        assert!(
+            notice.contains(&backup.display().to_string()),
+            "the notice must name the backup, or it is no better than silence: {notice}"
+        );
+        assert!(notice.contains("started from defaults"), "{notice}");
+    }
+
+    /// E11: the other half of a shape error. A file that loses *part* of itself
+    /// — a renamed key, a `null` where an array belonged — used to be treated
+    /// exactly like garbage: every workspace, chat and terminal discarded. It
+    /// now loads everything that decoded, and only that.
+    #[test]
+    fn a_partially_unknown_state_keeps_everything_it_can_decode() {
+        let root = unique_test_dir();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.json");
+        // `chats` is null in one workspace, both statuses and one `launch` are
+        // absent, the allocator hints are gone, and the identity table both
+        // names a chat that does not exist and omits a terminal that does.
+        let original = br#"{
+            "version": 2,
+            "namespace": "11111111111111111111111111111111",
+            "session_identities": {
+                "chats": {
+                    "7": "22222222222222222222222222222222",
+                    "11": "44444444444444444444444444444444"
+                },
+                "terminals": {}
+            },
+            "workspaces": [
+                {"id": 4, "name": "kept", "chats": null,
+                 "terminals": [{"id": 9, "name": "shell"}]},
+                {"id": 5, "name": "also kept", "cwd": null, "environment": {},
+                 "chats": [{"id": 7, "name": "chat"}], "terminals": []}
+            ]
+        }"#;
+        fs::write(&path, original).unwrap();
+        let store =
+            StateStore::acquire(StatePaths::from_explicit_path(path.clone()).unwrap()).unwrap();
+
+        let loaded = store.load_or_default().unwrap();
+
+        assert!(loaded.notice.is_none(), "nothing was discarded");
+        assert!(path.exists(), "no backup was needed");
+        let names = loaded
+            .state
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["kept", "also kept"]);
+        assert_eq!(loaded.state.workspaces[0].terminals[0].name, "shell");
+        assert_eq!(
+            loaded.state.workspaces[0].terminals[0].status,
+            TerminalStatus::Stopped
+        );
+        assert_eq!(loaded.state.workspaces[1].chats[0].name, "chat");
+        // The hints were rebuilt from the IDs actually in use...
+        assert_eq!(loaded.state.next_workspace_id, 6);
+        assert_eq!(loaded.state.next_chat_id, 8);
+        assert_eq!(loaded.state.next_terminal_id, 10);
+        // ...and the identity table matches the sessions that survived, so the
+        // repaired state is one the writer will accept.
+        loaded.state.validate_session_identities().unwrap();
+        assert!(loaded.needs_save);
+        store.save(&loaded.state).unwrap();
+    }
+
+    /// E11: leniency must not reach the version envelope. A state file from a
+    /// newer `mult` is still refused and still preserved byte for byte, and a
+    /// V1 file still migrates rather than being decoded leniently as a V2.
+    #[test]
+    fn leniency_does_not_weaken_the_version_boundary() {
+        let root = unique_test_dir();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.json");
+        // Same missing fields as the test above, but version 3.
+        let future =
+            br#"{"version":3,"namespace":"11111111111111111111111111111111","workspaces":[]}"#;
+        fs::write(&path, future).unwrap();
+        let store =
+            StateStore::acquire(StatePaths::from_explicit_path(path.clone()).unwrap()).unwrap();
+
+        let error = store.load_or_default().unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("is unsupported"));
+        assert_eq!(fs::read(&path).unwrap(), future);
+        drop(store);
+
+        // A V1 file goes through the migration, not the lenient V2 decode: its
+        // `version` field is rewritten and identities are assigned.
+        fs::write(
+            &path,
+            include_bytes!("../tests/fixtures/state/v1-current.json"),
+        )
+        .unwrap();
+        let store = StateStore::acquire(StatePaths::from_explicit_path(path).unwrap()).unwrap();
+        let loaded = store
+            .load_with_identity_source(&mut FixedIdentitySource::sequential(256))
+            .unwrap();
+
+        assert_eq!(loaded.state.version, STATE_VERSION);
+        assert!(loaded.needs_save);
+        assert!(loaded.notice.is_none());
+        loaded.state.validate_session_identities().unwrap();
     }
 
     /// G5: the backup rename is the one step that can fail after the decision to

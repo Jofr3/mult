@@ -96,6 +96,12 @@ pub struct Palette {
     highlight_med: Color,
     cursor: Color,
     success: Color,
+    /// Set when `NO_COLOR` is in the environment (E10). Every colour is
+    /// `Color::Reset`, so `mult` emits no SGR colour at all, and the overlays
+    /// that were carrying meaning in a background colour — the sidebar
+    /// selection, the palette's highlighted row, a text selection, the terminal
+    /// cursor — switch to reverse video instead of a hardcoded RGB fallback.
+    monochrome: bool,
 }
 
 /// A colorscheme key whose configured value did not parse. The palette keeps
@@ -148,10 +154,99 @@ impl Palette {
             ),
             cursor: parse("cursor", &colorscheme.cursor, moon::CURSOR),
             success: parse("success", &colorscheme.success, moon::SUCCESS),
+            monochrome: false,
         };
 
         (palette, issues)
     }
+
+    /// The palette used when `NO_COLOR` is set: nothing but the terminal's own
+    /// default foreground and background.
+    pub(crate) fn monochrome() -> Self {
+        Self {
+            nc: Color::Reset,
+            base: Color::Reset,
+            muted: Color::Reset,
+            text: Color::Reset,
+            love: Color::Reset,
+            gold: Color::Reset,
+            pine: Color::Reset,
+            foam: Color::Reset,
+            iris: Color::Reset,
+            highlight_med: Color::Reset,
+            cursor: Color::Reset,
+            success: Color::Reset,
+            monochrome: true,
+        }
+    }
+
+    /// A style that has to stand out from the pane around it: a selected row, a
+    /// highlighted match, a cursor overlay. With colour it is `preferred` on
+    /// `background`; without it, reverse video, which every terminal has.
+    fn emphasis(self, preferred: Color, background: Color) -> Style {
+        if self.monochrome {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+                .fg(readable_fg(preferred, background))
+                .bg(background)
+        }
+    }
+
+    /// The sidebar's selected row. Background (or reverse video) only, and
+    /// deliberately no foreground: each row's own status glyph has already
+    /// chosen one, and overriding it would put the selected pane's state back
+    /// on colour alone (E8).
+    fn selection_highlight(self) -> Style {
+        if self.monochrome {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default()
+                .bg(self.highlight_med)
+                .add_modifier(Modifier::BOLD)
+        }
+    }
+
+    /// Emphasis for a whole selected list row in a prompt, where the row is a
+    /// single uniform piece of text.
+    fn selected_row(self) -> Style {
+        if self.monochrome {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(self.text)
+                .bg(self.highlight_med)
+                .add_modifier(Modifier::BOLD)
+        }
+    }
+
+    /// Foreground for a semantic accent (an error, a hint, a status glyph).
+    /// Without colour the glyph itself carries the meaning (E8), so the only
+    /// thing left to say is "this is louder than body text".
+    fn accent(self, color: Color, emphatic: bool) -> Style {
+        if self.monochrome {
+            if emphatic {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            }
+        } else {
+            Style::default().fg(color)
+        }
+    }
+}
+
+/// Whether `NO_COLOR` is set to a non-empty value.
+///
+/// Read once: the environment cannot change under a running process in any way
+/// this should react to, and `draw` runs on every frame. Tests drive
+/// [`draw_with_palette`] with [`Palette::monochrome`] directly rather than
+/// mutating a process global.
+fn no_color_is_set() -> bool {
+    static NO_COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NO_COLOR.get_or_init(|| {
+        std::env::var_os("NO_COLOR").is_some_and(|value| !value.as_encoded_bytes().is_empty())
+    })
 }
 
 fn parse_color(input: &str) -> Option<Color> {
@@ -225,12 +320,34 @@ struct PaneRenderStyle {
 }
 
 pub fn draw(frame: &mut Frame, app: &App, pty_runtime: &PtyRuntime, config: &config::Config) {
-    let layout = layout_areas(app, frame.area());
-    let palette = config.palette();
+    let palette = if no_color_is_set() {
+        Palette::monochrome()
+    } else {
+        config.palette()
+    };
+    draw_with_palette(frame, app, pty_runtime, config, palette);
+}
+
+/// [`draw`] with the palette decided by the caller. `NO_COLOR` is a process
+/// global, so this is the seam the render tests use instead of mutating it.
+pub(crate) fn draw_with_palette(
+    frame: &mut Frame,
+    app: &App,
+    pty_runtime: &PtyRuntime,
+    config: &config::Config,
+    palette: Palette,
+) {
+    let frame_area = frame.area();
+    let layout = layout_areas(app, frame_area);
 
     draw_sidebar(frame, app, pty_runtime, layout.sidebar, palette);
     draw_main(frame, app, pty_runtime, layout.main, palette);
     draw_prompt_area(frame, app, layout.prompt, palette, config);
+    // Last, and over everything: the overlay is modal, so it must not be
+    // painted under a pane, and it occupies no layout space when it is down.
+    if app.is_help_visible() {
+        draw_help_overlay(frame, frame_area, palette);
+    }
 }
 
 pub fn selected_terminal_output_area(app: &App, frame_area: Rect) -> Option<(TerminalId, Rect)> {
@@ -301,9 +418,10 @@ fn prompt_height(app: &App) -> u16 {
         Some(_) => 3,
         None => 0,
     };
-    let error_height =
-        u16::from(app.save_error().is_some()) + u16::from(app.operation_error().is_some());
-    prompt_height + error_height
+    // The status surface only exists while it has something to say, so a quiet
+    // session gives every row back to the panes (E2).
+    let notice_height = u16::try_from(app.notices().len()).unwrap_or(u16::MAX);
+    prompt_height + notice_height
 }
 
 fn terminal_output_area(main: Rect) -> Rect {
@@ -348,11 +466,7 @@ fn draw_sidebar(
 
     let list = List::new(items)
         .style(style)
-        .highlight_style(
-            Style::default()
-                .bg(palette.highlight_med)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(palette.selection_highlight())
         .highlight_symbol(SIDEBAR_SELECTION_SYMBOL)
         .highlight_spacing(HighlightSpacing::Always);
 
@@ -381,21 +495,20 @@ fn sidebar_items(
 
         items.extend(workspace.chats.iter().map(|chat| {
             let done_seen = app.chat_done_seen(chat.id);
+            let (glyph, style) = chat_status_marker(chat.status, done_seen, palette);
             ListItem::new(Line::from(vec![
                 Span::raw("  "),
-                Span::styled("● ", chat_status_style(chat.status, done_seen, palette)),
+                Span::styled(glyph, style),
                 Span::raw(chat_sidebar_label(chat)),
             ]))
         }));
 
         items.extend(workspace.terminals.iter().map(|terminal| {
             let focused = terminal_sidebar_item_is_focused(app, workspace.id, terminal.id);
+            let (glyph, style) = terminal_icon_marker(terminal, pty_runtime, focused, palette);
             ListItem::new(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(
-                    "$ ",
-                    terminal_icon_style(terminal, pty_runtime, focused, palette),
-                ),
+                Span::styled(glyph, style),
                 Span::raw(terminal_display_label(
                     terminal,
                     pty_runtime,
@@ -694,14 +807,29 @@ fn draw_chat_details(
         let query = app
             .active_search_query_for_chat(chat_id)
             .unwrap_or_default();
-        render_lines_pane(
-            frame,
-            area,
-            search_result_lines("chat transcript", query, lines, output_rows, palette),
-            focused,
-            palette,
-            false,
-        );
+        let mut result = search_result_lines("chat transcript", query, lines, output_rows, palette);
+        // E12: chat search reads the *structured* transcript, which only the
+        // experimental process-agent backend writes and which nothing calls
+        // today, so it is empty for every chat a user can actually create. A
+        // bare "No matches." reads as "your text is not in this chat"; the
+        // truth is that there is nothing here to search yet, and the PTY
+        // output on screen is not what is being searched.
+        if app.chat_transcript_lines(chat_id).is_empty() {
+            result.push(Line::from(""));
+            result.push(Line::from(Span::styled(
+                "This chat has no structured transcript to search.",
+                Style::default().fg(palette.gold),
+            )));
+            result.push(Line::from(Span::styled(
+                "Chats run in a PTY; only the experimental process-agent backend records",
+                Style::default().fg(palette.muted),
+            )));
+            result.push(Line::from(Span::styled(
+                "searchable messages, and it has no call path yet. Esc clears the search.",
+                Style::default().fg(palette.muted),
+            )));
+        }
+        render_lines_pane(frame, area, result, focused, palette, false);
         return;
     }
 
@@ -860,10 +988,14 @@ fn render_terminal_parser(
         render_pane_too_small(frame, area, focused, palette);
         return;
     }
-    let cursor_style = Style::default().fg(palette.cursor).bg(palette.base);
-    let cursor_overlay_style = Style::default()
-        .fg(readable_fg(palette.nc, palette.cursor))
-        .bg(palette.cursor);
+    // Without colour the block would be invisible against the default
+    // foreground, so the cursor cell is reverse video instead (E10).
+    let cursor_style = if palette.monochrome {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default().fg(palette.cursor).bg(palette.base)
+    };
+    let cursor_overlay_style = palette.emphasis(palette.nc, palette.cursor);
     let cursor = Cursor::default()
         .symbol("█")
         .style(cursor_style)
@@ -1138,9 +1270,7 @@ fn render_text_selection(
     let end_row = range.end.row.min(visible_last_row);
     let start_col = range.start.col.min(area.width.saturating_sub(1));
     let end_col = range.end.col.min(area.width.saturating_sub(1));
-    let style = Style::default()
-        .fg(readable_fg(palette.nc, palette.foam))
-        .bg(palette.foam);
+    let style = palette.emphasis(palette.nc, palette.foam);
 
     for row in start_row..=end_row {
         // Clip the highlight to the row's glyph extent so trailing blank cells
@@ -1226,26 +1356,23 @@ fn draw_prompt_area(
     palette: Palette,
     config: &config::Config,
 ) {
-    let errors = [
-        app.save_error()
-            .map(|error| format!("State save failed: {error} — edit or quit to retry")),
-        app.operation_error()
-            .map(|error| format!("Operation failed: {error}")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-    let error_height = u16::try_from(errors.len()).unwrap_or(u16::MAX);
-    let [error_area, prompt_area] =
-        Layout::vertical([Constraint::Length(error_height), Constraint::Min(0)]).areas(area);
-    if !errors.is_empty() {
-        let lines = errors
-            .into_iter()
-            .map(|error| Line::from(Span::styled(error, Style::default().fg(palette.love))))
+    let notices = app.notices();
+    let notice_height = u16::try_from(notices.len()).unwrap_or(u16::MAX);
+    let [notice_area, prompt_area] =
+        Layout::vertical([Constraint::Length(notice_height), Constraint::Min(0)]).areas(area);
+    if !notices.is_empty() {
+        let lines = notices
+            .iter()
+            .map(|notice| {
+                Line::from(Span::styled(
+                    format!("{} {}", notice_marker(notice.level()), notice.text()),
+                    notice_style(notice.level(), palette),
+                ))
+            })
             .collect::<Vec<_>>();
         frame.render_widget(
             Paragraph::new(lines).style(Style::default().fg(palette.text).bg(palette.base)),
-            error_area,
+            notice_area,
         );
     }
 
@@ -1261,7 +1388,7 @@ fn draw_prompt_area(
                 area,
                 palette,
                 &prompt.input,
-                prompt.selected,
+                prompt.selected.index(),
                 prompt.error.as_deref(),
                 app.open_workspace_matches(&config.projects),
             )
@@ -1289,7 +1416,7 @@ fn draw_prompt_area(
             area,
             palette,
             &prompt.input,
-            prompt.selected,
+            prompt.selected.index(),
             app.active_command_palette_entries(),
         ),
         Prompt::Search(prompt) => draw_text_prompt(
@@ -1339,6 +1466,135 @@ fn draw_delete_confirmation_prompt(
     );
 }
 
+/// The keybinding overlay (E4).
+///
+/// Generated from [`crate::app::BINDINGS`], the same table the command palette
+/// filters, so a binding cannot be added to one and forgotten in the other.
+/// It is drawn over the frame rather than in the layout, so it costs nothing
+/// while it is down, and it degrades by truncation on a small terminal instead
+/// of overflowing: rows past the bottom are dropped and a footer says so.
+fn draw_help_overlay(frame: &mut Frame, frame_area: Rect, palette: Palette) {
+    if frame_area.is_empty() {
+        return;
+    }
+
+    // The overlay is a bordered panel as wide as its widest row and no wider
+    // than the frame. A fixed 64-column cap clipped the longest labels mid-word
+    // — "Move through results (palette, projec" — with nothing on screen to say
+    // they had been cut, and without a border it ran straight into whatever
+    // pane it covered ("▣ websKeybindings"). `CHROME` is the two columns and two
+    // rows the border costs.
+    const KEY_GAP: usize = 2;
+    const CHROME: u16 = 2;
+    let key_width = crate::app::BINDINGS
+        .iter()
+        .filter_map(|binding| binding.keys)
+        .map(text_width)
+        .max()
+        .unwrap_or(0);
+    let label_width = crate::app::BINDINGS
+        .iter()
+        .filter(|binding| binding.keys.is_some())
+        .map(|binding| text_width(binding.label))
+        .max()
+        .unwrap_or(0);
+    let footer = "esc / ? / F1 closes • ctrl-p opens the command palette";
+    let natural_width = (key_width + KEY_GAP + label_width).max(text_width(footer));
+    let width = u16::try_from(natural_width)
+        .unwrap_or(u16::MAX)
+        .saturating_add(CHROME)
+        .clamp(1, frame_area.width);
+    // What is left for a label once the border, the key column and its gap are
+    // paid for. Zero on a terminal narrower than the key column itself, where
+    // the rows are already degenerate.
+    let label_budget =
+        usize::from(width.saturating_sub(CHROME)).saturating_sub(key_width + KEY_GAP);
+
+    let mut lines = vec![Line::from(Span::styled(
+        "Keybindings",
+        Style::default()
+            .fg(palette.foam)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    for scope in [
+        crate::app::BindingScope::Global,
+        crate::app::BindingScope::Prompt,
+        crate::app::BindingScope::Mouse,
+    ] {
+        let mut heading_written = false;
+        for binding in crate::app::BINDINGS
+            .iter()
+            .filter(|binding| binding.scope == scope)
+        {
+            let Some(keys) = binding.keys else {
+                // Palette-only commands have no key to list; the palette itself
+                // is where they are discovered, and `Ctrl+p` is listed above.
+                continue;
+            };
+            if !heading_written {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    scope.title(),
+                    palette.accent(palette.iris, true),
+                )));
+                heading_written = true;
+            }
+            let padding = " ".repeat(key_width.saturating_sub(text_width(keys)));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{keys}{padding}"),
+                    palette.accent(palette.gold, false),
+                ),
+                Span::raw(" ".repeat(KEY_GAP)),
+                // Truncated with an ellipsis rather than clipped by the
+                // terminal, so a cut label says that it was cut.
+                Span::raw(truncate_text(binding.label, label_budget)),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        footer,
+        palette.accent(palette.muted, false),
+    )));
+
+    // Centre the overlay, but never let it exceed the frame: on a terminal too
+    // small for the whole list the visible part is still correct.
+    let height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(CHROME)
+        .clamp(1, frame_area.height);
+    let content_height = usize::from(height.saturating_sub(CHROME));
+    if content_height < lines.len() {
+        // Spend the last visible row saying the list is cut off rather than
+        // ending mid-table with no explanation.
+        lines.truncate(content_height.saturating_sub(1));
+        lines.push(Line::from(Span::styled(
+            "… resize for the rest",
+            palette.accent(palette.muted, false),
+        )));
+    }
+    let area = Rect {
+        x: frame_area.x + (frame_area.width - width) / 2,
+        y: frame_area.y + (frame_area.height - height) / 2,
+        width,
+        height,
+    };
+
+    let style = Style::default().fg(palette.text).bg(palette.base);
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered()
+                    .border_style(Style::default().fg(palette.muted).bg(palette.base))
+                    .style(style),
+            )
+            .style(style),
+        area,
+    );
+}
+
 fn search_prompt_label(scope: SearchScope) -> &'static str {
     match scope {
         SearchScope::Terminal(_) => "Search terminal: ",
@@ -1346,20 +1602,50 @@ fn search_prompt_label(scope: SearchScope) -> &'static str {
     }
 }
 
+/// The prompt's label, its text and its cursor, as spans.
+///
+/// The text is emitted verbatim in up to three spans — before the cursor, the
+/// single character under it, and after it — so concatenating them reproduces
+/// the stored string exactly. That is what keeps the cursor at the right
+/// *display* column for wide and combining characters: the character under the
+/// cursor is styled, never substituted, so it still occupies its own width.
+/// The only span that is not part of the text is the block drawn when the
+/// cursor sits past the last character, where there is no cell to style (E7).
+fn prompt_input_spans(
+    label: &'static str,
+    input: &crate::app::PromptInput,
+    palette: Palette,
+) -> Vec<Span<'static>> {
+    let (before, at, after) = input.split_at_cursor();
+    let mut spans = vec![
+        Span::styled(label, palette.accent(palette.muted, false)),
+        Span::raw(before.to_string()),
+    ];
+    if at.is_empty() {
+        spans.push(Span::styled(
+            "▌",
+            palette.accent(palette.cursor, palette.monochrome),
+        ));
+    } else {
+        spans.push(Span::styled(
+            at.to_string(),
+            palette.emphasis(palette.nc, palette.cursor),
+        ));
+        spans.push(Span::raw(after.to_string()));
+    }
+    spans
+}
+
 fn draw_open_workspace_prompt(
     frame: &mut Frame,
     area: Rect,
     palette: Palette,
-    input: &str,
+    input: &crate::app::PromptInput,
     selected: usize,
     error: Option<&str>,
     entries: Vec<OpenWorkspaceMatch>,
 ) {
-    let mut lines = vec![Line::from(vec![
-        Span::styled("Project: ", Style::default().fg(palette.muted)),
-        Span::raw(input.to_string()),
-        Span::styled("▌", Style::default().fg(palette.cursor)),
-    ])];
+    let mut lines = vec![Line::from(prompt_input_spans("Project: ", input, palette))];
 
     if let Some(error) = error {
         lines.push(Line::from(Span::styled(
@@ -1399,10 +1685,7 @@ fn open_workspace_match_line(
 ) -> Line<'static> {
     let marker = if selected { "› " } else { "  " };
     let style = if selected {
-        Style::default()
-            .fg(palette.text)
-            .bg(palette.highlight_med)
-            .add_modifier(Modifier::BOLD)
+        palette.selected_row()
     } else {
         Style::default().fg(palette.text)
     };
@@ -1420,19 +1703,15 @@ fn draw_command_palette_prompt(
     frame: &mut Frame,
     area: Rect,
     palette: Palette,
-    input: &str,
+    input: &crate::app::PromptInput,
     selected: usize,
     entries: Vec<CommandPaletteEntry>,
 ) {
     let mut lines = vec![
-        Line::from(vec![
-            Span::styled("Command: ", Style::default().fg(palette.muted)),
-            Span::raw(input.to_string()),
-            Span::styled("▌", Style::default().fg(palette.cursor)),
-        ]),
+        Line::from(prompt_input_spans("Command: ", input, palette)),
         Line::from(Span::styled(
             "type to filter • ↑/↓ select • enter runs • esc cancels".to_string(),
-            Style::default().fg(palette.muted),
+            palette.accent(palette.muted, false),
         )),
     ];
 
@@ -1467,10 +1746,7 @@ fn command_palette_line(
 ) -> Line<'static> {
     let marker = if selected { "› " } else { "  " };
     let style = if selected {
-        Style::default()
-            .fg(palette.text)
-            .bg(palette.highlight_med)
-            .add_modifier(Modifier::BOLD)
+        palette.selected_row()
     } else {
         Style::default().fg(palette.text)
     };
@@ -1488,22 +1764,18 @@ fn draw_text_prompt(
     area: Rect,
     palette: Palette,
     label: &'static str,
-    input: &str,
+    input: &crate::app::PromptInput,
     error: Option<&str>,
     help: &'static str,
 ) {
     let message = error.unwrap_or(help);
     let message_style = if error.is_some() {
-        Style::default().fg(palette.love)
+        palette.accent(palette.love, true)
     } else {
-        Style::default().fg(palette.muted)
+        palette.accent(palette.muted, false)
     };
     let prompt = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled(label, Style::default().fg(palette.muted)),
-            Span::raw(input.to_string()),
-            Span::styled("▌", Style::default().fg(palette.cursor)),
-        ]),
+        Line::from(prompt_input_spans(label, input, palette)),
         Line::from(Span::styled(message.to_string(), message_style)),
     ])
     .style(Style::default().fg(palette.text).bg(palette.base));
@@ -1543,47 +1815,84 @@ fn command_label_or_default(command: &str) -> String {
     }
 }
 
-/// Color of the agent status dot in the sidebar. Blue (`pine`, running) and
-/// gray (`muted`, inactive) are live states; green (`success`), yellow
-/// (`gold`), and red (`love`) act as notifications that the agent wants the
-/// user's attention. Green is suppressed once the finished agent has been seen
-/// (`done_seen`); yellow and red persist until the status itself changes — i.e.
-/// until a new prompt or an answered option moves the agent back to running.
-fn chat_status_style(status: ChatStatus, done_seen: bool, palette: Palette) -> Style {
-    let color = match status {
-        ChatStatus::Thinking => palette.pine,
-        ChatStatus::Waiting => palette.gold,
-        ChatStatus::Failed => palette.love,
-        ChatStatus::Done if !done_seen => palette.success,
-        ChatStatus::Done | ChatStatus::Idle => palette.muted,
+/// The agent status marker in the sidebar: glyph first, colour second (E8).
+///
+/// Every chat used to render the identical `"● "`, with the whole signal in the
+/// hue, so a red-green colourblind user could not tell a finished agent from a
+/// failed one — and with `NO_COLOR` (E10) nobody could. The shape now carries
+/// the state and the colour reinforces it. All six glyphs are single-width and
+/// long-standing Unicode; none needs a Nerd Font or an emoji font.
+///
+/// Blue (`pine`, running) and gray (`muted`, inactive) are live states; green
+/// (`success`), yellow (`gold`) and red (`love`) act as notifications that the
+/// agent wants the user's attention. Green is suppressed once the finished
+/// agent has been seen (`done_seen`); yellow and red persist until the status
+/// itself changes — i.e. until a new prompt or an answered option moves the
+/// agent back to running.
+fn chat_status_marker(
+    status: ChatStatus,
+    done_seen: bool,
+    palette: Palette,
+) -> (&'static str, Style) {
+    let (glyph, color, emphatic) = match status {
+        // half-filled: work in progress
+        ChatStatus::Thinking => ("◐ ", palette.pine, false),
+        // a question: the agent is asking the user to choose
+        ChatStatus::Waiting => ("? ", palette.gold, true),
+        ChatStatus::Failed => ("✗ ", palette.love, true),
+        // a tick only while the finish has not been acknowledged
+        ChatStatus::Done if !done_seen => ("✓ ", palette.success, true),
+        // settled: filled for a seen finish, hollow for never-started
+        ChatStatus::Done => ("● ", palette.muted, false),
+        ChatStatus::Idle => ("○ ", palette.muted, false),
     };
 
-    Style::default().fg(color)
+    (glyph, palette.accent(color, emphatic))
 }
 
-fn terminal_icon_style(
+/// The terminal marker in the sidebar, on the same principle as
+/// [`chat_status_marker`]: `>` is running, `✓`/`✗` are how it ended, `$` is a
+/// terminal that has not run anything worth reporting.
+fn terminal_icon_marker(
     terminal: &TerminalSession,
     pty_runtime: &PtyRuntime,
     focused: bool,
     palette: Palette,
-) -> Style {
-    let color = if terminal_has_active_command(terminal, pty_runtime) {
-        palette.pine
+) -> (&'static str, Style) {
+    let (glyph, color, emphatic) = if terminal_has_active_command(terminal, pty_runtime) {
+        ("> ", palette.pine, false)
     } else if let Some(exit) = pty_runtime.terminal_exit_status(PtyKey::Terminal(terminal.id)) {
         if exit.code == 0 && exit.signal.is_none() {
+            // A clean exit the user is already looking at is not news.
             if focused {
-                palette.muted
+                ("✓ ", palette.muted, false)
             } else {
-                palette.success
+                ("✓ ", palette.success, true)
             }
         } else {
-            palette.love
+            ("✗ ", palette.love, true)
         }
     } else {
-        palette.muted
+        ("$ ", palette.muted, false)
     };
 
-    Style::default().fg(color)
+    (glyph, palette.accent(color, emphatic))
+}
+
+fn notice_marker(level: crate::app::NoticeLevel) -> &'static str {
+    match level {
+        crate::app::NoticeLevel::Info => "i",
+        crate::app::NoticeLevel::Warning => "!",
+        crate::app::NoticeLevel::Error => "✗",
+    }
+}
+
+fn notice_style(level: crate::app::NoticeLevel, palette: Palette) -> Style {
+    match level {
+        crate::app::NoticeLevel::Info => palette.accent(palette.foam, false),
+        crate::app::NoticeLevel::Warning => palette.accent(palette.gold, true),
+        crate::app::NoticeLevel::Error => palette.accent(palette.love, true),
+    }
 }
 
 fn terminal_has_active_command(terminal: &TerminalSession, pty_runtime: &PtyRuntime) -> bool {
@@ -1670,7 +1979,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_icon_color_tracks_active_commands_and_completion_focus() {
+    fn terminal_icon_shape_and_color_track_active_commands_and_completion_focus() {
         let palette = test_palette();
         let pty_runtime = PtyRuntime::new_offline();
         let mut shell_terminal = TerminalSession {
@@ -1681,14 +1990,14 @@ mod tests {
         };
 
         assert_eq!(
-            terminal_icon_style(&shell_terminal, &pty_runtime, false, palette),
-            Style::default().fg(palette.muted)
+            terminal_icon_marker(&shell_terminal, &pty_runtime, false, palette),
+            ("$ ", Style::default().fg(palette.muted))
         );
 
         shell_terminal.status = TerminalStatus::Running;
         assert_eq!(
-            terminal_icon_style(&shell_terminal, &pty_runtime, false, palette),
-            Style::default().fg(palette.muted)
+            terminal_icon_marker(&shell_terminal, &pty_runtime, false, palette),
+            ("$ ", Style::default().fg(palette.muted))
         );
 
         let command_terminal = TerminalSession {
@@ -1700,8 +2009,8 @@ mod tests {
         let mut running_runtime = PtyRuntime::new_offline();
         running_runtime.mark_running_for_test(PtyKey::Terminal(command_terminal.id));
         assert_eq!(
-            terminal_icon_style(&command_terminal, &running_runtime, false, palette),
-            Style::default().fg(palette.pine)
+            terminal_icon_marker(&command_terminal, &running_runtime, false, palette),
+            ("> ", Style::default().fg(palette.pine))
         );
 
         let mut done_runtime = PtyRuntime::new_offline();
@@ -1713,48 +2022,92 @@ mod tests {
             },
         );
         assert_eq!(
-            terminal_icon_style(&command_terminal, &done_runtime, false, palette),
-            Style::default().fg(palette.success)
+            terminal_icon_marker(&command_terminal, &done_runtime, false, palette),
+            ("\u{2713} ", Style::default().fg(palette.success))
         );
         assert_eq!(
-            terminal_icon_style(&command_terminal, &done_runtime, true, palette),
-            Style::default().fg(palette.muted)
+            terminal_icon_marker(&command_terminal, &done_runtime, true, palette),
+            ("\u{2713} ", Style::default().fg(palette.muted))
+        );
+
+        let mut failed_runtime = PtyRuntime::new_offline();
+        failed_runtime.record_exit_status_for_test(
+            PtyKey::Terminal(command_terminal.id),
+            crate::pty::PtyExit {
+                code: 1,
+                signal: None,
+            },
+        );
+        // E8: a crash and a clean exit differ in shape, not only in hue.
+        assert_eq!(
+            terminal_icon_marker(&command_terminal, &failed_runtime, false, palette),
+            ("\u{2717} ", Style::default().fg(palette.love))
         );
     }
 
     #[test]
-    fn agent_icon_color_tracks_chat_status() {
+    fn agent_icon_shape_and_color_track_chat_status() {
         let palette = test_palette();
 
         assert_eq!(
-            chat_status_style(ChatStatus::Thinking, false, palette),
-            Style::default().fg(palette.pine)
+            chat_status_marker(ChatStatus::Thinking, false, palette),
+            ("\u{25d0} ", Style::default().fg(palette.pine))
         );
         assert_eq!(
-            chat_status_style(ChatStatus::Waiting, false, palette),
-            Style::default().fg(palette.gold)
+            chat_status_marker(ChatStatus::Waiting, false, palette),
+            ("? ", Style::default().fg(palette.gold))
         );
         assert_eq!(
-            chat_status_style(ChatStatus::Failed, false, palette),
-            Style::default().fg(palette.love)
+            chat_status_marker(ChatStatus::Failed, false, palette),
+            ("\u{2717} ", Style::default().fg(palette.love))
         );
         // Green only while the finished agent has not been seen; gray once seen.
         assert_eq!(
-            chat_status_style(ChatStatus::Done, false, palette),
-            Style::default().fg(palette.success)
+            chat_status_marker(ChatStatus::Done, false, palette),
+            ("\u{2713} ", Style::default().fg(palette.success))
         );
         assert_eq!(
-            chat_status_style(ChatStatus::Done, true, palette),
-            Style::default().fg(palette.muted)
+            chat_status_marker(ChatStatus::Done, true, palette),
+            ("\u{25cf} ", Style::default().fg(palette.muted))
         );
         assert_eq!(
-            chat_status_style(ChatStatus::Idle, false, palette),
-            Style::default().fg(palette.muted)
+            chat_status_marker(ChatStatus::Idle, false, palette),
+            ("\u{25cb} ", Style::default().fg(palette.muted))
         );
     }
 
     #[test]
-    fn default_sidebar_agent_icon_is_gray() {
+    fn every_status_is_a_distinct_single_width_glyph() {
+        // E8: colour must never be the only carrier of state. Two states that
+        // share a glyph would be indistinguishable to a colourblind user and
+        // under `NO_COLOR`, and a double-width glyph would shift the label of
+        // that one row.
+        let palette = test_palette();
+        let markers = [
+            chat_status_marker(ChatStatus::Idle, false, palette).0,
+            chat_status_marker(ChatStatus::Thinking, false, palette).0,
+            chat_status_marker(ChatStatus::Waiting, false, palette).0,
+            chat_status_marker(ChatStatus::Done, false, palette).0,
+            chat_status_marker(ChatStatus::Done, true, palette).0,
+            chat_status_marker(ChatStatus::Failed, false, palette).0,
+        ];
+        let unique = markers.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            unique.len(),
+            markers.len(),
+            "{markers:?} are not all distinct"
+        );
+        for marker in markers {
+            assert_eq!(
+                text_width(marker),
+                2,
+                "{marker:?} is not one glyph plus a space"
+            );
+        }
+    }
+
+    #[test]
+    fn default_sidebar_agent_icon_is_a_gray_hollow_circle() {
         let app = App::seeded();
         let backend = TestBackend::new(80, 6);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
@@ -1775,12 +2128,12 @@ mod tests {
             .buffer()
             .cell((3, 1))
             .expect("chat icon is in bounds");
-        assert_eq!(icon_cell.symbol(), "●");
+        assert_eq!(icon_cell.symbol(), "○");
         assert_eq!(icon_cell.fg, palette.muted);
     }
 
     #[test]
-    fn selected_done_sidebar_agent_icon_is_gray() {
+    fn selected_done_sidebar_agent_icon_is_a_gray_filled_circle() {
         let mut app = App::seeded();
         let workspace = app.project.workspaces[0].id;
         let chat = app.project.workspaces[0].chats[0].id;
@@ -1806,13 +2159,16 @@ mod tests {
             .buffer()
             .cell((3, 1))
             .expect("selected chat icon is in bounds");
+        // Seen-and-finished: filled, settled, gray — distinct in shape from
+        // the hollow "never started" circle and from the tick of an unseen
+        // finish.
         assert_eq!(icon_cell.symbol(), "●");
         assert_eq!(icon_cell.fg, palette.muted);
         assert_eq!(icon_cell.bg, palette.highlight_med);
     }
 
     #[test]
-    fn waiting_sidebar_agent_icon_is_yellow() {
+    fn waiting_sidebar_agent_icon_is_a_yellow_question_mark() {
         let mut app = App::seeded();
         app.project.workspaces[0].chats[0].status = ChatStatus::Waiting;
 
@@ -1835,7 +2191,7 @@ mod tests {
             .buffer()
             .cell((3, 1))
             .expect("chat icon is in bounds");
-        assert_eq!(icon_cell.symbol(), "●");
+        assert_eq!(icon_cell.symbol(), "?");
         // Waiting (the agent is asking the user to pick an option) is yellow,
         // and stays yellow even while selected — only an answer clears it.
         assert_eq!(icon_cell.fg, palette.gold);
@@ -2361,10 +2717,23 @@ mod tests {
         width: u16,
         height: u16,
     ) -> Buffer {
+        render_buffer_with_palette(app, pty_runtime, config, config.palette(), width, height)
+    }
+
+    /// `NO_COLOR` is a process global that no test may mutate (G7), so the
+    /// monochrome frames drive the palette seam instead.
+    fn render_buffer_with_palette(
+        app: &App,
+        pty_runtime: &PtyRuntime,
+        config: &config::Config,
+        palette: Palette,
+        width: u16,
+        height: u16,
+    ) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
-            .draw(|frame| draw(frame, app, pty_runtime, config))
+            .draw(|frame| draw_with_palette(frame, app, pty_runtime, config, palette))
             .expect("draw app");
         terminal.backend().buffer().clone()
     }
@@ -2517,6 +2886,248 @@ mod tests {
             frame_area.width,
             frame_area.height,
         )));
+    }
+
+    #[test]
+    fn snapshot_help_overlay() {
+        // E4: the overlay is generated from `app::BINDINGS`, so this snapshot
+        // is also the check that adding a binding without a label, or a
+        // palette command without a key, changes what the user is shown.
+        let mut app = App::default();
+        app.show_help();
+
+        insta::assert_snapshot!(buffer_snapshot(&render_buffer(
+            &app,
+            &PtyRuntime::new_offline(),
+            &config::Config::default(),
+            100,
+            40,
+        )));
+    }
+
+    #[test]
+    fn snapshot_status_surface_with_an_error() {
+        // E2: a daemon that will not connect, a save that failed and a config
+        // warning all land in one dismissible surface that exists only while
+        // it has something to say.
+        let mut app = App::default();
+        app.push_notice(
+            crate::app::NoticeLevel::Error,
+            crate::app::NoticeSource::Report,
+            "failed to connect to mult-server: No such file or directory (os error 2)",
+        );
+        app.push_notice(
+            crate::app::NoticeLevel::Warning,
+            crate::app::NoticeSource::Report,
+            "config.json: colorscheme.gold is not a #rrggbb color",
+        );
+        app.record_save_failure("Read-only file system (os error 30)");
+
+        insta::assert_snapshot!(buffer_snapshot(&render_buffer(
+            &app,
+            &PtyRuntime::new_offline(),
+            &config::Config::default(),
+            100,
+            30,
+        )));
+    }
+
+    #[test]
+    fn snapshot_no_color_frame() {
+        // E10: every colour is `Color::Reset`, and the selected sidebar row is
+        // reverse video rather than a background colour, so the frame still
+        // reads. The style legend is the assertion here.
+        let mut app = App::default();
+        app.project.workspaces[0]
+            .chats
+            .push(crate::model::ChatSession {
+                id: ChatId(4242),
+                name: "agent".to_string(),
+                status: ChatStatus::Waiting,
+                agent: AgentKind::Pi,
+                messages: Vec::new(),
+            });
+
+        insta::assert_snapshot!(buffer_snapshot(&render_buffer_with_palette(
+            &app,
+            &PtyRuntime::new_offline(),
+            &config::Config::default(),
+            Palette::monochrome(),
+            100,
+            30,
+        )));
+    }
+
+    #[test]
+    fn no_color_emits_no_color_at_all_and_keeps_overlays_distinguishable() {
+        let mut app = App::default();
+        let selected = app
+            .nav_items()
+            .iter()
+            .position(|item| matches!(item, NavItem::Terminal { .. }))
+            .expect("seed state has a terminal");
+        app.select_nav_index(selected);
+
+        let buffer = render_buffer_with_palette(
+            &app,
+            &PtyRuntime::new_offline(),
+            &config::Config::default(),
+            Palette::monochrome(),
+            100,
+            30,
+        );
+
+        // Not one truecolor or indexed escape: with `NO_COLOR` the terminal's
+        // own defaults are the only colours used.
+        for y in buffer.area().top()..buffer.area().bottom() {
+            for x in buffer.area().left()..buffer.area().right() {
+                let cell = buffer.cell((x, y)).expect("cell is in bounds");
+                assert_eq!(cell.fg, Color::Reset, "cell ({x},{y}) painted a foreground");
+                assert_eq!(cell.bg, Color::Reset, "cell ({x},{y}) painted a background");
+            }
+        }
+
+        // The selected sidebar row is still marked — by an attribute, not by a
+        // hardcoded RGB fallback, which is the trap E10 exists to avoid.
+        let reversed_rows = (buffer.area().top()..buffer.area().bottom())
+            .filter(|y| {
+                buffer
+                    .cell((0, *y))
+                    .is_some_and(|cell| cell.modifier.contains(Modifier::REVERSED))
+            })
+            .count();
+        assert_eq!(
+            reversed_rows, 1,
+            "exactly the selected sidebar row must be reverse video"
+        );
+    }
+
+    #[test]
+    fn a_prompt_cursor_styles_a_wide_character_without_rewriting_the_text() {
+        // E7: the spans that carry text must concatenate back to the stored
+        // string exactly, so the cursor lands on the right display column even
+        // when the character under it is double-width or carries a combining
+        // mark.
+        let palette = test_palette();
+        let mut input = crate::app::PromptInput::new("a日e\u{0301}b");
+        assert!(input.apply(crate::app::PromptEdit::MoveHome));
+        assert!(input.apply(crate::app::PromptEdit::MoveRight));
+
+        let spans = prompt_input_spans("Path: ", &input, palette);
+        // The label is span 0; the rest is the text, verbatim.
+        assert_eq!(spans[0].content, "Path: ");
+        let text = spans[1..]
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(text, input.as_str());
+        // The cursor is on the wide character itself, styled rather than
+        // replaced, so it keeps its two columns.
+        assert_eq!(spans[2].content, "日");
+        assert_eq!(text_width(&spans[1].content), 1);
+        assert_eq!(text_width(&spans[2].content), 2);
+
+        // Past the last character there is no cell to style, so the block is
+        // appended — the one span that is not part of the text.
+        assert!(input.apply(crate::app::PromptEdit::MoveEnd));
+        let spans = prompt_input_spans("Path: ", &input, palette);
+        assert_eq!(spans[1].content, input.as_str());
+        assert_eq!(spans[2].content, "▌");
+    }
+
+    #[test]
+    fn the_help_overlay_survives_a_terminal_too_small_to_hold_it() {
+        let mut app = App::default();
+        app.show_help();
+
+        // Down to a single cell: rendering must not panic, and anything with
+        // room for words must say the list is cut off rather than end
+        // mid-table.
+        for (width, height) in [(1, 1), (20, 4), (40, 8), (100, 12)] {
+            let text = draw_text(&app, &PtyRuntime::new_offline(), width, height);
+            if width >= 40 {
+                assert!(
+                    text.contains("resize for the rest"),
+                    "{width}x{height} truncated the overlay silently"
+                );
+            }
+        }
+
+        // With room for everything, no truncation notice.
+        let text = draw_text(&app, &PtyRuntime::new_offline(), 100, 40);
+        assert!(text.contains("Keybindings"));
+        assert!(text.contains("Ctrl+p"));
+        assert!(!text.contains("resize for the rest"));
+    }
+
+    /// E4: the overlay used to be capped at 64 columns whatever the terminal
+    /// was, so its longest labels were clipped mid-word by the renderer — "Move
+    /// through results (palette, projec" — with nothing to mark the cut. It is
+    /// now as wide as its widest row, and a label it genuinely cannot fit ends
+    /// in an ellipsis.
+    #[test]
+    fn the_help_overlay_fits_its_labels_and_marks_the_ones_it_cannot() {
+        let mut app = App::default();
+        app.show_help();
+        let longest = crate::app::BINDINGS
+            .iter()
+            .filter(|binding| binding.keys.is_some())
+            .map(|binding| binding.label)
+            .max_by_key(|label| text_width(label))
+            .expect("the table has bindings with keys");
+
+        let roomy = draw_text(&app, &PtyRuntime::new_offline(), 120, 40);
+        assert!(
+            roomy.contains(longest),
+            "the widest label must be shown whole: {longest:?}"
+        );
+        assert!(
+            !roomy.contains('…'),
+            "nothing was cut, so nothing is marked"
+        );
+
+        // Too narrow for the longest label, but wide enough to say so.
+        let narrow = draw_text(&app, &PtyRuntime::new_offline(), 60, 40);
+        assert!(!narrow.contains(longest));
+        assert!(
+            narrow.contains('…'),
+            "a clipped label must say it was clipped"
+        );
+    }
+
+    /// E12: chat search reads the structured transcript, which nothing writes
+    /// today. "No matches." on its own is a lie by omission — it reads as "your
+    /// text is not in this chat" rather than "there is nothing here to search".
+    #[test]
+    fn searching_a_chat_says_the_structured_transcript_is_not_populated() {
+        let mut app = App::default();
+        let workspace = app.project.workspaces[0].id;
+        let chat = app
+            .project
+            .add_chat(
+                workspace,
+                "chat".to_string(),
+                ChatStatus::Idle,
+                AgentKind::Pi,
+            )
+            .expect("identity")
+            .expect("chat added");
+        app.select_item(NavItem::Chat { workspace, chat });
+        assert!(app.begin_search(), "a selected chat can be searched");
+        for ch in "hello".chars() {
+            app.push_prompt_char(ch);
+        }
+        app.submit_search();
+
+        let text = draw_text(&app, &PtyRuntime::new_offline(), 100, 30);
+        assert!(
+            text.contains("no structured transcript to search"),
+            "{text}"
+        );
+        assert!(
+            text.contains("experimental process-agent backend"),
+            "{text}"
+        );
     }
 
     fn vt100_parser(rows: u16, cols: u16, bytes: &[u8]) -> vt100::Parser {
@@ -2774,6 +3385,7 @@ mod tests {
                 highlight_med: moon::HIGHLIGHT_MED,
                 cursor: moon::CURSOR,
                 success: moon::SUCCESS,
+                monochrome: false,
             }
         );
         // ...and every default parses, so no key is silently on a fallback.

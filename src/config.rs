@@ -1,16 +1,19 @@
 use std::{
     env,
     ffi::OsStr,
-    io,
+    fmt, io,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{
+    de::{self, MapAccess, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 
 use crate::{
     paths,
-    storage::{read_private_file, SecureDirectory},
+    storage::{read_private_file, SecureDirectory, CONFIG_DIRECTORY},
     ui::Palette,
 };
 
@@ -20,7 +23,21 @@ const CONFIG_FILE_NAME: &str = "config.json";
 /// writes; anything near this is not one.
 const MAX_CONFIG_FILE_BYTES: usize = 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The parsed `config.json`.
+///
+/// Two policies, applied consistently (documented in `docs/CONFIG.md`):
+///
+/// - anything that means the file cannot be understood is a **startup error**:
+///   malformed JSON, a value of the wrong type, and — with
+///   `deny_unknown_fields` — a key `mult` does not know. A typo used to be
+///   accepted and do nothing, which is indistinguishable from the feature not
+///   working (E6).
+/// - anything that has a safe, obvious fallback is a **warning**: a colour that
+///   does not parse keeps the built-in default, and a `projects` entry pointing
+///   somewhere that does not exist is still offered. Both are collected into
+///   [`Config::warnings`] rather than swallowed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default_pi_agent_command")]
     pub pi_agent_command: String,
@@ -47,6 +64,15 @@ pub struct Config {
     pub projects: Vec<ConfiguredProject>,
     #[serde(default)]
     pub colorscheme: ColorSchemeConfig,
+    /// Non-fatal problems found while loading, in file order. Derived from the
+    /// keys above rather than read from the file, so it is skipped by serde and
+    /// ignored by equality.
+    ///
+    /// Read it through [`Config::warnings`]. It is public only so a `Config`
+    /// stays constructible with a struct literal outside this crate, which the
+    /// binary's tests rely on; loading is the only thing that should write it.
+    #[serde(skip)]
+    pub warnings: Vec<String>,
 }
 
 impl Config {
@@ -55,12 +81,100 @@ impl Config {
     pub fn palette(&self) -> Palette {
         self.colorscheme.palette()
     }
+
+    /// Problems that did not stop startup, each a complete sentence naming the
+    /// config file.
+    ///
+    /// `main` prints these to stderr today. They are exposed as plain strings
+    /// so the in-app status surface (E2) can show them without knowing anything
+    /// about colours or project paths.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// Collects the value-level warnings for a config just read from `path`.
+    fn collect_warnings(&mut self, path: &Path) {
+        let file = path.display();
+        let mut warnings = Vec::new();
+
+        for issue in Palette::from_colorscheme_reporting(&self.colorscheme).1 {
+            warnings.push(format!(
+                "{file}: colorscheme.{} is not a #rrggbb color ({:?}); keeping the built-in default",
+                issue.key, issue.value
+            ));
+        }
+
+        for (index, project) in self.projects.iter().enumerate() {
+            if project.name.trim().is_empty() {
+                warnings.push(format!("{file}: projects[{index}] has an empty name"));
+            }
+            if project.path.as_os_str().is_empty() {
+                warnings.push(format!("{file}: projects[{index}] has an empty path"));
+                continue;
+            }
+            // Checked, not enforced: a project directory may legitimately be on
+            // a filesystem that is not mounted yet, and refusing to start over a
+            // shortcut nobody pressed would be absurd. The shortcut stays in the
+            // list either way and fails when it is opened.
+            let expanded = project.expanded_path();
+            if !expanded.is_dir() {
+                warnings.push(format!(
+                    "{file}: project {:?} points at {} which is not a directory; the shortcut is still offered",
+                    project.name,
+                    expanded.display()
+                ));
+            }
+        }
+
+        self.warnings = warnings;
+    }
 }
+
+// Equality is over the configured values only. `warnings` is derived from them
+// plus the state of the filesystem at load time, so two configs with the same
+// contents stay equal whether or not either was read from disk — the same rule
+// the memoized palette follows.
+impl PartialEq for Config {
+    fn eq(&self, other: &Self) -> bool {
+        self.pi_agent_command == other.pi_agent_command
+            && self.claude_code_command == other.claude_code_command
+            && self.auto_start_pi_agent == other.auto_start_pi_agent
+            && self.auto_start_claude_code_agent == other.auto_start_claude_code_agent
+            && self.auto_start_terminals == other.auto_start_terminals
+            && self.mouse_capture == other.mouse_capture
+            && self.clipboard_osc52 == other.clipboard_osc52
+            && self.projects == other.projects
+            && self.colorscheme == other.colorscheme
+    }
+}
+
+impl Eq for Config {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ConfiguredProject {
     pub name: String,
     pub path: PathBuf,
+}
+
+impl ConfiguredProject {
+    /// `path` with a leading `~` expanded from `$HOME`, as the open-workspace
+    /// prompt expands it before importing the workspace.
+    ///
+    /// `app::expand_path` is the twin of this and should collapse onto it when
+    /// F20 folds the duplicated helpers together; it is duplicated rather than
+    /// shared today because `app` is not a dependency of `config`.
+    pub fn expanded_path(&self) -> PathBuf {
+        let Some(text) = self.path.to_str() else {
+            return self.path.clone();
+        };
+        if text == "~" {
+            return env::var_os("HOME").map_or_else(|| self.path.clone(), PathBuf::from);
+        }
+        match (text.strip_prefix("~/"), env::var_os("HOME")) {
+            (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+            _ => self.path.clone(),
+        }
+    }
 }
 
 /// The built-in color scheme (Rosé Pine Moon), as the hex strings a user would
@@ -102,6 +216,7 @@ pub const DEFAULT_COLOR_SCHEME: DefaultColorScheme = DefaultColorScheme {
 };
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ColorSchemeConfig {
     #[serde(default = "default_moon_nc", rename = "_nc", alias = "nc")]
     pub nc: String,
@@ -203,27 +318,84 @@ impl Default for Config {
             clipboard_osc52: default_clipboard_osc52(),
             projects: Vec::new(),
             colorscheme: ColorSchemeConfig::default(),
+            warnings: Vec::new(),
         }
     }
 }
 
+/// A project is written either as `{"name": …, "path": …}` or as the pair
+/// `["name", "path"]`.
+///
+/// Hand-written rather than an `#[serde(untagged)]` enum: untagged buffers the
+/// value and reports every failure as "data did not match any variant", losing
+/// both the offending key and the line it was on. Streaming it keeps
+/// `deny_unknown_fields`-quality messages *and* serde_json's position, so a
+/// mistyped `"pathh"` reads like every other config error (E6).
 impl<'de> Deserialize<'de> for ConfiguredProject {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum RawProject {
-            Object { name: String, path: PathBuf },
-            Pair(String, PathBuf),
-        }
+        struct ProjectVisitor;
 
-        match RawProject::deserialize(deserializer)? {
-            RawProject::Object { name, path } | RawProject::Pair(name, path) => {
-                Ok(Self { name, path })
+        impl<'de> Visitor<'de> for ProjectVisitor {
+            type Value = ConfiguredProject;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter
+                    .write_str("a project object with `name` and `path`, or a [name, path] pair")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<ConfiguredProject, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let name = sequence
+                    .next_element::<String>()?
+                    .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let path = sequence
+                    .next_element::<PathBuf>()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                if sequence.next_element::<de::IgnoredAny>()?.is_some() {
+                    return Err(de::Error::invalid_length(3, &self));
+                }
+                Ok(ConfiguredProject { name, path })
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<ConfiguredProject, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                const FIELDS: &[&str] = &["name", "path"];
+                let mut name: Option<String> = None;
+                let mut path: Option<PathBuf> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "name" => {
+                            if name.is_some() {
+                                return Err(de::Error::duplicate_field("name"));
+                            }
+                            name = Some(map.next_value()?);
+                        }
+                        "path" => {
+                            if path.is_some() {
+                                return Err(de::Error::duplicate_field("path"));
+                            }
+                            path = Some(map.next_value()?);
+                        }
+                        unknown => return Err(de::Error::unknown_field(unknown, FIELDS)),
+                    }
+                }
+
+                Ok(ConfiguredProject {
+                    name: name.ok_or_else(|| de::Error::missing_field("name"))?,
+                    path: path.ok_or_else(|| de::Error::missing_field("path"))?,
+                })
             }
         }
+
+        deserializer.deserialize_any(ProjectVisitor)
     }
 }
 
@@ -247,15 +419,21 @@ impl Default for ColorSchemeConfig {
     }
 }
 
-pub fn load_or_default() -> io::Result<Config> {
-    load_from_path(&resolve_config_path()?)
+/// Loads the config, with `flag` being whatever `--config` carried.
+pub fn load_or_default(flag: Option<&Path>) -> io::Result<Config> {
+    load_from_path(&resolve_config_path(flag)?)
 }
 
-pub fn resolve_config_path() -> io::Result<PathBuf> {
-    config_path_from(env::var_os(CONFIG_PATH_ENV).as_deref(), paths::config_home)
+pub fn resolve_config_path(flag: Option<&Path>) -> io::Result<PathBuf> {
+    config_path_from(
+        flag,
+        env::var_os(CONFIG_PATH_ENV).as_deref(),
+        paths::config_home,
+    )
 }
 
-/// The config-path policy as a pure function of its inputs.
+/// The config-path policy as a pure function of its inputs: `--config`, then
+/// `$MULT_CONFIG_PATH`, then `<config home>/mult/config.json`.
 ///
 /// `$MULT_CONFIG_PATH` is a process global, so the test that used to cover this
 /// either mutated it — racing every sibling test — or branched on whatever the
@@ -264,10 +442,14 @@ pub fn resolve_config_path() -> io::Result<PathBuf> {
 /// drives this directly. `config_home` stays lazy because an explicit override
 /// must keep working on a machine with no resolvable configuration home.
 fn config_path_from(
-    explicit: Option<&OsStr>,
+    flag: Option<&Path>,
+    environment: Option<&OsStr>,
     config_home: impl FnOnce() -> io::Result<PathBuf>,
 ) -> io::Result<PathBuf> {
-    match explicit {
+    if let Some(path) = flag {
+        return Ok(path.to_path_buf());
+    }
+    match environment {
         Some(path) => Ok(PathBuf::from(path)),
         None => Ok(config_home()?.join("mult").join(CONFIG_FILE_NAME)),
     }
@@ -275,8 +457,12 @@ fn config_path_from(
 
 /// Display-oriented compatibility helper. Loading uses [`resolve_config_path`]
 /// and returns an error instead of ever selecting the current directory.
+///
+/// Note this cannot see `--config`: it is called from the renderer, which is
+/// handed a [`Config`] and not the command line. It therefore names the path a
+/// *default* invocation would read.
 pub fn config_path() -> PathBuf {
-    resolve_config_path().unwrap_or_else(|_| PathBuf::from("<configuration path unavailable>"))
+    resolve_config_path(None).unwrap_or_else(|_| PathBuf::from("<configuration path unavailable>"))
 }
 
 /// Read the config with the same discipline as state, and for a sharper reason:
@@ -297,10 +483,10 @@ pub fn config_path() -> PathBuf {
 /// Anything else fails loudly rather than silently running with defaults,
 /// because a rejected config is a signal, not a fallback.
 fn load_from_path(path: &Path) -> io::Result<Config> {
-    let directory = match SecureDirectory::open_parent(path, false, false) {
+    let directory = match SecureDirectory::open_parent_for(path, false, false, CONFIG_DIRECTORY) {
         Ok(directory) => directory,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
-        Err(error) => return Err(error),
+        Err(error) => return Err(describe_read_failure(path, error)),
     };
     let name = path.file_name().ok_or_else(|| {
         io::Error::new(
@@ -309,15 +495,77 @@ fn load_from_path(path: &Path) -> io::Result<Config> {
         )
     })?;
 
-    match read_private_file(
+    let bytes = read_private_file(
         &directory,
         name,
         &format!("config file {}", path.display()),
         MAX_CONFIG_FILE_BYTES,
-    )? {
-        Some(bytes) => serde_json::from_slice(&bytes).map_err(invalid_data),
+    )
+    .map_err(|error| describe_read_failure(path, error))?;
+
+    match bytes {
+        Some(bytes) => {
+            let mut config: Config = serde_json::from_slice(&bytes)
+                .map_err(|error| describe_parse_failure(path, error))?;
+            config.collect_warnings(path);
+            Ok(config)
+        }
         None => Ok(Config::default()),
     }
+}
+
+/// Turns a `serde_json` failure into `config error at <path>:<line>:<col>: …`.
+///
+/// The user used to get a `Debug` dump with no filename in it at all (E5).
+/// serde carries the position separately *and* repeats it at the end of the
+/// message, so the tail is stripped rather than printed twice.
+fn describe_parse_failure(path: &Path, error: serde_json::Error) -> io::Error {
+    let message = error.to_string();
+    let message = match message.find(" at line ") {
+        Some(cut) => &message[..cut],
+        None => message.as_str(),
+    };
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "config error at {}:{}:{}: {message}",
+            path.display(),
+            error.line(),
+            error.column()
+        ),
+    )
+}
+
+/// Names the config file on the failures that happen *below* `mult`, inside the
+/// `O_NOFOLLOW` opens.
+///
+/// A symlinked config is the common one: the open fails with `ELOOP` (or
+/// `ENOTDIR`, when a *directory* on the way is the link) before any of this
+/// module's own descriptions are attached, so the user saw a bare
+/// `Os { code: 40, kind: FilesystemLoop, … }` naming neither the file nor the
+/// reason. That is the layout most dotfile managers produce, so it needs to say
+/// what happened and what to do instead.
+fn describe_read_failure(path: &Path, error: io::Error) -> io::Error {
+    let cause = match error.raw_os_error() {
+        Some(libc::ELOOP) => "the file is a symbolic link",
+        // An `O_NOFOLLOW|O_DIRECTORY` open of a symlinked directory reports
+        // exactly this, as does a plain file used as a directory.
+        Some(libc::ENOTDIR) => {
+            "a directory component of the path is a symbolic link, or is not a directory"
+        }
+        _ => return error,
+    };
+
+    io::Error::new(
+        error.kind(),
+        format!(
+            "config error at {}: {cause}, and symlinked config files are not supported — every \
+             path component is opened with O_NOFOLLOW because the commands in this file are \
+             shell-evaluated and auto-started. Copy the file instead of linking it, or point \
+             --config / $MULT_CONFIG_PATH at a real file",
+            path.display()
+        ),
+    )
 }
 
 fn default_pi_agent_command() -> String {
@@ -396,10 +644,6 @@ fn default_success() -> String {
     DEFAULT_COLOR_SCHEME.success.to_string()
 }
 
-fn invalid_data(error: serde_json::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -431,20 +675,40 @@ mod tests {
 
     #[test]
     fn config_path_uses_config_home_or_override() {
-        let from_home = config_path_from(None, || Ok(PathBuf::from("/xdg-config")))
+        let from_home = config_path_from(None, None, || Ok(PathBuf::from("/xdg-config")))
             .expect("a resolvable config home yields a path");
         assert_eq!(from_home, Path::new("/xdg-config/mult/config.json"));
 
-        let overridden = config_path_from(Some(OsStr::new("/elsewhere/mult.json")), || {
+        let overridden = config_path_from(None, Some(OsStr::new("/elsewhere/mult.json")), || {
             panic!("an override must not consult the configuration home")
         })
         .expect("an override is used verbatim");
         assert_eq!(overridden, Path::new("/elsewhere/mult.json"));
     }
 
+    /// E1's precedence rule, at the seam that decides it: `--config` outranks
+    /// `$MULT_CONFIG_PATH`, which outranks the configuration home.
+    #[test]
+    fn the_config_flag_outranks_the_environment_and_the_default() {
+        let from_flag = config_path_from(
+            Some(Path::new("/flag/config.json")),
+            Some(OsStr::new("/environment/config.json")),
+            || panic!("a flag must not consult the configuration home"),
+        )
+        .expect("the flag is used verbatim");
+        assert_eq!(from_flag, Path::new("/flag/config.json"));
+
+        let from_environment =
+            config_path_from(None, Some(OsStr::new("/environment/config.json")), || {
+                panic!("the environment must not consult the configuration home")
+            })
+            .expect("the environment is used verbatim");
+        assert_eq!(from_environment, Path::new("/environment/config.json"));
+    }
+
     #[test]
     fn config_path_reports_an_unresolvable_home_instead_of_guessing() {
-        let error = config_path_from(None, || {
+        let error = config_path_from(None, None, || {
             Err(io::Error::new(io::ErrorKind::NotFound, "no home"))
         })
         .expect_err("without a config home there is no path to return");
@@ -600,6 +864,178 @@ mod tests {
         let config = load_from_path(&path).expect("load config with no directory");
 
         assert_eq!(config, Config::default());
+    }
+
+    /// G13: a config that is not JSON must fail loudly. Silently starting on
+    /// the defaults would tell the user their file "does not work" with no way
+    /// to find out why.
+    #[test]
+    fn malformed_config_json_is_an_error_not_a_silent_default() {
+        let path = unique_temp_file();
+        fs::write(&path, "{\n  \"pi_agent_command\": \"pi\",\n}\n").expect("write config");
+
+        let error = load_from_path(&path).expect_err("malformed JSON must be refused");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let message = error.to_string();
+        assert!(
+            message.starts_with(&format!("config error at {}:3:1: ", path.display())),
+            "the file and position must lead the message: {message}"
+        );
+        // serde repeats the position at the end of its own message; printing it
+        // twice is noise.
+        assert!(!message.contains("at line 3 column 1"), "{message}");
+        assert!(message.contains("trailing comma"), "{message}");
+    }
+
+    /// G13/E6: `auto_start_terminal` (no `s`) used to be accepted and do
+    /// nothing, which is indistinguishable from the setting not working.
+    #[test]
+    fn unknown_config_keys_are_reported() {
+        let path = unique_temp_file();
+        fs::write(&path, "{\n  \"auto_start_terminal\": false\n}\n").expect("write config");
+
+        let error = load_from_path(&path).expect_err("an unknown key must be refused");
+
+        let message = error.to_string();
+        assert!(
+            message.starts_with(&format!("config error at {}:2:23: ", path.display())),
+            "{message}"
+        );
+        assert!(
+            message.contains("unknown field `auto_start_terminal`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("auto_start_terminals"),
+            "the known keys are listed, so the typo is obvious: {message}"
+        );
+
+        // Nested objects and project entries are held to the same rule.
+        fs::write(&path, r##"{"colorscheme":{"foreground":"#ffffff"}}"##).expect("write config");
+        assert!(load_from_path(&path)
+            .expect_err("an unknown colorscheme key must be refused")
+            .to_string()
+            .contains("unknown field `foreground`"));
+
+        fs::write(&path, r#"{"projects":[{"name":"a","pathh":"/tmp"}]}"#).expect("write config");
+        assert!(load_from_path(&path)
+            .expect_err("an unknown project key must be refused")
+            .to_string()
+            .contains("unknown field `pathh`"));
+    }
+
+    /// G13/E6: a colour that does not parse keeps its default — that part was
+    /// always true — but it is now *reported* instead of vanishing.
+    #[test]
+    fn invalid_color_strings_fall_back_to_the_default_palette_and_report() {
+        let path = unique_temp_file();
+        fs::write(
+            &path,
+            r##"{"colorscheme":{"text":"blue","base":"#12345","_nc":"#000001"}}"##,
+        )
+        .expect("write config");
+
+        let config = load_from_path(&path).expect("a bad colour is not a startup error");
+
+        // The two unparsable keys keep the built-in colours; the valid one is
+        // applied, so this is not simply "the whole scheme was discarded".
+        let mut expected = Config::default();
+        expected.colorscheme.nc = "#000001".to_string();
+        assert_eq!(config.palette(), expected.palette());
+
+        let warnings = config.warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains(&format!("{}: colorscheme.base", path.display()))
+                && warnings[0].contains("\"#12345\"")
+                && warnings[0].contains("keeping the built-in default"),
+            "{warnings:?}"
+        );
+        assert!(warnings[1].contains("colorscheme.text"), "{warnings:?}");
+        assert!(
+            Config::default().warnings().is_empty(),
+            "a valid config warns about nothing"
+        );
+    }
+
+    /// E6: a shortcut pointing nowhere is a warning, not a startup failure —
+    /// the directory may simply not be mounted yet, and nothing has been asked
+    /// of it.
+    #[test]
+    fn a_project_path_that_is_not_a_directory_is_a_warning_not_an_error() {
+        let directory = unique_temp_dir();
+        let present = directory.join("present");
+        fs::create_dir(&present).expect("create project directory");
+        let path = directory.join(CONFIG_FILE_NAME);
+        fs::write(
+            &path,
+            format!(
+                r#"{{"projects":[["here","{}"],["gone","{}"]]}}"#,
+                present.display(),
+                directory.join("absent").display()
+            ),
+        )
+        .expect("write config");
+
+        let config = load_from_path(&path).expect("a missing project path is not fatal");
+
+        assert_eq!(config.projects.len(), 2, "the shortcut is still offered");
+        let warnings = config.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("project \"gone\""), "{warnings:?}");
+        assert!(warnings[0].contains("is not a directory"), "{warnings:?}");
+    }
+
+    /// E5: `O_NOFOLLOW` rejects a symlinked config inside `openat`, so the user
+    /// used to see a bare `Os { code: 40, kind: FilesystemLoop, … }` that
+    /// mentioned neither the config file nor the fact that this is now the
+    /// rule. Both the path and the workaround have to be in the message.
+    #[test]
+    fn a_symlinked_config_names_the_path_and_the_workaround() {
+        let directory = unique_temp_dir();
+        let target = directory.join("dotfiles-config.json");
+        fs::write(&target, r#"{"pi_agent_command":"linked"}"#).expect("write target");
+        let path = directory.join(CONFIG_FILE_NAME);
+        symlink(&target, &path).expect("link config path");
+
+        let error = load_from_path(&path).expect_err("a symlinked config must be refused");
+
+        let message = error.to_string();
+        assert!(
+            message.starts_with(&format!("config error at {}: ", path.display())),
+            "{message}"
+        );
+        assert!(message.contains("the file is a symbolic link"), "{message}");
+        assert!(
+            message.contains("symlinked config files are not supported"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Copy the file instead of linking it"),
+            "the workaround has to be in the message: {message}"
+        );
+        assert!(message.contains("$MULT_CONFIG_PATH"), "{message}");
+    }
+
+    /// E5: the shared reader's directory checks used to say "state" even when
+    /// it was the config directory that failed.
+    #[test]
+    fn a_rejected_config_directory_says_config_not_state() {
+        let directory = unique_temp_dir();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777))
+            .expect("widen directory");
+        let path = directory.join(CONFIG_FILE_NAME);
+        fs::write(&path, "{}").expect("write config");
+
+        let error = load_from_path(&path).expect_err("a replaceable parent must be refused");
+
+        let message = error.to_string();
+        assert!(
+            message.starts_with("config parent is writable"),
+            "{message}"
+        );
+        assert!(!message.contains("state"), "{message}");
     }
 
     #[test]

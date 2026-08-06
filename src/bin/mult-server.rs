@@ -33,6 +33,7 @@ use std::{
     net::Shutdown,
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
+    process::ExitCode,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Condvar, Mutex,
@@ -40,6 +41,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+use mult::cli::{self, Binary, Invocation};
 
 use mult_protocol::{
     bounded_screen_dimensions, default_socket_path, ensure_private_dir, peer::verify_peer_is_self,
@@ -558,10 +561,39 @@ struct SpawnedPane {
     child: Box<dyn Child + Send + Sync>,
 }
 
-fn main() -> io::Result<()> {
+/// Exit status for a command line that could not be run, distinct from a
+/// failure while running.
+const USAGE_EXIT_CODE: u8 = 2;
+
+fn main() -> ExitCode {
+    let options = match cli::parse(Binary::Server, env::args_os().skip(1)) {
+        Ok(Invocation::Run(options)) => options,
+        Ok(Invocation::Print(text)) => {
+            println!("{text}");
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(USAGE_EXIT_CODE);
+        }
+    };
+
+    match run(options) {
+        Ok(()) => ExitCode::SUCCESS,
+        // `Display`, never `Debug`: a daemon that fails to bind should say so
+        // in a sentence, not as a struct dump.
+        Err(error) => {
+            eprintln!("mult-server: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(options: cli::Options) -> io::Result<()> {
     ignore_hangup_signal()?;
     let shutdown = install_shutdown_signals()?;
-    let socket_path = default_socket_path();
+    // `--socket` outranks `$MULT_SOCKET_PATH`, which outranks the default.
+    let socket_path = options.socket.unwrap_or_else(default_socket_path);
     bind_socket_path(&socket_path)?;
     let server = Arc::new(Mutex::new(ServerState::new()?));
     let listener = bind_unix_listener(&socket_path)?;

@@ -168,17 +168,40 @@ impl IdentitySource for SecureIdentitySource {
     }
 }
 
+/// Decoding is deliberately lenient about fields that can be *reconstructed*
+/// and strict about everything else.
+///
+/// A single renamed or `null`ed field used to make the whole file undecodable,
+/// which routed it into backup-and-reset and discarded every workspace, chat
+/// and terminal the user had (E11). Fields whose value can be rebuilt — the ID
+/// allocator hints, the identity table, a workspace's terminals, a session's
+/// status — therefore fall back to a default and are repaired on load, while
+/// anything carrying information nothing else holds (an ID, a name, the state
+/// namespace) stays required, because inventing one silently would be a
+/// different kind of data loss.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectState {
     pub version: u32,
     pub(crate) namespace: StateNamespace,
+    /// Reconciled against the sessions that decoded — see
+    /// [`ProjectState::normalize_session_identities`].
+    #[serde(default, deserialize_with = "null_or_default")]
     pub(crate) session_identities: SessionIdentities,
     /// Active daemon process incarnations for agent chats. Kept in a private
     /// identity table so ordinary chat edits cannot replace generations.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "null_or_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub(crate) agent_generations: BTreeMap<ChatId, AgentGeneration>,
+    /// Allocator hints, recomputed by `normalize_next_ids` when they are absent
+    /// or inconsistent with the IDs actually in use.
+    #[serde(default, deserialize_with = "null_or_default")]
     pub next_workspace_id: u64,
+    #[serde(default, deserialize_with = "null_or_default")]
     pub next_chat_id: u64,
+    #[serde(default, deserialize_with = "null_or_default")]
     pub next_terminal_id: u64,
     pub workspaces: Vec<Workspace>,
 }
@@ -187,9 +210,15 @@ pub struct ProjectState {
 pub struct Workspace {
     pub id: WorkspaceId,
     pub name: String,
+    #[serde(default, deserialize_with = "null_or_default")]
     pub cwd: Option<PathBuf>,
+    #[serde(default, deserialize_with = "null_or_default")]
     pub environment: BTreeMap<String, String>,
+    /// A workspace that loses its chats keeps its terminals, and vice versa:
+    /// the two lists fail independently rather than taking the file with them.
+    #[serde(default, deserialize_with = "null_or_default")]
     pub chats: Vec<ChatSession>,
+    #[serde(default, deserialize_with = "null_or_default")]
     pub terminals: Vec<TerminalSession>,
 }
 
@@ -197,10 +226,13 @@ pub struct Workspace {
 pub struct ChatSession {
     pub id: ChatId,
     pub name: String,
+    /// Runtime-derived: an unowned `Thinking`/`Waiting` is reset to `Idle` on
+    /// load anyway, so a missing status costs nothing.
+    #[serde(default, deserialize_with = "null_or_default")]
     pub status: ChatStatus,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_or_default")]
     pub agent: AgentKind,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_or_default")]
     pub messages: Vec<ChatMessage>,
 }
 
@@ -252,8 +284,11 @@ pub enum ChatMessageRole {
 pub struct TerminalSession {
     pub id: TerminalId,
     pub name: String,
+    /// Runtime-derived: the daemon is authoritative about whether a pane is
+    /// live, so a missing status resolves itself on the first poll.
+    #[serde(default, deserialize_with = "null_or_default")]
     pub status: TerminalStatus,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_or_default")]
     pub launch: TerminalLaunch,
 }
 
@@ -276,8 +311,9 @@ pub enum PtyKey {
     ChatAgent(ChatId),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChatStatus {
+    #[default]
     Idle,
     Thinking,
     Waiting,
@@ -285,8 +321,9 @@ pub enum ChatStatus {
     Done,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalStatus {
+    #[default]
     Stopped,
     Running,
 }
@@ -491,6 +528,77 @@ impl ProjectState {
             self.session_identities.terminals.insert(id, token);
         }
         Ok(())
+    }
+
+    /// Reconciles the identity and generation tables with the sessions that are
+    /// actually present, returning whether anything changed.
+    ///
+    /// `validate_session_identities` demands an exact correspondence, so a
+    /// state file that lost a chat — a renamed field, a `null` where an array
+    /// belonged, a hand edit that added a terminal — failed startup outright
+    /// even when everything else in it was intact. Reconciling keeps what
+    /// decoded: entries for sessions that are gone are dropped, a duplicated
+    /// token is re-minted, and a session with no token gets a fresh one.
+    ///
+    /// Minting is the fail-safe direction. A fresh token cannot claim the
+    /// daemon session the old one owned, so the pane comes back stopped instead
+    /// of adopting a session it cannot prove it owns (C12).
+    pub(crate) fn normalize_session_identities(
+        &mut self,
+        source: &mut impl IdentitySource,
+    ) -> io::Result<bool> {
+        let chat_ids = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.chats.iter().map(|chat| chat.id))
+            .collect::<BTreeSet<_>>();
+        let terminal_ids = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.terminals.iter().map(|terminal| terminal.id))
+            .collect::<BTreeSet<_>>();
+
+        let mut changed = false;
+        let mut seen_tokens = BTreeSet::new();
+        let identities = &mut self.session_identities;
+        let before = identities.chats.len() + identities.terminals.len();
+        identities
+            .chats
+            .retain(|id, token| chat_ids.contains(id) && seen_tokens.insert(*token));
+        identities
+            .terminals
+            .retain(|id, token| terminal_ids.contains(id) && seen_tokens.insert(*token));
+        changed |= identities.chats.len() + identities.terminals.len() != before;
+
+        let generations = &mut self.agent_generations;
+        let before = generations.len();
+        let mut seen_generations = BTreeSet::new();
+        generations
+            .retain(|id, generation| chat_ids.contains(id) && seen_generations.insert(*generation));
+        changed |= generations.len() != before;
+
+        for id in chat_ids {
+            if self.session_identities.chats.contains_key(&id) {
+                continue;
+            }
+            let token = self
+                .allocate_session_token(source)
+                .map_err(allocation_io_error)?;
+            self.session_identities.chats.insert(id, token);
+            changed = true;
+        }
+        for id in terminal_ids {
+            if self.session_identities.terminals.contains_key(&id) {
+                continue;
+            }
+            let token = self
+                .allocate_session_token(source)
+                .map_err(allocation_io_error)?;
+            self.session_identities.terminals.insert(id, token);
+            changed = true;
+        }
+
+        Ok(changed)
     }
 }
 
@@ -1059,6 +1167,21 @@ fn decode_hex_digit(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         _ => None,
     }
+}
+
+/// Accepts a missing field, an explicit `null`, or a value.
+///
+/// `#[serde(default)]` alone covers only the *missing* case, and a `null` where
+/// a struct or an array belongs is the other half of the shape errors that used
+/// to cost a user their whole state file (E11). A wrong *type* is still an
+/// error: `"workspaces": "nonsense"` carries data this code cannot interpret,
+/// and quietly treating it as empty would destroy it rather than report it.
+fn null_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 fn generate_identity<T>(
@@ -1741,6 +1864,73 @@ mod tests {
             next_terminal_id: 1,
             workspaces: Vec::new(),
         }
+    }
+
+    /// E11: reconciliation is what makes a lenient decode usable. Whatever the
+    /// identity table lost, gained or duplicated, the state that comes out has
+    /// to be one the writer accepts.
+    #[test]
+    fn reconciling_identities_drops_stale_entries_and_mints_missing_ones() {
+        let mut source = SecureIdentitySource::new().unwrap();
+        let mut state = ProjectState::default();
+        let terminal = state.workspaces[0].terminals[0].id;
+        let chat = state
+            .add_chat(
+                state.workspaces[0].id,
+                "chat".to_string(),
+                ChatStatus::Idle,
+                AgentKind::Pi,
+            )
+            .unwrap()
+            .unwrap();
+        let generation = state.begin_agent_generation(chat).unwrap().unwrap();
+
+        // A table describing a session that is gone, missing one that is here,
+        // and reusing a token across the two.
+        let stolen = state.session_identities.terminals[&terminal];
+        state.session_identities.chats.insert(ChatId(9_999), stolen);
+        state.session_identities.terminals.remove(&terminal);
+        state.agent_generations.insert(ChatId(9_999), generation);
+
+        assert!(state.normalize_session_identities(&mut source).unwrap());
+
+        state.validate_session_identities().unwrap();
+        assert!(!state.session_identities.chats.contains_key(&ChatId(9_999)));
+        assert!(!state.agent_generations.contains_key(&ChatId(9_999)));
+        assert!(state.session_identities.terminals.contains_key(&terminal));
+        assert!(state.agent_generations.contains_key(&chat));
+        // A consistent table is left exactly as it is.
+        assert!(!state.normalize_session_identities(&mut source).unwrap());
+    }
+
+    /// E11: `#[serde(default)]` covers a missing field; a `null` needs the
+    /// helper. Both must reach the same place, and a value of the wrong *type*
+    /// must still be an error rather than being silently dropped.
+    #[test]
+    fn a_missing_or_null_reconstructible_field_decodes_to_its_default() {
+        let missing: Workspace =
+            serde_json::from_str(r#"{"id":1,"name":"w"}"#).expect("missing fields default");
+        let nulled: Workspace = serde_json::from_str(
+            r#"{"id":1,"name":"w","cwd":null,"environment":null,"chats":null,"terminals":null}"#,
+        )
+        .expect("null fields default");
+
+        assert_eq!(missing, nulled);
+        assert!(missing.chats.is_empty() && missing.terminals.is_empty());
+
+        let terminal: TerminalSession =
+            serde_json::from_str(r#"{"id":1,"name":"t"}"#).expect("missing status defaults");
+        assert_eq!(terminal.status, TerminalStatus::Stopped);
+        assert_eq!(terminal.launch, TerminalLaunch::Shell);
+
+        // Wrong type, not absent: this carries data, and treating it as empty
+        // would destroy it instead of reporting it.
+        assert!(
+            serde_json::from_str::<Workspace>(r#"{"id":1,"name":"w","chats":"none"}"#).is_err()
+        );
+        // Nothing reconstructs an ID or a name.
+        assert!(serde_json::from_str::<Workspace>(r#"{"name":"w"}"#).is_err());
+        assert!(serde_json::from_str::<Workspace>(r#"{"id":1}"#).is_err());
     }
 
     fn empty_workspace(id: WorkspaceId, name: &str) -> Workspace {

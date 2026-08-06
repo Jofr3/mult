@@ -104,14 +104,28 @@ MULT_SERVER_AUTOSPAWN=0 mult
 
 ## A `state.json.corrupt-…` file appeared and my workspaces are gone
 
-**Cause.** The state file did not decode as valid JSON for the current schema.
-Rather than overwrite it, `mult` renames it aside to
+**Cause.** The state file could not be decoded at all — it is not JSON, or a
+field carries a value of a type nothing can interpret. Rather than overwrite it,
+`mult` renames it aside to
 `state.json.corrupt-{unix-seconds}-{16 random hex digits}`, mode `0600`, and
 starts from defaults.
 
-**This is currently silent.** Nothing in the UI tells you it happened — you
-notice because your workspaces are missing. (Surfacing it is `E11` in
-[BACKLOG.md](BACKLOG.md).) The backup is your copy of the old state:
+**This is no longer silent.** The reset is reported on stderr at startup and in
+the app's notice area, naming both files:
+
+> `mult: state file {path} could not be decoded ({decode error}); it was moved to
+> {backup} and this session started from defaults`
+
+**A reset is now the last resort, not the first.** A file that merely lost
+*part* of itself — a renamed key, a `null` where an array belonged, missing
+`next_*_id` hints, an identity table that no longer matches — is decoded for what
+it still holds: the workspaces, chats and terminals that survive are kept, the
+allocator hints and identity table are rebuilt around them, and no backup is
+made. A terminal whose session identity had to be re-minted comes back
+**stopped** rather than adopting a daemon session it cannot prove it owns.
+Only a file the decoder can make nothing of takes the backup-and-reset path.
+
+The backup is your copy of the old state:
 
 ```sh
 ls -l "${XDG_DATA_HOME:-$HOME/.local/share}/mult/"
@@ -369,13 +383,23 @@ MULT_STATE_PATH=/var/lib/mult/state.json MULT_CONFIG_PATH=/etc/mult/config.json 
 
 ---
 
-## "Too many levels of symbolic links" at startup (symlinked config)
+## "symlinked config files are not supported" at startup
 
-> `Error: Os { code: 40, kind: FilesystemLoop, message: "Too many levels of symbolic links" }`
+> `mult: config error at {path}: the file is a symbolic link, and symlinked
+> config files are not supported — every path component is opened with
+> O_NOFOLLOW because the commands in this file are shell-evaluated and
+> auto-started. Copy the file instead of linking it, or point --config /
+> $MULT_CONFIG_PATH at a real file`
 
 or, when a **directory** on the way to the config is the link:
 
-> `Error: Os { code: 20, kind: NotADirectory, message: "Not a directory" }`
+> `mult: config error at {path}: a directory component of the path is a symbolic
+> link, or is not a directory, and symlinked config files are not supported — …`
+
+(Before E5 these were the raw `openat` failures — `Error: Os { code: 40, kind:
+FilesystemLoop, … }` and `Error: Os { code: 20, kind: NotADirectory, … }` — which
+named neither the config nor the reason. If you see *those*, you are on an older
+build.)
 
 **Cause.** `config.json` is now read with the same discipline as the state file,
 and for a sharper reason: `pi_agent_command` and `claude_code_command` are handed
@@ -385,9 +409,10 @@ so a symlinked `config.json` — or a symlinked directory anywhere above it — 
 refused, and the link's target is never read. Neither `$MULT_CONFIG_PATH` nor
 `$XDG_CONFIG_HOME` is a way around this; both steer the same checked path.
 
-These two messages are the raw `openat` failures rather than one of `mult`'s own,
-which is why they name neither the config nor the path: an `O_NOFOLLOW` open of a
-symlink is `ELOOP`, and an `O_NOFOLLOW|O_DIRECTORY` open of one is `ENOTDIR`.
+The two cases are distinguished by what the kernel reports: an `O_NOFOLLOW` open
+of a symlink is `ELOOP`, and an `O_NOFOLLOW|O_DIRECTORY` open of one is `ENOTDIR`
+— which a plain file used as a directory also produces, hence the "or is not a
+directory" in the second message.
 
 **Symlinked config files are no longer supported.** That is the layout most
 dotfile managers produce — GNU stow always links, and a bare-repo setup or
@@ -431,15 +456,17 @@ source:
 
 and, for the containing directory:
 
-> `state parent is writable by group or others, so its lock inode is replaceable: {path}`
+> `config parent is writable by group or others, so the config it holds is replaceable, and its commands are shell-evaluated: {path}`
 >
-> `private state directory is not owned by the effective user: {path}`
+> `private config directory is not owned by the effective user: {path}`
 >
-> `state parent is not a directory: {path}`
+> `config parent is not a directory: {path}`
 
-Those last three say **state** even when it is the *config* directory that
-failed: state and config share one hardened read implementation and its messages
-were written for state. Check the path in the message, not the noun.
+State and config share one hardened read implementation, so the *state* file
+produces the same three with `state` in place of `config` (and "its lock inode is
+replaceable" as the reason). Older builds said **state** in both cases; if a
+message names `state` while the path is clearly your config, you are on a build
+from before E5.
 
 Note that the mode of the config file itself is repaired rather than refused — a
 `0644` config is `chmod`ed to `0600` as it is read — so only a mode that could

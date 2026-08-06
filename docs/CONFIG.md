@@ -11,15 +11,19 @@ for failure modes see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 `mult` picks the first of:
 
-1. `$MULT_CONFIG_PATH`, used verbatim if set (including a relative path);
-2. `$XDG_CONFIG_HOME/mult/config.json`, if `XDG_CONFIG_HOME` is absolute;
-3. `~/.config/mult/config.json`, taking `~` from an absolute `$HOME` and
+1. `--config <path>`, used verbatim (including a relative path);
+2. `$MULT_CONFIG_PATH`, used verbatim if set;
+3. `$XDG_CONFIG_HOME/mult/config.json`, if `XDG_CONFIG_HOME` is absolute;
+4. `~/.config/mult/config.json`, taking `~` from an absolute `$HOME` and
    otherwise from the effective user's passwd entry.
+
+That order is the general rule for every path `mult` takes: **flag > environment
+variable > default**. `mult --help` lists the three (`--config`, `--state`,
+`--socket`), and both `--config <path>` and `--config=<path>` are accepted.
 
 If none of those resolves, startup fails rather than writing into the current
 directory. A **missing** file is not an error — `mult` starts on the built-in
-defaults, so the whole file is optional. A file that exists but is not valid
-JSON, or whose values have the wrong type, is a startup error.
+defaults, so the whole file is optional.
 
 The file also has to pass an ownership check before a byte of it is read, for a
 sharper reason than state has: `pi_agent_command` and `claude_code_command` are
@@ -44,16 +48,44 @@ longer loads. See
 [Too many levels of symbolic links](TROUBLESHOOTING.md#too-many-levels-of-symbolic-links-at-startup-symlinked-config)
 for the messages and the workaround.
 
-Current parsing behaviour worth knowing:
+## What is an error and what is a warning
 
-- **Every key is optional.** Any key you omit falls back to its default below.
-- **Unknown keys are ignored silently.** There is no `deny_unknown_fields` yet,
-  so a typo (`colorscheme.foreground`, `auto_start_pi`) is accepted and does
-  nothing. Check spelling against this file. (Tracked as `E6` in
-  [BACKLOG.md](BACKLOG.md).)
-- **A colour that does not parse falls back to its default silently.** The parse
-  failure is captured per key inside the renderer but nothing surfaces it yet
-  (also `E6`). If a colour "doesn't take", check its syntax first.
+The rule is whether `mult` can still act on the file as written.
+
+**Startup errors** — `mult` prints one line and exits non-zero, having changed
+nothing:
+
+- the file is not valid JSON;
+- a value has the wrong type (`"mouse_capture": "yes"`);
+- a key is not one `mult` knows. `deny_unknown_fields` is on for the top-level
+  object, for `colorscheme`, and for a `projects` entry, so a typo like
+  `auto_start_terminal` (no `s`) or `colorscheme.foreground` fails instead of
+  being accepted and doing nothing;
+- the file, or the directory holding it, fails one of the ownership checks above.
+
+Parse errors name the file and the position, and the accepted keys are listed:
+
+```
+mult: config error at /home/you/.config/mult/config.json:2:23: unknown field
+`auto_start_terminal`, expected one of `pi_agent_command`, `claude_code_command`,
+`auto_start_pi_agent`, `auto_start_claude_code_agent`, `auto_start_terminals`,
+`mouse_capture`, `clipboard_osc52`, `projects`, `colorscheme`
+```
+
+**Warnings** — `mult` starts, uses a documented fallback, and tells you. Each
+warning is printed to stderr at startup and shown in the app's notice area:
+
+- a colour that does not parse (`"text": "blue"`) keeps the built-in default for
+  that key; the rest of the scheme is unaffected;
+- a `projects` entry whose `path` is not a directory right now, or whose `name`
+  is empty. The shortcut is still offered — the directory may simply not be
+  mounted yet — and fails if you open it.
+
+Nothing is ignored silently. If you set something and nothing happens, `mult`
+either refused to start or said so.
+
+Also worth knowing: **every key is optional.** Any key you omit falls back to its
+default below.
 
 ## Top-level keys
 
@@ -81,15 +113,21 @@ produce the same `{name, path}` pair:
 ]
 ```
 
+Both spellings reject unknown keys, so `{"name": "mult", "pathh": "…"}` is a
+startup error rather than a shortcut that silently has no path.
+
 A leading `~` or `~/` in `path` is expanded from `$HOME`. If `$HOME` is unset the
-path is used literally. Paths are not validated when the config is loaded; a
-shortcut pointing at a directory that does not exist fails when you open it.
+path is used literally. The expanded path is checked once, at load: a shortcut
+pointing at something that is not a directory is reported as a warning and kept,
+and it fails if you open it. The check is a snapshot — a directory that appears
+(or disappears) later is not re-checked until the next start or config reload.
 
 ### `colorscheme`
 
 Values are `#rrggbb` or `rrggbb` (case-insensitive, surrounding whitespace
 trimmed). Anything else — a named colour, a 3-digit hex, an `rgb()` function —
-does not parse and silently keeps the default for that key.
+does not parse, keeps the default for that key, and is reported as a warning
+naming the key and the value you wrote.
 
 The defaults are Rosé Pine Moon and live in one place,
 `config::DEFAULT_COLOR_SCHEME`; the renderer derives its compile-time fallbacks

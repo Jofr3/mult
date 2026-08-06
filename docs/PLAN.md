@@ -132,6 +132,18 @@ case; the vt100 adapter is directly tested.
 **Files:** `src/main.rs`, `src/bin/mult-server.rs`, new `src/cli.rs`, `src/config.rs`,
 `src/storage.rs`, `src/runtime.rs`, `src/ui.rs`, `src/git.rs`
 
+**Split into two slices** so the two halves could land in parallel without
+touching each other's files:
+
+- **R7a — CLI, config validation and state recovery.** E1, E5, E6, E11, G13.
+  `src/main.rs`, new `src/cli.rs`, `src/config.rs`, `src/storage.rs`,
+  `src/model.rs`, `src/bin/mult-server.rs`. Hands two seams to R7b:
+  `Config::warnings() -> &[String]` and `LoadedState::notice: Option<String>`.
+- **R7b — status surface and in-app affordances.** E2, E4, E7, E8, E9, E10, E12,
+  and F13/F21 (which the shared prompt handler subsumed). `src/app.rs`,
+  `src/ui.rs`, `src/runtime.rs`, `src/pty.rs`, `README.md`. Consumes both of
+  R7a's seams and unblocks B8, which is now closed with no wire change.
+
 E2's status surface unblocks B8. E12 is F1's residual: `MULT_AGENT_CMD` and chat search are
 documented as working while being inert — mark them, do not remove them.
 
@@ -214,7 +226,8 @@ tag↔version and runs tests before publishing; the docs tree has one roadmap.
 | R4 | Security | done |
 | R5 | Emulator panics and fuzzing | done |
 | R6 | Render performance | done |
-| R7 | CLI, error surfacing and config validation | todo |
+| R7a | CLI, config validation and state recovery | done |
+| R7b | Status surface and in-app affordances | done |
 | R8 | Interaction affordances | todo |
 | R9 | Architecture, mechanical | todo |
 | R10 | Architecture, structural | todo |

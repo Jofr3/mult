@@ -6,6 +6,7 @@ use std::{
     io::{self, Read, Write},
     num::NonZeroU64,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
@@ -38,9 +39,33 @@ pub const MAX_PENDING_REQUESTS_PER_CLIENT: usize = 1_024;
 /// Maximum number of completed request results retained for one resumable scope.
 pub const MAX_CACHED_REQUEST_RESULTS_PER_SCOPE: usize = 4_096;
 
+/// A `--socket` value installed by the CLI, ahead of `$MULT_SOCKET_PATH`.
+///
+/// The client resolves its socket deep inside `PtyRuntime`, not in `main`, so a
+/// command-line override has to reach the resolver rather than a constructor
+/// argument. The obvious alternative — `set_var(SOCKET_PATH_ENV, …)` — mutates a
+/// process global that other threads read, which this workspace deliberately
+/// does not do (G7). This cell is written at most once, from `main`, before any
+/// thread exists, and is only ever read afterwards; `OnceLock` makes both of
+/// those structural rather than a convention.
+static SOCKET_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Installs the command-line socket override. Fails, handing the path back, if
+/// one was already installed — the CLI installs exactly one, before anything
+/// resolves a socket.
+pub fn set_socket_path_override(path: PathBuf) -> Result<(), PathBuf> {
+    SOCKET_PATH_OVERRIDE.set(path)
+}
+
+/// The socket path in force: `--socket`, then `$MULT_SOCKET_PATH`, then the
+/// default under `$XDG_RUNTIME_DIR`.
 pub fn default_socket_path() -> PathBuf {
+    let environment = env::var_os(SOCKET_PATH_ENV);
     socket_path_from(
-        env::var_os(SOCKET_PATH_ENV).as_deref(),
+        SOCKET_PATH_OVERRIDE
+            .get()
+            .map(|path| path.as_os_str())
+            .or(environment.as_deref()),
         env::var_os("XDG_RUNTIME_DIR").as_deref(),
         socket_user_component,
     )

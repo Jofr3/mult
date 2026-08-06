@@ -45,6 +45,19 @@ just server
 cargo run --bin mult-server
 ```
 
+## Command line
+
+```text
+mult [--config <path>] [--state <path>] [--socket <path>] [-h|--help] [-V|--version]
+mult-server [--socket <path>] [-h|--help] [-V|--version]
+```
+
+Each option overrides its environment variable, which overrides the default:
+**flag > environment > default**. `--flag value` and `--flag=value` are
+equivalent. An unknown option or a stray argument is an error with a non-zero
+exit, never a silent start. `mult-server` rejects `--config` and `--state`
+rather than accepting a flag it would ignore — the daemon reads neither file.
+
 ## Useful commands
 
 ```sh
@@ -119,11 +132,19 @@ Global controls when no prompt is open:
 | `Ctrl+t` | Add a new shell terminal to the selected workspace |
 | `Ctrl+f` | Open/import a workspace |
 | `Ctrl+p` | Open the command palette |
-| `Ctrl+s` | Search the selected chat/terminal pane |
+| `Ctrl+s` | Search the selected terminal pane (see the note below for chats) |
 | `Ctrl+q` | Ask to delete the selected chat/terminal, or an empty workspace |
+| `Ctrl+n` | Dismiss the status notices |
+| `?` or `F1` | Show every key and command in an overlay |
 | `Ctrl+Esc` | Quit |
 
 Typing in a selected chat or terminal starts/focuses its PTY and forwards input to it.
+Because of that, `?` only opens the overlay when no pane would have received it;
+`F1` and the palette's "Show keybindings" always work.
+
+Errors with no pane to report into — a daemon that will not connect, a failed
+state save, a config warning — appear in a status surface above the prompt line.
+Notices fade after 12 seconds, at most four are shown, and `Ctrl+n` clears them.
 
 Prompt controls:
 
@@ -131,7 +152,11 @@ Prompt controls:
 | --- | --- |
 | `Enter` | Submit or confirm a pending deletion |
 | `Esc` or `Ctrl+c` | Cancel, including a pending deletion |
-| `Backspace` | Delete one character |
+| `Left`/`Right` | Move the cursor one character |
+| `Home`/`End` or `Ctrl+a`/`Ctrl+e` | Move the cursor to the start/end |
+| `Backspace`/`Delete` | Delete the character before/after the cursor |
+| `Ctrl+w` | Delete the word before the cursor |
+| `Ctrl+u` | Delete everything before the cursor |
 | `Up`/`Down` or `Ctrl+k`/`Ctrl+j` | Move through prompt results where supported |
 
 Mouse support:
@@ -141,13 +166,20 @@ Mouse support:
 - `Ctrl+Shift+C` copies the active `mult` text selection when the terminal forwards that key to `mult`.
 - Both copy paths are gated by `clipboard_osc52` (default `true`). Set it to `false` and `mult` never writes an OSC 52 escape: selection still highlights and `Ctrl+Shift+C` is still consumed, but nothing reaches the clipboard.
 
-The command palette includes discoverable actions for focus changes, starting input, adding/deleting sessions, opening workspaces, search, clearing search, and quitting.
+The command palette includes discoverable actions for focus changes, starting input, adding/deleting sessions, opening workspaces, search, clearing search, showing the keybinding overlay, dismissing notices, reloading the config, and quitting. The palette and the overlay are generated from one binding table, so neither can drift from the other.
+
+"Reload config" re-reads `config.json` in place. The colorscheme, `projects`, agent commands and auto-start settings apply to the next frame; `mouse_capture` is a terminal mode set once for the session and needs a restart, and an already-running PTY keeps the command it was started with. A config that fails to load leaves the running one in place and reports the error.
+
+**Chat search is not wired up.** `Ctrl+s` on a chat searches the *structured* transcript, which only the experimental process-agent backend writes and which nothing calls today, so it is empty for every chat you can create — the pane says so instead of reporting "no matches". Terminal search works normally. See [docs/ROADMAP.md](docs/ROADMAP.md#open-decisions-carried-over).
+
+`NO_COLOR` (set to any non-empty value) drops every colour: `mult` then emits nothing but the terminal's own foreground and background, and uses bold/reverse video and per-state glyphs so status is still readable.
 
 ## Configuration
 
 Config path:
 
-- `$MULT_CONFIG_PATH`, if set
+- `--config <path>`, if given
+- otherwise `$MULT_CONFIG_PATH`, if set
 - otherwise `$XDG_CONFIG_HOME/mult/config.json`
 - otherwise the effective user's passwd home at `~/.config/mult/config.json`; startup fails clearly if no durable home can be resolved
 
@@ -186,11 +218,12 @@ Variables you may set. All are optional.
 
 | Variable | Read by | Purpose |
 | --- | --- | --- |
-| `MULT_CONFIG_PATH` | client | Override the config file path, used verbatim. |
-| `MULT_STATE_PATH` | client | Override the state file path. |
-| `MULT_SOCKET_PATH` | client, daemon | Override the `mult-server` Unix socket path. Both ends must agree. |
+| `MULT_CONFIG_PATH` | client | Override the config file path, used verbatim. `--config` outranks it. |
+| `MULT_STATE_PATH` | client | Override the state file path. `--state` outranks it. |
+| `MULT_SOCKET_PATH` | client, daemon | Override the `mult-server` Unix socket path. Both ends must agree. `--socket` outranks it, on either binary. |
 | `MULT_SERVER_AUTOSPAWN` | client | Set to `0`, `false`, `False` or `FALSE` to stop the client autospawning `mult-server`. Any other value, or unset, leaves autospawn on. |
 | `MULT_AGENT_CMD` | client, daemon | **Experimental, and currently a no-op.** The process-agent backend it configures has no production call path, so setting it changes nothing today. When it is wired, it is argv-split with simple shell-style quotes and backslash escapes — no shell expansion, unlike `pi_agent_command`. Retained rather than removed because `src/transcript.rs` builds on the same types; see [docs/ROADMAP.md](docs/ROADMAP.md#open-decisions-carried-over). |
+| `NO_COLOR` | client | Set to any non-empty value to disable colour entirely. Read once per process; the palette becomes the terminal's own foreground and background, with bold, reverse video and per-state glyphs carrying what colour used to. |
 | `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `HOME` | client | Standard. Used to resolve config and state when the overrides above are unset; must be absolute. |
 | `XDG_RUNTIME_DIR` | client, daemon | Standard. The default socket parent and the home of the agent status journals; falls back to `/tmp/mult-<euid>` when unset. |
 | `SHELL` | client, daemon | The login shell used for agent commands and command terminals. |
@@ -227,11 +260,12 @@ maps the errors this code actually emits to their causes.
 
 State path:
 
-- `$MULT_STATE_PATH`, if set
+- `--state <path>`, if given
+- otherwise `$MULT_STATE_PATH`, if set
 - otherwise `$XDG_DATA_HOME/mult/state.json`
 - otherwise the effective user's passwd home at `~/.local/share/mult/state.json`; startup fails clearly if no durable home can be resolved
 
-The state file is owned by one TUI at a time through a nonblocking process-lifetime lock acquired before loading. A second TUI using the same state path fails clearly instead of overwriting a stale snapshot. Writes are atomic through an owner-only temporary file; state and lock files are `0600`, and newly-created state directories are `0700`. Invalid JSON is moved aside with a `.corrupt-*` suffix before resetting to defaults; state files with a newer schema version are rejected without rewriting them. Version-1 state is explicitly migrated to version 2 and saved before any daemon restoration or command launch.
+The state file is owned by one TUI at a time through a nonblocking process-lifetime lock acquired before loading. A second TUI using the same state path fails clearly instead of overwriting a stale snapshot. Writes are atomic through an owner-only temporary file; state and lock files are `0600`, and newly-created state directories are `0700`. A file that lost part of itself — a renamed or `null` field, missing ID hints, an identity table that no longer matches — is decoded for what it still holds and repaired in place rather than discarded; only a file the decoder can make nothing of is moved aside with a `.corrupt-*` suffix before resetting to defaults, and that reset is reported on stderr and in the app, naming the backup. State files with a newer schema version are rejected without rewriting them. Version-1 state is explicitly migrated to version 2 and saved before any daemon restoration or command launch.
 
 Durable state contains the workspace tree, terminal metadata and launch commands, immutable session identities, statuses, and messages received through the structured experimental process-agent API. Normal Pi and Claude Code chats run in PTYs: their raw terminal output can survive a TUI reconnect while the same daemon session lives, but it is not treated as an authoritative structured transcript and does not survive daemon loss. Raw terminal buffers and scrollback are not stored in the JSON state file. The separate bounded transcript-journal codec is reserved for backends that provide real role/message boundaries; `mult` never invents those boundaries by scraping PTY bytes.
 
@@ -245,14 +279,15 @@ Pi and Claude Code lifecycle bridges write generation-scoped, append-only status
 
 ```text
 src/lib.rs                        library root; the modules below marked (lib) are public
-src/main.rs                       `mult` entry point: state lock, config load, signal handlers, panic-safe cleanup
+src/main.rs                       `mult` entry point: argument parsing, config load, state lock, signal handlers, panic-safe cleanup
 src/runtime.rs                    TUI event loop, keymap, mouse, clipboard, agent status bridge, hook/extension generation, save scheduling
 src/terminal_guard.rs             RAII terminal mode setup and restore
 src/app.rs                  (lib) app state, navigation, prompts, search, mutations
 src/model.rs                (lib) durable project model, IDs, session identity, state schema
 src/ui.rs                   (lib) Ratatui rendering, palette, and the vt100 -> ratatui adapter
 src/pty.rs                  (lib) client-side PTY runtime and server protocol adapter
-src/config.rs               (lib) config loading, defaults, and DEFAULT_COLOR_SCHEME
+src/cli.rs                  (lib) argument parsing for both binaries
+src/config.rs               (lib) config loading, validation, defaults, and DEFAULT_COLOR_SCHEME
 src/storage.rs              (lib) state load/save, ownership lock, migrations, corrupt-state backups
 src/paths.rs                (lib) XDG/HOME resolution for the config and state directories
 src/git.rs                  (lib) workspace git branch probe
