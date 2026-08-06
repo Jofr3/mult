@@ -6,6 +6,7 @@ pub mod git;
 pub mod model;
 pub mod paths;
 pub mod pty;
+pub mod runtime;
 pub mod storage;
 pub mod transcript;
 pub mod ui;

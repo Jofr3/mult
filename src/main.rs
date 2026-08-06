@@ -8,14 +8,13 @@ use std::{
 use mult::{
     app::{App, NoticeLevel, NoticeSource},
     cli::{self, Binary, Invocation, Options},
-    config, storage,
+    config, runtime, storage,
 };
 use signal_hook::{
     consts::signal::{SIGHUP, SIGINT, SIGTERM},
     flag,
 };
 
-mod runtime;
 mod terminal_guard;
 
 use terminal_guard::TerminalGuard;
