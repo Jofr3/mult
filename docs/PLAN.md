@@ -187,7 +187,15 @@ persisted-shape change could land without also moving several thousand lines bet
   this bump.
 - **R10b — the module splits.** F9, F15, F5, F6. `src/runtime.rs` → `src/runtime/`,
   `src/ui.rs` → `src/ui/`, `src/app.rs` → `src/app/`, new `src/layout.rs`, `src/lib.rs`.
-  Strictly structural: no wire, state or behaviour change is left for it.
+  Strictly structural: no wire, state or behaviour change is left for it. **Both halves
+  landed.** `runtime` is library-visible (`pub mod runtime;`), so the 68 tests that were
+  stranded in the binary's test target now run in the library's; the snapshot files moved
+  with `src/ui.rs` → `src/ui/mod.rs` and are byte-identical. F5 also collapsed
+  `prompt: Option<Prompt>` + `focus: FocusMode` into one private `InteractionMode`, and F6
+  made `AppLayout` the single geometry, resolved once per loop iteration and handed to both
+  `ui::draw` and the resize/mouse handlers. Six tests were added (three for the mode, two
+  for the layout, one pinning that a layout change alone resizes a pane exactly once);
+  nothing was deleted, so 453 tests became 459.
 
 `main` did not do v1's module split, so every v1 fix phrased against `src/runtime/*` or
 `src/app/*` needs its path rewritten before porting. F16 was materially bigger than v1: it had
@@ -241,6 +249,6 @@ tag↔version and runs tests before publishing; the docs tree has one roadmap.
 | R8 | Interaction affordances | todo |
 | R9 | Architecture, mechanical | done |
 | R10a | Typed errors, wire bump, status seam, liveness | done |
-| R10b | Architecture, structural (module splits) | todo |
+| R10b | Architecture, structural (module splits) | done |
 | R11 | Tests | done |
 | R12 | CI, docs and release | done |

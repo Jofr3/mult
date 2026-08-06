@@ -5,12 +5,12 @@ use std::fs;
 
 use ratatui::layout::Rect;
 
+use crate::layout::AppLayout;
 use crate::{
     app::{App, NoticeLevel, NoticeSource},
     config::Config,
     model::{self, ChatStatus, PtyKey, TerminalLaunch},
     pty::{AttachExistingResult, PtyDimensions, PtyEvent, PtyRuntime, PtySpawn},
-    ui,
 };
 
 use super::agent_status::{
@@ -38,7 +38,7 @@ pub(super) fn restore_persisted_sessions(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
-    frame_area: Rect,
+    layout: AppLayout,
 ) {
     register_project_session_identities(app, pty_runtime);
     let terminals = app
@@ -63,7 +63,7 @@ pub(super) fn restore_persisted_sessions(
 
     for (workspace, terminal, name, is_command) in terminals {
         let key = PtyKey::Terminal(terminal);
-        let size = terminal_dimensions(app, frame_area);
+        let size = terminal_dimensions(layout);
         match pty_runtime.attach_existing(key, size) {
             Ok(AttachExistingResult::Attached) => app.record_terminal_started(terminal),
             Ok(AttachExistingResult::Missing) => {
@@ -79,7 +79,7 @@ pub(super) fn restore_persisted_sessions(
                 } else {
                     // Preserve existing shell restoration behavior. The strict
                     // no-relaunch rule applies to configured command terminals.
-                    start_terminal(app, pty_runtime, config, frame_area, workspace, terminal);
+                    start_terminal(app, pty_runtime, config, layout, workspace, terminal);
                 }
             }
             Err(error) if is_command => {
@@ -92,7 +92,7 @@ pub(super) fn restore_persisted_sessions(
             }
             Err(_) => {
                 app.record_terminal_stopped(terminal);
-                start_terminal(app, pty_runtime, config, frame_area, workspace, terminal);
+                start_terminal(app, pty_runtime, config, layout, workspace, terminal);
             }
         }
     }
@@ -121,7 +121,7 @@ pub(super) fn restore_persisted_sessions(
             );
             continue;
         }
-        let size = chat_agent_dimensions(app, frame_area);
+        let size = chat_agent_dimensions(layout);
         match pty_runtime.attach_existing(key, size) {
             Ok(AttachExistingResult::Attached) => {
                 reconcile_agent_status(app, pty_runtime, chat, agent, generation);
@@ -153,27 +153,20 @@ fn start_selected_terminal(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
-    frame_area: Rect,
+    layout: AppLayout,
 ) {
     let Some((workspace_id, terminal_id)) = app.selected_terminal_id() else {
         return;
     };
 
-    start_terminal(
-        app,
-        pty_runtime,
-        config,
-        frame_area,
-        workspace_id,
-        terminal_id,
-    );
+    start_terminal(app, pty_runtime, config, layout, workspace_id, terminal_id);
 }
 
 pub(super) fn start_terminal(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     _config: &Config,
-    frame_area: Rect,
+    layout: AppLayout,
     workspace_id: model::WorkspaceId,
     terminal_id: model::TerminalId,
 ) -> bool {
@@ -217,7 +210,7 @@ pub(super) fn start_terminal(
             workspace.environment.clone(),
         ),
     };
-    spawn.size = terminal_dimensions(app, frame_area);
+    spawn.size = terminal_dimensions(layout);
 
     match pty_runtime.start(spawn) {
         Ok(()) => {
@@ -239,7 +232,7 @@ pub(super) fn auto_start_selected_terminal(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
-    frame_area: Rect,
+    layout: AppLayout,
 ) -> bool {
     if !config.auto_start_terminals || app.is_prompt_active() {
         return false;
@@ -256,7 +249,7 @@ pub(super) fn auto_start_selected_terminal(
         return false;
     }
 
-    start_selected_terminal(app, pty_runtime, config, frame_area);
+    start_selected_terminal(app, pty_runtime, config, layout);
     true
 }
 
@@ -264,7 +257,7 @@ pub(super) fn start_or_focus_selected_terminal(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
-    frame_area: Rect,
+    layout: AppLayout,
 ) {
     let Some((_, terminal_id)) = app.selected_terminal_id() else {
         return;
@@ -272,7 +265,7 @@ pub(super) fn start_or_focus_selected_terminal(
     let key = PtyKey::Terminal(terminal_id);
 
     if !pty_runtime.is_running(key) {
-        start_selected_terminal(app, pty_runtime, config, frame_area);
+        start_selected_terminal(app, pty_runtime, config, layout);
     }
 
     if pty_runtime.is_running(key) {
@@ -284,9 +277,9 @@ pub(super) fn resize_visible_terminal(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     _config: &Config,
-    frame_area: Rect,
+    layout: AppLayout,
 ) -> bool {
-    let Some((terminal_id, area)) = ui::selected_terminal_output_area(app, frame_area) else {
+    let Some((terminal_id, area)) = layout.selected_terminal_output(app) else {
         return false;
     };
     let size = pty_dimensions_from_area(area);
@@ -298,9 +291,9 @@ pub(super) fn resize_visible_chat_agent(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     _config: &Config,
-    frame_area: Rect,
+    layout: AppLayout,
 ) -> bool {
-    let Some((chat_id, area)) = ui::selected_chat_agent_output_area(app, frame_area) else {
+    let Some((chat_id, area)) = layout.selected_chat_agent_output(app) else {
         return false;
     };
     let terminal_id = PtyKey::ChatAgent(chat_id);
@@ -333,12 +326,12 @@ fn pty_dimensions_changed(pty_runtime: &PtyRuntime, terminal: PtyKey, size: PtyD
     }
 }
 
-fn terminal_dimensions(app: &App, frame_area: Rect) -> PtyDimensions {
-    pty_dimensions_from_area(ui::terminal_output_area_for(app, frame_area))
+fn terminal_dimensions(layout: AppLayout) -> PtyDimensions {
+    pty_dimensions_from_area(layout.terminal_output())
 }
 
-pub(super) fn chat_agent_dimensions(app: &App, frame_area: Rect) -> PtyDimensions {
-    pty_dimensions_from_area(ui::chat_agent_output_area_for(app, frame_area))
+pub(super) fn chat_agent_dimensions(layout: AppLayout) -> PtyDimensions {
+    pty_dimensions_from_area(layout.chat_agent_output())
 }
 
 fn pty_dimensions_from_area(area: Rect) -> PtyDimensions {
@@ -454,23 +447,25 @@ mod tests {
         let (mut runtime, observed, server, socket_path) = recording_attached_runtime(terminal);
         let config = Config::default();
         let area = Rect::new(0, 0, 120, 40);
+        let layout = AppLayout::compute(&app, area);
 
-        restore_persisted_sessions(&mut app, &mut runtime, &config, area);
+        restore_persisted_sessions(&mut app, &mut runtime, &config, layout);
         // Settle the pane at the visible size, whatever the attach reported.
-        resize_visible_terminal(&mut app, &mut runtime, &config, area);
+        resize_visible_terminal(&mut app, &mut runtime, &config, layout);
 
         for _ in 0..8 {
             assert!(
-                !resize_visible_terminal(&mut app, &mut runtime, &config, area),
+                !resize_visible_terminal(&mut app, &mut runtime, &config, layout),
                 "an unchanged size is not a redraw reason either"
             );
         }
         // A genuine resize must still reach the daemon.
+        let resized = AppLayout::compute(&app, Rect::new(0, 0, 100, 30));
         assert!(resize_visible_terminal(
             &mut app,
             &mut runtime,
             &config,
-            Rect::new(0, 0, 100, 30)
+            resized
         ));
 
         drop(runtime);
@@ -502,18 +497,79 @@ mod tests {
         let _ = fs::remove_file(socket_path);
     }
 
+    /// F6, guarding D1: the pane is sized from the layout the loop resolved, so
+    /// a *layout* change with no terminal-size change must still reach the
+    /// daemon — and must reach it exactly once.
+    ///
+    /// A notice takes a row off the main pane. Before `AppLayout` the geometry
+    /// was recomputed inside the renderer and again at each resize site, so
+    /// "resize only when the dimensions changed" was answered against whichever
+    /// copy the caller happened to hold; now there is one value and this pins
+    /// that a change in it is what fires the resize.
+    #[test]
+    fn a_notice_resizes_the_visible_pane_once_without_a_terminal_resize() {
+        let (mut app, _, terminal) = running_command_app("echo noticed".to_string());
+        let (mut runtime, observed, server, socket_path) = recording_attached_runtime(terminal);
+        let config = Config::default();
+        let area = Rect::new(0, 0, 120, 40);
+
+        let quiet = AppLayout::compute(&app, area);
+        restore_persisted_sessions(&mut app, &mut runtime, &config, quiet);
+        resize_visible_terminal(&mut app, &mut runtime, &config, quiet);
+        assert!(
+            !resize_visible_terminal(&mut app, &mut runtime, &config, quiet),
+            "the pane is settled at the quiet layout"
+        );
+
+        app.push_notice(NoticeLevel::Error, NoticeSource::Report, "daemon is gone");
+        let noticed = AppLayout::compute(&app, area);
+        assert_eq!(
+            noticed.main.height,
+            quiet.main.height - 1,
+            "the status surface must cost the pane a row"
+        );
+        assert!(
+            resize_visible_terminal(&mut app, &mut runtime, &config, noticed),
+            "a shorter main pane is a resize the daemon has to hear about"
+        );
+        for _ in 0..4 {
+            assert!(
+                !resize_visible_terminal(&mut app, &mut runtime, &config, noticed),
+                "and only once, however many ticks run at the same layout"
+            );
+        }
+
+        drop(runtime);
+        server.join().expect("recording server exits");
+        let rows = observed
+            .into_iter()
+            .filter_map(|message| match message {
+                ClientMessage::Resize { rows, .. } => Some(rows),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rows.contains(&noticed.main.height),
+            "the daemon must be told the notice-shortened height: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| **row == noticed.main.height)
+                .count(),
+            1,
+            "exactly one write for that size: {rows:?}"
+        );
+        let _ = fs::remove_file(socket_path);
+    }
+
     #[test]
     fn restoration_attaches_to_an_existing_command_session_without_creating_it() {
         let (mut app, _, terminal) = running_command_app("echo restored".to_string());
         let (mut runtime, observed, server, socket_path) =
             connected_restoration_runtime(terminal, RestorationReply::Attached);
 
-        restore_persisted_sessions(
-            &mut app,
-            &mut runtime,
-            &Config::default(),
-            Rect::new(0, 0, 120, 40),
-        );
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
+        restore_persisted_sessions(&mut app, &mut runtime, &Config::default(), layout);
 
         assert!(matches!(
             observed
@@ -545,12 +601,8 @@ mod tests {
         let (mut runtime, observed, server, socket_path) =
             connected_restoration_runtime(terminal, RestorationReply::Missing);
 
-        restore_persisted_sessions(
-            &mut app,
-            &mut runtime,
-            &Config::default(),
-            Rect::new(0, 0, 120, 40),
-        );
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
+        restore_persisted_sessions(&mut app, &mut runtime, &Config::default(), layout);
 
         assert!(matches!(
             observed
@@ -579,11 +631,12 @@ mod tests {
         });
         let offline_socket = unique_status_path("offline-restore").with_extension("sock");
         let mut offline = PtyRuntime::with_socket_path(offline_socket, SpawnPolicy::Autospawn);
+        let reloaded_layout = AppLayout::compute(&reloaded, Rect::new(0, 0, 120, 40));
         assert!(!auto_start_selected_terminal(
             &mut reloaded,
             &mut offline,
             &Config::default(),
-            Rect::new(0, 0, 120, 40),
+            reloaded_layout,
         ));
         assert!(!side_effect.exists());
 
@@ -643,12 +696,8 @@ mod tests {
         let (mut runtime, observed, server, socket_path) =
             connected_restoration_runtime(terminal, RestorationReply::Missing);
 
-        restore_persisted_sessions(
-            &mut app,
-            &mut runtime,
-            &Config::default(),
-            Rect::new(0, 0, 120, 40),
-        );
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
+        restore_persisted_sessions(&mut app, &mut runtime, &Config::default(), layout);
 
         let request = observed
             .recv_timeout(Duration::from_secs(2))
@@ -689,12 +738,8 @@ mod tests {
         let socket = unique_status_path("unreachable-daemon").with_extension("sock");
         let mut runtime = PtyRuntime::with_socket_path(socket, SpawnPolicy::Autospawn);
 
-        restore_persisted_sessions(
-            &mut app,
-            &mut runtime,
-            &Config::default(),
-            Rect::new(0, 0, 120, 40),
-        );
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
+        restore_persisted_sessions(&mut app, &mut runtime, &Config::default(), layout);
 
         assert!(
             !app.project
@@ -709,10 +754,10 @@ mod tests {
     #[test]
     fn restored_terminal_dimensions_use_visible_main_width_even_when_not_selected() {
         let app = App::default();
-        let frame_area = Rect::new(0, 0, 120, 40);
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
 
         assert_eq!(
-            terminal_dimensions(&app, frame_area),
+            terminal_dimensions(layout),
             PtyDimensions { rows: 40, cols: 86 }
         );
     }

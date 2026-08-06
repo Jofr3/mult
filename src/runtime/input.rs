@@ -6,8 +6,8 @@
 //! selected pane — so nothing behind a modal surface can see a keystroke.
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::Rect;
 
+use crate::layout::AppLayout;
 use crate::{
     app::{App, NavItem, Prompt},
     config::Config,
@@ -38,14 +38,14 @@ pub(super) fn handle_event(
     config: &Config,
     store: &storage::StateStore,
     event: Event,
-    frame_area: Rect,
+    layout: AppLayout,
 ) {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
-            handle_key(app, pty_runtime, config, store, key, frame_area);
+            handle_key(app, pty_runtime, config, store, key, layout);
         }
-        Event::Mouse(mouse) => handle_mouse(app, pty_runtime, config, mouse, frame_area),
-        Event::Paste(text) => handle_paste(app, pty_runtime, config, store, text, frame_area),
+        Event::Mouse(mouse) => handle_mouse(app, pty_runtime, config, mouse, layout),
+        Event::Paste(text) => handle_paste(app, pty_runtime, config, store, text, layout),
         _ => {}
     }
 }
@@ -56,7 +56,7 @@ pub(super) fn handle_key(
     config: &Config,
     store: &storage::StateStore,
     key: KeyEvent,
-    frame_area: Rect,
+    layout: AppLayout,
 ) {
     if is_quit_key(key) {
         app.quit();
@@ -70,15 +70,15 @@ pub(super) fn handle_key(
         return;
     }
 
-    match &app.prompt {
+    match app.prompt() {
         Some(Prompt::OpenWorkspace(_)) => handle_open_workspace_key(app, config, key),
         Some(Prompt::NewTerminalCommand(_)) => handle_terminal_command_key(app, key),
         Some(Prompt::CommandPalette(_)) => {
-            handle_command_palette_key(app, pty_runtime, config, store, key, frame_area);
+            handle_command_palette_key(app, pty_runtime, config, store, key, layout);
         }
         Some(Prompt::Search(_)) => handle_search_key(app, key),
         Some(Prompt::ConfirmDelete(_)) => handle_delete_confirmation_key(app, pty_runtime, key),
-        None => handle_unprompted_key(app, pty_runtime, config, store, key, frame_area),
+        None => handle_unprompted_key(app, pty_runtime, config, store, key, layout),
     }
 }
 
@@ -88,7 +88,7 @@ fn handle_paste(
     config: &Config,
     store: &storage::StateStore,
     text: String,
-    frame_area: Rect,
+    layout: AppLayout,
 ) {
     if app.is_prompt_active() {
         for ch in text.chars().filter(|ch| !ch.is_control()) {
@@ -97,8 +97,7 @@ fn handle_paste(
         return;
     }
 
-    let Some(terminal_id) =
-        start_selected_pty_if_needed(app, pty_runtime, config, store, frame_area)
+    let Some(terminal_id) = start_selected_pty_if_needed(app, pty_runtime, config, store, layout)
     else {
         return;
     };
@@ -121,17 +120,17 @@ fn handle_unprompted_key(
     config: &Config,
     store: &storage::StateStore,
     key: KeyEvent,
-    frame_area: Rect,
+    layout: AppLayout,
 ) {
     if opens_help(app, key) {
         app.show_help();
         return;
     }
-    if handle_control_key(app, pty_runtime, config, store, key, frame_area) {
+    if handle_control_key(app, pty_runtime, config, store, key, layout) {
         return;
     }
 
-    handle_selected_pty_input_key(app, pty_runtime, config, store, key, frame_area);
+    handle_selected_pty_input_key(app, pty_runtime, config, store, key, layout);
 }
 
 /// `F1` always opens the overlay; `?` only when no pane would have received it.
@@ -166,7 +165,7 @@ fn handle_control_key(
     config: &Config,
     store: &storage::StateStore,
     key: KeyEvent,
-    frame_area: Rect,
+    layout: AppLayout,
 ) -> bool {
     if is_shifted_control_char(key, 'c') {
         copy_current_text_selection(app, pty_runtime, config);
@@ -193,7 +192,7 @@ fn handle_control_key(
         return true;
     }
     if is_unshifted_control_char(key, 'a') {
-        add_agent_to_selected_workspace(app, pty_runtime, config, store, frame_area, AgentKind::Pi);
+        add_agent_to_selected_workspace(app, pty_runtime, config, store, layout, AgentKind::Pi);
         return true;
     }
     if is_unshifted_control_char(key, 'x') {
@@ -202,7 +201,7 @@ fn handle_control_key(
             pty_runtime,
             config,
             store,
-            frame_area,
+            layout,
             AgentKind::ClaudeCode,
         );
         return true;
@@ -230,7 +229,7 @@ fn handle_selected_pty_input_key(
     config: &Config,
     store: &storage::StateStore,
     key: KeyEvent,
-    frame_area: Rect,
+    layout: AppLayout,
 ) {
     // Emptiness does not depend on cursor-key mode, so this also avoids starting
     // a PTY for keys that map to nothing (e.g. shortcuts handled elsewhere).
@@ -238,8 +237,7 @@ fn handle_selected_pty_input_key(
         return;
     }
 
-    let Some(terminal_id) =
-        start_selected_pty_if_needed(app, pty_runtime, config, store, frame_area)
+    let Some(terminal_id) = start_selected_pty_if_needed(app, pty_runtime, config, store, layout)
     else {
         return;
     };
@@ -268,7 +266,7 @@ fn start_selected_pty_if_needed(
     pty_runtime: &mut PtyRuntime,
     config: &Config,
     store: &storage::StateStore,
-    frame_area: Rect,
+    layout: AppLayout,
 ) -> Option<PtyKey> {
     match app.selected_item()? {
         NavItem::Chat { workspace, chat } => {
@@ -281,7 +279,7 @@ fn start_selected_pty_if_needed(
                     pty_runtime,
                     config,
                     store,
-                    frame_area,
+                    layout,
                     ChatAgentLaunch {
                         workspace_id: workspace,
                         chat_id: chat,
@@ -297,7 +295,7 @@ fn start_selected_pty_if_needed(
         } => {
             let key = PtyKey::Terminal(terminal);
             if !pty_runtime.is_running(key) {
-                start_terminal(app, pty_runtime, config, frame_area, workspace, terminal);
+                start_terminal(app, pty_runtime, config, layout, workspace, terminal);
             }
             if pty_runtime.is_running(key) {
                 app.begin_terminal_input();
@@ -314,12 +312,12 @@ pub(super) fn focus_selected_input(
     pty_runtime: &mut PtyRuntime,
     config: &Config,
     store: &storage::StateStore,
-    frame_area: Rect,
+    layout: AppLayout,
 ) {
     if app.selected_chat_id().is_some() {
-        start_or_focus_selected_chat_agent(app, pty_runtime, config, store, frame_area);
+        start_or_focus_selected_chat_agent(app, pty_runtime, config, store, layout);
     } else if app.selected_terminal_id().is_some() {
-        start_or_focus_selected_terminal(app, pty_runtime, config, frame_area);
+        start_or_focus_selected_terminal(app, pty_runtime, config, layout);
     }
 }
 
@@ -330,6 +328,7 @@ mod tests {
     use crate::app::NoticeLevel;
     use crate::app::NoticeSource;
     use crate::runtime::{keymap::key_to_pty_bytes, test_support::*};
+    use ratatui::layout::Rect;
 
     #[test]
     fn ctrl_j_and_ctrl_k_navigate_selection() {
@@ -337,7 +336,7 @@ mod tests {
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
         let config = Config::default();
-        let frame_area = Rect::new(0, 0, 120, 40);
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
 
         handle_unprompted_key(
             &mut app,
@@ -345,7 +344,7 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
-            frame_area,
+            layout,
         );
         assert_eq!(app.selected_index(), Some(1));
         assert_eq!(app.selected_item(), Some(app.nav_items()[1]));
@@ -356,7 +355,7 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
-            frame_area,
+            layout,
         );
         assert_eq!(app.selected_index(), Some(0));
         assert_eq!(app.selected_item(), Some(app.nav_items()[0]));
@@ -368,7 +367,7 @@ mod tests {
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
         let config = Config::default();
-        let frame_area = Rect::new(0, 0, 120, 40);
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
 
         handle_unprompted_key(
             &mut app,
@@ -376,9 +375,9 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
-            frame_area,
+            layout,
         );
-        assert!(matches!(app.prompt, Some(Prompt::CommandPalette(_))));
+        assert!(matches!(app.prompt(), Some(Prompt::CommandPalette(_))));
         app.cancel_prompt();
 
         let workspace = app.project.workspaces[0].id;
@@ -394,9 +393,9 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
-            frame_area,
+            layout,
         );
-        assert!(matches!(app.prompt, Some(Prompt::Search(_))));
+        assert!(matches!(app.prompt(), Some(Prompt::Search(_))));
     }
 
     #[test]
@@ -405,7 +404,7 @@ mod tests {
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
         let config = Config::default();
-        let frame_area = Rect::new(0, 0, 120, 40);
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
         let initial_terminals = app.project.workspaces[0].terminals.len();
 
         handle_unprompted_key(
@@ -414,7 +413,7 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
-            frame_area,
+            layout,
         );
         handle_unprompted_key(
             &mut app,
@@ -422,12 +421,12 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
-            frame_area,
+            layout,
         );
 
         assert_eq!(app.project.workspaces[0].terminals.len(), initial_terminals);
         assert!(!app.should_quit);
-        assert_eq!(app.prompt, None);
+        assert_eq!(app.prompt(), None);
     }
 
     #[test]
@@ -436,7 +435,7 @@ mod tests {
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
         let config = Config::default();
-        let frame_area = Rect::new(0, 0, 120, 40);
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
         let initial_terminals = app.project.workspaces[0].terminals.len();
 
         handle_unprompted_key(
@@ -445,7 +444,7 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
-            frame_area,
+            layout,
         );
         assert_eq!(
             app.project.workspaces[0].terminals.len(),
@@ -461,7 +460,7 @@ mod tests {
                 KeyCode::Char('Q'),
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             ),
-            frame_area,
+            layout,
         );
         assert!(!app.should_quit);
 
@@ -471,7 +470,7 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL),
-            frame_area,
+            layout,
         );
         assert!(app.should_quit);
         assert_eq!(
@@ -486,9 +485,9 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
-            frame_area,
+            layout,
         );
-        assert!(matches!(app.prompt, Some(Prompt::ConfirmDelete(_))));
+        assert!(matches!(app.prompt(), Some(Prompt::ConfirmDelete(_))));
         assert_eq!(
             app.project.workspaces[0].terminals.len(),
             initial_terminals + 1
@@ -500,9 +499,9 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            frame_area,
+            layout,
         );
-        assert_eq!(app.prompt, None);
+        assert_eq!(app.prompt(), None);
         assert_eq!(
             app.project.workspaces[0].terminals.len(),
             initial_terminals + 1
@@ -514,7 +513,7 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
-            frame_area,
+            layout,
         );
         handle_key(
             &mut app,
@@ -522,9 +521,9 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            frame_area,
+            layout,
         );
-        assert_eq!(app.prompt, None);
+        assert_eq!(app.prompt(), None);
         assert_eq!(app.project.workspaces[0].terminals.len(), initial_terminals);
     }
 
@@ -534,7 +533,7 @@ mod tests {
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
         let config = Config::default();
-        let frame_area = Rect::new(0, 0, 120, 40);
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
         let workspace = app.project.workspaces[0].id;
         assert!(app.project.workspaces[0].chats.is_empty());
 
@@ -544,7 +543,7 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
-            frame_area,
+            layout,
         );
 
         // Ctrl+x adds and selects a chat backed by Claude Code, distinct from
@@ -564,7 +563,7 @@ mod tests {
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
         let config = Config::default();
-        let frame_area = Rect::new(0, 0, 120, 40);
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
         let initial_terminals = app.project.workspaces[0].terminals.len();
 
         handle_unprompted_key(
@@ -573,10 +572,10 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-            frame_area,
+            layout,
         );
 
-        assert_eq!(app.prompt, None);
+        assert_eq!(app.prompt(), None);
         assert_eq!(app.project.workspaces[0].terminals.len(), initial_terminals);
     }
 
@@ -586,7 +585,7 @@ mod tests {
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
         let config = Config::default();
-        let frame_area = Rect::new(0, 0, 120, 40);
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
         let key = KeyEvent::new(
             KeyCode::Char('c'),
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
@@ -598,7 +597,7 @@ mod tests {
             &config,
             &store,
             key,
-            frame_area,
+            layout,
         ));
         assert!(key_to_pty_bytes(key).is_empty());
         assert!(key_to_pty_bytes(KeyEvent::new(
@@ -614,7 +613,7 @@ mod tests {
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
         let config = Config::default();
-        let frame_area = Rect::new(0, 0, 120, 40);
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
 
         handle_unprompted_key(
             &mut app,
@@ -622,9 +621,9 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
-            frame_area,
+            layout,
         );
-        assert!(matches!(app.prompt, Some(Prompt::OpenWorkspace(_))));
+        assert!(matches!(app.prompt(), Some(Prompt::OpenWorkspace(_))));
     }
 
     // ---- E4: the help overlay ---------------------------------------------
@@ -633,8 +632,8 @@ mod tests {
     fn f1_opens_help_over_a_selected_pty_but_a_bare_question_mark_does_not() {
         let store = test_state_store("help-f1");
         let config = Config::default();
-        let frame_area = Rect::new(0, 0, 120, 40);
         let mut app = App::default();
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
         let mut pty_runtime = PtyRuntime::new_offline();
 
         // The seed state has a terminal selected, so `?` belongs to it.
@@ -645,7 +644,7 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
-            frame_area,
+            layout,
         );
         assert!(!app.is_help_visible(), "? must reach a pane that wants it");
 
@@ -655,7 +654,7 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
-            frame_area,
+            layout,
         );
         assert!(app.is_help_visible());
     }
@@ -664,8 +663,8 @@ mod tests {
     fn the_help_overlay_swallows_keys_and_closes_on_the_next_one() {
         let store = test_state_store("help-modal");
         let config = Config::default();
-        let frame_area = Rect::new(0, 0, 120, 40);
         let mut app = App::default();
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
         let mut pty_runtime = PtyRuntime::new_offline();
         app.show_help();
 
@@ -676,7 +675,7 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
-            frame_area,
+            layout,
         );
         assert!(!app.is_help_visible());
         assert!(!pty_runtime.is_running(app.pty_input_target().expect("a pane is selected")));
@@ -689,7 +688,7 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL),
-            frame_area,
+            layout,
         );
         assert!(app.should_quit);
     }
@@ -698,8 +697,8 @@ mod tests {
     fn ctrl_n_dismisses_notices_but_otherwise_reaches_the_pty() {
         let store = test_state_store("notice-dismiss");
         let config = Config::default();
-        let frame_area = Rect::new(0, 0, 120, 40);
         let mut app = App::default();
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
         let mut pty_runtime = PtyRuntime::new_offline();
         app.push_notice(
             NoticeLevel::Error,
@@ -713,7 +712,7 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
-            frame_area,
+            layout,
         ));
         assert!(app.notices().is_empty());
 
@@ -725,7 +724,7 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
-            frame_area,
+            layout,
         ));
     }
 }

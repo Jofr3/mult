@@ -4,8 +4,8 @@
 use std::fs::{self};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::Rect;
 
+use crate::layout::AppLayout;
 use crate::{
     app::{App, CommandAction, PromptEdit},
     config::Config,
@@ -146,12 +146,12 @@ pub(super) fn handle_command_palette_key(
     config: &Config,
     store: &storage::StateStore,
     key: KeyEvent,
-    frame_area: Rect,
+    layout: AppLayout,
 ) {
     match apply_shared_prompt_key(app, key) {
         PromptKey::Submit => {
             if let Some(action) = app.submit_command_palette() {
-                execute_command_action(app, pty_runtime, config, store, action, frame_area);
+                execute_command_action(app, pty_runtime, config, store, action, layout);
             }
         }
         PromptKey::Previous => app.select_previous_command_palette_entry(),
@@ -185,7 +185,7 @@ fn execute_command_action(
     config: &Config,
     store: &storage::StateStore,
     action: CommandAction,
-    frame_area: Rect,
+    layout: AppLayout,
 ) {
     match action {
         CommandAction::ShowKeybindings => app.show_help(),
@@ -197,18 +197,9 @@ fn execute_command_action(
         CommandAction::FocusSelectedPane => {
             app.focus_selected_main();
         }
-        CommandAction::StartInput => {
-            focus_selected_input(app, pty_runtime, config, store, frame_area)
-        }
+        CommandAction::StartInput => focus_selected_input(app, pty_runtime, config, store, layout),
         CommandAction::AddAgentChat => {
-            add_agent_to_selected_workspace(
-                app,
-                pty_runtime,
-                config,
-                store,
-                frame_area,
-                AgentKind::Pi,
-            );
+            add_agent_to_selected_workspace(app, pty_runtime, config, store, layout, AgentKind::Pi);
         }
         CommandAction::AddClaudeCodeChat => {
             add_agent_to_selected_workspace(
@@ -216,7 +207,7 @@ fn execute_command_action(
                 pty_runtime,
                 config,
                 store,
-                frame_area,
+                layout,
                 AgentKind::ClaudeCode,
             );
         }
@@ -243,6 +234,7 @@ mod tests {
     use crate::app::NavItem;
     use crate::app::Prompt;
     use crate::runtime::test_support::*;
+    use ratatui::layout::Rect;
     use std::io;
 
     #[test]
@@ -267,7 +259,7 @@ mod tests {
         assert!(app.project.terminal(workspace, terminal).is_some());
         assert!(!app.is_dirty());
         assert!(matches!(
-            app.prompt,
+            app.prompt(),
             Some(Prompt::ConfirmDelete(ref prompt))
                 if prompt.error.as_deref().is_some_and(|error| error.contains("daemon refused stop"))
         ));
@@ -317,7 +309,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
         );
         assert!(matches!(
-            app.prompt,
+            app.prompt(),
             Some(Prompt::OpenWorkspace(ref prompt)) if prompt.selected.index() == 1
         ));
 
@@ -327,7 +319,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
         );
         assert!(matches!(
-            app.prompt,
+            app.prompt(),
             Some(Prompt::OpenWorkspace(ref prompt)) if prompt.selected.index() == 0
         ));
     }
@@ -406,7 +398,7 @@ mod tests {
 
             // ...and cancelling is the same key everywhere.
             drive(&mut app, ctrl('c'));
-            assert!(app.prompt.is_none(), "{name}");
+            assert!(app.prompt().is_none(), "{name}");
         }
     }
 
@@ -423,7 +415,7 @@ mod tests {
         let store = test_state_store("ctrl-k");
         let mut pty_runtime = PtyRuntime::new_offline();
         let config = Config::default();
-        let frame_area = Rect::new(0, 0, 120, 40);
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
 
         handle_command_palette_key(
             &mut app,
@@ -431,7 +423,7 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
-            frame_area,
+            layout,
         );
 
         assert_eq!(
@@ -439,7 +431,7 @@ mod tests {
             "focus",
             "ctrl-k must not delete anything"
         );
-        let Some(Prompt::CommandPalette(prompt)) = &app.prompt else {
+        let Some(Prompt::CommandPalette(prompt)) = app.prompt() else {
             panic!("palette is open");
         };
         let len = app.active_command_palette_entries().len();
@@ -467,8 +459,8 @@ mod tests {
     fn the_palette_can_open_the_overlay_and_ask_for_a_config_reload() {
         let store = test_state_store("help-palette");
         let config = Config::default();
-        let frame_area = Rect::new(0, 0, 120, 40);
         let mut app = App::default();
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
         let mut pty_runtime = PtyRuntime::new_offline();
 
         execute_command_action(
@@ -477,7 +469,7 @@ mod tests {
             &config,
             &store,
             CommandAction::ShowKeybindings,
-            frame_area,
+            layout,
         );
         assert!(app.is_help_visible());
 
@@ -487,7 +479,7 @@ mod tests {
             &config,
             &store,
             CommandAction::ReloadConfig,
-            frame_area,
+            layout,
         );
         // The action only records the request; the loop, which owns the
         // `Config`, performs the swap (E9).

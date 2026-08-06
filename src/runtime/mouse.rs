@@ -4,12 +4,12 @@
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
+use crate::layout::AppLayout;
 use crate::{
     app::{App, SelectionCell},
     config::Config,
     model::PtyKey,
     pty::PtyRuntime,
-    ui,
 };
 
 use super::clipboard::copy_text_selection_to_clipboard;
@@ -21,7 +21,7 @@ pub(super) fn handle_mouse(
     pty_runtime: &mut PtyRuntime,
     config: &Config,
     mouse: MouseEvent,
-    frame_area: Rect,
+    layout: AppLayout,
 ) {
     if app.is_prompt_active() {
         return;
@@ -29,26 +29,26 @@ pub(super) fn handle_mouse(
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            begin_text_selection_at_mouse(app, frame_area, mouse);
+            begin_text_selection_at_mouse(app, layout, mouse);
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            update_text_selection_at_mouse(app, frame_area, mouse);
+            update_text_selection_at_mouse(app, layout, mouse);
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            finish_text_selection_at_mouse(app, pty_runtime, config, frame_area, mouse);
+            finish_text_selection_at_mouse(app, pty_runtime, config, layout, mouse);
         }
         MouseEventKind::ScrollUp => {
-            scroll_output_at_mouse(app, pty_runtime, frame_area, mouse, ScrollDirection::Up);
+            scroll_output_at_mouse(app, pty_runtime, layout, mouse, ScrollDirection::Up);
         }
         MouseEventKind::ScrollDown => {
-            scroll_output_at_mouse(app, pty_runtime, frame_area, mouse, ScrollDirection::Down);
+            scroll_output_at_mouse(app, pty_runtime, layout, mouse, ScrollDirection::Down);
         }
         _ => {}
     }
 }
 
-fn begin_text_selection_at_mouse(app: &mut App, frame_area: Rect, mouse: MouseEvent) -> bool {
-    let Some((terminal, area)) = selected_output_area(app, frame_area) else {
+fn begin_text_selection_at_mouse(app: &mut App, layout: AppLayout, mouse: MouseEvent) -> bool {
+    let Some((terminal, area)) = selected_output_area(app, layout) else {
         app.clear_text_selection();
         return false;
     };
@@ -63,8 +63,8 @@ fn begin_text_selection_at_mouse(app: &mut App, frame_area: Rect, mouse: MouseEv
     true
 }
 
-fn update_text_selection_at_mouse(app: &mut App, frame_area: Rect, mouse: MouseEvent) -> bool {
-    let Some((terminal, cell)) = active_selection_cell_at_mouse(app, frame_area, mouse) else {
+fn update_text_selection_at_mouse(app: &mut App, layout: AppLayout, mouse: MouseEvent) -> bool {
+    let Some((terminal, cell)) = active_selection_cell_at_mouse(app, layout, mouse) else {
         return false;
     };
     app.update_text_selection(terminal, cell)
@@ -74,10 +74,10 @@ fn finish_text_selection_at_mouse(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
     config: &Config,
-    frame_area: Rect,
+    layout: AppLayout,
     mouse: MouseEvent,
 ) -> bool {
-    let Some((terminal, cell)) = active_selection_cell_at_mouse(app, frame_area, mouse) else {
+    let Some((terminal, cell)) = active_selection_cell_at_mouse(app, layout, mouse) else {
         return false;
     };
     let Some(selection) = app.end_text_selection(terminal, cell) else {
@@ -93,22 +93,23 @@ fn finish_text_selection_at_mouse(
 
 fn active_selection_cell_at_mouse(
     app: &App,
-    frame_area: Rect,
+    layout: AppLayout,
     mouse: MouseEvent,
 ) -> Option<(PtyKey, SelectionCell)> {
     let selection = app.text_selection?;
-    let (terminal, area) = selected_output_area(app, frame_area)?;
+    let (terminal, area) = selected_output_area(app, layout)?;
     if terminal != selection.terminal {
         return None;
     }
     mouse_cell_in_area(area, mouse.column, mouse.row).map(|cell| (terminal, cell))
 }
 
-fn selected_output_area(app: &App, frame_area: Rect) -> Option<(PtyKey, Rect)> {
-    if let Some((terminal, area)) = ui::selected_terminal_output_area(app, frame_area) {
+fn selected_output_area(app: &App, layout: AppLayout) -> Option<(PtyKey, Rect)> {
+    if let Some((terminal, area)) = layout.selected_terminal_output(app) {
         return Some((PtyKey::Terminal(terminal), area));
     }
-    ui::selected_chat_agent_output_area(app, frame_area)
+    layout
+        .selected_chat_agent_output(app)
         .map(|(chat, area)| (PtyKey::ChatAgent(chat), area))
 }
 
@@ -136,12 +137,11 @@ enum ScrollDirection {
 fn scroll_output_at_mouse(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
-    frame_area: Rect,
+    layout: AppLayout,
     mouse: MouseEvent,
     direction: ScrollDirection,
 ) -> bool {
-    let Some((terminal, area)) = output_terminal_at(app, frame_area, mouse.column, mouse.row)
-    else {
+    let Some((terminal, area)) = output_terminal_at(app, layout, mouse.column, mouse.row) else {
         return false;
     };
 
@@ -170,11 +170,11 @@ fn scroll_output_at_mouse(
 
 fn output_terminal_at(
     app: &App,
-    frame_area: Rect,
+    layout: AppLayout,
     column: u16,
     row: u16,
 ) -> Option<(PtyKey, Rect)> {
-    selected_output_area(app, frame_area).filter(|(_, area)| rect_contains(*area, column, row))
+    selected_output_area(app, layout).filter(|(_, area)| rect_contains(*area, column, row))
 }
 
 fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
@@ -261,8 +261,9 @@ mod tests {
             .expect("resize parser");
         pty_runtime.process_terminal_output(terminal_id, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
         let config = config_with(|config| config.mouse_capture = true);
-        let frame_area = Rect::new(0, 0, 120, 40);
-        let (_, output_area) = ui::selected_terminal_output_area(&app, frame_area)
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
+        let (_, output_area) = layout
+            .selected_terminal_output(&app)
             .expect("terminal selection has output area");
 
         handle_event(
@@ -276,7 +277,7 @@ mod tests {
                 row: output_area.y,
                 modifiers: KeyModifiers::NONE,
             }),
-            frame_area,
+            layout,
         );
         assert_eq!(
             pty_runtime.terminal_lines(terminal_id),
@@ -294,7 +295,7 @@ mod tests {
                 row: output_area.y,
                 modifiers: KeyModifiers::NONE,
             }),
-            frame_area,
+            layout,
         );
         assert_eq!(
             pty_runtime.terminal_lines(terminal_id),
@@ -327,8 +328,9 @@ mod tests {
         // our local scrollback must stay pinned to the bottom.
         pty_runtime.process_terminal_output(terminal_id, b"\x1b[?1000h\x1b[?1006h");
         let config = config_with(|config| config.mouse_capture = true);
-        let frame_area = Rect::new(0, 0, 120, 40);
-        let (_, output_area) = ui::selected_terminal_output_area(&app, frame_area)
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
+        let (_, output_area) = layout
+            .selected_terminal_output(&app)
             .expect("terminal selection has output area");
 
         handle_event(
@@ -342,7 +344,7 @@ mod tests {
                 row: output_area.y,
                 modifiers: KeyModifiers::NONE,
             }),
-            frame_area,
+            layout,
         );
 
         assert_eq!(
@@ -384,8 +386,9 @@ mod tests {
             .expect("resize parser");
         pty_runtime.process_terminal_output(terminal_id, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
         let config = config_with(|config| config.mouse_capture = true);
-        let frame_area = Rect::new(0, 0, 120, 40);
-        let (_, output_area) = ui::selected_terminal_output_area(&app, frame_area)
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
+        let (_, output_area) = layout
+            .selected_terminal_output(&app)
             .expect("terminal selection has output area");
 
         handle_event(
@@ -399,7 +402,7 @@ mod tests {
                 row: output_area.y,
                 modifiers: KeyModifiers::NONE,
             }),
-            frame_area,
+            layout,
         );
         let selection = app
             .text_selection_for(terminal_id)
@@ -418,7 +421,7 @@ mod tests {
                 row: output_area.y,
                 modifiers: KeyModifiers::NONE,
             }),
-            frame_area,
+            layout,
         );
         let selection = app
             .text_selection_for(terminal_id)

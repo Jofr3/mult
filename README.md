@@ -280,11 +280,43 @@ Pi and Claude Code lifecycle bridges write generation-scoped, append-only status
 ```text
 src/lib.rs                        library root; the modules below marked (lib) are public
 src/main.rs                       `mult` entry point: argument parsing, config load, state lock, signal handlers, panic-safe cleanup
-src/runtime.rs                    TUI event loop, keymap, mouse, clipboard, agent status bridge, hook/extension generation, save scheduling
 src/terminal_guard.rs             RAII terminal mode setup and restore
-src/app.rs                  (lib) app state, navigation, prompts, search, mutations
+src/runtime/                (lib) the TUI event loop and its wiring
+  mod.rs                            the loop itself: per-tick ordering, config reload, host-terminal failure policy
+  input.rs                          key and paste dispatch, global control-key shortcuts
+  prompt.rs                         prompt key handlers and the command-palette actions
+  keymap.rs                         key -> PTY byte encoder and the control-key predicates
+  mouse.rs                          mouse hit-testing, text selection, scrollback
+  clipboard.rs                      OSC 52 clipboard writes, base64, tmux passthrough
+  session.rs                        PTY restore/start/resize and drained PTY events
+  agent_launch.rs                   starting and focusing chat agents; the process-agent backend
+  agent_command.rs                  agent command lines and the generated extension/hook files
+  agent_status.rs                   the per-chat agent status journals and the daemon reconciliation
+  save.rs                           save scheduling and its exemptions
+src/app/                    (lib) session state
+  mod.rs                            the `App` struct, construction, save flags, help, `InteractionMode`
+  nav.rs                            the sidebar walk and the selection over it
+  prompt.rs                         prompt input, editing, the palette and command-terminal prompts
+  open_workspace.rs                 project fuzzy matching, path expansion, workspace import
+  search.rs                         pane search and the chat transcript
+  selection.rs                      mouse text selection in cells
+  notices.rs                        the status-surface notices
+  bindings.rs                       the keybinding table and the palette generated from it
+  mutate.rs                         workspace/chat/terminal creation and deletion
+src/ui/                     (lib) Ratatui rendering
+  mod.rs                            frame composition: which surface goes where, in what order
+  theme.rs                          palette, colour parsing, WCAG contrast, NO_COLOR
+  vt_screen.rs                      the vt100 -> tui_term adapter
+  sidebar.rs                        the sidebar and its status glyphs
+  main_pane.rs                      the selected chat or terminal pane
+  terminal_view.rs                  drawing a live PTY screen and the selection highlight
+  prompt.rs                         the prompt surface
+  status.rs                         the notice surface
+  help.rs                           the keybinding overlay
+  text.rs                           display-width text helpers
+  snapshots/                        insta snapshots for the ui render tests
+src/layout.rs               (lib) `AppLayout`: the frame divided, resolved once per loop iteration
 src/model.rs                (lib) durable project model, IDs, session identity, state schema
-src/ui.rs                   (lib) Ratatui rendering, palette, and the vt100 -> ratatui adapter
 src/pty.rs                  (lib) client-side PTY runtime and server protocol adapter
 src/cli.rs                  (lib) argument parsing for both binaries
 src/config.rs               (lib) config loading, validation, defaults, and DEFAULT_COLOR_SCHEME
@@ -293,18 +325,18 @@ src/paths.rs                (lib) XDG/HOME resolution for the config and state d
 src/git.rs                  (lib) workspace git branch probe
 src/agent.rs                (lib) experimental process-agent backend
 src/transcript.rs           (lib) bounded append-only transcript journal (built, not yet wired)
-src/snapshots/                    insta snapshots for the ui.rs render tests
 src/bin/mult-server.rs            PTY server process
 crates/protocol/                  shared client/server protocol types, framing, and peer checks
 tests/pty_integration.rs          end-to-end PTY tests against a real daemon
 tests/fixtures/state/             golden state files for the migration tests
-extensions/mult-status.ts         bundled pi status extension (embedded via include_str! in src/runtime.rs)
+extensions/mult-status.ts         bundled pi status extension (embedded via include_str! in src/runtime/agent_command.rs)
 extensions/mult-claude-status.sh  bundled Claude Code status hook script (likewise)
 ```
 
-`runtime.rs` and `terminal_guard.rs` are declared by `src/main.rs` rather than
-`src/lib.rs`, so they are private to the `mult` binary and cannot be reached from
-integration tests. Documentation lives in [docs/](docs/): the
+`terminal_guard.rs` is the only module declared by `src/main.rs` rather than
+`src/lib.rs`, so it is private to the `mult` binary and cannot be reached from
+integration tests; `runtime` joined the library in R10b. Documentation lives in
+[docs/](docs/): the
 [roadmap](docs/ROADMAP.md), the [daemon design](docs/DAEMON.md), the
 [config reference](docs/CONFIG.md), [troubleshooting](docs/TROUBLESHOOTING.md),
 and [releasing](docs/RELEASING.md).

@@ -8,6 +8,49 @@ and the project aims to adhere to
 
 ## [Unreleased]
 
+### Module structure (R10b)
+
+Behaviour-preserving throughout: no wire, state, config or rendering change.
+`PROTOCOL_VERSION` stays 11, `STATE_VERSION` stays 3, and every `insta` snapshot
+is byte-identical.
+
+- `runtime` is part of the library (`pub mod runtime;`) instead of a module
+  declared only by `src/main.rs`, so `tests/` and the rest of the crate can reach
+  it. Its 68 tests moved from the binary's test target to the library's, and the
+  fixtures they had duplicated per test site are one `#[cfg(test)] test_support`
+  module. `terminal_guard` is now the only binary-private module (F9).
+- `src/runtime.rs` (5428 lines) split into `src/runtime/`: `mod.rs` (the event
+  loop, its per-tick ordering, config reload and host-terminal failure policy)
+  plus `input`, `prompt`, `keymap`, `mouse`, `clipboard`, `session`,
+  `agent_launch`, `agent_command`, `agent_status` and `save` (F9).
+- `src/ui.rs` (3504 lines) split into `src/ui/`: `theme` (palette, colour
+  parsing, WCAG contrast, `NO_COLOR`), `vt_screen` (the `vt100` → `tui_term`
+  adapter), `terminal_view`, `sidebar`, `main_pane`, `prompt`, `status`, `help`
+  and `text`. `src/snapshots/` moved to `src/ui/snapshots/`; the snapshot names
+  come from the module path, so they did not change (F15).
+- New `src/layout.rs`. `AppLayout::compute(&App, Rect)` is the one place the
+  frame is divided, and the event loop resolves it once per iteration and hands
+  the same value to `ui::draw` and to the resize and mouse handlers. The renderer
+  is no longer the geometry oracle: `ui` consumes rects and no longer answers
+  "where is the selected pane" (F6).
+- `App`'s `prompt: Option<Prompt>` and `focus: FocusMode` are one private
+  `InteractionMode`: either a modal prompt owns the keyboard, or the session is
+  browsing with the focus on the sidebar or on the selected pane. Which pane is
+  derived from the selection rather than stored beside it, so a focus that names
+  a pane the sidebar is not on cannot be constructed. `App::prompt()` and
+  `App::focus()` replace the two public fields; `focus()` reports `None` while a
+  prompt is up, which is what the renderer already meant (F5).
+- `src/app.rs` (3687 lines) split into `src/app/`: `mod`, `nav`, `prompt`,
+  `open_workspace`, `search`, `selection`, `notices`, `bindings` and `mutate`
+  (F5).
+- Six tests added: three pinning the interaction mode (a prompt takes and gives
+  back the focus untouched; focus follows the selection; a PTY exiting under an
+  open prompt does not close it), two pinning that an open prompt and a live
+  notice each cost the main pane rows, and one pinning that a layout change with
+  no terminal-size change resizes the visible pane exactly once — the timing
+  guarantee R3 established, now answered from a single layout instead of three
+  separately recomputed copies.
+
 ### Wire protocol 11 and state schema 3 (R10a)
 
 **Breaking (daemon):** the wire protocol moves from 10 to 11. Stop any running

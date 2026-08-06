@@ -7,8 +7,8 @@
 use std::io::{self};
 
 use mult_protocol::AGENT_STATUS_SCHEMA_VERSION;
-use ratatui::layout::Rect;
 
+use crate::layout::AppLayout;
 use crate::{
     agent::{
         self, AgentBackend, AgentEvent, NoopAgentBackend, ProcessAgentBackend, ProcessAgentCommand,
@@ -157,7 +157,7 @@ pub(super) fn add_agent_to_selected_workspace(
     pty_runtime: &mut PtyRuntime,
     config: &Config,
     store: &storage::StateStore,
-    frame_area: Rect,
+    layout: AppLayout,
     agent: AgentKind,
 ) {
     if let Some((workspace, chat)) = app.add_chat_to_selected_workspace_and_return(agent) {
@@ -166,7 +166,7 @@ pub(super) fn add_agent_to_selected_workspace(
             pty_runtime,
             config,
             store,
-            frame_area,
+            layout,
             ChatAgentLaunch {
                 workspace_id: workspace,
                 chat_id: chat,
@@ -181,7 +181,7 @@ pub(super) fn start_or_focus_selected_chat_agent(
     pty_runtime: &mut PtyRuntime,
     config: &Config,
     store: &storage::StateStore,
-    frame_area: Rect,
+    layout: AppLayout,
 ) {
     let Some((workspace_id, chat_id)) = app.selected_chat_id() else {
         return;
@@ -192,7 +192,7 @@ pub(super) fn start_or_focus_selected_chat_agent(
         pty_runtime,
         config,
         store,
-        frame_area,
+        layout,
         ChatAgentLaunch {
             workspace_id,
             chat_id,
@@ -216,7 +216,7 @@ pub(super) fn start_or_focus_chat_agent(
     pty_runtime: &mut PtyRuntime,
     config: &Config,
     store: &storage::StateStore,
-    frame_area: Rect,
+    layout: AppLayout,
     launch: ChatAgentLaunch,
 ) {
     let ChatAgentLaunch {
@@ -283,7 +283,7 @@ pub(super) fn start_or_focus_chat_agent(
             app.mark_chat_status_by_id(chat_id, ChatStatus::Failed);
             return;
         }
-        match pty_runtime.attach_existing(terminal_id, chat_agent_dimensions(app, frame_area)) {
+        match pty_runtime.attach_existing(terminal_id, chat_agent_dimensions(layout)) {
             Ok(AttachExistingResult::Attached) => {
                 reconcile_agent_status(app, pty_runtime, chat_id, agent, generation);
                 if focus_after_start {
@@ -380,7 +380,7 @@ pub(super) fn start_or_focus_chat_agent(
         generation.to_string(),
     );
     let mut spawn = PtySpawn::command_line(terminal_id, command.clone(), cwd, environment);
-    spawn.size = chat_agent_dimensions(app, frame_area);
+    spawn.size = chat_agent_dimensions(layout);
 
     match pty_runtime.start(spawn) {
         Ok(()) => {
@@ -418,7 +418,7 @@ pub(super) fn auto_start_selected_chat_agent(
     pty_runtime: &mut PtyRuntime,
     config: &Config,
     store: &storage::StateStore,
-    frame_area: Rect,
+    layout: AppLayout,
 ) -> bool {
     if app.is_prompt_active() {
         return false;
@@ -445,7 +445,7 @@ pub(super) fn auto_start_selected_chat_agent(
         pty_runtime,
         config,
         store,
-        frame_area,
+        layout,
         ChatAgentLaunch {
             workspace_id,
             chat_id,

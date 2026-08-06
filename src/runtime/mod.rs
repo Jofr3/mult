@@ -31,6 +31,7 @@ use crossterm::event::{self};
 use mult_protocol::peer::effective_uid;
 use ratatui::{layout::Rect, DefaultTerminal};
 
+use crate::layout::AppLayout;
 use crate::{
     app::{App, NoticeLevel, NoticeSource},
     config::{self, Config},
@@ -82,7 +83,8 @@ pub fn run(
     // cannot see once the alternate screen is open (E2/E6).
     report_config_warnings(&mut app, &config);
     register_project_session_identities(&app, &mut pty_runtime);
-    restore_persisted_sessions(&mut app, &mut pty_runtime, &config, frame_area);
+    let mut layout = AppLayout::compute(&app, frame_area);
+    restore_persisted_sessions(&mut app, &mut pty_runtime, &config, layout);
     refresh_workspace_git_branches(&mut app);
     let mut last_git_branch_refresh = Instant::now();
 
@@ -143,25 +145,43 @@ pub fn run(
             &mut agent_status_bridge,
             now,
         );
+        // Resolved here, and only here: after everything that can change what
+        // the frame has to hold — an expired or freshly drained notice, a
+        // reloaded config, a `ConnectionError` pushed by `drain_pty_events` —
+        // and immediately before the surfaces that consume it. Resolving it at
+        // the top of the tick instead would size the panes for a status surface
+        // one notice out of date, and since the draw below clears `needs_redraw`
+        // a quiet session would keep that frame until the next event (F6).
+        // Nothing between here and the draw pushes a notice or opens a prompt,
+        // so this layout is still the right one when the frame is painted.
+        layout = AppLayout::compute(&app, frame_area);
+
         needs_redraw |= save_content_if_due(&mut app, &mut save_schedule, now, save);
-        needs_redraw |= resize_visible_terminal(&mut app, &mut pty_runtime, &config, frame_area);
-        needs_redraw |= resize_visible_chat_agent(&mut app, &mut pty_runtime, &config, frame_area);
+        needs_redraw |= resize_visible_terminal(&mut app, &mut pty_runtime, &config, layout);
+        needs_redraw |= resize_visible_chat_agent(&mut app, &mut pty_runtime, &config, layout);
+        needs_redraw |= auto_start_selected_terminal(&mut app, &mut pty_runtime, &config, layout);
         needs_redraw |=
-            auto_start_selected_terminal(&mut app, &mut pty_runtime, &config, frame_area);
-        needs_redraw |=
-            auto_start_selected_chat_agent(&mut app, &mut pty_runtime, &config, store, frame_area);
+            auto_start_selected_chat_agent(&mut app, &mut pty_runtime, &config, store, layout);
 
         if needs_redraw {
             // A retried draw keeps `needs_redraw` set so the frame is rebuilt on
             // the next tick rather than silently skipped.
             let drawn = host_terminal_io!(
                 terminal
-                    .draw(|frame| ui::draw(frame, &app, &pty_runtime, &config))
+                    .draw(|frame| ui::draw(frame, &app, &pty_runtime, &config, layout))
                     .map(|completed| Some(completed.area)),
                 None
             );
             if let Some(area) = drawn {
-                frame_area = area;
+                // A host-terminal resize only becomes visible here: `ratatui`
+                // resizes its buffer inside `draw`. Re-resolving keeps the
+                // events read below hit-testing against the geometry the user
+                // is looking at, which is what the pre-`AppLayout` loop did by
+                // handing the handlers the freshly drawn `frame_area`.
+                if area != frame_area {
+                    frame_area = area;
+                    layout = AppLayout::compute(&app, frame_area);
+                }
                 needs_redraw = false;
             }
         }
@@ -169,14 +189,7 @@ pub fn run(
 
         if host_terminal_io!(event::poll(EVENT_POLL_INTERVAL), false) {
             if let Some(event) = host_terminal_io!(event::read().map(Some), None) {
-                handle_event(
-                    &mut app,
-                    &mut pty_runtime,
-                    &config,
-                    store,
-                    event,
-                    frame_area,
-                );
+                handle_event(&mut app, &mut pty_runtime, &config, store, event, layout);
                 needs_redraw = true;
                 while !app.should_quit
                     && host_terminal_io!(event::poll(READY_EVENT_POLL_INTERVAL), false)
@@ -184,14 +197,7 @@ pub fn run(
                     let Some(event) = host_terminal_io!(event::read().map(Some), None) else {
                         break;
                     };
-                    handle_event(
-                        &mut app,
-                        &mut pty_runtime,
-                        &config,
-                        store,
-                        event,
-                        frame_area,
-                    );
+                    handle_event(&mut app, &mut pty_runtime, &config, store, event, layout);
                 }
                 // Everything the user just did is persisted before the loop can
                 // observe `should_quit`, so a quit never leaves work behind.
