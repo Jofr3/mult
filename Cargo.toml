@@ -33,3 +33,7 @@ tui-term = { version = "0.3.4", default-features = false }
 # Fork of vt100 0.15 with deep visible scrollback support; keep tui-term's
 # vt100 feature disabled and render through the local adapter in src/ui.rs.
 vt100 = { package = "fnug-vt100", version = "0.15.2" }
+
+[dev-dependencies]
+# Full-buffer render snapshots for the TUI (see `src/ui.rs` tests).
+insta = "1"

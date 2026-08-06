@@ -44,11 +44,15 @@ pub struct PtyDimensions {
     pub cols: u16,
 }
 
+/// Notifications drained by the render loop. `Scrollback` and `Output` report
+/// only *how much* arrived: the bytes themselves are already committed to the
+/// terminal's parser by the time the event is queued, so carrying a copy of
+/// every chunk through the queue allocated per chunk for nobody to read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PtyEvent {
     Scrollback {
         terminal: PtyKey,
-        bytes: Vec<u8>,
+        byte_count: usize,
     },
     ReplayTruncated {
         terminal: PtyKey,
@@ -56,7 +60,7 @@ pub enum PtyEvent {
     },
     Output {
         terminal: PtyKey,
-        bytes: Vec<u8>,
+        byte_count: usize,
     },
     TakenOver {
         terminal: PtyKey,
@@ -139,7 +143,12 @@ pub struct PtyRuntime {
 const SERVER_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 const ATTACH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(5);
-const SERVER_EVENT_QUEUE_CAPACITY: usize = 4_096;
+/// Slots in the reader thread's queue. Each slot can hold an 8 KiB PTY chunk,
+/// so this bounds the client-side backlog at roughly 2 MiB if the render thread
+/// stalls; at 4096 it was ~32 MiB. Overflow simply parks the reader thread,
+/// which applies backpressure to the daemon instead of buffering for it, and
+/// the synchronous request loops drain the queue themselves while they wait.
+const SERVER_EVENT_QUEUE_CAPACITY: usize = 256;
 const TERMINAL_SCROLLBACK_LINES: usize = 5_000;
 const TERMINAL_MAX_CSI_SEQUENCE_BYTES: usize = 128;
 const PRIMARY_DEVICE_ATTRIBUTES_RESPONSE: &[u8] = b"\x1b[?1;2c";
@@ -1102,7 +1111,7 @@ impl PtyRuntime {
                     self.feed_terminal_output(terminal, &replay_bytes, false);
                     self.pending_events.push(PtyEvent::Scrollback {
                         terminal,
-                        bytes: std::mem::take(&mut replay_bytes),
+                        byte_count: replay_bytes.len(),
                     });
                     if replay_omitted > 0 {
                         self.pending_events.push(PtyEvent::ReplayTruncated {
@@ -1347,7 +1356,7 @@ impl PtyRuntime {
                 self.expected_output.insert(pane, next);
                 if let Some(terminal) = self.key_for_pane(pane) {
                     self.feed_terminal_output(terminal, &bytes, true);
-                    events.push(PtyEvent::Output { terminal, bytes });
+                    push_output_event(events, terminal, bytes.len());
                 }
             }
             ServerMessage::PaneExited { pane, lease, exit } => {
@@ -1752,6 +1761,28 @@ impl PtyExit {
             None => format!("exit {}", self.code),
         }
     }
+}
+
+/// Queue an `Output` notification, folding it into the immediately preceding
+/// one when the same terminal produced it. A busy pane arrives as a burst of
+/// 8 KiB chunks within a single drain; the render loop only needs to know that
+/// output happened and how much, so a burst costs one event, not one per chunk.
+fn push_output_event(events: &mut Vec<PtyEvent>, terminal: PtyKey, byte_count: usize) {
+    if let Some(PtyEvent::Output {
+        terminal: previous_terminal,
+        byte_count: previous_count,
+    }) = events.last_mut()
+    {
+        if *previous_terminal == terminal {
+            *previous_count = previous_count.saturating_add(byte_count);
+            return;
+        }
+    }
+
+    events.push(PtyEvent::Output {
+        terminal,
+        byte_count,
+    });
 }
 
 fn terminal_screen_rows(parser: &Parser) -> Vec<String> {
@@ -2923,8 +2954,8 @@ mod tests {
             event,
             PtyEvent::Output {
                 terminal: event_terminal,
-                bytes,
-            } if *event_terminal == terminal && bytes == b"!"
+                byte_count: 1,
+            } if *event_terminal == terminal
         )));
         assert!(runtime.terminal_lines(terminal)[0].contains("abcdef!"));
         assert_eq!(
@@ -3468,7 +3499,7 @@ mod tests {
             events,
             vec![PtyEvent::Output {
                 terminal,
-                bytes: b"\x1b[c".to_vec(),
+                byte_count: 3,
             }]
         );
         assert_eq!(
@@ -3540,7 +3571,41 @@ mod tests {
             events,
             vec![PtyEvent::Output {
                 terminal,
-                bytes: b"hello".to_vec(),
+                byte_count: 5,
+            }]
+        );
+        assert_eq!(runtime.terminal_lines(terminal)[0], "hello");
+    }
+
+    #[test]
+    fn adjacent_output_events_from_one_pane_are_coalesced() {
+        let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
+        let (sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::Terminal(TerminalId(9));
+        let pane = PaneId(9);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 16 });
+
+        for (sequence, bytes) in [(0, b"hel".as_slice()), (3, b"lo".as_slice())] {
+            sender
+                .send(ServerMessage::PtyOutput {
+                    pane,
+                    lease: test_lease(),
+                    sequence: OutputSequence::new(sequence),
+                    bytes: bytes.to_vec(),
+                })
+                .expect("send output event");
+        }
+
+        let events = runtime.drain_events();
+
+        // Two chunks, one notification: both are already in the parser, so the
+        // render loop only needs to know that output arrived and how much.
+        assert_eq!(
+            events,
+            vec![PtyEvent::Output {
+                terminal,
+                byte_count: 5,
             }]
         );
         assert_eq!(runtime.terminal_lines(terminal)[0], "hello");
@@ -3727,8 +3792,8 @@ mod tests {
             event,
             PtyEvent::Output {
                 terminal: event_terminal,
-                bytes,
-            } if *event_terminal == terminal && bytes == b"pane-b-output"
+                byte_count: 13,
+            } if *event_terminal == terminal
         )));
     }
 

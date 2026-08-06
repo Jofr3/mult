@@ -1,11 +1,12 @@
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::paths;
+use crate::{paths, ui::Palette};
 
 const CONFIG_PATH_ENV: &str = "MULT_CONFIG_PATH";
 const CONFIG_FILE_NAME: &str = "config.json";
@@ -30,13 +31,59 @@ pub struct Config {
     pub colorscheme: ColorSchemeConfig,
 }
 
+impl Config {
+    /// The parsed color scheme, memoized on the [`ColorSchemeConfig`] it comes
+    /// from. See [`ColorSchemeConfig::palette`].
+    pub fn palette(&self) -> Palette {
+        self.colorscheme.palette()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ConfiguredProject {
     pub name: String,
     pub path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The built-in color scheme (Rosé Pine Moon), as the hex strings a user would
+/// write in `config.json`.
+///
+/// This is the *only* place those values are spelled out: [`ColorSchemeConfig`]
+/// defaults to them, and `ui` derives its compile-time fallback `Color`s from
+/// the same literals, so the config text and the rendered defaults cannot drift
+/// apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultColorScheme {
+    pub nc: &'static str,
+    pub base: &'static str,
+    pub muted: &'static str,
+    pub text: &'static str,
+    pub love: &'static str,
+    pub gold: &'static str,
+    pub pine: &'static str,
+    pub foam: &'static str,
+    pub iris: &'static str,
+    pub highlight_med: &'static str,
+    pub cursor: &'static str,
+    pub success: &'static str,
+}
+
+pub const DEFAULT_COLOR_SCHEME: DefaultColorScheme = DefaultColorScheme {
+    nc: "#1f1d30",
+    base: "#232136",
+    muted: "#6e6a86",
+    text: "#e0def4",
+    love: "#eb6f92",
+    gold: "#f6c177",
+    pine: "#3e8fb0",
+    foam: "#9ccfd8",
+    iris: "#c4a7e7",
+    highlight_med: "#44415a",
+    cursor: "#ffffff",
+    success: "#3e8f54",
+};
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ColorSchemeConfig {
     #[serde(default = "default_moon_nc", rename = "_nc", alias = "nc")]
     pub nc: String,
@@ -62,7 +109,69 @@ pub struct ColorSchemeConfig {
     pub cursor: String,
     #[serde(default = "default_success")]
     pub success: String,
+    /// Memoized parse of the twelve keys above, sited here rather than on
+    /// `Config` so the cache travels with the exact strings it was derived
+    /// from: every way of producing a color scheme — `default`, deserialize,
+    /// clone — yields a value with its own empty cell, so no scheme can ever
+    /// observe another's palette. The renderer asks once per frame; parsing
+    /// twelve hex strings 60 times a second was pure waste.
+    ///
+    /// Treat the fields above as read-only once a scheme is in use: assigning
+    /// one in place after the palette has been observed keeps the old colors.
+    /// Nothing does — the render path only ever holds `&Config`.
+    #[serde(skip)]
+    palette: OnceLock<Palette>,
 }
+
+impl ColorSchemeConfig {
+    /// The parsed palette. Keys that fail to parse fall back to the built-in
+    /// default and are reported by [`Palette::from_colorscheme_reporting`].
+    pub fn palette(&self) -> Palette {
+        *self.palette.get_or_init(|| Palette::from_colorscheme(self))
+    }
+}
+
+// The palette is a cache, not state: a clone starts with an empty cell, and
+// equality ignores it, so two schemes with the same colors stay equal whether
+// or not either has rendered a frame.
+impl Clone for ColorSchemeConfig {
+    fn clone(&self) -> Self {
+        Self {
+            nc: self.nc.clone(),
+            base: self.base.clone(),
+            muted: self.muted.clone(),
+            text: self.text.clone(),
+            love: self.love.clone(),
+            gold: self.gold.clone(),
+            pine: self.pine.clone(),
+            foam: self.foam.clone(),
+            iris: self.iris.clone(),
+            highlight_med: self.highlight_med.clone(),
+            cursor: self.cursor.clone(),
+            success: self.success.clone(),
+            palette: OnceLock::new(),
+        }
+    }
+}
+
+impl PartialEq for ColorSchemeConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.nc == other.nc
+            && self.base == other.base
+            && self.muted == other.muted
+            && self.text == other.text
+            && self.love == other.love
+            && self.gold == other.gold
+            && self.pine == other.pine
+            && self.foam == other.foam
+            && self.iris == other.iris
+            && self.highlight_med == other.highlight_med
+            && self.cursor == other.cursor
+            && self.success == other.success
+    }
+}
+
+impl Eq for ColorSchemeConfig {}
 
 impl Default for Config {
     fn default() -> Self {
@@ -114,6 +223,7 @@ impl Default for ColorSchemeConfig {
             highlight_med: default_moon_highlight_med(),
             cursor: default_cursor(),
             success: default_success(),
+            palette: OnceLock::new(),
         }
     }
 }
@@ -169,51 +279,51 @@ fn default_mouse_capture() -> bool {
 }
 
 fn default_moon_nc() -> String {
-    "#1f1d30".to_string()
+    DEFAULT_COLOR_SCHEME.nc.to_string()
 }
 
 fn default_moon_base() -> String {
-    "#232136".to_string()
+    DEFAULT_COLOR_SCHEME.base.to_string()
 }
 
 fn default_moon_muted() -> String {
-    "#6e6a86".to_string()
+    DEFAULT_COLOR_SCHEME.muted.to_string()
 }
 
 fn default_moon_text() -> String {
-    "#e0def4".to_string()
+    DEFAULT_COLOR_SCHEME.text.to_string()
 }
 
 fn default_moon_love() -> String {
-    "#eb6f92".to_string()
+    DEFAULT_COLOR_SCHEME.love.to_string()
 }
 
 fn default_moon_gold() -> String {
-    "#f6c177".to_string()
+    DEFAULT_COLOR_SCHEME.gold.to_string()
 }
 
 fn default_moon_pine() -> String {
-    "#3e8fb0".to_string()
+    DEFAULT_COLOR_SCHEME.pine.to_string()
 }
 
 fn default_moon_foam() -> String {
-    "#9ccfd8".to_string()
+    DEFAULT_COLOR_SCHEME.foam.to_string()
 }
 
 fn default_moon_iris() -> String {
-    "#c4a7e7".to_string()
+    DEFAULT_COLOR_SCHEME.iris.to_string()
 }
 
 fn default_moon_highlight_med() -> String {
-    "#44415a".to_string()
+    DEFAULT_COLOR_SCHEME.highlight_med.to_string()
 }
 
 fn default_cursor() -> String {
-    "#ffffff".to_string()
+    DEFAULT_COLOR_SCHEME.cursor.to_string()
 }
 
 fn default_success() -> String {
-    "#3e8f54".to_string()
+    DEFAULT_COLOR_SCHEME.success.to_string()
 }
 
 fn invalid_data(error: serde_json::Error) -> io::Error {
@@ -350,6 +460,30 @@ mod tests {
         assert_eq!(config.colorscheme.nc, "#000001");
         assert_eq!(config.colorscheme.text, "#ffffff");
         assert_eq!(config.colorscheme.base, "#232136");
+    }
+
+    #[test]
+    fn each_color_scheme_memoizes_its_own_palette() {
+        let default_config = Config::default();
+        let custom = Config {
+            colorscheme: ColorSchemeConfig {
+                text: "#010203".to_string(),
+                ..ColorSchemeConfig::default()
+            },
+            ..Config::default()
+        };
+
+        // Prime the default's cache first: a second scheme built afterwards
+        // must still see its own colors, not the one already parsed.
+        let default_palette = default_config.palette();
+        assert_ne!(custom.palette(), default_palette);
+        assert_eq!(custom.palette(), custom.palette());
+        assert_eq!(default_config.palette(), default_palette);
+
+        // A clone re-parses its own colors rather than inheriting the cell...
+        assert_eq!(custom.clone().palette(), custom.palette());
+        // ...and a primed cache does not make two equal configs unequal.
+        assert_eq!(default_config, Config::default());
     }
 
     #[test]

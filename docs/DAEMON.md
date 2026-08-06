@@ -106,6 +106,16 @@ When retained raw history is truncated, `first_sequence` and `omitted_prefix_byt
 
 The client applies replay to its parser only after the complete transaction validates. A wrong lease, duplicate range, gap, overflow, mismatched watermark, or live output before `ReplayEnd` leaves the attachment unreconciled and requires a fresh attach replay.
 
+Replay holds the pane barrier — that is what makes the transaction ordered — but not the global daemon lock, so an attach serializes only the pane it attaches to. If the attaching connection's send queue overflows mid-transaction, the daemon abandons the transaction and keeps the connection: the attachment is simply unreconciled and the client re-attaches once its writer has caught up.
+
+Retained raw history is bounded by the client's scrollback need (5 000 lines at a 512-byte-per-line budget, ~2.4 MiB per pane), not by the wire frame limit. Replay chunks are the retained chunks themselves, so a queued replay does not make the history resident a second time.
+
+## PTY input queueing
+
+Client input and paste are handed to a per-pane writer thread through a bounded queue and are never written from the connection's own thread. A PTY write blocks as soon as the child stops reading its standard input, and a blocking write on the routing path would stall every pane and every client.
+
+The queue is bounded (1 MiB per pane) and refuses rather than drops or blocks. A refused write is reported as a pane-scoped `LeaseRejected`, which does not close the connection: the bytes were definitely not delivered, and the client treats the rejection as conclusive instead of assuming they landed. A write error on the master closes the queue, so subsequent writes are refused rather than silently discarded.
+
 ## PTY and child lifecycle
 
 Session IDs are reserved under the server lock before spawning PTYs, so duplicate requested IDs cannot race with creation. If spawning fails, the reservation is released. Fallible master-side setup occurs before spawn; an unpublished child is killed and definitively reaped before its handle is dropped.
@@ -132,7 +142,7 @@ PTY children start as isolated session and process-group leaders. Stop and daemo
 5. wait for the sole waiter to reap the direct child and for PTY output to drain;
 6. finalize and remove the session exactly once.
 
-`SIGINT` or `SIGTERM` starts graceful daemon shutdown, blocks new session creation, attach/takeover, and mutations, and routes every existing pane through this path before removing the socket. Attach commits and shutdown are serialized under the daemon state lock: if shutdown wins, a new attach gets a cached correlated `AttachError::Failed` shutdown result, while an earlier cached success cannot rebind a replacement connection. A second termination signal uses the signal handler's forced-shutdown behavior. `SIGHUP` remains ignored so closing the launching terminal does not tear down sessions.
+`SIGINT` or `SIGTERM` starts graceful daemon shutdown, blocks new session creation, attach/takeover, and mutations, and routes every existing pane through this path before removing the socket. The wait for panes to finalize is bounded (10 s, comfortably longer than one `SIGTERM` grace plus `SIGKILL` finalize cycle): a pane whose stop driver times out is never removed, and the daemon must still exit rather than stay alive holding a bound socket. The socket is unlinked on every exit path, including an early startup failure. Attach commits and shutdown are serialized under the daemon state lock: if shutdown wins, a new attach gets a cached correlated `AttachError::Failed` shutdown result, while an earlier cached success cannot rebind a replacement connection. A second termination signal uses the signal handler's forced-shutdown behavior. `SIGHUP` remains ignored so closing the launching terminal does not tear down sessions.
 
 Portable process-group signaling covers the root PTY group plus a captured distinct foreground group. A descendant that deliberately creates a new session can escape those groups; fully supervising such descendants would require platform-specific process enumeration, cgroups/service supervision, or a launch wrapper.
 

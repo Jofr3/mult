@@ -1079,16 +1079,20 @@ impl App {
         }
     }
 
+    /// `lines` is a closure rather than a value because the caller's only source
+    /// of terminal text is a full screen scrape (a `String` per row): with no
+    /// search active — the common case, every frame — this returns before the
+    /// scrape ever runs.
     pub fn terminal_search_matches(
         &self,
         terminal: TerminalId,
-        lines: Vec<String>,
+        lines: impl FnOnce() -> Vec<String>,
     ) -> Option<Vec<String>> {
         let search = self.active_search.as_ref()?;
         if search.scope != SearchScope::Terminal(terminal) {
             return None;
         }
-        Some(filter_lines(lines, &search.query))
+        Some(filter_lines(lines(), &search.query))
     }
 
     pub fn terminal_search_status(
@@ -2174,13 +2178,31 @@ mod tests {
 
         let lines = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
         assert_eq!(
-            app.terminal_search_matches(terminal, lines.clone()),
+            app.terminal_search_matches(terminal, || lines.clone()),
             Some(vec!["alpha".to_string()])
         );
         assert!(app
             .terminal_search_status(terminal, lines)
             .unwrap()
             .contains("1 match"));
+    }
+
+    #[test]
+    fn terminal_search_matches_skips_the_scrape_without_an_active_search() {
+        let app = App::default();
+        let terminal = app.project.workspaces[0].terminals[0].id;
+        let mut scraped = false;
+
+        let matches = app.terminal_search_matches(terminal, || {
+            scraped = true;
+            Vec::new()
+        });
+
+        assert_eq!(matches, None);
+        assert!(
+            !scraped,
+            "with no search active the caller's screen scrape must never run"
+        );
     }
 
     #[test]

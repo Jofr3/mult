@@ -81,6 +81,65 @@ and the project aims to adhere to
   through the login shell (`$SHELL -lc`) and are therefore shell-evaluated,
   unlike the argv-split `MULT_AGENT_CMD`.
 
+### Fixed — daemon lock discipline and pane lifecycle
+
+- `mult-server` no longer writes to a PTY while holding the global daemon lock.
+  Client input and paste go through a bounded per-pane queue drained by a
+  dedicated writer thread, so a child that stops reading its standard input can
+  no longer freeze every pane and every client in the daemon. A full queue
+  (1 MiB per pane) is **refused** with a pane-scoped `LeaseRejected` rather than
+  silently dropped or blocked on; the connection stays usable.
+- Attach replay releases the global daemon lock before it runs. It still holds
+  the pane barrier that orders replay against live output, so an attach now
+  serializes only the pane it attaches to instead of the whole daemon.
+- An attach whose replay overflows the client's send queue no longer disconnects
+  the client it has just attached; the attachment is left unreconciled and the
+  client re-attaches, instead of looping through reconnects.
+- Retained PTY history is stored as refcounted chunks instead of one flat
+  buffer. Trimming is now O(bytes dropped) rather than an O(history) memmove per
+  8 KiB read under the pane lock, and replay sends the pane's own chunks, so
+  attaching no longer makes the whole retained history resident a second time
+  (previously ~64 MiB per attaching client per pane).
+- Retained history per pane is sized from the client's actual scrollback need
+  (~2.4 MiB) instead of twice the wire frame limit (32 MiB).
+- Daemon shutdown is bounded by a 10 s deadline. A pane whose stop driver timed
+  out is never removed, and the unbounded wait for it left `mult-server` running
+  forever with its socket still bound. The socket is now unlinked on every exit
+  path, including an early startup failure.
+- The PTY reader thread no longer probes `tcgetpgrp` and `/proc/<pid>/cmdline`
+  after every 8 KiB read; it shares the debounced foreground-process poll the
+  input path already used.
+- Pane routing is a map lookup. The dead linear-scan fallback, which locked
+  every pane while holding the daemon lock on every input, resize and detach,
+  is gone.
+
+### Fixed — render performance
+
+- Terminal panes render without rebuilding a heap string for every cell on every
+  frame. The vt100 adapter dropped a redundant clone of an already-owned
+  `String`, stopped asking blank cells for contents they do not have, and stores
+  each cell's text inline (24 bytes, which is exactly the six-codepoint maximum
+  `vt100` can put in a cell) instead of on the heap. At 200×50 this measured
+  755 → 578 µs and 15 189 → 2 585 allocations per frame, with a byte-identical
+  rendered buffer.
+- Terminal search no longer scrapes the whole screen into a `String` per row on
+  every frame. The scrape is passed as a closure and runs only when a search is
+  actually active — 42–46 µs and ~2 700 allocations per frame that were being
+  discarded immediately.
+- The colour scheme is parsed once instead of twelve hex parses per frame, and
+  the Rosé Pine Moon defaults have a single definition again: `config.rs` holds
+  the hex strings and the renderer derives its fallback colours from them at
+  compile time, so the two can no longer disagree. A colour that fails to parse
+  is now reported per key (still falling back to the default) rather than
+  silently swallowed.
+- Sidebar label truncation measures character widths without allocating.
+- `PtyEvent::Output` / `Scrollback` carry a byte count instead of a copy of every
+  chunk that crossed the socket; the bytes were already committed to the
+  terminal's parser and no consumer read them. Adjacent chunks from the same pane
+  are coalesced into one event per drain.
+- The client's server-event queue holds 256 messages rather than 4096, capping
+  the backlog at roughly 2 MiB instead of 32 MiB when the render thread stalls.
+
 ## [0.1.0]
 
 Initial prototype: a Ratatui/Crossterm client plus a persistent `mult-server`

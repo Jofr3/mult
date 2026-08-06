@@ -28,23 +28,62 @@ const SIDEBAR_SELECTION_SYMBOL: &str = " ";
 const WORKSPACE_ICON: &str = "▣ ";
 const GIT_BRANCH_ICON: &str = "";
 
+/// The built-in Rosé Pine Moon colors, derived at compile time from the very
+/// hex strings [`config::DEFAULT_COLOR_SCHEME`] hands the user. There is no
+/// second copy of these values to drift: a change there is a change here, and a
+/// malformed entry fails the build rather than silently falling back.
 mod moon {
     use ratatui::style::Color;
 
-    pub const NC: Color = Color::Rgb(31, 29, 48);
-    pub const BASE: Color = Color::Rgb(35, 33, 54);
-    pub const MUTED: Color = Color::Rgb(110, 106, 134);
-    pub const TEXT: Color = Color::Rgb(224, 222, 244);
-    pub const LOVE: Color = Color::Rgb(235, 111, 146);
-    pub const GOLD: Color = Color::Rgb(246, 193, 119);
-    pub const PINE: Color = Color::Rgb(62, 143, 176);
-    pub const FOAM: Color = Color::Rgb(156, 207, 216);
-    pub const IRIS: Color = Color::Rgb(196, 167, 231);
-    pub const HIGHLIGHT_MED: Color = Color::Rgb(68, 65, 90);
+    use super::default_color;
+    use crate::config::DEFAULT_COLOR_SCHEME as SCHEME;
+
+    pub const NC: Color = default_color(SCHEME.nc);
+    pub const BASE: Color = default_color(SCHEME.base);
+    pub const MUTED: Color = default_color(SCHEME.muted);
+    pub const TEXT: Color = default_color(SCHEME.text);
+    pub const LOVE: Color = default_color(SCHEME.love);
+    pub const GOLD: Color = default_color(SCHEME.gold);
+    pub const PINE: Color = default_color(SCHEME.pine);
+    pub const FOAM: Color = default_color(SCHEME.foam);
+    pub const IRIS: Color = default_color(SCHEME.iris);
+    pub const HIGHLIGHT_MED: Color = default_color(SCHEME.highlight_med);
+    pub const CURSOR: Color = default_color(SCHEME.cursor);
+    pub const SUCCESS: Color = default_color(SCHEME.success);
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Palette {
+/// Const-evaluable `#rrggbb` parse, used only for the built-in defaults. User
+/// input goes through [`parse_color`], which reports failure instead.
+const fn default_color(hex: &str) -> Color {
+    let bytes = hex.as_bytes();
+    let offset = match bytes.len() {
+        6 => 0,
+        7 if bytes[0] == b'#' => 1,
+        _ => panic!("a default colorscheme entry must be 6 hex digits, optionally `#`-prefixed"),
+    };
+
+    Color::Rgb(
+        hex_byte(bytes[offset], bytes[offset + 1]),
+        hex_byte(bytes[offset + 2], bytes[offset + 3]),
+        hex_byte(bytes[offset + 4], bytes[offset + 5]),
+    )
+}
+
+const fn hex_byte(high: u8, low: u8) -> u8 {
+    hex_digit(high) * 16 + hex_digit(low)
+}
+
+const fn hex_digit(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => panic!("a default colorscheme entry contains a non-hex digit"),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
     nc: Color,
     base: Color,
     muted: Color,
@@ -59,22 +98,59 @@ struct Palette {
     success: Color,
 }
 
+/// A colorscheme key whose configured value did not parse. The palette keeps
+/// the built-in default for that key and hands the failure back rather than
+/// swallowing it.
+///
+/// This is the seam a later slice reports startup configuration warnings
+/// through; nothing surfaces these yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColorParseIssue {
+    /// The key as written in `config.json` (note `_nc`, not `nc`).
+    pub key: &'static str,
+    pub value: String,
+}
+
 impl Palette {
-    fn from_colorscheme(colorscheme: &ColorSchemeConfig) -> Self {
-        Self {
-            nc: parse_color(&colorscheme.nc).unwrap_or(moon::NC),
-            base: parse_color(&colorscheme.base).unwrap_or(moon::BASE),
-            muted: parse_color(&colorscheme.muted).unwrap_or(moon::MUTED),
-            text: parse_color(&colorscheme.text).unwrap_or(moon::TEXT),
-            love: parse_color(&colorscheme.love).unwrap_or(moon::LOVE),
-            gold: parse_color(&colorscheme.gold).unwrap_or(moon::GOLD),
-            pine: parse_color(&colorscheme.pine).unwrap_or(moon::PINE),
-            foam: parse_color(&colorscheme.foam).unwrap_or(moon::FOAM),
-            iris: parse_color(&colorscheme.iris).unwrap_or(moon::IRIS),
-            highlight_med: parse_color(&colorscheme.highlight_med).unwrap_or(moon::HIGHLIGHT_MED),
-            cursor: parse_color(&colorscheme.cursor).unwrap_or(Color::Rgb(255, 255, 255)),
-            success: parse_color(&colorscheme.success).unwrap_or(Color::Rgb(62, 143, 84)),
-        }
+    pub(crate) fn from_colorscheme(colorscheme: &ColorSchemeConfig) -> Self {
+        Self::from_colorscheme_reporting(colorscheme).0
+    }
+
+    pub(crate) fn from_colorscheme_reporting(
+        colorscheme: &ColorSchemeConfig,
+    ) -> (Self, Vec<ColorParseIssue>) {
+        let mut issues = Vec::new();
+        let mut parse = |key: &'static str, value: &str, fallback: Color| match parse_color(value) {
+            Some(color) => color,
+            None => {
+                issues.push(ColorParseIssue {
+                    key,
+                    value: value.to_string(),
+                });
+                fallback
+            }
+        };
+
+        let palette = Self {
+            nc: parse("_nc", &colorscheme.nc, moon::NC),
+            base: parse("base", &colorscheme.base, moon::BASE),
+            muted: parse("muted", &colorscheme.muted, moon::MUTED),
+            text: parse("text", &colorscheme.text, moon::TEXT),
+            love: parse("love", &colorscheme.love, moon::LOVE),
+            gold: parse("gold", &colorscheme.gold, moon::GOLD),
+            pine: parse("pine", &colorscheme.pine, moon::PINE),
+            foam: parse("foam", &colorscheme.foam, moon::FOAM),
+            iris: parse("iris", &colorscheme.iris, moon::IRIS),
+            highlight_med: parse(
+                "highlight_med",
+                &colorscheme.highlight_med,
+                moon::HIGHLIGHT_MED,
+            ),
+            cursor: parse("cursor", &colorscheme.cursor, moon::CURSOR),
+            success: parse("success", &colorscheme.success, moon::SUCCESS),
+        };
+
+        (palette, issues)
     }
 }
 
@@ -150,7 +226,7 @@ struct PaneRenderStyle {
 
 pub fn draw(frame: &mut Frame, app: &App, pty_runtime: &PtyRuntime, config: &config::Config) {
     let layout = layout_areas(app, frame.area());
-    let palette = Palette::from_colorscheme(&config.colorscheme);
+    let palette = config.palette();
 
     draw_sidebar(frame, app, pty_runtime, layout.sidebar, palette);
     draw_main(frame, app, pty_runtime, layout.main, palette);
@@ -461,6 +537,14 @@ fn text_width(value: &str) -> usize {
     Span::raw(value).width()
 }
 
+/// Display width of a single character. `Span::raw` borrows, so encoding into a
+/// stack buffer keeps this allocation-free — this runs per character of every
+/// sidebar row, twice per row, every frame.
+fn char_width(ch: char) -> usize {
+    let mut buffer = [0u8; 4];
+    text_width(ch.encode_utf8(&mut buffer))
+}
+
 fn truncate_text(value: &str, max_width: usize) -> String {
     if text_width(value) <= max_width {
         return value.to_string();
@@ -476,12 +560,11 @@ fn truncate_text(value: &str, max_width: usize) -> String {
     let mut output = String::new();
     let mut width = 0;
     for ch in value.chars() {
-        let ch = ch.to_string();
-        let ch_width = text_width(&ch);
+        let ch_width = char_width(ch);
         if width + ch_width + ellipsis_width > max_width {
             break;
         }
-        output.push_str(&ch);
+        output.push(ch);
         width += ch_width;
     }
     output.push('…');
@@ -705,10 +788,11 @@ fn draw_terminal_details(
         return;
     };
 
-    if let Some(lines) = app.terminal_search_matches(
-        terminal_id,
-        pty_runtime.terminal_all_lines(PtyKey::Terminal(terminal_id)),
-    ) {
+    // Lazy on purpose: scraping the screen builds a `String` per row, and no
+    // search is active on the overwhelming majority of frames.
+    if let Some(lines) = app.terminal_search_matches(terminal_id, || {
+        pty_runtime.terminal_all_lines(PtyKey::Terminal(terminal_id))
+    }) {
         let query = app
             .active_search
             .as_ref()
@@ -801,6 +885,54 @@ fn render_terminal_parser(
     }
 }
 
+/// Bytes of cell contents stored inline. `vt100` caps a cell at six `char`s
+/// (`CODEPOINTS_IN_CELL`) — a base character plus combining marks — so 6 × 4
+/// bytes covers every cell the parser can produce, and the heap arm below is a
+/// safety net rather than a live path.
+const INLINE_SYMBOL_BYTES: usize = 24;
+
+/// A cell's text, kept out of the heap. `TerminalScreen` rebuilds every cell on
+/// every frame, so a `String` here was one allocation per cell per frame.
+#[derive(Debug, Clone)]
+enum CellSymbol {
+    Inline {
+        bytes: [u8; INLINE_SYMBOL_BYTES],
+        len: u8,
+    },
+    Spilled(Box<str>),
+}
+
+impl CellSymbol {
+    const EMPTY: Self = Self::Inline {
+        bytes: [0; INLINE_SYMBOL_BYTES],
+        len: 0,
+    };
+
+    fn new(contents: &str) -> Self {
+        let Ok(len) = u8::try_from(contents.len()) else {
+            return Self::Spilled(Box::from(contents));
+        };
+        if usize::from(len) > INLINE_SYMBOL_BYTES {
+            return Self::Spilled(Box::from(contents));
+        }
+
+        let mut bytes = [0; INLINE_SYMBOL_BYTES];
+        bytes[..contents.len()].copy_from_slice(contents.as_bytes());
+        Self::Inline { bytes, len }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            // Always built from a `&str`, so the slice is valid UTF-8 by
+            // construction; the fallback keeps this free of `unsafe`.
+            Self::Inline { bytes, len } => {
+                std::str::from_utf8(&bytes[..usize::from(*len)]).unwrap_or_default()
+            }
+            Self::Spilled(contents) => contents,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct TerminalScreen {
     rows: u16,
@@ -812,7 +944,7 @@ struct TerminalScreen {
 
 #[derive(Debug, Clone)]
 struct TerminalCell {
-    symbol: String,
+    symbol: CellSymbol,
     has_contents: bool,
     style: Style,
 }
@@ -820,16 +952,17 @@ struct TerminalCell {
 impl TerminalScreen {
     fn from_vt100(screen: &vt100::Screen) -> Self {
         let (rows, cols) = screen.size();
-        let cells = (0..rows)
-            .flat_map(|row| {
-                (0..cols).map(move |col| {
+        let mut cells = Vec::with_capacity(usize::from(rows) * usize::from(cols));
+        for row in 0..rows {
+            for col in 0..cols {
+                cells.push(
                     screen
                         .cell(row, col)
                         .map(TerminalCell::from_vt100)
-                        .unwrap_or_default()
-                })
-            })
-            .collect();
+                        .unwrap_or_default(),
+                );
+            }
+        }
         let (cursor_row, cursor_col) = screen.cursor_position();
         let scrollback = u16::try_from(screen.scrollback()).unwrap_or(u16::MAX);
 
@@ -854,7 +987,7 @@ impl TerminalScreen {
 impl Default for TerminalCell {
     fn default() -> Self {
         Self {
-            symbol: String::new(),
+            symbol: CellSymbol::EMPTY,
             has_contents: false,
             style: Style::reset(),
         }
@@ -877,9 +1010,20 @@ impl TerminalCell {
             modifier |= Modifier::REVERSED;
         }
 
+        // `vt100::Cell::contents` builds an owned `String`, and a blank cell's
+        // symbol is never rendered (see `apply`), so blanks skip the call
+        // entirely and the rest copy the result inline instead of cloning it
+        // onto the heap a second time.
+        let has_contents = cell.has_contents();
+        let symbol = if has_contents {
+            CellSymbol::new(&cell.contents())
+        } else {
+            CellSymbol::EMPTY
+        };
+
         Self {
-            symbol: cell.contents().to_string(),
-            has_contents: cell.has_contents(),
+            symbol,
+            has_contents,
             style: Style::reset()
                 .fg(vt100_color_to_ratatui(cell.fgcolor()))
                 .bg(vt100_color_to_ratatui(cell.bgcolor()))
@@ -912,7 +1056,7 @@ impl TerminalCellWidget for TerminalCell {
 
     fn apply(&self, cell: &mut ratatui::buffer::Cell) {
         if self.has_contents {
-            cell.set_symbol(&self.symbol);
+            cell.set_symbol(self.symbol.as_str());
         }
         cell.set_style(self.style);
     }
@@ -1404,7 +1548,7 @@ fn terminal_has_active_command(terminal: &TerminalSession, pty_runtime: &PtyRunt
 
 #[cfg(test)]
 mod tests {
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
 
     use super::*;
     use crate::app::SelectionCell;
@@ -2159,16 +2303,313 @@ mod tests {
         width: u16,
         height: u16,
     ) -> String {
+        format!(
+            "{:?}",
+            render_buffer(app, pty_runtime, config, width, height)
+        )
+    }
+
+    fn render_buffer(
+        app: &App,
+        pty_runtime: &PtyRuntime,
+        config: &config::Config,
+        width: u16,
+        height: u16,
+    ) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
             .draw(|frame| draw(frame, app, pty_runtime, config))
             .expect("draw app");
-        format!("{:?}", terminal.backend().buffer())
+        terminal.backend().buffer().clone()
+    }
+
+    /// Render a whole `TestBackend` buffer as a snapshot: the glyph grid, a
+    /// parallel grid of per-cell style keys, and a legend resolving them. The
+    /// style grid is the point — `.contains(…)` assertions cannot see a sidebar
+    /// that changed width, a header that moved, or a selection that stopped
+    /// painting, and all three are pane-background changes before they are text
+    /// changes.
+    ///
+    /// Rows are bracketed with `|` so trailing blanks are visible. A wide glyph
+    /// leaves its successor cell's symbol empty (ratatui's own convention), so
+    /// the symbol row stays as wide as the terminal while the style row always
+    /// has exactly one key per cell.
+    fn buffer_snapshot(buffer: &Buffer) -> String {
+        let area = buffer.area();
+        let mut legend: Vec<Style> = Vec::new();
+        let mut symbol_rows = Vec::new();
+        let mut style_rows = Vec::new();
+
+        for y in area.top()..area.bottom() {
+            let mut symbols = String::new();
+            let mut styles = String::new();
+            for x in area.left()..area.right() {
+                let cell = buffer.cell((x, y)).expect("cell is in bounds");
+                symbols.push_str(cell.symbol());
+                let style = cell.style();
+                let key = legend.iter().position(|known| *known == style);
+                styles.push(legend_key(key.unwrap_or_else(|| {
+                    legend.push(style);
+                    legend.len() - 1
+                })));
+            }
+            symbol_rows.push(symbols);
+            style_rows.push(styles);
+        }
+
+        let mut snapshot = format!("size: {}x{}\n\nsymbols:\n", area.width, area.height);
+        for row in &symbol_rows {
+            snapshot.push_str(&format!("|{row}|\n"));
+        }
+        snapshot.push_str("\nstyles:\n");
+        for row in &style_rows {
+            snapshot.push_str(&format!("|{row}|\n"));
+        }
+        snapshot.push_str("\nlegend:\n");
+        for (index, style) in legend.iter().enumerate() {
+            snapshot.push_str(&format!("  {} = {style:?}\n", legend_key(index)));
+        }
+        snapshot
+    }
+
+    fn legend_key(index: usize) -> char {
+        const KEYS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        KEYS.get(index).map_or('?', |key| char::from(*key))
+    }
+
+    /// The seed app with a terminal selected and `output` fed to a parser sized
+    /// to the visible output area, so terminal snapshots do not depend on how
+    /// the runtime happened to size the pane.
+    fn terminal_app_with_output(frame_area: Rect, output: &[u8]) -> (App, PtyRuntime, PtyKey) {
+        let mut app = App::default();
+        let selected = app
+            .nav_items()
+            .iter()
+            .position(|item| matches!(item, NavItem::Terminal { .. }))
+            .expect("seed state has a terminal");
+        app.select_nav_index(selected);
+        let (terminal_id, output_area) =
+            selected_terminal_output_area(&app, frame_area).expect("terminal has an output area");
+        let terminal_id = PtyKey::Terminal(terminal_id);
+
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime
+            .resize(
+                terminal_id,
+                crate::pty::PtyDimensions {
+                    rows: output_area.height,
+                    cols: output_area.width,
+                },
+            )
+            .expect("resize parser");
+        pty_runtime.process_terminal_output(terminal_id, output);
+
+        (app, pty_runtime, terminal_id)
+    }
+
+    // Snapshot scenarios deliberately avoid the chat pane's "not started" hint,
+    // which prints `config::config_path()` and is therefore `$HOME`-dependent,
+    // and never populate git branches, which are supplied by the caller rather
+    // than probed here. Nothing else in `draw` reads the environment or a clock.
+
+    #[test]
+    fn snapshot_default_frame() {
+        let app = App::default();
+
+        insta::assert_snapshot!(buffer_snapshot(&render_buffer(
+            &app,
+            &PtyRuntime::new_offline(),
+            &config::Config::default(),
+            100,
+            30,
+        )));
+    }
+
+    #[test]
+    fn snapshot_narrow_frame_80x24() {
+        let app = App::default();
+
+        insta::assert_snapshot!(buffer_snapshot(&render_buffer(
+            &app,
+            &PtyRuntime::new_offline(),
+            &config::Config::default(),
+            80,
+            24,
+        )));
+    }
+
+    #[test]
+    fn snapshot_command_palette_prompt() {
+        let mut app = App::default();
+        app.begin_command_palette();
+        app.push_prompt_char('t');
+
+        insta::assert_snapshot!(buffer_snapshot(&render_buffer(
+            &app,
+            &PtyRuntime::new_offline(),
+            &config::Config::default(),
+            100,
+            30,
+        )));
+    }
+
+    #[test]
+    fn snapshot_terminal_with_scrollback_and_selection() {
+        let frame_area = Rect::new(0, 0, 60, 12);
+        let (mut app, mut pty_runtime, terminal_id) = terminal_app_with_output(
+            frame_area,
+            b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight\r\nnine\r\nten\r\neleven\r\ntwelve\r\nthirteen",
+        );
+        assert!(pty_runtime.scroll_up(terminal_id, 2).expect("scroll up"));
+        app.begin_text_selection(terminal_id, SelectionCell { row: 1, col: 0 });
+        app.update_text_selection(terminal_id, SelectionCell { row: 2, col: 3 });
+
+        insta::assert_snapshot!(buffer_snapshot(&render_buffer(
+            &app,
+            &pty_runtime,
+            &config::Config::default(),
+            frame_area.width,
+            frame_area.height,
+        )));
+    }
+
+    fn vt100_parser(rows: u16, cols: u16, bytes: &[u8]) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(bytes);
+        parser
+    }
+
+    #[test]
+    fn vt100_attributes_map_to_ratatui_modifiers() {
+        let parser = vt100_parser(
+            1,
+            8,
+            b"\x1b[1mB\x1b[0m\x1b[3mI\x1b[0m\x1b[4mU\x1b[0m\x1b[7mR\x1b[0m\x1b[1;3;4;7mA\x1b[0m",
+        );
+        let screen = TerminalScreen::from_vt100(parser.screen());
+        let cell = |col| screen.cell(0, col).expect("cell is in bounds");
+
+        assert_eq!(cell(0).symbol.as_str(), "B");
+        assert_eq!(cell(0).style.add_modifier, Modifier::BOLD);
+        assert_eq!(cell(1).style.add_modifier, Modifier::ITALIC);
+        assert_eq!(cell(2).style.add_modifier, Modifier::UNDERLINED);
+        assert_eq!(cell(3).style.add_modifier, Modifier::REVERSED);
+        assert_eq!(
+            cell(4).style.add_modifier,
+            Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED | Modifier::REVERSED
+        );
+        // An untouched cell carries no attributes at all.
+        assert_eq!(cell(5).style.add_modifier, Modifier::empty());
+    }
+
+    #[test]
+    fn vt100_color_variants_map_to_reset_indexed_and_rgb() {
+        assert_eq!(vt100_color_to_ratatui(vt100::Color::Default), Color::Reset);
+        assert_eq!(
+            vt100_color_to_ratatui(vt100::Color::Idx(9)),
+            Color::Indexed(9)
+        );
+        assert_eq!(
+            vt100_color_to_ratatui(vt100::Color::Rgb(1, 2, 3)),
+            Color::Rgb(1, 2, 3)
+        );
+
+        // ...and the same three shapes as the adapter sees them: default,
+        // an SGR palette index, and a 24-bit foreground over an indexed
+        // background.
+        let parser = vt100_parser(
+            1,
+            8,
+            b"d\x1b[31mi\x1b[0m\x1b[38;2;10;20;30m\x1b[48;5;42mr\x1b[0m",
+        );
+        let screen = TerminalScreen::from_vt100(parser.screen());
+        let cell = |col| screen.cell(0, col).expect("cell is in bounds");
+
+        assert_eq!(cell(0).style.fg, Some(Color::Reset));
+        assert_eq!(cell(0).style.bg, Some(Color::Reset));
+        assert_eq!(cell(1).style.fg, Some(Color::Indexed(1)));
+        assert_eq!(cell(2).style.fg, Some(Color::Rgb(10, 20, 30)));
+        assert_eq!(cell(2).style.bg, Some(Color::Indexed(42)));
+    }
+
+    #[test]
+    fn wide_cell_occupies_one_symbol_and_blank_successor() {
+        let parser = vt100_parser(1, 8, "你a".as_bytes());
+        let screen = TerminalScreen::from_vt100(parser.screen());
+        let cell = |col| screen.cell(0, col).expect("cell is in bounds");
+
+        // The wide glyph lives in a single grid cell and carries the whole
+        // character; the column it visually covers is its continuation.
+        assert!(cell(0).has_contents());
+        assert_eq!(cell(0).symbol.as_str(), "你");
+        // vt100 marks a wide continuation by setting a flag bit in the same
+        // byte that stores the length, so `has_contents` reports `true` for it
+        // while its *contents* are empty. Keying the symbol off the contents —
+        // not off the flag — is what stops the pair being overprinted with a
+        // stray glyph, and it is why the adapter cannot treat `has_contents` as
+        // "non-empty".
+        assert!(cell(1).has_contents());
+        assert_eq!(cell(1).symbol.as_str(), "");
+        // The next character resumes at the column after the pair.
+        assert!(cell(2).has_contents());
+        assert_eq!(cell(2).symbol.as_str(), "a");
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let target = &mut buffer[(0, 0)];
+        target.set_symbol("stale");
+        cell(1).apply(target);
+        assert_eq!(target.symbol(), "");
+    }
+
+    #[test]
+    fn cell_symbols_survive_combining_marks_and_the_inline_capacity_boundary() {
+        // vt100 packs a base character plus combining marks into one cell, up
+        // to six codepoints; all of them must reach the buffer.
+        let with_marks = "e\u{0301}\u{0302}\u{0303}\u{0304}\u{0305}";
+        let parser = vt100_parser(1, 4, with_marks.as_bytes());
+        let screen = TerminalScreen::from_vt100(parser.screen());
+        assert_eq!(
+            screen
+                .cell(0, 0)
+                .expect("cell is in bounds")
+                .symbol
+                .as_str(),
+            with_marks
+        );
+
+        // Six four-byte codepoints is the largest cell vt100 can build, and it
+        // is exactly the inline capacity: it must stay inline and round-trip.
+        let at_capacity = "\u{1f600}".repeat(6);
+        assert_eq!(at_capacity.len(), INLINE_SYMBOL_BYTES);
+        assert!(matches!(
+            CellSymbol::new(&at_capacity),
+            CellSymbol::Inline { .. }
+        ));
+        assert_eq!(CellSymbol::new(&at_capacity).as_str(), at_capacity);
+
+        // One byte past spills to the heap rather than truncating.
+        let past_capacity = format!("{at_capacity}a");
+        assert!(matches!(
+            CellSymbol::new(&past_capacity),
+            CellSymbol::Spilled(_)
+        ));
+        assert_eq!(CellSymbol::new(&past_capacity).as_str(), past_capacity);
+
+        assert_eq!(CellSymbol::EMPTY.as_str(), "");
+        assert_eq!(TerminalCell::default().symbol.as_str(), "");
     }
 
     fn test_palette() -> Palette {
-        Palette::from_colorscheme(&config::Config::default().colorscheme)
+        config::Config::default().palette()
+    }
+
+    /// `ColorSchemeConfig` carries a private palette cache, so its fields
+    /// cannot be filled with functional-update syntax from here.
+    fn colorscheme_with(mutate: impl FnOnce(&mut ColorSchemeConfig)) -> ColorSchemeConfig {
+        let mut colorscheme = ColorSchemeConfig::default();
+        mutate(&mut colorscheme);
+        colorscheme
     }
 
     #[test]
@@ -2187,14 +2628,73 @@ mod tests {
 
     #[test]
     fn custom_cursor_and_success_colors_are_themable() {
-        let mut colorscheme = config::Config::default().colorscheme;
-        colorscheme.cursor = "#010203".to_string();
-        colorscheme.success = "#0a0b0c".to_string();
+        let colorscheme = colorscheme_with(|colorscheme| {
+            colorscheme.cursor = "#010203".to_string();
+            colorscheme.success = "#0a0b0c".to_string();
+        });
 
         let palette = Palette::from_colorscheme(&colorscheme);
 
         assert_eq!(palette.cursor, Color::Rgb(1, 2, 3));
         assert_eq!(palette.success, Color::Rgb(10, 11, 12));
+    }
+
+    #[test]
+    fn built_in_palette_matches_the_default_colorscheme_strings() {
+        // The two representations of Rosé Pine Moon — the hex strings the
+        // config layer hands users and the `Color`s the renderer falls back to
+        // — are derived from one constant; this fails if a future edit
+        // reintroduces a second copy of either.
+        let from_strings = Palette::from_colorscheme(&ColorSchemeConfig::default());
+
+        assert_eq!(
+            from_strings,
+            Palette {
+                nc: moon::NC,
+                base: moon::BASE,
+                muted: moon::MUTED,
+                text: moon::TEXT,
+                love: moon::LOVE,
+                gold: moon::GOLD,
+                pine: moon::PINE,
+                foam: moon::FOAM,
+                iris: moon::IRIS,
+                highlight_med: moon::HIGHLIGHT_MED,
+                cursor: moon::CURSOR,
+                success: moon::SUCCESS,
+            }
+        );
+        // ...and every default parses, so no key is silently on a fallback.
+        assert_eq!(
+            Palette::from_colorscheme_reporting(&ColorSchemeConfig::default()).1,
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn unparseable_colors_keep_the_default_and_are_reported_per_key() {
+        let colorscheme = colorscheme_with(|colorscheme| {
+            colorscheme.nc = "not-a-color".to_string();
+            colorscheme.gold = "#12345".to_string();
+        });
+
+        let (palette, issues) = Palette::from_colorscheme_reporting(&colorscheme);
+
+        assert_eq!(palette.nc, moon::NC);
+        assert_eq!(palette.gold, moon::GOLD);
+        assert_eq!(
+            issues,
+            vec![
+                ColorParseIssue {
+                    key: "_nc",
+                    value: "not-a-color".to_string(),
+                },
+                ColorParseIssue {
+                    key: "gold",
+                    value: "#12345".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
