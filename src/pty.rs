@@ -24,7 +24,7 @@ use mult_protocol::{
     write_message, AgentSessionMetadata, AgentStatusError, AgentStatusOutcome, AgentStatusQuery,
     AgentStatusRecord, AttachError, AttachOutcome, AttachmentLease, ClientMessage, ClientScopeId,
     CreateError, CreateOutcome, ForegroundProcessInfo, LaunchSpec, LeaseRejectionReason,
-    OutputSequence, PaneId, RequestId, ServerInstanceId, ServerMessage, SessionId,
+    OutputSequence, PaneId, RejectCode, RequestId, ServerInstanceId, ServerMessage, SessionId,
     SessionIdentity as WireSessionIdentity, SessionInfo, StateNamespace as WireStateNamespace,
     StopError, StopOutcome, MAX_PENDING_REQUESTS_PER_CLIENT, MIN_SCREEN_COLS, MIN_SCREEN_ROWS,
     PROTOCOL_VERSION, SOCKET_PATH_ENV,
@@ -119,6 +119,147 @@ impl std::fmt::Display for PtyDeliveryError {
 }
 
 impl std::error::Error for PtyDeliveryError {}
+
+/// Why a [`PtyRuntime`] operation failed.
+///
+/// `io::Error` used to be this module's universal error type, so callers
+/// classified failures by `ErrorKind` — `NotFound` meaning "the daemon has no
+/// such session", `NotConnected` meaning "offline" — or by matching substrings
+/// of a message. Both are lossy and neither is a contract: `ErrorKind` has no
+/// variant for most of what the daemon can say, and rewording a message
+/// silently changes behaviour (F8). Every daemon refusal now arrives as a
+/// [`RejectCode`], and `io::Result` survives only at the true I/O boundary —
+/// sockets, files, and the framing helpers in `mult_protocol`.
+///
+/// Written by hand rather than derived: this workspace adds no dependencies,
+/// so there is no `thiserror`.
+#[derive(Debug)]
+pub enum PtyError {
+    /// The daemon refused the operation. `code` is the contract that callers
+    /// switch on; `detail` is the daemon's diagnostic text and is never parsed.
+    Rejected { code: RejectCode, detail: String },
+    /// There is no daemon connection. A connector may already be running, so
+    /// the next attempt can succeed without the caller doing anything.
+    Offline(String),
+    /// The connection dropped while a request was outstanding.
+    Disconnected(String),
+    /// A correlated request did not complete within its deadline.
+    Timeout(String),
+    /// A frame was written and then failed. The daemon may have received none,
+    /// part, or all of it, so these are never replayed automatically.
+    DeliveryUncertain(PtyDeliveryError),
+    /// The daemon spoke out of the order the protocol requires. The attachment
+    /// is left unreconciled; only a fresh attach replay can rebuild it.
+    ProtocolViolation(String),
+    /// The caller asked for something it may not ask for: a terminal with no
+    /// registered durable identity, or one that is already attached. A local
+    /// bug or a misuse, never a daemon condition.
+    Invalid(String),
+    /// Socket or OS I/O failed.
+    Io(io::Error),
+}
+
+pub type PtyResult<T> = Result<T, PtyError>;
+
+impl PtyError {
+    /// The daemon's machine-readable reason, when the daemon is the one that
+    /// refused. Local failures have none.
+    pub fn code(&self) -> Option<RejectCode> {
+        match self {
+            Self::Rejected { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
+    /// Whether the request should be re-sent over a fresh connection rather
+    /// than reported. Only the transport is at fault here; the daemon never
+    /// saw, or never answered, the request.
+    fn is_disconnected(&self) -> bool {
+        match self {
+            Self::Offline(_) | Self::Disconnected(_) => true,
+            Self::Io(error) => matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::NotConnected
+            ),
+            _ => false,
+        }
+    }
+
+    /// Whether this failure leaves the pane's attachment in an unknown state.
+    ///
+    /// When it does, the local pane mapping and lease are kept: only a takeover,
+    /// a scoped rejection, a correlated stop/exit or a fresh attach may prove
+    /// what the daemon actually did. A definite rejection is the opposite — the
+    /// daemon answered, so the attachment can be torn down at once.
+    pub fn is_reconciliation_uncertain(&self) -> bool {
+        match self {
+            Self::Offline(_)
+            | Self::Disconnected(_)
+            | Self::Timeout(_)
+            | Self::DeliveryUncertain(_)
+            | Self::ProtocolViolation(_) => true,
+            Self::Io(error) => matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::NotConnected
+            ),
+            Self::Rejected { .. } | Self::Invalid(_) => false,
+        }
+    }
+
+    /// The uncertain delivery this failure describes, if any. The runtime uses
+    /// it to name the operation whose bytes may or may not have landed.
+    pub fn delivery(&self) -> Option<&PtyDeliveryError> {
+        match self {
+            Self::DeliveryUncertain(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for PtyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected { code, detail } if detail.is_empty() => write!(formatter, "{code}"),
+            Self::Rejected { code, detail } => write!(formatter, "{code}: {detail}"),
+            Self::Offline(message)
+            | Self::Disconnected(message)
+            | Self::Timeout(message)
+            | Self::ProtocolViolation(message)
+            | Self::Invalid(message) => formatter.write_str(message),
+            Self::DeliveryUncertain(error) => error.fmt(formatter),
+            Self::Io(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for PtyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DeliveryUncertain(error) => Some(error),
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for PtyError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<PtyDeliveryError> for PtyError {
+    fn from(error: PtyDeliveryError) -> Self {
+        Self::DeliveryUncertain(error)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtyExit {
@@ -281,7 +422,7 @@ struct PtyPane {
 /// *collects* the result (see [`PtyRuntime::poll_connector`]), which is a
 /// non-blocking `is_finished` check plus a `join` that is already complete.
 struct PendingConnect {
-    handle: thread::JoinHandle<io::Result<EstablishedConnection>>,
+    handle: thread::JoinHandle<PtyResult<EstablishedConnection>>,
     /// Client scope this attempt asked the daemon to resume, captured when the
     /// attempt started so a result cannot be judged against a scope that moved
     /// on in the meantime.
@@ -401,11 +542,11 @@ impl PtyRuntime {
 
     /// As [`Self::with_socket_path`] with [`SpawnPolicy::Autospawn`], but a
     /// connection failure fails construction instead of being queued.
-    pub fn connect_to_socket(socket_path: PathBuf) -> io::Result<Self> {
+    pub fn connect_to_socket(socket_path: PathBuf) -> PtyResult<Self> {
         Self::connect_to_socket_with(socket_path, SpawnPolicy::Autospawn)
     }
 
-    fn connect_to_socket_with(socket_path: PathBuf, spawn: SpawnPolicy) -> io::Result<Self> {
+    fn connect_to_socket_with(socket_path: PathBuf, spawn: SpawnPolicy) -> PtyResult<Self> {
         let mut runtime = Self::disconnected(socket_path, Vec::new());
         runtime.connect_inner(spawn)?;
         Ok(runtime)
@@ -543,15 +684,14 @@ impl PtyRuntime {
         &mut self,
         terminal: PtyKey,
         identity: SessionIdentity,
-    ) -> io::Result<()> {
+    ) -> PtyResult<()> {
         let identity = wire_session_identity(identity);
         if self
             .registered_session_identity(terminal)
             .is_some_and(|current| current != identity)
         {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cannot replace an immutable PTY session identity",
+            return Err(PtyError::Invalid(
+                "cannot replace an immutable PTY session identity".to_string(),
             ));
         }
         self.pane_entry(terminal).identity = Some(identity);
@@ -566,17 +706,15 @@ impl PtyRuntime {
         &mut self,
         terminal: PtyKey,
         metadata: AgentSessionMetadata,
-    ) -> io::Result<()> {
+    ) -> PtyResult<()> {
         if !matches!(terminal, PtyKey::ChatAgent(_)) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "agent metadata may only be registered for a chat PTY",
+            return Err(PtyError::Invalid(
+                "agent metadata may only be registered for a chat PTY".to_string(),
             ));
         }
         if self.registered_session_identity(terminal).is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "register the durable session identity before agent metadata",
+            return Err(PtyError::Invalid(
+                "register the durable session identity before agent metadata".to_string(),
             ));
         }
         if self.is_running(terminal)
@@ -585,9 +723,8 @@ impl PtyRuntime {
                 .and_then(|pane| pane.agent)
                 .is_some_and(|current| current != metadata)
         {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "cannot replace agent generation while its PTY is running",
+            return Err(PtyError::Invalid(
+                "cannot replace agent generation while its PTY is running".to_string(),
             ));
         }
         self.pane_entry(terminal).agent = Some(metadata);
@@ -750,7 +887,7 @@ impl PtyRuntime {
         &mut self,
         terminal: PtyKey,
         size: PtyDimensions,
-    ) -> io::Result<AttachExistingResult> {
+    ) -> PtyResult<AttachExistingResult> {
         let size = size.clamped();
         if self.is_running(terminal) {
             return Ok(AttachExistingResult::Attached);
@@ -780,12 +917,15 @@ impl PtyRuntime {
         self.finish_request(request_id);
         match result {
             Ok(()) => Ok(AttachExistingResult::Attached),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // "The daemon has no such session" is a specific answer, not a
+            // shade of `ErrorKind::NotFound`: restoration reports the pane
+            // missing and, crucially, never relaunches a persisted command (C1).
+            Err(error) if error.code() == Some(RejectCode::UnknownSession) => {
                 self.clear_attachment(pane);
                 Ok(AttachExistingResult::Missing)
             }
             Err(error) => {
-                if !is_reconciliation_uncertain(&error) {
+                if !error.is_reconciliation_uncertain() {
                     self.clear_attachment(pane);
                 }
                 Err(error)
@@ -793,12 +933,11 @@ impl PtyRuntime {
         }
     }
 
-    pub fn start(&mut self, mut spawn: PtySpawn) -> io::Result<()> {
+    pub fn start(&mut self, mut spawn: PtySpawn) -> PtyResult<()> {
         spawn.size = spawn.size.clamped();
         if self.is_running(spawn.terminal) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "terminal already has a server attachment",
+            return Err(PtyError::Invalid(
+                "terminal already has a server attachment".to_string(),
             ));
         }
         if self.attached_pane(spawn.terminal).is_some() {
@@ -813,7 +952,7 @@ impl PtyRuntime {
         result
     }
 
-    fn start_attached(&mut self, spawn: PtySpawn) -> io::Result<()> {
+    fn start_attached(&mut self, spawn: PtySpawn) -> PtyResult<()> {
         self.ensure_connected()?;
         self.reset_parser(spawn.terminal, spawn.size);
         let entry = self.pane_entry(spawn.terminal);
@@ -843,7 +982,7 @@ impl PtyRuntime {
         let create_result = self.perform_create(create_id, create);
         self.finish_request(create_id);
         if let Err(error) = create_result {
-            if !is_reconciliation_uncertain(&error) {
+            if !error.is_reconciliation_uncertain() {
                 self.clear_attachment(pane);
             }
             return Err(error);
@@ -860,14 +999,14 @@ impl PtyRuntime {
         let result = self.perform_attach(spawn.terminal, session, spawn.size, attach_id, attach);
         self.finish_request(attach_id);
         if let Err(error) = &result {
-            if !is_reconciliation_uncertain(error) {
+            if !error.is_reconciliation_uncertain() {
                 self.clear_attachment(pane);
             }
         }
         result
     }
 
-    pub fn stop(&mut self, terminal: PtyKey) -> io::Result<bool> {
+    pub fn stop(&mut self, terminal: PtyKey) -> PtyResult<bool> {
         let Some(pane) = self.attached_pane(terminal) else {
             return Ok(false);
         };
@@ -889,7 +1028,7 @@ impl PtyRuntime {
         Ok(true)
     }
 
-    pub fn list_sessions(&mut self, namespace: StateNamespace) -> io::Result<Vec<SessionInfo>> {
+    pub fn list_sessions(&mut self, namespace: StateNamespace) -> PtyResult<Vec<SessionInfo>> {
         self.ensure_connected()?;
         let namespace = wire_state_namespace(namespace);
         self.write(&ClientMessage::ListSessions { namespace })?;
@@ -897,15 +1036,13 @@ impl PtyRuntime {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out waiting for the namespaced session list",
+                return Err(PtyError::Timeout(
+                    "timed out waiting for the namespaced session list".to_string(),
                 ));
             }
             let Some(connection) = self.connection.as_ref() else {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "mult-server disconnected while listing sessions",
+                return Err(PtyError::Disconnected(
+                    "mult-server disconnected while listing sessions".to_string(),
                 ));
             };
             match connection.receiver.recv_timeout(remaining) {
@@ -915,16 +1052,14 @@ impl PtyRuntime {
                 }) if received == namespace => return Ok(sessions),
                 Ok(message) => self.route_during_request(message),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "timed out waiting for the namespaced session list",
+                    return Err(PtyError::Timeout(
+                        "timed out waiting for the namespaced session list".to_string(),
                     ));
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.disconnect();
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "mult-server disconnected while listing sessions",
+                    return Err(PtyError::Disconnected(
+                        "mult-server disconnected while listing sessions".to_string(),
                     ));
                 }
             }
@@ -934,7 +1069,7 @@ impl PtyRuntime {
     pub fn update_agent_status(
         &mut self,
         record: AgentStatusRecord,
-    ) -> io::Result<AgentStatusRecord> {
+    ) -> PtyResult<AgentStatusRecord> {
         let request_id = self.allocate_request()?;
         let request = ClientMessage::UpdateAgentStatus { request_id, record };
         let outcome = self.perform_agent_status(request_id, request);
@@ -951,7 +1086,7 @@ impl PtyRuntime {
     pub fn get_agent_status(
         &mut self,
         query: AgentStatusQuery,
-    ) -> io::Result<Option<AgentStatusRecord>> {
+    ) -> PtyResult<Option<AgentStatusRecord>> {
         let request_id = self.allocate_request()?;
         let request = ClientMessage::GetAgentStatus { request_id, query };
         let outcome = self.perform_agent_status(request_id, request);
@@ -965,7 +1100,7 @@ impl PtyRuntime {
         }
     }
 
-    pub fn send_input(&mut self, terminal: PtyKey, input: &[u8]) -> io::Result<bool> {
+    pub fn send_input(&mut self, terminal: PtyKey, input: &[u8]) -> PtyResult<bool> {
         let Some(pane) = self.attached_pane(terminal) else {
             return Ok(false);
         };
@@ -979,7 +1114,7 @@ impl PtyRuntime {
         pane: PaneId,
         input: &[u8],
         track_command: bool,
-    ) -> io::Result<()> {
+    ) -> PtyResult<()> {
         if !input.is_empty() {
             let alternate_screen = self
                 .parser(terminal)
@@ -1020,7 +1155,7 @@ impl PtyRuntime {
         }
     }
 
-    pub fn send_paste(&mut self, terminal: PtyKey, text: &str) -> io::Result<bool> {
+    pub fn send_paste(&mut self, terminal: PtyKey, text: &str) -> PtyResult<bool> {
         let Some(pane) = self.attached_pane(terminal) else {
             return Ok(false);
         };
@@ -1095,15 +1230,15 @@ impl PtyRuntime {
         }
     }
 
-    pub fn scroll_up(&mut self, terminal: PtyKey, rows: usize) -> io::Result<bool> {
+    pub fn scroll_up(&mut self, terminal: PtyKey, rows: usize) -> PtyResult<bool> {
         Ok(self.scroll_parser(terminal, rows as i32))
     }
 
-    pub fn scroll_down(&mut self, terminal: PtyKey, rows: usize) -> io::Result<bool> {
+    pub fn scroll_down(&mut self, terminal: PtyKey, rows: usize) -> PtyResult<bool> {
         Ok(self.scroll_parser(terminal, -(rows.min(i32::MAX as usize) as i32)))
     }
 
-    pub fn resize(&mut self, terminal: PtyKey, size: PtyDimensions) -> io::Result<()> {
+    pub fn resize(&mut self, terminal: PtyKey, size: PtyDimensions) -> PtyResult<()> {
         // Clamped once here so the parser and the daemon's PTY are driven at
         // the same size; the daemon applies the same policy independently.
         let size = size.clamped();
@@ -1184,9 +1319,11 @@ impl PtyRuntime {
         self.work_remaining || !self.pending_reattach.is_empty()
     }
 
-    fn allocate_request(&mut self) -> io::Result<RequestId> {
+    fn allocate_request(&mut self) -> PtyResult<RequestId> {
         if self.pending_requests.len() >= MAX_PENDING_REQUESTS_PER_CLIENT {
-            return Err(io::Error::other("too many pending PTY requests"));
+            return Err(PtyError::Invalid(
+                "too many pending PTY requests".to_string(),
+            ));
         }
         let request_id = self
             .next_request_id
@@ -1202,7 +1339,7 @@ impl PtyRuntime {
             .retain(|message| message_request_id(message) != Some(request_id));
     }
 
-    fn perform_create(&mut self, request_id: RequestId, request: ClientMessage) -> io::Result<()> {
+    fn perform_create(&mut self, request_id: RequestId, request: ClientMessage) -> PtyResult<()> {
         let (expected_identity, expected_session) = match &request {
             ClientMessage::CreateSession {
                 identity,
@@ -1216,7 +1353,7 @@ impl PtyRuntime {
         loop {
             let message = match self.receive_for_request(request_id, deadline) {
                 Ok(message) => message,
-                Err(error) if is_disconnected_error(&error) => {
+                Err(error) if error.is_disconnected() => {
                     self.resume_and_resend(&request)?;
                     continue;
                 }
@@ -1240,7 +1377,12 @@ impl PtyRuntime {
                         CreateOutcome::Error(error) => Err(create_error(error)),
                     };
                 }
-                ServerMessage::Error { message } => return Err(io::Error::other(message)),
+                ServerMessage::Error { code, message } => {
+                    return Err(PtyError::Rejected {
+                        code,
+                        detail: message,
+                    })
+                }
                 message => self.route_during_request(message),
             }
         }
@@ -1253,7 +1395,7 @@ impl PtyRuntime {
         size: PtyDimensions,
         request_id: RequestId,
         request: ClientMessage,
-    ) -> io::Result<()> {
+    ) -> PtyResult<()> {
         // This attach is authoritative for `terminal`, so a queued background
         // re-attachment for it would only duplicate the round trip.
         self.pending_reattach.retain(|queued| *queued != terminal);
@@ -1268,7 +1410,7 @@ impl PtyRuntime {
         loop {
             let message = match self.receive_for_request(request_id, deadline) {
                 Ok(message) => message,
-                Err(error) if is_disconnected_error(&error) => {
+                Err(error) if error.is_disconnected() => {
                     self.resume_and_resend(&request)?;
                     self.reset_parser(terminal, size);
                     let entry = self.pane_entry(terminal);
@@ -1403,7 +1545,12 @@ impl PtyRuntime {
                         "live output arrived before replay end",
                     ));
                 }
-                ServerMessage::Error { message } => return Err(io::Error::other(message)),
+                ServerMessage::Error { code, message } => {
+                    return Err(PtyError::Rejected {
+                        code,
+                        detail: message,
+                    })
+                }
                 message => self.route_during_request(message),
             }
         }
@@ -1413,13 +1560,13 @@ impl PtyRuntime {
         &mut self,
         request_id: RequestId,
         request: ClientMessage,
-    ) -> io::Result<AgentStatusOutcome> {
+    ) -> PtyResult<AgentStatusOutcome> {
         self.write_idempotent_request(&request)?;
         let deadline = Instant::now() + ATTACH_ACK_TIMEOUT;
         loop {
             let message = match self.receive_for_request(request_id, deadline) {
                 Ok(message) => message,
-                Err(error) if is_disconnected_error(&error) => {
+                Err(error) if error.is_disconnected() => {
                     self.resume_and_resend(&request)?;
                     continue;
                 }
@@ -1430,13 +1577,18 @@ impl PtyRuntime {
                     request_id: received,
                     outcome,
                 } if received == request_id => return Ok(outcome),
-                ServerMessage::Error { message } => return Err(io::Error::other(message)),
+                ServerMessage::Error { code, message } => {
+                    return Err(PtyError::Rejected {
+                        code,
+                        detail: message,
+                    })
+                }
                 message => self.route_during_request(message),
             }
         }
     }
 
-    fn perform_stop(&mut self, request_id: RequestId, request: ClientMessage) -> io::Result<()> {
+    fn perform_stop(&mut self, request_id: RequestId, request: ClientMessage) -> PtyResult<()> {
         let (stop_pane, stop_lease) = match &request {
             ClientMessage::Stop { pane, lease, .. } => (*pane, *lease),
             _ => unreachable!("perform_stop requires Stop"),
@@ -1446,7 +1598,7 @@ impl PtyRuntime {
         loop {
             let message = match self.receive_for_request(request_id, deadline) {
                 Ok(message) => message,
-                Err(error) if is_disconnected_error(&error) => {
+                Err(error) if error.is_disconnected() => {
                     self.resume_and_resend(&request)?;
                     continue;
                 }
@@ -1474,7 +1626,12 @@ impl PtyRuntime {
                     // be mistaken for a later incarnation reusing this pane ID.
                     self.clear_attachment(pane);
                 }
-                ServerMessage::Error { message } => return Err(io::Error::other(message)),
+                ServerMessage::Error { code, message } => {
+                    return Err(PtyError::Rejected {
+                        code,
+                        detail: message,
+                    })
+                }
                 message => self.route_during_request(message),
             }
         }
@@ -1484,7 +1641,7 @@ impl PtyRuntime {
         &mut self,
         request_id: RequestId,
         deadline: Instant,
-    ) -> io::Result<ServerMessage> {
+    ) -> PtyResult<ServerMessage> {
         if let Some(index) = self
             .deferred_messages
             .iter()
@@ -1498,15 +1655,13 @@ impl PtyRuntime {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out waiting for correlated mult-server response",
+                return Err(PtyError::Timeout(
+                    "timed out waiting for correlated mult-server response".to_string(),
                 ));
             }
             let Some(connection) = self.connection.as_ref() else {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "not connected to mult-server",
+                return Err(PtyError::Offline(
+                    "not connected to mult-server".to_string(),
                 ));
             };
             match connection.receiver.recv_timeout(remaining) {
@@ -1515,16 +1670,14 @@ impl PtyRuntime {
                 }
                 Ok(message) => return Ok(message),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "timed out waiting for correlated mult-server response",
+                    return Err(PtyError::Timeout(
+                        "timed out waiting for correlated mult-server response".to_string(),
                     ));
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.disconnect();
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "mult-server disconnected before correlated response",
+                    return Err(PtyError::Disconnected(
+                        "mult-server disconnected before correlated response".to_string(),
                     ));
                 }
             }
@@ -1670,14 +1823,26 @@ impl PtyRuntime {
                 reason,
             } => {
                 if self.lease_of(pane) == Some(lease) {
-                    let terminal = self
-                        .clear_attachment(pane)
-                        .unwrap_or_else(|| key_for_pane_id(pane));
+                    // A refused write is the one rejection that does not mean
+                    // the lease is gone: the pane is still ours and its writer
+                    // queue will drain. Tearing the attachment down here would
+                    // trade a wedged child for a full re-attach and replay. The
+                    // daemon could not say so before protocol 11, because it had
+                    // to reuse `NotOwner` for a full queue (F8).
+                    let terminal = if reason == LeaseRejectionReason::WriteRefused {
+                        self.key_for_pane(pane)
+                            .unwrap_or_else(|| key_for_pane_id(pane))
+                    } else {
+                        self.clear_attachment(pane)
+                            .unwrap_or_else(|| key_for_pane_id(pane))
+                    };
                     events.push(PtyEvent::Error {
                         terminal,
                         message: format!(
-                            "{:?} rejected for pane {}: {:?}",
-                            operation, pane.0, reason
+                            "{:?} rejected for pane {}: {}",
+                            operation,
+                            pane.0,
+                            reason.code()
                         ),
                     });
                 }
@@ -1687,8 +1852,10 @@ impl PtyRuntime {
             // pane (or `Terminal(0)`) to blame was wrong in both directions —
             // it hid the error when nothing was attached and slandered an
             // unrelated pane when something was (B8).
-            ServerMessage::Error { message } => {
-                events.push(PtyEvent::ConnectionError { message });
+            ServerMessage::Error { code, message } => {
+                events.push(PtyEvent::ConnectionError {
+                    message: format!("{code}: {message}"),
+                });
             }
         }
     }
@@ -1721,7 +1888,7 @@ impl PtyRuntime {
         Some(terminal)
     }
 
-    fn identity_for_key(&self, terminal: PtyKey) -> io::Result<WireSessionIdentity> {
+    fn identity_for_key(&self, terminal: PtyKey) -> PtyResult<WireSessionIdentity> {
         if let Some(identity) = self.registered_session_identity(terminal) {
             return Ok(identity);
         }
@@ -1731,19 +1898,18 @@ impl PtyRuntime {
         }
         #[cfg(not(test))]
         {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("PTY session {terminal:?} has no registered durable identity"),
-            ))
+            Err(PtyError::Invalid(format!(
+                "PTY session {terminal:?} has no registered durable identity"
+            )))
         }
     }
 
-    fn lease_for_pane(&self, pane: PaneId) -> io::Result<AttachmentLease> {
+    fn lease_for_pane(&self, pane: PaneId) -> PtyResult<AttachmentLease> {
         self.lease_of(pane).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotConnected,
-                format!("pane {} attachment has not been reconciled", pane.0),
-            )
+            PtyError::Disconnected(format!(
+                "pane {} attachment has not been reconciled",
+                pane.0
+            ))
         })
     }
 
@@ -1775,15 +1941,14 @@ impl PtyRuntime {
     /// while the client is disconnected therefore **fails visibly and
     /// immediately** instead of freezing the frame for up to eight seconds; the
     /// connection lands in the background and the next attempt succeeds.
-    fn ensure_connected(&mut self) -> io::Result<()> {
+    fn ensure_connected(&mut self) -> PtyResult<()> {
         self.poll_connector();
         if self.connection.is_none() {
             // An explicit user action is worth an immediate attempt, so this
             // bypasses the retry backoff — but never runs two connectors at once.
             self.start_connector(SpawnPolicy::Autospawn);
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "not connected to mult-server; a connection attempt is in progress",
+            return Err(PtyError::Offline(
+                "not connected to mult-server; a connection attempt is in progress".to_string(),
             ));
         }
         self.service_reattachments();
@@ -1905,7 +2070,9 @@ impl PtyRuntime {
         self.finish_request(request_id);
         match result {
             Ok(()) => true,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // The daemon says the session is gone: report the pane exited
+            // rather than treating it as a transport problem.
+            Err(error) if error.code() == Some(RejectCode::UnknownSession) => {
                 let pane = pane_for_key(terminal);
                 self.clear_attachment(pane);
                 let status = PtyExit {
@@ -1971,7 +2138,7 @@ impl PtyRuntime {
     /// idempotency key must be replayed on the very connection it re-establishes.
     /// Everything reachable from the render loop uses the connector thread
     /// instead.
-    fn connect_inner(&mut self, spawn: SpawnPolicy) -> io::Result<bool> {
+    fn connect_inner(&mut self, spawn: SpawnPolicy) -> PtyResult<bool> {
         let resume = self.client_scope;
         let established = establish_connection(&self.socket_path, spawn, resume)?;
         Ok(self.install_connection(established, resume))
@@ -2074,6 +2241,7 @@ impl PtyRuntime {
                     }
                     Err(error) => {
                         let _ = sender.send(ServerMessage::Error {
+                            code: RejectCode::DaemonInternal,
                             message: format!("failed to read from mult-server: {error}"),
                         });
                         break;
@@ -2109,16 +2277,16 @@ impl PtyRuntime {
         let _ = writer.shutdown(Shutdown::Both);
     }
 
-    fn write_idempotent_request(&mut self, message: &ClientMessage) -> io::Result<()> {
+    fn write_idempotent_request(&mut self, message: &ClientMessage) -> PtyResult<()> {
         self.ensure_connected()?;
         match self.write(message) {
             Ok(()) => Ok(()),
-            Err(error) if is_disconnected_error(&error) => self.resume_and_resend(message),
+            Err(error) if error.is_disconnected() => self.resume_and_resend(message),
             Err(error) => Err(error),
         }
     }
 
-    fn resume_and_resend(&mut self, message: &ClientMessage) -> io::Result<()> {
+    fn resume_and_resend(&mut self, message: &ClientMessage) -> PtyResult<()> {
         let previous_scope = self.client_scope;
         let previous_instance = self.server_instance;
         self.disconnect();
@@ -2127,9 +2295,9 @@ impl PtyRuntime {
             || self.client_scope != previous_scope
             || self.server_instance != previous_instance
         {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "mult-server identity changed; refusing to replay an unresolved request",
+            return Err(PtyError::ProtocolViolation(
+                "mult-server identity changed; refusing to replay an unresolved request"
+                    .to_string(),
             ));
         }
         self.write(message)
@@ -2140,43 +2308,40 @@ impl PtyRuntime {
         message: &ClientMessage,
         operation: PtyDeliveryOperation,
         pane: PaneId,
-    ) -> io::Result<()> {
+    ) -> PtyResult<()> {
         let Some(connection) = &self.connection else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "not connected to mult-server",
+            return Err(PtyError::Offline(
+                "not connected to mult-server".to_string(),
             ));
         };
         let result = {
-            let mut writer = connection
-                .writer
-                .lock()
-                .map_err(|_| io::Error::other("server socket writer lock poisoned"))?;
+            let mut writer = connection.writer.lock().map_err(|_| {
+                PtyError::Io(io::Error::other("server socket writer lock poisoned"))
+            })?;
             write_non_replayable_frame(&mut *writer, message, operation, pane)
         };
-        if result.as_ref().is_err_and(|error| {
-            error
-                .get_ref()
-                .and_then(|source| source.downcast_ref::<PtyDeliveryError>())
-                .is_some()
-        }) {
+        // Uncertain delivery is the one write failure that must not leave the
+        // socket in use: the frame may be half on the wire.
+        if result
+            .as_ref()
+            .is_err_and(|error| error.delivery().is_some())
+        {
             self.disconnect();
         }
         result
     }
 
-    fn write(&self, message: &ClientMessage) -> io::Result<()> {
+    fn write(&self, message: &ClientMessage) -> PtyResult<()> {
         let Some(connection) = &self.connection else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "not connected to mult-server",
+            return Err(PtyError::Offline(
+                "not connected to mult-server".to_string(),
             ));
         };
         let mut writer = connection
             .writer
             .lock()
             .map_err(|_| io::Error::other("server socket writer lock poisoned"))?;
-        write_message(&mut *writer, message)
+        Ok(write_message(&mut *writer, message)?)
     }
 }
 
@@ -2203,18 +2368,22 @@ fn write_non_replayable_frame(
     message: &ClientMessage,
     operation: PtyDeliveryOperation,
     pane: PaneId,
-) -> io::Result<()> {
+) -> PtyResult<()> {
     let mut tracked = AttemptTrackingWriter {
         inner: writer,
         attempted: false,
     };
     match write_message(&mut tracked, message) {
         Ok(()) => Ok(()),
-        Err(error) if !tracked.attempted => Err(error),
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::ConnectionAborted,
-            PtyDeliveryError { operation, pane },
-        )),
+        // Nothing reached the socket, so this is an ordinary definite failure.
+        Err(error) if !tracked.attempted => Err(PtyError::Io(error)),
+        // Bytes were attempted and then failed: the daemon may have received
+        // none, part, or all of the frame. Typed as uncertain so no layer above
+        // can decide to retry terminal bytes on its own.
+        Err(_) => Err(PtyError::DeliveryUncertain(PtyDeliveryError {
+            operation,
+            pane,
+        })),
     }
 }
 
@@ -2258,7 +2427,7 @@ fn establish_connection(
     socket_path: &Path,
     spawn: SpawnPolicy,
     resume: Option<ClientScopeId>,
-) -> io::Result<EstablishedConnection> {
+) -> PtyResult<EstablishedConnection> {
     let mut stream = if spawn.allows_spawn() {
         connect_or_spawn_server(socket_path)?
     } else {
@@ -2810,7 +2979,7 @@ struct ServerHello {
 fn validate_server_hello_with_timeout(
     stream: &mut UnixStream,
     timeout: Duration,
-) -> io::Result<ServerHello> {
+) -> PtyResult<ServerHello> {
     stream.set_read_timeout(Some(timeout))?;
     let result = validate_server_hello(stream);
     let reset_result = stream.set_read_timeout(None);
@@ -2824,21 +2993,23 @@ fn validate_server_hello_with_timeout(
     }
 }
 
-fn map_server_hello_error(error: io::Error, timeout: Duration) -> io::Error {
-    if matches!(
-        error.kind(),
-        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-    ) {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("timed out after {timeout:?} waiting for mult-server hello"),
-        )
-    } else {
-        error
+fn map_server_hello_error(error: PtyError, timeout: Duration) -> PtyError {
+    match &error {
+        PtyError::Io(io_error)
+            if matches!(
+                io_error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            PtyError::Timeout(format!(
+                "timed out after {timeout:?} waiting for mult-server hello"
+            ))
+        }
+        _ => error,
     }
 }
 
-fn validate_server_hello(reader: &mut impl io::Read) -> io::Result<ServerHello> {
+fn validate_server_hello(reader: &mut impl io::Read) -> PtyResult<ServerHello> {
     match read_message::<ServerMessage>(reader)? {
         ServerMessage::Hello {
             protocol_version,
@@ -2850,19 +3021,24 @@ fn validate_server_hello(reader: &mut impl io::Read) -> io::Result<ServerHello> 
             client_scope,
             resumed,
         }),
+        // A version disagreement is the one connection failure with a concrete
+        // remedy, so it is classified rather than merged into "invalid data":
+        // the status surface can tell the user to restart the daemon.
         ServerMessage::Hello {
             protocol_version, ..
-        } => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
+        } => Err(PtyError::Rejected {
+            code: RejectCode::ProtocolMismatch,
+            detail: format!(
                 "mult-server protocol version {protocol_version} is incompatible with client version {PROTOCOL_VERSION}; restart mult-server"
             ),
-        )),
-        ServerMessage::Error { message } => Err(io::Error::new(io::ErrorKind::InvalidData, message)),
-        message => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unexpected mult-server hello response: {message:?}"),
-        )),
+        }),
+        ServerMessage::Error { code, message } => Err(PtyError::Rejected {
+            code,
+            detail: message,
+        }),
+        message => Err(PtyError::ProtocolViolation(format!(
+            "unexpected mult-server hello response: {message:?}"
+        ))),
     }
 }
 
@@ -2879,111 +3055,76 @@ fn message_request_id(message: &ServerMessage) -> Option<RequestId> {
     }
 }
 
-fn protocol_order_error(message: &str) -> io::Error {
+fn protocol_order_error(message: &str) -> PtyError {
     // Keep the terminal/session mapping but mark this attach unreconciled. A
     // later explicit attach can rebuild from an authoritative replay.
-    io::Error::new(io::ErrorKind::ConnectionAborted, message)
+    PtyError::ProtocolViolation(message.to_string())
 }
 
-fn create_error(error: CreateError) -> io::Error {
-    match error {
+/// Every daemon refusal becomes a [`PtyError::Rejected`] carrying the wire's own
+/// [`RejectCode`]. The `detail` string is only ever rendered — control flow
+/// switches on the code, so rewording any of these cannot change behaviour.
+fn create_error(error: CreateError) -> PtyError {
+    let detail = match &error {
         CreateError::SessionAlreadyExists { session }
-        | CreateError::IdentityAlreadyExists { session } => io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("session {} already exists", session.id.0),
-        ),
-        CreateError::IdentityMismatch { session, mismatch } => io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("session {} identity mismatch: {mismatch:?}", session.0),
-        ),
-        CreateError::InvalidAgentMetadata(error) => agent_status_error(error),
-        CreateError::RequestCollision => {
-            io::Error::new(io::ErrorKind::InvalidData, "create request ID collision")
+        | CreateError::IdentityAlreadyExists { session } => {
+            format!("session {} already exists", session.id.0)
         }
-        CreateError::RetryExpired => {
-            io::Error::new(io::ErrorKind::InvalidData, "create request retry expired")
+        CreateError::IdentityMismatch { session, mismatch } => {
+            format!("session {} identity mismatch: {mismatch:?}", session.0)
         }
-        CreateError::Failed { message } => io::Error::other(message),
-    }
-}
-
-fn attach_error(error: AttachError) -> io::Error {
-    match error {
-        AttachError::SessionNotFound { session } => io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("server session {} is unavailable", session.0),
-        ),
-        AttachError::IdentityMismatch { session, mismatch } => io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "server session {} identity mismatch: {mismatch:?}",
-                session.0
-            ),
-        ),
-        AttachError::Superseded => io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "attachment request was superseded by a takeover",
-        ),
-        AttachError::RequestCollision => {
-            io::Error::new(io::ErrorKind::InvalidData, "attach request ID collision")
-        }
-        AttachError::RetryExpired => {
-            io::Error::new(io::ErrorKind::InvalidData, "attach request retry expired")
-        }
-        AttachError::Failed { message } => io::Error::other(message),
-    }
-}
-
-fn stop_error(error: StopError) -> io::Error {
-    match error {
-        StopError::RequestCollision => {
-            io::Error::new(io::ErrorKind::InvalidData, "stop request ID collision")
-        }
-        StopError::RetryExpired => {
-            io::Error::new(io::ErrorKind::InvalidData, "stop request retry expired")
-        }
-        StopError::IdentityMismatch { pane, mismatch } => io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("pane {} identity mismatch: {mismatch:?}", pane.0),
-        ),
-        StopError::LeaseRejected(reason) => {
-            let kind = if reason == LeaseRejectionReason::PaneMissing {
-                io::ErrorKind::NotFound
-            } else {
-                io::ErrorKind::PermissionDenied
-            };
-            io::Error::new(kind, format!("stop lease rejected: {reason:?}"))
-        }
-        StopError::Failed { message } => io::Error::other(message),
-    }
-}
-
-fn agent_status_error(error: AgentStatusError) -> io::Error {
-    let kind = match error {
-        AgentStatusError::SessionNotFound { .. } => io::ErrorKind::NotFound,
-        AgentStatusError::IdentityMismatch(_)
-        | AgentStatusError::NotAgentSession { .. }
-        | AgentStatusError::WrongChat { .. }
-        | AgentStatusError::WrongAgent { .. }
-        | AgentStatusError::StaleGeneration { .. }
-        | AgentStatusError::FinalStatusConflict { .. } => io::ErrorKind::PermissionDenied,
-        AgentStatusError::RequestCollision
-        | AgentStatusError::RetryExpired
-        | AgentStatusError::WrongSchema { .. } => io::ErrorKind::InvalidData,
-        AgentStatusError::Failed { .. } => io::ErrorKind::Other,
+        CreateError::InvalidAgentMetadata(error) => format!("agent metadata rejected: {error:?}"),
+        CreateError::RequestCollision => "create request ID collision".to_string(),
+        CreateError::RetryExpired => "create request retry expired".to_string(),
+        CreateError::Failed { message, .. } => message.clone(),
     };
-    io::Error::new(kind, format!("agent status rejected: {error:?}"))
+    PtyError::Rejected {
+        code: error.code(),
+        detail,
+    }
 }
 
-fn is_reconciliation_uncertain(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::TimedOut
-            | io::ErrorKind::BrokenPipe
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::NotConnected
-    )
+fn attach_error(error: AttachError) -> PtyError {
+    let detail = match &error {
+        AttachError::SessionNotFound { session } => {
+            format!("server session {} is unavailable", session.0)
+        }
+        AttachError::IdentityMismatch { session, mismatch } => format!(
+            "server session {} identity mismatch: {mismatch:?}",
+            session.0
+        ),
+        AttachError::Superseded => "attachment request was superseded by a takeover".to_string(),
+        AttachError::RequestCollision => "attach request ID collision".to_string(),
+        AttachError::RetryExpired => "attach request retry expired".to_string(),
+        AttachError::Failed { message, .. } => message.clone(),
+    };
+    PtyError::Rejected {
+        code: error.code(),
+        detail,
+    }
+}
+
+fn stop_error(error: StopError) -> PtyError {
+    let detail = match &error {
+        StopError::RequestCollision => "stop request ID collision".to_string(),
+        StopError::RetryExpired => "stop request retry expired".to_string(),
+        StopError::IdentityMismatch { pane, mismatch } => {
+            format!("pane {} identity mismatch: {mismatch:?}", pane.0)
+        }
+        StopError::LeaseRejected(reason) => format!("stop lease rejected: {reason:?}"),
+        StopError::Failed { message, .. } => message.clone(),
+    };
+    PtyError::Rejected {
+        code: error.code(),
+        detail,
+    }
+}
+
+fn agent_status_error(error: AgentStatusError) -> PtyError {
+    PtyError::Rejected {
+        code: error.code(),
+        detail: format!("agent status rejected: {error:?}"),
+    }
 }
 
 fn connect_or_spawn_server(path: &Path) -> io::Result<UnixStream> {
@@ -3166,16 +3307,6 @@ fn server_executable_name() -> &'static str {
     } else {
         "mult-server"
     }
-}
-
-fn is_disconnected_error(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::BrokenPipe
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::NotConnected
-    )
 }
 
 fn wire_session_identity(identity: SessionIdentity) -> WireSessionIdentity {
@@ -3386,7 +3517,8 @@ mod tests {
 
         let error = validate_server_hello(&mut bytes.as_slice()).expect_err("reject version");
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        // F8: a version disagreement is a code, not a shade of "invalid data".
+        assert_eq!(error.code(), Some(RejectCode::ProtocolMismatch));
         assert!(error.to_string().contains("restart mult-server"));
     }
 
@@ -3397,7 +3529,7 @@ mod tests {
         let error = validate_server_hello_with_timeout(&mut client, Duration::from_millis(10))
             .expect_err("silent peer should time out");
 
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(matches!(error, PtyError::Timeout(_)));
         assert!(error.to_string().contains("waiting for mult-server hello"));
     }
 
@@ -3606,7 +3738,10 @@ mod tests {
                     omitted_prefix_bytes: 5,
                 })
                 .unwrap();
-            for (sequence, bytes) in [(5, b"abc".to_vec()), (8, b"def".to_vec())] {
+            for (sequence, bytes) in [
+                (5, Arc::<[u8]>::from(&b"abc"[..])),
+                (8, Arc::<[u8]>::from(&b"def"[..])),
+            ] {
                 sender
                     .send(ServerMessage::ReplayChunk {
                         request_id,
@@ -3630,7 +3765,7 @@ mod tests {
                     pane,
                     lease,
                     sequence: OutputSequence::new(11),
-                    bytes: b"!".to_vec(),
+                    bytes: Arc::from(b"!".to_vec()),
                 })
                 .unwrap();
         });
@@ -3757,7 +3892,7 @@ mod tests {
             .start(PtySpawn::shell(terminal, None, BTreeMap::new()))
             .expect_err("attach rejection should fail start");
 
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(error.code(), Some(RejectCode::Superseded));
         assert!(!runtime.is_running(terminal));
         assert_eq!(runtime.key_for_pane(pane), None);
         completed_rx
@@ -3812,6 +3947,7 @@ mod tests {
             .send(ServerMessage::StopResult {
                 request_id: RequestId::MIN,
                 outcome: StopOutcome::Error(StopError::Failed {
+                    code: RejectCode::DaemonInternal,
                     message: "failed to kill child".to_string(),
                 }),
             })
@@ -3819,7 +3955,8 @@ mod tests {
 
         let error = runtime.stop(terminal).expect_err("stop should fail");
 
-        assert_eq!(error.to_string(), "failed to kill child");
+        assert_eq!(error.code(), Some(RejectCode::DaemonInternal));
+        assert!(error.to_string().contains("failed to kill child"));
         let message = read_client_message(&mut server_stream, "reading Stop");
         assert_eq!(
             message,
@@ -4000,7 +4137,10 @@ mod tests {
 
         let error = runtime.stop(terminal).expect_err("stop should fail");
 
-        assert_eq!(error.kind(), io::ErrorKind::Other);
+        // A poisoned local writer lock is our own I/O failing, not the daemon
+        // refusing anything, so it carries no `RejectCode`.
+        assert!(matches!(error, PtyError::Io(_)));
+        assert_eq!(error.code(), None);
         assert!(runtime.is_running(terminal));
         assert_eq!(runtime.key_for_pane(pane), Some(terminal));
     }
@@ -4234,7 +4374,7 @@ mod tests {
                 pane,
                 lease: test_lease(),
                 sequence: OutputSequence::ZERO,
-                bytes: b"\x1b[c".to_vec(),
+                bytes: Arc::from(b"\x1b[c".to_vec()),
             })
             .expect("send terminal query");
 
@@ -4276,7 +4416,7 @@ mod tests {
                 pane,
                 lease: test_lease(),
                 sequence: OutputSequence::ZERO,
-                bytes: b"abc\x1b[6n".to_vec(),
+                bytes: Arc::from(b"abc\x1b[6n".to_vec()),
             })
             .expect("send output with embedded cursor query");
 
@@ -4331,7 +4471,7 @@ mod tests {
                 pane,
                 lease: test_lease(),
                 sequence: OutputSequence::ZERO,
-                bytes: flood,
+                bytes: Arc::from(flood),
             })
             .expect("send query flood");
 
@@ -4754,7 +4894,7 @@ mod tests {
                 pane,
                 lease: test_lease(),
                 sequence: OutputSequence::ZERO,
-                bytes: b"hello".to_vec(),
+                bytes: Arc::from(b"hello".to_vec()),
             })
             .expect("send output event");
 
@@ -4785,7 +4925,7 @@ mod tests {
                     pane,
                     lease: test_lease(),
                     sequence: OutputSequence::new(sequence),
-                    bytes: bytes.to_vec(),
+                    bytes: Arc::from(bytes),
                 })
                 .expect("send output event");
         }
@@ -4851,6 +4991,7 @@ mod tests {
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
         sender
             .send(ServerMessage::Error {
+                code: RejectCode::TooManyPendingRequests,
                 message: "daemon is at capacity".to_string(),
             })
             .expect("queue a connection-wide error");
@@ -4859,7 +5000,9 @@ mod tests {
 
         assert!(
             events.contains(&PtyEvent::ConnectionError {
-                message: "daemon is at capacity".to_string(),
+                // The code leads: the status surface names the machine-readable
+                // reason, and the daemon's prose only elaborates on it (F8).
+                message: "too many pending requests: daemon is at capacity".to_string(),
             }),
             "{events:?}"
         );
@@ -5018,7 +5161,7 @@ mod tests {
                 pane,
                 lease: test_lease(),
                 sequence: OutputSequence::ZERO,
-                bytes: b"pane-b-output".to_vec(),
+                bytes: Arc::from(b"pane-b-output".to_vec()),
             })
             .unwrap();
         sender
@@ -5110,7 +5253,7 @@ mod tests {
                 pane: pane_b,
                 lease: test_lease(),
                 sequence: OutputSequence::ZERO,
-                bytes: b"b".to_vec(),
+                bytes: Arc::from(b"b".to_vec()),
             })
             .unwrap();
         sender
@@ -5205,7 +5348,7 @@ mod tests {
                 pane,
                 lease: test_lease(),
                 sequence: OutputSequence::new(1),
-                bytes: b"gap".to_vec(),
+                bytes: Arc::from(b"gap".to_vec()),
             },
             &mut events,
         );
@@ -5234,8 +5377,7 @@ mod tests {
             .expect_err("closed peer makes delivery uncertain");
 
         assert!(error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<PtyDeliveryError>())
+            .delivery()
             .is_some_and(|error| error.operation == PtyDeliveryOperation::Input));
         assert!(runtime.connection.is_none());
         assert!(runtime.is_running(terminal));
@@ -5288,8 +5430,7 @@ mod tests {
             let error = write_non_replayable_frame(&mut writer, &message, operation, pane)
                 .expect_err("flush failure after a complete frame is uncertain");
             assert!(error
-                .get_ref()
-                .and_then(|source| source.downcast_ref::<PtyDeliveryError>())
+                .delivery()
                 .is_some_and(|delivery| delivery.operation == operation));
             assert_eq!(writer.flushes, 1, "the frame is never replayed");
             assert_eq!(
@@ -5552,7 +5693,7 @@ mod tests {
         let error = runtime
             .ensure_connected()
             .expect_err("a disconnected runtime must not block on connect");
-        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        assert!(matches!(error, PtyError::Offline(_)));
 
         let deadline = Instant::now() + TEST_IO_TIMEOUT;
         while runtime.connection.is_none() && Instant::now() < deadline {
@@ -5619,7 +5760,7 @@ mod tests {
                     pane,
                     lease: test_lease(),
                     sequence,
-                    bytes: b"x".to_vec(),
+                    bytes: Arc::from(b"x".to_vec()),
                 })
                 .expect("queue output");
             sequence = sequence.checked_add_bytes(1).expect("advance sequence");
@@ -5665,7 +5806,7 @@ mod tests {
                     pane,
                     lease: test_lease(),
                     sequence,
-                    bytes: vec![b'x'; chunk],
+                    bytes: Arc::from(vec![b'x'; chunk]),
                 })
                 .expect("queue output");
             sequence = sequence.checked_add_bytes(chunk).expect("advance sequence");

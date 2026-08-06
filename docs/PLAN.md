@@ -175,14 +175,24 @@ deleting the three alias pairs, and F17 must keep `terminal_all_lines`, which is
 ---
 
 ### R10 — Architecture, structural
-**Items:** F9, F15, F5, F6, F8, F10, F16
-**Files:** `src/runtime.rs` → `src/runtime/`, `src/ui.rs` → `src/ui/`, `src/app.rs` →
-`src/app/`, new `src/layout.rs`, `src/lib.rs`, `crates/protocol/`
+
+**Split into two slices** along the semantic/structural seam, so the wire bump and the
+persisted-shape change could land without also moving several thousand lines between files:
+
+- **R10a — typed errors, the wire bump, the status seam, liveness single-sourcing.**
+  F8, F10, F16. `crates/protocol/`, `src/pty.rs`, `src/bin/mult-server.rs`, `src/model.rs`,
+  `src/app.rs`, `src/storage.rs`, `src/runtime.rs`, `docs/DAEMON.md`. **This slice spent the
+  effort's single `PROTOCOL_VERSION` bump (10 → 11)** and the only `STATE_VERSION` bump
+  (2 → 3); no module was split. It also closed A9's residual, which was waiting on exactly
+  this bump.
+- **R10b — the module splits.** F9, F15, F5, F6. `src/runtime.rs` → `src/runtime/`,
+  `src/ui.rs` → `src/ui/`, `src/app.rs` → `src/app/`, new `src/layout.rs`, `src/lib.rs`.
+  Strictly structural: no wire, state or behaviour change is left for it.
 
 `main` did not do v1's module split, so every v1 fix phrased against `src/runtime/*` or
-`src/app/*` needs its path rewritten before porting. F16 is materially bigger than v1: it must
-now coexist with `STATE_VERSION = 2`, its V1→V2 migration, and the future-version
-byte-preservation guarantee. F8 carries the single wire bump if one is still outstanding.
+`src/app/*` needs its path rewritten before porting. F16 was materially bigger than v1: it had
+to coexist with `STATE_VERSION = 2`, its V1→V2 migration, and the future-version
+byte-preservation guarantee.
 
 ---
 
@@ -230,6 +240,7 @@ tag↔version and runs tests before publishing; the docs tree has one roadmap.
 | R7b | Status surface and in-app affordances | done |
 | R8 | Interaction affordances | todo |
 | R9 | Architecture, mechanical | done |
-| R10 | Architecture, structural | todo |
+| R10a | Typed errors, wire bump, status seam, liveness | done |
+| R10b | Architecture, structural (module splits) | todo |
 | R11 | Tests | done |
 | R12 | CI, docs and release | done |

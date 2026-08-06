@@ -28,7 +28,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    env, fs,
+    env, fmt, fs,
     io::{self, Read, Write},
     net::Shutdown,
     os::unix::net::{UnixListener, UnixStream},
@@ -53,8 +53,8 @@ use mult_protocol::{
     AgentStatusQuery, AgentStatusRecord, AttachError, AttachOutcome, AttachmentLease,
     ClientMessage, ClientScopeId, CreateError, CreateOutcome, ExitInfo, ForegroundProcessInfo,
     IdentityMismatch, LaunchSpec, LeaseOperation, LeaseRejectionReason, OutputSequence, PaneId,
-    PaneInfo, RequestId, ServerInstanceId, ServerMessage, SessionId, SessionIdentity, SessionInfo,
-    StateNamespace, StopError, StopOutcome, AGENT_STATUS_SCHEMA_VERSION,
+    PaneInfo, RejectCode, RequestId, ServerInstanceId, ServerMessage, SessionId, SessionIdentity,
+    SessionInfo, StateNamespace, StopError, StopOutcome, AGENT_STATUS_SCHEMA_VERSION,
     MAX_CACHED_REQUEST_RESULTS_PER_SCOPE, MAX_MESSAGE_BYTES, MAX_PENDING_REQUESTS_PER_CLIENT,
     PROTOCOL_VERSION,
 };
@@ -140,6 +140,65 @@ const WAIT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_ERROR_MESSAGE: &str = "mult-server is shutting down";
 
+/// A daemon-side failure on its way to a client.
+///
+/// It carries the machine-readable [`RejectCode`] the wire will hand over next
+/// to the diagnostic text. Before protocol 11 these were bare `io::Error`s
+/// whose *message* was the only thing distinguishing one rejection from
+/// another, and control flow keyed off that in both directions: the create
+/// handler branched on `kind() == AlreadyExists`, and the client and the tests
+/// matched substrings such as `"lease space exhausted"`. Rewording a message
+/// silently changed behaviour. The code is the contract now; `message` exists
+/// to be shown to a human and is never parsed.
+#[derive(Debug)]
+struct Rejection {
+    code: RejectCode,
+    message: String,
+}
+
+impl Rejection {
+    fn new(code: RejectCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// A failure inside the daemon with no more specific classification: a
+    /// poisoned lock, a failed `ioctl`, an unexpected OS error.
+    fn internal(message: impl fmt::Display) -> Self {
+        Self::new(RejectCode::DaemonInternal, message.to_string())
+    }
+
+    fn into_create_error(self) -> CreateError {
+        CreateError::Failed {
+            code: self.code,
+            message: self.message,
+        }
+    }
+
+    fn into_attach_error(self) -> AttachError {
+        AttachError::Failed {
+            code: self.code,
+            message: self.message,
+        }
+    }
+}
+
+impl fmt::Display for Rejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Rejection {}
+
+impl From<io::Error> for Rejection {
+    fn from(error: io::Error) -> Self {
+        Self::internal(error)
+    }
+}
+
 #[derive(Clone)]
 struct ClientHandle {
     id: ClientId,
@@ -186,8 +245,10 @@ impl ClientHandle {
 
 /// Builds the wire message for one queued delivery, or `None` for `Close`.
 ///
-/// Called from the client's writer thread so a refcounted payload is copied at
-/// most once, at the moment it is serialized.
+/// Called from the client's writer thread. Since protocol 11 the payload
+/// messages carry `Arc<[u8]>`, so this is a refcount bump: the pane's retained
+/// chunk is serialized straight out of the allocation the PTY reader produced,
+/// with no copy of PTY bytes anywhere on the broadcast path (A9).
 fn delivery_message(delivery: ClientDelivery) -> Option<ServerMessage> {
     match delivery {
         ClientDelivery::Message(message) => Some(message),
@@ -200,7 +261,7 @@ fn delivery_message(delivery: ClientDelivery) -> Option<ServerMessage> {
             pane,
             lease,
             sequence,
-            bytes: bytes.to_vec(),
+            bytes,
         }),
         ClientDelivery::Replay {
             request_id,
@@ -213,7 +274,7 @@ fn delivery_message(delivery: ClientDelivery) -> Option<ServerMessage> {
             pane,
             lease,
             sequence,
-            bytes: bytes.to_vec(),
+            bytes,
         }),
         ClientDelivery::Close => None,
     }
@@ -729,21 +790,23 @@ impl ServerState {
         self.allocate_scope().map(|scope| (scope, false))
     }
 
-    fn allocate_lease(&mut self) -> io::Result<AttachmentLease> {
-        let lease = self
-            .next_lease
-            .ok_or_else(|| io::Error::other("attachment lease space exhausted"))?;
+    fn allocate_lease(&mut self) -> Result<AttachmentLease, Rejection> {
+        let lease = self.next_lease.ok_or_else(|| {
+            Rejection::new(
+                RejectCode::ResourceExhausted,
+                "attachment lease space exhausted",
+            )
+        })?;
         self.next_lease = lease.checked_next();
         Ok(lease)
     }
 
-    fn allocate_session_id(&mut self) -> io::Result<SessionId> {
+    fn allocate_session_id(&mut self) -> Result<SessionId, Rejection> {
         loop {
             let session = SessionId(self.next_session_id);
-            self.next_session_id = self
-                .next_session_id
-                .checked_add(1)
-                .ok_or_else(|| io::Error::other("session ID space exhausted"))?;
+            self.next_session_id = self.next_session_id.checked_add(1).ok_or_else(|| {
+                Rejection::new(RejectCode::ResourceExhausted, "session ID space exhausted")
+            })?;
             if !self.sessions.contains_key(&session) && !self.reserved_sessions.contains(&session) {
                 return Ok(session);
             }
@@ -754,15 +817,18 @@ impl ServerState {
         &mut self,
         requested_id: Option<SessionId>,
         identity: SessionIdentity,
-    ) -> io::Result<SessionId> {
+    ) -> Result<SessionId, Rejection> {
         if self.shutting_down {
-            return Err(io::Error::other(SHUTDOWN_ERROR_MESSAGE));
+            return Err(Rejection::new(
+                RejectCode::ShuttingDown,
+                SHUTDOWN_ERROR_MESSAGE,
+            ));
         }
         if self.session_by_identity.contains_key(&identity)
             || self.reserved_identities.contains(&identity)
         {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
+            return Err(Rejection::new(
+                RejectCode::SessionAlreadyExists,
                 "logical session identity already exists or is being created",
             ));
         }
@@ -771,8 +837,8 @@ impl ServerState {
             None => self.allocate_session_id()?,
         };
         if self.sessions.contains_key(&session) || !self.reserved_sessions.insert(session) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
+            return Err(Rejection::new(
+                RejectCode::SessionAlreadyExists,
                 format!("session {} already exists or is being created", session.0),
             ));
         }
@@ -785,9 +851,16 @@ impl ServerState {
         self.reserved_identities.remove(&identity);
     }
 
-    fn publish_reserved_session(&mut self, session: SessionId, pane: SharedPane) -> io::Result<()> {
+    fn publish_reserved_session(
+        &mut self,
+        session: SessionId,
+        pane: SharedPane,
+    ) -> Result<(), Rejection> {
         if self.shutting_down {
-            return Err(io::Error::other(SHUTDOWN_ERROR_MESSAGE));
+            return Err(Rejection::new(
+                RejectCode::ShuttingDown,
+                SHUTDOWN_ERROR_MESSAGE,
+            ));
         }
         let (identity, agent) = {
             let pane = pane.lock().map_err(lock_error)?;
@@ -798,7 +871,10 @@ impl ServerState {
             || !self.reserved_sessions.contains(&session)
             || !self.reserved_identities.contains(&identity)
         {
-            return Err(io::Error::other("session was created concurrently"));
+            return Err(Rejection::new(
+                RejectCode::SessionAlreadyExists,
+                "session was created concurrently",
+            ));
         }
         self.release_session_reservation(session, identity);
         self.session_by_identity.insert(identity, session);
@@ -1331,12 +1407,14 @@ fn handle_client_messages(
     } = message
     else {
         let _ = client.try_deliver(ServerMessage::Error {
+            code: RejectCode::ProtocolOrder,
             message: "expected protocol hello before other client messages".to_string(),
         });
         return Ok(());
     };
     if protocol_version != PROTOCOL_VERSION {
         let _ = client.try_deliver(ServerMessage::Error {
+            code: RejectCode::ProtocolMismatch,
             message: format!(
                 "client protocol version {protocol_version} is incompatible with server version {PROTOCOL_VERSION}; restart mult clients"
             ),
@@ -1361,6 +1439,7 @@ fn handle_client_messages(
         match message {
             ClientMessage::Hello { .. } => {
                 let _ = client.try_deliver(ServerMessage::Error {
+                    code: RejectCode::ProtocolOrder,
                     message: "protocol hello may only be sent once per connection".to_string(),
                 });
                 break;
@@ -1400,9 +1479,6 @@ fn handle_client_messages(
                     LeaseOperation::Paste,
                 );
             }
-            ClientMessage::Scroll { .. }
-            | ClientMessage::ScrollToTop { .. }
-            | ClientMessage::ScrollToBottom { .. } => {}
             ClientMessage::Resize {
                 pane,
                 lease,
@@ -1465,6 +1541,7 @@ fn handle_create_request(
             let response = ServerMessage::CreateResult {
                 request_id: *request_id,
                 outcome: CreateOutcome::Error(CreateError::Failed {
+                    code: RejectCode::TooManyPendingRequests,
                     message: "too many pending requests".to_string(),
                 }),
             };
@@ -1530,7 +1607,9 @@ fn handle_create_request(
             Ok(pane) => CreateOutcome::Created {
                 session: pane.lock().map_err(lock_error)?.session_info(),
             },
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            // The code, not an `io::ErrorKind`, decides whether this was a
+            // collision worth re-resolving into a structured "already exists".
+            Err(error) if error.code == RejectCode::SessionAlreadyExists => {
                 let numeric = requested_id.and_then(|id| {
                     server
                         .lock()
@@ -1558,14 +1637,10 @@ fn handle_create_request(
                         session: pane.lock().map_err(lock_error)?.session_info(),
                     })
                 } else {
-                    CreateOutcome::Error(CreateError::Failed {
-                        message: error.to_string(),
-                    })
+                    CreateOutcome::Error(error.into_create_error())
                 }
             }
-            Err(error) => CreateOutcome::Error(CreateError::Failed {
-                message: error.to_string(),
-            }),
+            Err(error) => CreateOutcome::Error(error.into_create_error()),
         }
     };
     let response = ServerMessage::CreateResult {
@@ -1674,6 +1749,7 @@ fn handle_attach_request_with_hooks(
             let response = ServerMessage::AttachResult {
                 request_id: *request_id,
                 outcome: AttachOutcome::Error(AttachError::Failed {
+                    code: RejectCode::TooManyPendingRequests,
                     message: "too many pending requests".to_string(),
                 }),
             };
@@ -1705,6 +1781,7 @@ fn handle_attach_request_with_hooks(
         let response = ServerMessage::AttachResult {
             request_id: *request_id,
             outcome: AttachOutcome::Error(AttachError::Failed {
+                code: RejectCode::ShuttingDown,
                 message: SHUTDOWN_ERROR_MESSAGE.to_string(),
             }),
         };
@@ -1798,6 +1875,7 @@ fn handle_attach_request_with_hooks(
                     client,
                     *request_id,
                     AttachError::Failed {
+                        code: RejectCode::DaemonInternal,
                         message: error.to_string(),
                     },
                 );
@@ -1850,6 +1928,7 @@ fn handle_attach_request_with_hooks(
             let response = ServerMessage::AttachResult {
                 request_id: *request_id,
                 outcome: AttachOutcome::Error(AttachError::Failed {
+                    code: RejectCode::DaemonInternal,
                     message: error.to_string(),
                 }),
             };
@@ -1862,12 +1941,10 @@ fn handle_attach_request_with_hooks(
     }
     let lease = match state.allocate_lease() {
         Ok(lease) => lease,
-        Err(error) => {
+        Err(rejection) => {
             let response = ServerMessage::AttachResult {
                 request_id: *request_id,
-                outcome: AttachOutcome::Error(AttachError::Failed {
-                    message: error.to_string(),
-                }),
+                outcome: AttachOutcome::Error(rejection.into_attach_error()),
             };
             let waiters = state.complete_request(key, response.clone());
             drop(pane_state);
@@ -2090,10 +2167,11 @@ fn handle_leased_input(
         // The bytes were definitely not delivered, so say so. `LeaseRejected`
         // is the pane-scoped refusal channel: it does not close the connection,
         // and the client treats it as conclusive rather than assuming the
-        // keystrokes landed. `NotOwner` is the daemon's established "this
-        // mutation is refused right now" reason — `validate_mutation_lease`
-        // already returns it for shutdown and for a stopping pane. A dedicated
-        // reason would be clearer but is a wire change; see BACKLOG F8.
+        // keystrokes landed. Protocol 11 gives this its own reason: reusing
+        // `NotOwner` (which `validate_mutation_lease` returns for shutdown and
+        // for a stopping pane) made a wedged child indistinguishable from a
+        // lost lease, and a client that tears down its attachment on `NotOwner`
+        // did the wrong thing for a queue that will drain (F8).
         eprintln!(
             "refusing PTY input for pane {}: writer queue {refusal:?}",
             pane_id.0
@@ -2103,7 +2181,7 @@ fn handle_leased_input(
             pane_id,
             lease,
             operation,
-            LeaseRejectionReason::NotOwner,
+            LeaseRejectionReason::WriteRefused,
         );
         return;
     }
@@ -2234,6 +2312,7 @@ fn handle_stop_request(
             let response = ServerMessage::StopResult {
                 request_id: *request_id,
                 outcome: StopOutcome::Error(StopError::Failed {
+                    code: RejectCode::TooManyPendingRequests,
                     message: "too many pending requests".to_string(),
                 }),
             };
@@ -2354,6 +2433,7 @@ fn handle_agent_status_request(
                 ServerMessage::AgentStatusResult {
                     request_id,
                     outcome: AgentStatusOutcome::Error(AgentStatusError::Failed {
+                        code: RejectCode::TooManyPendingRequests,
                         message: "too many pending requests".to_string(),
                     }),
                 },
@@ -2538,7 +2618,7 @@ fn is_client_disconnect(error: &io::Error) -> bool {
     )
 }
 
-fn create_session(server: &SharedServer, spec: SessionCreateSpec) -> io::Result<SharedPane> {
+fn create_session(server: &SharedServer, spec: SessionCreateSpec) -> Result<SharedPane, Rejection> {
     create_session_with_spawner(server, spec, spawn_pane)
 }
 
@@ -2546,19 +2626,21 @@ fn create_session_with_spawner(
     server: &SharedServer,
     spec: SessionCreateSpec,
     spawn: impl FnOnce(SessionId, PaneSpawnSpec) -> io::Result<SpawnedPane>,
-) -> io::Result<SharedPane> {
+) -> Result<SharedPane, Rejection> {
     let identity = spec.pane.identity;
     let session = {
         let mut state = server.lock().map_err(lock_error)?;
         state.reserve_session(spec.requested_id, identity)?
     };
+    // Spawning is the one step here that is genuine I/O; everything it can
+    // report is a failure to launch the child, so it classifies as one.
     let mut spawned = match spawn(session, spec.pane) {
         Ok(spawned) => spawned,
         Err(error) => {
             if let Ok(mut state) = server.lock() {
                 state.release_session_reservation(session, identity);
             }
-            return Err(error);
+            return Err(Rejection::new(RejectCode::LaunchFailed, error.to_string()));
         }
     };
 
@@ -2695,6 +2777,7 @@ fn spawn_waiter(mut child: Box<dyn Child + Send + Sync>, pane: SharedPane, serve
                 fail_pending_stops(
                     &server,
                     &pane,
+                    RejectCode::DaemonInternal,
                     format!("failed to wait for PTY child: {message}"),
                 );
                 let signal = pane
@@ -2833,7 +2916,7 @@ fn start_stop_if_needed(server: SharedServer, pane: SharedPane) {
             }
             pane_state.notify_lifecycle();
         }
-        fail_pending_stops(&server, &pane, message);
+        fail_pending_stops(&server, &pane, RejectCode::DaemonInternal, message);
     });
 }
 
@@ -2914,7 +2997,11 @@ fn wait_for_finalization(pane: &SharedPane, timeout: Duration) -> bool {
     }
 }
 
-fn fail_pending_stops(server: &SharedServer, pane: &SharedPane, message: String) {
+/// Completes every stop still awaiting this pane with the same failure.
+///
+/// `code` is the classification the client switches on; `message` says which
+/// step of termination failed and is diagnostic only.
+fn fail_pending_stops(server: &SharedServer, pane: &SharedPane, code: RejectCode, message: String) {
     let deliveries = {
         let mut state = match server.lock() {
             Ok(state) => state,
@@ -2931,6 +3018,7 @@ fn fail_pending_stops(server: &SharedServer, pane: &SharedPane, message: String)
                 let response = ServerMessage::StopResult {
                     request_id: key.request_id,
                     outcome: StopOutcome::Error(StopError::Failed {
+                        code,
                         message: message.clone(),
                     }),
                 };
@@ -3503,8 +3591,8 @@ mod tests {
             server
                 .reserve_session(Some(SessionId(1)), test_identity())
                 .unwrap_err()
-                .kind(),
-            io::ErrorKind::AlreadyExists
+                .code,
+            RejectCode::SessionAlreadyExists
         );
         server.release_session_reservation(SessionId(1), test_identity());
         assert!(server.reserved_sessions.is_empty());
@@ -3578,8 +3666,10 @@ mod tests {
             &first,
             ServerMessage::AttachResult {
                 request_id: received,
-                outcome: AttachOutcome::Error(AttachError::Failed { message }),
-            } if *received == request_id && message == SHUTDOWN_ERROR_MESSAGE
+                outcome: AttachOutcome::Error(AttachError::Failed { code, message }),
+            } if *received == request_id
+                && *code == RejectCode::ShuttingDown
+                && message == SHUTDOWN_ERROR_MESSAGE
         ));
         {
             let pane_state = pane.lock().unwrap();
@@ -3633,8 +3723,10 @@ mod tests {
             new_receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
             ServerMessage::AttachResult {
                 request_id: received,
-                outcome: AttachOutcome::Error(AttachError::Failed { ref message }),
-            } if received == request_id && message == SHUTDOWN_ERROR_MESSAGE
+                outcome: AttachOutcome::Error(AttachError::Failed { code, ref message }),
+            } if received == request_id
+                && code == RejectCode::ShuttingDown
+                && message == SHUTDOWN_ERROR_MESSAGE
         ));
         let pane_state = pane.lock().unwrap();
         assert_eq!((pane_state.rows, pane_state.cols), (1, 1));
@@ -3670,8 +3762,10 @@ mod tests {
             replacement_receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
             ServerMessage::AttachResult {
                 request_id: received,
-                outcome: AttachOutcome::Error(AttachError::Failed { ref message }),
-            } if received == request_id && message == SHUTDOWN_ERROR_MESSAGE
+                outcome: AttachOutcome::Error(AttachError::Failed { code, ref message }),
+            } if received == request_id
+                && code == RejectCode::ShuttingDown
+                && message == SHUTDOWN_ERROR_MESSAGE
         ));
         assert!(pane.lock().unwrap().owner.as_ref().is_some_and(|owner| {
             owner.scope == scope && owner.lease == lease && owner.client.id == first.id
@@ -3696,6 +3790,7 @@ mod tests {
         let response = ServerMessage::CreateResult {
             request_id: id,
             outcome: CreateOutcome::Error(CreateError::Failed {
+                code: RejectCode::DaemonInternal,
                 message: "injected".to_string(),
             }),
         };
@@ -3864,6 +3959,7 @@ mod tests {
         let response = ServerMessage::CreateResult {
             request_id: rejected_id,
             outcome: CreateOutcome::Error(CreateError::Failed {
+                code: RejectCode::TooManyPendingRequests,
                 message: "too many pending requests".to_string(),
             }),
         };
@@ -4014,9 +4110,13 @@ mod tests {
             assert!(matches!(
                 receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
                 ServerMessage::AttachResult {
-                    outcome: AttachOutcome::Error(AttachError::Failed { ref message }),
+                    // F8: the *code* is what the client keys off. This used to
+                    // assert on a substring of the daemon's prose, which is
+                    // exactly the coupling that made rewording a message a
+                    // silent behaviour change.
+                    outcome: AttachOutcome::Error(AttachError::Failed { code, .. }),
                     ..
-                } if message.contains("lease space exhausted")
+                } if code == RejectCode::ResourceExhausted
             ));
         }
     }
@@ -4121,7 +4221,7 @@ mod tests {
                 ..
             } if received == request_id
                 && received_lease == lease
-                && bytes == b"delivery-failed-but-retained"
+                && bytes.as_ref() == b"delivery-failed-but-retained"
         ));
         assert!(matches!(
             resumed_receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
@@ -4454,7 +4554,7 @@ mod tests {
             } if received == request_id && received_lease == lease => bytes,
             message => panic!("unexpected replay message: {message:?}"),
         };
-        assert_eq!(replay, replay_bytes);
+        assert_eq!(replay.as_ref(), replay_bytes.as_slice());
         assert!(matches!(
             receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
             ServerMessage::ReplayEnd {
@@ -4473,7 +4573,7 @@ mod tests {
             } if received_lease == lease
         ));
 
-        let mut combined = replay;
+        let mut combined = replay.to_vec();
         let mut expected_sequence = replay_watermark;
         for number in 32..64 {
             match receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap() {
@@ -4483,7 +4583,7 @@ mod tests {
                     sequence,
                     bytes,
                 } if received_lease == lease && sequence == expected_sequence => {
-                    assert_eq!(bytes, record(number));
+                    assert_eq!(bytes.as_ref(), record(number).as_slice());
                     expected_sequence = expected_sequence.checked_add_bytes(bytes.len()).unwrap();
                     combined.extend_from_slice(&bytes);
                 }
@@ -5047,7 +5147,7 @@ mod tests {
         ));
         assert!(matches!(
             receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
-            ServerMessage::ReplayChunk { ref bytes, .. } if bytes == b"scrollback"
+            ServerMessage::ReplayChunk { ref bytes, .. } if bytes.as_ref() == b"scrollback"
         ));
         assert!(matches!(
             receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap(),
@@ -5452,7 +5552,7 @@ mod tests {
 
         for expected in [&b"first"[..], &b"second"[..]] {
             match receiver.recv_timeout(TEST_IO_TIMEOUT).unwrap() {
-                ServerMessage::PtyOutput { bytes, .. } => assert_eq!(bytes, expected),
+                ServerMessage::PtyOutput { bytes, .. } => assert_eq!(bytes.as_ref(), expected),
                 message => panic!("unexpected delivery: {message:?}"),
             }
         }

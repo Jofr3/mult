@@ -1295,7 +1295,7 @@ fn numbered_attach_replay_and_live_output_are_exactly_contiguous() {
             "live output must begin at the watermark"
         );
         expected = sequence.checked_add_bytes(bytes.len()).unwrap();
-        combined.extend(bytes);
+        combined.extend_from_slice(&bytes);
     }
     assert_eq!(
         extract_numbered_records(&combined),
@@ -1356,7 +1356,7 @@ fn stop_before_child_exit_finalizes_once_without_a_stale_session() {
             } if pane == attached.pane && lease == attached.lease => {
                 assert_eq!(sequence, expected_sequence, "live output sequence gap");
                 expected_sequence = sequence.checked_add_bytes(bytes.len()).unwrap();
-                output.extend(bytes);
+                output.extend_from_slice(&bytes);
             }
             ServerMessage::ForegroundProcess { pane, lease, .. }
                 if pane == attached.pane && lease == attached.lease => {}
@@ -1441,7 +1441,7 @@ fn natural_exit_before_stop_returns_already_absent_without_a_stale_session() {
             } if pane == attached.pane && lease == attached.lease => {
                 assert_eq!(sequence, expected_sequence, "live output sequence gap");
                 expected_sequence = sequence.checked_add_bytes(bytes.len()).unwrap();
-                output.extend(bytes);
+                output.extend_from_slice(&bytes);
             }
             ServerMessage::ForegroundProcess { pane, lease, .. }
                 if pane == attached.pane && lease == attached.lease => {}
@@ -1697,7 +1697,7 @@ impl RawClient {
             let ServerMessage::PtyOutput { bytes: output, .. } = message else {
                 unreachable!()
             };
-            bytes.extend(output);
+            bytes.extend_from_slice(&output);
         }
         Ok(bytes)
     }
@@ -1755,7 +1755,7 @@ impl RawClient {
                         return Err("replay chunk identified wrong attachment".to_string());
                     }
                     replay_ranges.push((sequence, bytes.len()));
-                    replay_bytes.extend(bytes);
+                    replay_bytes.extend_from_slice(&bytes);
                 }
                 ServerMessage::ReplayEnd {
                     pane: end_pane,
@@ -2021,7 +2021,7 @@ fn receive_attachment_marker(
             } if pane == attachment.pane && lease == attachment.lease => {
                 assert_eq!(sequence, expected_sequence, "live output sequence gap");
                 expected_sequence = sequence.checked_add_bytes(bytes.len()).unwrap();
-                output.extend(bytes);
+                output.extend_from_slice(&bytes);
             }
             ServerMessage::ForegroundProcess { pane, lease, .. }
                 if pane == attachment.pane && lease == attachment.lease => {}

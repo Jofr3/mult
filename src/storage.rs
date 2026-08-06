@@ -18,9 +18,9 @@ use serde::Deserialize;
 
 use crate::{
     model::{
-        AgentKind, ChatId, ChatMessage, ChatSession, ChatStatus, IdentitySource, ProjectState,
-        SecureIdentitySource, SessionIdentities, StateNamespace, TerminalId, TerminalLaunch,
-        TerminalSession, TerminalStatus, Workspace, WorkspaceId, STATE_VERSION,
+        null_or_default, AgentGeneration, AgentKind, ChatId, ChatMessage, ChatSession, ChatStatus,
+        IdentitySource, ProjectState, SecureIdentitySource, SessionIdentities, StateNamespace,
+        TerminalId, TerminalLaunch, TerminalSession, Workspace, WorkspaceId, STATE_VERSION,
     },
     paths,
 };
@@ -127,12 +127,100 @@ impl StatePaths {
     }
 }
 
+/// Why a state operation failed.
+///
+/// The distinctions a caller must make here are semantic, and `io::ErrorKind`
+/// carries none of them: "another process owns this file" and "this file is
+/// from a newer build" are both `Other`/`InvalidData`, and telling them apart
+/// meant reading the message (F8). `io::Result` survives underneath, where the
+/// file and directory primitives genuinely do I/O.
+///
+/// Written by hand — this workspace adds no dependencies, so no `thiserror`.
+#[derive(Debug)]
+pub enum StateError {
+    /// Another `mult` process holds the state lock. Nothing was read or
+    /// written; the other process is the single writer by design.
+    Locked { path: PathBuf },
+    /// The file declares a state version this build does not know. Nothing is
+    /// read, moved, or written: a newer client's state must survive an older
+    /// client opening it, byte for byte.
+    UnsupportedVersion { path: PathBuf, version: u32 },
+    /// The state handed to `save` is not one this build may write.
+    Invalid(String),
+    /// The file could not be decoded. It was moved aside to `backup`, and the
+    /// session continues from an empty project.
+    Corrupt { path: PathBuf, backup: PathBuf },
+    /// Underlying file or directory I/O failed.
+    Io(io::Error),
+}
+
+pub type StateResult<T> = Result<T, StateError>;
+
+impl std::fmt::Display for StateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Locked { path } => write!(
+                formatter,
+                "another mult process owns state path {}",
+                path.display()
+            ),
+            Self::UnsupportedVersion { path, version } => write!(
+                formatter,
+                "state file version {version} is unsupported (current version is {STATE_VERSION}); not modifying {}",
+                path.display()
+            ),
+            Self::Invalid(message) => formatter.write_str(message),
+            Self::Corrupt { path, backup } => write!(
+                formatter,
+                "state file {} could not be decoded; it was moved to {}",
+                path.display(),
+                backup.display()
+            ),
+            Self::Io(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for StateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for StateError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<StateError> for io::Error {
+    /// `main` and the runtime still hand failures to `io::Result` boundaries
+    /// (process exit, the save scheduler's notice text), so a `StateError`
+    /// converts back with its `Display` preserved.
+    fn from(error: StateError) -> Self {
+        match error {
+            StateError::Io(error) => error,
+            StateError::Locked { .. } => {
+                io::Error::new(io::ErrorKind::WouldBlock, error.to_string())
+            }
+            StateError::UnsupportedVersion { .. }
+            | StateError::Invalid(_)
+            | StateError::Corrupt { .. } => {
+                io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+            }
+        }
+    }
+}
+
 impl StateStore {
-    pub fn acquire_default() -> io::Result<Self> {
+    pub fn acquire_default() -> StateResult<Self> {
         Self::acquire(StatePaths::resolve()?)
     }
 
-    pub fn acquire(paths: StatePaths) -> io::Result<Self> {
+    pub fn acquire(paths: StatePaths) -> StateResult<Self> {
         let directory =
             SecureDirectory::open_parent(paths.state_path(), true, paths.normalize_parent)?;
         let lock_name = paths.lock_name();
@@ -149,15 +237,11 @@ impl StateStore {
             if error.raw_os_error() == Some(libc::EWOULDBLOCK)
                 || error.raw_os_error() == Some(libc::EAGAIN)
             {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!(
-                        "another mult process owns state path {}",
-                        paths.state.display()
-                    ),
-                ));
+                return Err(StateError::Locked {
+                    path: paths.state.clone(),
+                });
             }
-            return Err(error);
+            return Err(error.into());
         }
 
         let store = Self {
@@ -173,20 +257,24 @@ impl StateStore {
         self.paths.state_path()
     }
 
-    pub fn load_or_default(&self) -> io::Result<LoadedState> {
+    pub fn load_or_default(&self) -> StateResult<LoadedState> {
         let mut source = SecureIdentitySource::new()?;
         self.load_with_identity_source(&mut source)
     }
 
-    pub fn save(&self, state: &ProjectState) -> io::Result<()> {
+    pub fn save(&self, state: &ProjectState) -> StateResult<()> {
         validate_current_state(state)?;
-        save_to_directory(state, &self.directory, self.paths.state_name())
+        Ok(save_to_directory(
+            state,
+            &self.directory,
+            self.paths.state_name(),
+        )?)
     }
 
     fn load_with_identity_source(
         &self,
         source: &mut impl IdentitySource,
-    ) -> io::Result<LoadedState> {
+    ) -> StateResult<LoadedState> {
         let bytes = match self.read_state_bytes()? {
             Some(bytes) => bytes,
             None => {
@@ -202,11 +290,16 @@ impl StateStore {
 
         match decode_state(&bytes) {
             Ok(DecodedState::V1(old)) => Ok(LoadedState {
-                state: migrate_v1_to_v2(old, source)?,
+                state: migrate_v1_to_current(old, source)?,
                 needs_save: true,
                 notice: None,
             }),
-            Ok(DecodedState::V2(mut state)) => {
+            Ok(DecodedState::V2(old)) => Ok(LoadedState {
+                state: migrate_v2_to_v3(old, source)?,
+                needs_save: true,
+                notice: None,
+            }),
+            Ok(DecodedState::V3(mut state)) => {
                 // Repair before validating, not after: a lenient decode can
                 // leave the ID allocators and the identity table describing a
                 // slightly different set of sessions than actually decoded, and
@@ -242,13 +335,12 @@ impl StateStore {
                     )),
                 })
             }
-            Err(StateDecodeError::UnsupportedVersion(version)) => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "state file version {version} is unsupported (current version is {STATE_VERSION}); not modifying {}",
-                    self.paths.state.display()
-                ),
-            )),
+            Err(StateDecodeError::UnsupportedVersion(version)) => {
+                Err(StateError::UnsupportedVersion {
+                    path: self.paths.state.clone(),
+                    version,
+                })
+            }
         }
     }
 
@@ -339,7 +431,7 @@ impl StateStore {
 /// acquires the same lifetime lock for the duration of its write, and therefore
 /// fails with `WouldBlock` while a `mult` session owns the state file rather
 /// than racing it with an unlocked atomic rename.
-pub fn save(state: &ProjectState) -> io::Result<()> {
+pub fn save(state: &ProjectState) -> StateResult<()> {
     let store = StateStore::acquire(StatePaths::resolve()?)?;
     store.save(state)
 }
@@ -350,19 +442,16 @@ pub fn state_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("<state path unavailable>"))
 }
 
-fn validate_current_state(state: &ProjectState) -> io::Result<()> {
+fn validate_current_state(state: &ProjectState) -> StateResult<()> {
     if state.version != STATE_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "refusing to save state version {}; expected {STATE_VERSION}",
-                state.version
-            ),
-        ));
+        return Err(StateError::Invalid(format!(
+            "refusing to save state version {}; expected {STATE_VERSION}",
+            state.version
+        )));
     }
     state
         .validate_session_identities()
-        .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))
+        .map_err(|message| StateError::Invalid(message.to_string()))
 }
 
 fn decode_state(bytes: &[u8]) -> Result<DecodedState, StateDecodeError> {
@@ -374,20 +463,96 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, StateDecodeError> {
         1 => serde_json::from_slice(bytes)
             .map(DecodedState::V1)
             .map_err(StateDecodeError::InvalidJson),
-        STATE_VERSION => serde_json::from_slice(bytes)
+        2 => serde_json::from_slice(bytes)
             .map(DecodedState::V2)
+            .map_err(StateDecodeError::InvalidJson),
+        STATE_VERSION => serde_json::from_slice(bytes)
+            .map(DecodedState::V3)
             .map_err(StateDecodeError::InvalidJson),
         version => Err(StateDecodeError::UnsupportedVersion(version)),
     }
 }
 
-fn migrate_v1_to_v2(old: StateV1, source: &mut impl IdentitySource) -> io::Result<ProjectState> {
-    let namespace = next_namespace(source)?;
+/// Version 1 predates state namespaces and session identities, so it migrates
+/// through the version-2 shape rather than duplicating what
+/// [`migrate_v2_to_v3`] already does. The chain is deliberate: one hop per
+/// version keeps each migration small enough to be read and tested on its own.
+fn migrate_v1_to_v2(old: StateV1) -> Vec<WorkspaceV2> {
+    old.workspaces
+        .into_iter()
+        .map(|workspace| WorkspaceV2 {
+            id: workspace.id,
+            name: workspace.name,
+            cwd: workspace.cwd,
+            environment: workspace.environment,
+            chats: workspace
+                .chats
+                .into_iter()
+                .map(|chat| ChatSession {
+                    id: chat.id,
+                    name: chat.name,
+                    status: chat.status,
+                    agent: chat.agent,
+                    messages: chat.messages,
+                })
+                .collect(),
+            terminals: workspace
+                .terminals
+                .into_iter()
+                .map(|terminal| TerminalV2 {
+                    id: terminal.id,
+                    name: terminal.name,
+                    status: terminal.status,
+                    launch: terminal.launch,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn migrate_v1_to_current(
+    old: StateV1,
+    source: &mut impl IdentitySource,
+) -> io::Result<ProjectState> {
+    let next_workspace_id = old.next_workspace_id;
+    let next_chat_id = old.next_chat_id;
+    let next_terminal_id = old.next_terminal_id;
+    migrate_v2_to_v3(
+        StateV2 {
+            version: 2,
+            // Version 1 has no namespace, so one is minted here. `migrate_v2_to_v3`
+            // then assigns the per-session tokens against it.
+            namespace: next_namespace(source)?,
+            session_identities: SessionIdentities::default(),
+            agent_generations: BTreeMap::new(),
+            next_workspace_id,
+            next_chat_id,
+            next_terminal_id,
+            workspaces: migrate_v1_to_v2(old),
+        },
+        source,
+    )
+}
+
+/// Version 2 -> 3: persist *intent* instead of *liveness* (F16).
+///
+/// Terminals: a `status` of `Running` meant "this pane was live when we last
+/// saved", which is precisely the terminal the next launch should reattach —
+/// so it becomes `restore_on_launch: true`, and `Stopped` becomes `false`. No
+/// data is discarded and none is invented.
+///
+/// Chats: version 2 knew nothing about whether a finished chat had been seen
+/// (the bit lived in a runtime-only `App` side table), so every finished chat
+/// arrives as the unseen [`ChatStatus::Done`] — which is exactly what version 2
+/// displayed after a restart, since that side table always started empty. The
+/// unowned `Thinking`/`Waiting` reset that `normalize_unowned_agent_statuses`
+/// performs on load applies afterwards, unchanged.
+fn migrate_v2_to_v3(old: StateV2, source: &mut impl IdentitySource) -> io::Result<ProjectState> {
     let mut state = ProjectState {
         version: STATE_VERSION,
-        namespace,
-        session_identities: SessionIdentities::default(),
-        agent_generations: BTreeMap::new(),
+        namespace: old.namespace,
+        session_identities: old.session_identities,
+        agent_generations: old.agent_generations,
         next_workspace_id: old.next_workspace_id,
         next_chat_id: old.next_chat_id,
         next_terminal_id: old.next_terminal_id,
@@ -399,27 +564,14 @@ fn migrate_v1_to_v2(old: StateV1, source: &mut impl IdentitySource) -> io::Resul
                 name: workspace.name,
                 cwd: workspace.cwd,
                 environment: workspace.environment,
-                chats: workspace
-                    .chats
-                    .into_iter()
-                    .map(|chat| ChatSession {
-                        id: chat.id,
-                        name: chat.name,
-                        status: match chat.status {
-                            ChatStatus::Thinking | ChatStatus::Waiting => ChatStatus::Idle,
-                            status => status,
-                        },
-                        agent: chat.agent,
-                        messages: chat.messages,
-                    })
-                    .collect(),
+                chats: workspace.chats,
                 terminals: workspace
                     .terminals
                     .into_iter()
                     .map(|terminal| TerminalSession {
                         id: terminal.id,
                         name: terminal.name,
-                        status: terminal.status,
+                        restore_on_launch: terminal.status.into_restore_intent(),
                         launch: terminal.launch,
                     })
                     .collect(),
@@ -430,7 +582,16 @@ fn migrate_v1_to_v2(old: StateV1, source: &mut impl IdentitySource) -> io::Resul
     state
         .normalize_next_ids()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    state.assign_session_identities(source)?;
+    // Normalize rather than assign: a version-2 file already carries an
+    // identity table and its tokens must survive verbatim, or the daemon
+    // sessions it owns become unaddressable. Version 1 arrives with an empty
+    // table, so the same call mints every token instead.
+    state.normalize_session_identities(source)?;
+    // Same rule the version-3 load path applies: a `Thinking`/`Waiting` chat
+    // that no live generation owns is not thinking, it is idle. Version 1 has
+    // no generations at all, so every such chat resets — which is exactly what
+    // the old `migrate_v1_to_v2` did inline.
+    normalize_unowned_agent_statuses(&mut state);
     validate_current_state(&state)?;
     Ok(state)
 }
@@ -526,7 +687,8 @@ struct StateVersionEnvelope {
 
 enum DecodedState {
     V1(StateV1),
-    V2(ProjectState),
+    V2(StateV2),
+    V3(ProjectState),
 }
 
 #[derive(Debug)]
@@ -570,9 +732,81 @@ struct ChatV1 {
 struct TerminalV1 {
     id: TerminalId,
     name: String,
-    status: TerminalStatus,
+    status: TerminalStatusV2,
     #[serde(default)]
     launch: TerminalLaunch,
+}
+
+/// The version-2 on-disk shape.
+///
+/// It differs from the current [`ProjectState`] in exactly one place — a
+/// terminal persisted *liveness* (`status`) where version 3 persists *intent*
+/// (`restore_on_launch`) — but the whole tree is mirrored here rather than
+/// patched into the live type, so the model never carries a field that exists
+/// only for a migration. The leniency attributes match `ProjectState`'s: a
+/// slightly damaged version-2 file must keep loading exactly as well after the
+/// bump as it did before it (E11).
+#[derive(Debug, Deserialize)]
+struct StateV2 {
+    #[allow(dead_code)]
+    version: u32,
+    namespace: StateNamespace,
+    #[serde(default, deserialize_with = "null_or_default")]
+    session_identities: SessionIdentities,
+    #[serde(default, deserialize_with = "null_or_default")]
+    agent_generations: BTreeMap<ChatId, AgentGeneration>,
+    #[serde(default, deserialize_with = "null_or_default")]
+    next_workspace_id: u64,
+    #[serde(default, deserialize_with = "null_or_default")]
+    next_chat_id: u64,
+    #[serde(default, deserialize_with = "null_or_default")]
+    next_terminal_id: u64,
+    workspaces: Vec<WorkspaceV2>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceV2 {
+    id: WorkspaceId,
+    name: String,
+    #[serde(default, deserialize_with = "null_or_default")]
+    cwd: Option<PathBuf>,
+    #[serde(default, deserialize_with = "null_or_default")]
+    environment: BTreeMap<String, String>,
+    #[serde(default, deserialize_with = "null_or_default")]
+    chats: Vec<ChatSession>,
+    #[serde(default, deserialize_with = "null_or_default")]
+    terminals: Vec<TerminalV2>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalV2 {
+    id: TerminalId,
+    name: String,
+    #[serde(default, deserialize_with = "null_or_default")]
+    status: TerminalStatusV2,
+    #[serde(default, deserialize_with = "null_or_default")]
+    launch: TerminalLaunch,
+}
+
+/// Liveness as versions 1 and 2 persisted it. Retained only so their terminals
+/// can be read; nothing in the running client has a `TerminalStatus` any more.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+enum TerminalStatusV2 {
+    #[default]
+    Stopped,
+    Running,
+}
+
+impl TerminalStatusV2 {
+    /// A terminal that was live when the file was written is one the user meant
+    /// to have running, so it is exactly the terminal to restore. This is the
+    /// whole content of the V2 -> V3 migration.
+    ///
+    /// It grants no permission to *relaunch*: restoration is attach-only for a
+    /// `TerminalLaunch::Command`, which is a security property (C1).
+    const fn into_restore_intent(self) -> bool {
+        matches!(self, Self::Running)
+    }
 }
 
 pub(crate) struct SecureDirectory {
@@ -987,7 +1221,9 @@ mod tests {
         let error = StateStore::acquire(paths.clone())
             .err()
             .expect("second state owner must fail");
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        // F8: "another process owns this" is a variant, not an `ErrorKind` a
+        // caller has to guess the meaning of.
+        assert!(matches!(error, StateError::Locked { .. }));
         assert!(error
             .to_string()
             .contains("another mult process owns state path"));
@@ -1015,7 +1251,10 @@ mod tests {
             .err()
             .expect("world-writable parent must not anchor the lifetime lock");
 
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            error,
+            StateError::Io(error) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
     }
 
     #[test]
@@ -1059,7 +1298,7 @@ mod tests {
             .err()
             .expect("a second acquisition must not succeed while the owner holds the lock");
 
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(matches!(error, StateError::Locked { .. }));
         assert_eq!(fs::read(&path).unwrap(), owned_bytes);
         drop(store);
     }
@@ -1101,28 +1340,103 @@ mod tests {
     }
 
     #[test]
-    fn v1_original_shape_migrates_to_exact_golden_v2() {
+    fn v1_original_shape_migrates_to_exact_golden_v3() {
         assert_golden_migration(
             include_bytes!("../tests/fixtures/state/v1-original.json"),
-            include_bytes!("../tests/fixtures/state/v1-original.expected-v2.json"),
+            include_bytes!("../tests/fixtures/state/v1-original.expected-v3.json"),
         );
     }
 
     #[test]
-    fn v1_current_shape_migrates_to_exact_golden_v2() {
+    fn v1_current_shape_migrates_to_exact_golden_v3() {
         assert_golden_migration(
             include_bytes!("../tests/fixtures/state/v1-current.json"),
-            include_bytes!("../tests/fixtures/state/v1-current.expected-v2.json"),
+            include_bytes!("../tests/fixtures/state/v1-current.expected-v3.json"),
         );
     }
 
     #[test]
-    fn canonical_v2_fixture_does_not_need_save() {
+    fn v2_shape_migrates_to_exact_golden_v3() {
+        assert_golden_migration(
+            include_bytes!("../tests/fixtures/state/v2-current.json"),
+            include_bytes!("../tests/fixtures/state/v2-current.expected-v3.json"),
+        );
+    }
+
+    /// F16 round trip: a version-2 file on disk still loads, keeps every field
+    /// it carried, and turns its persisted *liveness* into the *intent* version
+    /// 3 stores — without inventing a restore for a terminal that was stopped.
+    #[test]
+    fn a_v2_file_loads_and_preserves_its_data_through_the_migration() {
+        let path = unique_test_dir().join("state.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = include_bytes!("../tests/fixtures/state/v2-current.json");
+        fs::write(&path, original).unwrap();
+        let store =
+            StateStore::acquire(StatePaths::from_explicit_path(path.clone()).unwrap()).unwrap();
+
+        let loaded = store.load_or_default().unwrap();
+
+        assert!(loaded.notice.is_none(), "a migration is not a recovery");
+        assert!(
+            loaded.needs_save,
+            "the file is rewritten at the new version"
+        );
+        assert_eq!(loaded.state.version, STATE_VERSION);
+        let workspace = &loaded.state.workspaces[0];
+        assert_eq!(workspace.name, "complete");
+        assert_eq!(workspace.cwd.as_deref(), Some(Path::new("/work/project")));
+        assert_eq!(workspace.environment["RUST_LOG"], "debug");
+
+        // Chats keep their names, agents and every message.
+        assert_eq!(workspace.chats.len(), 2);
+        assert_eq!(workspace.chats[0].status, ChatStatus::Done);
+        assert!(
+            !workspace.chats[0].status.done_seen(),
+            "version 2 never knew whether a finish had been seen, so it has not"
+        );
+        assert_eq!(workspace.chats[0].messages.len(), 2);
+        assert_eq!(workspace.chats[1].agent, AgentKind::ClaudeCode);
+
+        // Terminals: liveness became intent, and nothing else moved.
+        assert_eq!(workspace.terminals.len(), 2);
+        assert_eq!(workspace.terminals[0].name, "shell");
+        assert!(
+            !workspace.terminals[0].restore_on_launch,
+            "a stopped terminal is not restored"
+        );
+        assert!(
+            workspace.terminals[1].restore_on_launch,
+            "a running terminal is one the user meant to have running"
+        );
+        assert_eq!(
+            workspace.terminals[1].launch,
+            TerminalLaunch::Command("printf migrated-only".to_string()),
+            "the command text survives; C1 still forbids re-executing it"
+        );
+
+        // Identities are carried across, not re-minted, so the daemon sessions
+        // the file already owns stay addressable: the migrated file has to
+        // serialize back to the same namespace and token table it came in with.
+        let reserialized: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&loaded.state).unwrap()).unwrap();
+        let source: serde_json::Value = serde_json::from_slice(original).unwrap();
+        assert_eq!(reserialized["namespace"], source["namespace"]);
+        assert_eq!(
+            reserialized["session_identities"],
+            source["session_identities"]
+        );
+        loaded.state.validate_session_identities().unwrap();
+        store.save(&loaded.state).unwrap();
+    }
+
+    #[test]
+    fn canonical_v3_fixture_does_not_need_save() {
         let path = unique_test_dir().join("state.json");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
-            include_bytes!("../tests/fixtures/state/v2-current.json"),
+            include_bytes!("../tests/fixtures/state/v2-current.expected-v3.json"),
         )
         .unwrap();
         let store = StateStore::acquire(StatePaths::from_explicit_path(path).unwrap()).unwrap();
@@ -1154,14 +1468,17 @@ mod tests {
     fn future_state_is_rejected_and_preserved_byte_for_byte() {
         let path = unique_test_dir().join("state.json");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let original = include_bytes!("../tests/fixtures/state/future-v3-unknown.json");
+        let original = include_bytes!("../tests/fixtures/state/future-v4-unknown.json");
         fs::write(&path, original).unwrap();
         let store =
             StateStore::acquire(StatePaths::from_explicit_path(path.clone()).unwrap()).unwrap();
 
         let error = store.load_or_default().unwrap_err();
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(
+            error,
+            StateError::UnsupportedVersion { version: 4, .. }
+        ));
         assert_eq!(fs::read(path).unwrap(), original);
     }
 
@@ -1276,10 +1593,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(names, ["kept", "also kept"]);
         assert_eq!(loaded.state.workspaces[0].terminals[0].name, "shell");
-        assert_eq!(
-            loaded.state.workspaces[0].terminals[0].status,
-            TerminalStatus::Stopped
-        );
+        assert!(!loaded.state.workspaces[0].terminals[0].restore_on_launch);
         assert_eq!(loaded.state.workspaces[1].chats[0].name, "chat");
         // The hints were rebuilt from the IDs actually in use...
         assert_eq!(loaded.state.next_workspace_id, 6);
@@ -1300,21 +1614,25 @@ mod tests {
         let root = unique_test_dir();
         fs::create_dir_all(&root).unwrap();
         let path = root.join("state.json");
-        // Same missing fields as the test above, but version 3.
+        // Same missing fields as the test above, but a version this build does
+        // not know.
         let future =
-            br#"{"version":3,"namespace":"11111111111111111111111111111111","workspaces":[]}"#;
+            br#"{"version":4,"namespace":"11111111111111111111111111111111","workspaces":[]}"#;
         fs::write(&path, future).unwrap();
         let store =
             StateStore::acquire(StatePaths::from_explicit_path(path.clone()).unwrap()).unwrap();
 
         let error = store.load_or_default().unwrap_err();
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(
+            error,
+            StateError::UnsupportedVersion { version: 4, .. }
+        ));
         assert!(error.to_string().contains("is unsupported"));
         assert_eq!(fs::read(&path).unwrap(), future);
         drop(store);
 
-        // A V1 file goes through the migration, not the lenient V2 decode: its
+        // A V1 file goes through the migration, not the lenient current decode: its
         // `version` field is rewritten and identities are assigned.
         fs::write(
             &path,
@@ -1354,7 +1672,7 @@ mod tests {
         let error = store.load_or_default().unwrap_err();
 
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(error, StateError::Io(_)));
         assert!(
             error.to_string().contains("failed to move"),
             "the error must name the step that failed: {error}"
@@ -1518,7 +1836,7 @@ mod tests {
 
         let error = store.load_or_default().unwrap_err();
 
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(error, StateError::Io(_)));
         assert!(error.to_string().contains("exceeds"));
         assert_eq!(
             fs::metadata(&path).unwrap().len(),
@@ -1561,12 +1879,12 @@ mod tests {
     }
 
     fn assert_golden_migration(input: &[u8], expected: &[u8]) {
-        let decoded = match decode_state(input).unwrap() {
-            DecodedState::V1(state) => state,
-            DecodedState::V2(_) => panic!("fixture must be v1"),
-        };
         let mut source = FixedIdentitySource::sequential(256);
-        let migrated = migrate_v1_to_v2(decoded, &mut source).unwrap();
+        let migrated = match decode_state(input).unwrap() {
+            DecodedState::V1(state) => migrate_v1_to_current(state, &mut source).unwrap(),
+            DecodedState::V2(state) => migrate_v2_to_v3(state, &mut source).unwrap(),
+            DecodedState::V3(_) => panic!("a golden migration fixture must predate v3"),
+        };
         let actual = format!("{}\n", serde_json::to_string_pretty(&migrated).unwrap());
 
         assert_eq!(actual.as_bytes(), expected);

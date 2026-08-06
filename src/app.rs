@@ -9,7 +9,7 @@ use crate::{
     config::ConfiguredProject,
     model::{
         AgentGeneration, AgentKind, ChatId, ChatMessage, ChatMessageRole, ChatStatus, ProjectState,
-        PtyKey, TerminalId, TerminalStatus, WorkspaceId, DEFAULT_AGENT_CHAT_TITLE,
+        PtyKey, TerminalId, WorkspaceId, DEFAULT_AGENT_CHAT_TITLE,
     },
 };
 
@@ -24,14 +24,6 @@ pub struct App {
     pub prompt: Option<Prompt>,
     pub focus: FocusMode,
     pub chat_buffers: BTreeMap<ChatId, ChatBuffer>,
-    /// Chats whose current `Done` state the user has already seen — either by
-    /// navigating onto them while finished, or because they finished while
-    /// already selected. A `Done` chat in this set renders gray (inactive); a
-    /// `Done` chat absent from it renders green (an unseen "finished"
-    /// notification). Entries are dropped the moment a chat leaves `Done`, so
-    /// re-prompting a finished agent arms a fresh notification. Runtime-only and
-    /// keyed by the globally-unique `ChatId`, exactly like `chat_buffers`.
-    seen_done: BTreeSet<ChatId>,
     pub workspace_git_branches: BTreeMap<WorkspaceId, String>,
     pub active_search: Option<SearchState>,
     pub text_selection: Option<TextSelection>,
@@ -814,16 +806,17 @@ impl App {
             .map(|chat| (chat.id, ChatBuffer::from_messages(&chat.messages)))
             .filter(|(_, buffer)| !buffer.is_empty())
             .collect();
-        // A stopped command loaded from disk must require a deliberate start.
-        // This also carries restoration safety across client restarts without
-        // changing the durable schema: a vanished Running command is saved as
-        // Stopped, then reconstructed here as recovery-required on next load.
+        // A command loaded from disk with no restore intent must require a
+        // deliberate start. This is what carries C1's no-relaunch rule across
+        // client restarts: a command whose pane vanished is saved with
+        // `restore_on_launch` clear, and is reconstructed here as
+        // recovery-required on the next load.
         let recoverable_terminals = project
             .workspaces
             .iter()
             .flat_map(|workspace| workspace.terminals.iter())
             .filter_map(|terminal| {
-                (terminal.status == TerminalStatus::Stopped
+                (!terminal.restore_on_launch
                     && matches!(terminal.launch, crate::model::TerminalLaunch::Command(_)))
                 .then_some(terminal.id)
             })
@@ -834,7 +827,6 @@ impl App {
             prompt: None,
             focus: FocusMode::Sidebar,
             chat_buffers,
-            seen_done: BTreeSet::new(),
             workspace_git_branches: BTreeMap::new(),
             active_search: None,
             text_selection: None,
@@ -1291,39 +1283,34 @@ impl App {
         self.mark_selected_done_seen();
     }
 
-    /// Marks the currently selected chat's `Done` state as seen, if it is
-    /// finished. A no-op for any other status or when a terminal is selected.
+    /// Marks the currently selected chat's finished state as seen. A no-op for
+    /// any other status or when a terminal is selected.
+    ///
+    /// The bit lives in [`ChatStatus`] itself, so this is the only place that
+    /// can set it and there is no second table to fall out of step (F16).
     fn mark_selected_done_seen(&mut self) {
-        if let Some((workspace, chat)) = self.selected_chat_id() {
-            if matches!(
-                self.project.chat(workspace, chat).map(|chat| chat.status),
-                Some(ChatStatus::Done)
-            ) {
-                self.seen_done.insert(chat);
-            }
+        let Some((workspace, chat)) = self.selected_chat_id() else {
+            return;
+        };
+        let Some(session) = self.project.chat_mut(workspace, chat) else {
+            return;
+        };
+        if session.status.is_done() && !session.status.done_seen() {
+            session.status = ChatStatus::DoneSeen;
+            self.dirty = true;
         }
     }
 
-    /// Keeps `seen_done` consistent whenever a chat's status changes. A chat
-    /// that finishes while the user is already looking at it counts as seen
-    /// immediately (so it never flashes green); finishing in the background
-    /// arms the green notification; leaving `Done` clears the flag so the next
-    /// finish is notified afresh.
-    fn reconcile_done_seen(&mut self, chat: ChatId, status: ChatStatus) {
-        let seen_now = status == ChatStatus::Done
-            && self.selected_chat_id().map(|(_, chat)| chat) == Some(chat);
-        if seen_now {
-            self.seen_done.insert(chat);
-        } else {
-            self.seen_done.remove(&chat);
-        }
-    }
-
-    /// Whether the chat's current `Done` state has already been seen by the
-    /// user. Only meaningful for finished chats; the renderer uses it to choose
-    /// between the green "finished" notification and the gray inactive icon.
+    /// Whether the chat has finished and the user has already looked at it.
+    /// The renderer uses this to choose between the green "finished"
+    /// notification and the gray inactive icon.
     pub fn chat_done_seen(&self, chat: ChatId) -> bool {
-        self.seen_done.contains(&chat)
+        self.project
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.chats.iter())
+            .find(|session| session.id == chat)
+            .is_some_and(|session| session.status.done_seen())
     }
 
     fn available_command_palette_entries(&self) -> Vec<CommandPaletteEntry> {
@@ -1599,7 +1586,6 @@ impl App {
                 if self.project.remove_chat(workspace, chat).is_some() {
                     runtime_terminals.push(PtyKey::ChatAgent(chat));
                     self.chat_buffers.remove(&chat);
-                    self.seen_done.remove(&chat);
                     self.mark_structural_change();
                     self.remove_workspace_if_empty(workspace);
                 }
@@ -1682,14 +1668,15 @@ impl App {
         }
     }
 
-    pub fn mark_terminal_running(&mut self, terminal: TerminalId) {
+    /// Records that this terminal is attached, so the next launch should bring
+    /// it back.
+    ///
+    /// This persists *intent*, not liveness: whether the pane is live right now
+    /// is `PtyRuntime`'s to answer and nothing else's (F16). Losing this call
+    /// therefore costs a restoration, not a terminal stuck "running" forever.
+    pub fn record_terminal_started(&mut self, terminal: TerminalId) {
         self.recoverable_terminals.remove(&terminal);
-        if let Some(terminal) = self.project.terminal_mut_by_id(terminal) {
-            if terminal.status != TerminalStatus::Running {
-                terminal.status = TerminalStatus::Running;
-                self.dirty = true;
-            }
-        }
+        self.set_terminal_restore_intent(terminal, true);
     }
 
     pub fn mark_terminal_recoverable(&mut self, terminal: TerminalId) {
@@ -1708,10 +1695,17 @@ impl App {
         self.recoverable_terminals.contains(&terminal)
     }
 
-    pub fn mark_terminal_stopped(&mut self, terminal: TerminalId) {
+    /// Records that this terminal is not attached, so the next launch leaves it
+    /// alone until the user asks. The counterpart of
+    /// [`Self::record_terminal_started`].
+    pub fn record_terminal_stopped(&mut self, terminal: TerminalId) {
+        self.set_terminal_restore_intent(terminal, false);
+    }
+
+    fn set_terminal_restore_intent(&mut self, terminal: TerminalId, restore: bool) {
         if let Some(terminal) = self.project.terminal_mut_by_id(terminal) {
-            if terminal.status != TerminalStatus::Stopped {
-                terminal.status = TerminalStatus::Stopped;
+            if terminal.restore_on_launch != restore {
+                terminal.restore_on_launch = restore;
                 self.dirty = true;
             }
         }
@@ -1853,32 +1847,10 @@ impl App {
                 );
             }
             AgentEvent::StatusChanged { target, status } => {
-                let changed = self
-                    .project
-                    .chat_mut(target.workspace, target.chat)
-                    .is_some_and(|chat| {
-                        let changed = chat.status != status;
-                        chat.status = status;
-                        changed
-                    });
-                if changed {
-                    self.dirty = true;
-                    self.reconcile_done_seen(target.chat, status);
-                }
+                self.mark_chat_status_by_id(target.chat, status);
             }
             AgentEvent::Error { target, message } => {
-                let changed = self
-                    .project
-                    .chat_mut(target.workspace, target.chat)
-                    .is_some_and(|chat| {
-                        let changed = chat.status != ChatStatus::Failed;
-                        chat.status = ChatStatus::Failed;
-                        changed
-                    });
-                if changed {
-                    self.dirty = true;
-                    self.reconcile_done_seen(target.chat, ChatStatus::Failed);
-                }
+                self.mark_chat_status_by_id(target.chat, ChatStatus::Failed);
                 self.append_chat_message(target, ChatMessageRole::Error, message);
             }
         }
@@ -1982,9 +1954,20 @@ impl App {
         changed
     }
 
-    /// Returns whether the chat's status actually changed (useful for deciding
-    /// if a redraw is needed).
+    /// Sets a chat's status, resolving the seen bit in the same assignment.
+    /// Returns whether anything changed (useful for deciding if a redraw is
+    /// needed).
+    ///
+    /// A chat that finishes while the user is already looking at it counts as
+    /// seen immediately, so it never flashes as an unseen notification;
+    /// finishing in the background arms one; leaving the finished state drops
+    /// the bit, so re-prompting a finished agent arms a fresh notification.
+    /// Callers pass the plain status they observed — the seen bit is derived
+    /// here and never theirs to decide, which is what makes the two
+    /// impossible to fall out of step (F16).
     pub fn mark_chat_status_by_id(&mut self, chat: ChatId, status: ChatStatus) -> bool {
+        let seen = self.selected_chat_id().map(|(_, chat)| chat) == Some(chat);
+        let status = status.with_done_seen(seen);
         let mut changed = false;
         for chat_session in self
             .project
@@ -2000,9 +1983,6 @@ impl App {
                 }
                 break;
             }
-        }
-        if changed {
-            self.reconcile_done_seen(chat, status);
         }
         changed
     }
@@ -2142,7 +2122,7 @@ impl App {
                 return;
             }
         };
-        match project.add_terminal(workspace, "shell".to_string(), TerminalStatus::Stopped) {
+        match project.add_terminal(workspace, "shell".to_string()) {
             Ok(Some(_)) => {}
             Ok(None) => {
                 self.set_open_workspace_error("new workspace disappeared during import");
@@ -2183,12 +2163,10 @@ impl App {
             .unwrap_or(1);
         let name = command_terminal_name(&command, next);
 
-        match self.project.add_command_terminal(
-            workspace,
-            name.clone(),
-            TerminalStatus::Stopped,
-            command,
-        ) {
+        match self
+            .project
+            .add_command_terminal(workspace, name.clone(), command)
+        {
             Ok(Some(terminal)) => {
                 self.prompt = None;
                 self.select_item(NavItem::Terminal {
@@ -2240,10 +2218,7 @@ impl App {
             .unwrap_or(1);
 
         let name = format!("terminal-{next}");
-        match self
-            .project
-            .add_terminal(workspace, name.clone(), TerminalStatus::Stopped)
-        {
+        match self.project.add_terminal(workspace, name.clone()) {
             Ok(Some(terminal)) => {
                 self.select_item(NavItem::Terminal {
                     workspace,
@@ -2784,12 +2759,12 @@ mod tests {
         let terminal = state.workspaces[0].terminals[0].id;
         state.workspaces[0].terminals[0].launch =
             crate::model::TerminalLaunch::Command("cargo test".to_string());
-        state.workspaces[0].terminals[0].status = TerminalStatus::Stopped;
+        state.workspaces[0].terminals[0].restore_on_launch = false;
 
         let mut app = App::new(state);
         assert!(app.terminal_requires_recovery(terminal));
 
-        app.mark_terminal_running(terminal);
+        app.record_terminal_started(terminal);
         assert!(!app.terminal_requires_recovery(terminal));
     }
 
@@ -3068,7 +3043,7 @@ mod tests {
         let chat_status = app.project.workspaces[0].chats[0].status;
         app.mark_clean();
 
-        app.mark_terminal_stopped(terminal);
+        app.record_terminal_stopped(terminal);
         app.mark_chat_status_by_id(chat, chat_status);
 
         assert!(!app.is_dirty());
@@ -3150,10 +3125,14 @@ mod tests {
             status: ChatStatus::Done,
         });
 
+        // F16: the chat the user is already looking at counts as seen the
+        // instant it finishes, so the seen bit is decided in the same
+        // assignment as the status rather than in a separate table afterwards.
         assert_eq!(
             app.project.chat(workspace, chat).unwrap().status,
-            ChatStatus::Done
+            ChatStatus::DoneSeen
         );
+        assert!(app.chat_done_seen(chat));
         assert!(app.is_dirty());
 
         app.mark_clean();

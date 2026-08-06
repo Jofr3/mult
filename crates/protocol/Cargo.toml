@@ -9,7 +9,10 @@ repository.workspace = true
 
 [dependencies]
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
-serde = { version = "1.0", features = ["derive"] }
+# `rc` is what lets `PtyOutput`/`ReplayChunk` carry `Arc<[u8]>` instead of
+# `Vec<u8>`. It is a feature of a dependency we already have, not a new one, and
+# it removes the last copy of every PTY byte on the daemon's broadcast path (A9).
+serde = { version = "1.0", features = ["derive", "rc"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

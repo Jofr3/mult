@@ -25,7 +25,7 @@ use mult::{
     },
     config::{self, Config},
     git,
-    model::{self, AgentKind, ChatStatus, PtyKey, TerminalLaunch, TerminalStatus},
+    model::{self, AgentKind, ChatStatus, PtyKey, TerminalLaunch},
     pty::{AttachExistingResult, PtyDimensions, PtyEvent, PtyRuntime, PtySpawn, SpawnPolicy},
     storage, ui,
 };
@@ -66,23 +66,73 @@ struct MultAgentStatusRecord {
     status: String,
 }
 
-/// Client-side state of the agent status bridge: where each chat's status
-/// journal lives and how far it has been read.
+/// Where the client reads agent status transitions from.
 ///
-/// Both halves exist to keep an idle session cheap (S3/B3). The journal path is
-/// derived from a namespace, a session token and a generation — four
-/// allocations to format — so it is built once per agent session and cached
-/// rather than rebuilt on every ~16 ms tick, and the journals are polled on
-/// [`AGENT_STATUS_POLL_INTERVAL`] rather than every tick. A status dot updating
-/// within a quarter second is indistinguishable from instant; 60 Hz `open` +
-/// `fstat` + `seek` + `read` + `close` per chat was not.
-#[derive(Default)]
-struct AgentStatusBridgeState {
-    sources: HashMap<model::ChatId, AgentStatusSource>,
+/// The agent status bridge is the only per-frame external dependency the client
+/// polls that is neither the daemon nor the host terminal, and it was concrete
+/// and file-backed, so every test of it had to write real files with real modes
+/// into a real temporary directory (F10). The seam splits the two things that
+/// were tangled: *what the records mean*, which is pure logic worth testing on
+/// a double, and *how a journal file is safely read*, which is a security
+/// boundary and must keep being tested against the filesystem.
+trait AgentStatusSource {
+    /// Records appended for this chat's current agent session since the last
+    /// call, oldest first. A source that cannot be read yields nothing: the
+    /// daemon remains authoritative, so a missing or malformed journal is not
+    /// an error the caller can act on.
+    fn poll(
+        &mut self,
+        chat: model::ChatId,
+        identity: model::SessionIdentity,
+        generation: model::AgentGeneration,
+    ) -> Vec<MultAgentStatusRecord>;
+
+    /// Drops per-chat read state for chats that no longer have a live agent
+    /// session. A chat that stopped, or was deleted, keeps no cursor: the
+    /// journal it named is gone, and a later chat must never inherit a stale
+    /// read offset.
+    fn retain(&mut self, live: &[model::ChatId]);
+}
+
+/// The agent status bridge: a polling clock plus whichever source it reads.
+///
+/// The clock exists to keep an idle session cheap (S3/B3): a status dot
+/// updating within a quarter second is indistinguishable from instant, whereas
+/// 60 Hz `open` + `fstat` + `seek` + `read` + `close` per chat was not.
+struct AgentStatusBridge<S> {
+    source: S,
     last_poll: Option<Instant>,
 }
 
-struct AgentStatusSource {
+impl<S: Default> Default for AgentStatusBridge<S> {
+    fn default() -> Self {
+        Self {
+            source: S::default(),
+            last_poll: None,
+        }
+    }
+}
+
+impl<S> AgentStatusBridge<S> {
+    /// Whether the journals are due to be polled at `now`.
+    fn is_due(&self, now: Instant) -> bool {
+        self.last_poll
+            .is_none_or(|last| now.saturating_duration_since(last) >= AGENT_STATUS_POLL_INTERVAL)
+    }
+}
+
+/// The production [`AgentStatusSource`]: append-only JSONL journals under the
+/// private runtime directory, read without following symlinks.
+///
+/// The journal path is derived from a namespace, a session token and a
+/// generation — four allocations to format — so it is built once per agent
+/// session and cached rather than rebuilt on every tick.
+#[derive(Default)]
+struct JournalStatusSource {
+    journals: HashMap<model::ChatId, AgentStatusJournal>,
+}
+
+struct AgentStatusJournal {
     /// The identity/generation the cached `path` was built from. A restarted
     /// agent gets a new generation, which invalidates the entry.
     identity: model::SessionIdentity,
@@ -98,29 +148,23 @@ struct AgentStatusCursor {
     offset: u64,
 }
 
-impl AgentStatusBridgeState {
-    /// Whether the journals are due to be polled at `now`.
-    fn is_due(&self, now: Instant) -> bool {
-        self.last_poll
-            .is_none_or(|last| now.saturating_duration_since(last) >= AGENT_STATUS_POLL_INTERVAL)
-    }
-
+impl JournalStatusSource {
     /// The cached journal for `chat`, rebuilding the path only when the agent
     /// session behind it changed.
-    fn source_for(
+    fn journal_for(
         &mut self,
         chat: model::ChatId,
         identity: model::SessionIdentity,
         generation: model::AgentGeneration,
-    ) -> &mut AgentStatusSource {
+    ) -> &mut AgentStatusJournal {
         let stale = self
-            .sources
+            .journals
             .get(&chat)
-            .is_none_or(|source| source.identity != identity || source.generation != generation);
+            .is_none_or(|journal| journal.identity != identity || journal.generation != generation);
         if stale {
-            self.sources.insert(
+            self.journals.insert(
                 chat,
-                AgentStatusSource {
+                AgentStatusJournal {
                     identity,
                     generation,
                     path: mult_agent_status_path(identity, generation),
@@ -128,9 +172,35 @@ impl AgentStatusBridgeState {
                 },
             );
         }
-        self.sources
+        self.journals
             .get_mut(&chat)
-            .expect("a source for this chat was just ensured")
+            .expect("a journal for this chat was just ensured")
+    }
+}
+
+impl AgentStatusSource for JournalStatusSource {
+    fn poll(
+        &mut self,
+        chat: model::ChatId,
+        identity: model::SessionIdentity,
+        generation: model::AgentGeneration,
+    ) -> Vec<MultAgentStatusRecord> {
+        let journal = self.journal_for(chat, identity, generation);
+        let AgentStatusJournal { path, cursor, .. } = journal;
+        let Ok(records) = read_mult_agent_status_records(path, cursor) else {
+            return Vec::new();
+        };
+        // The cursor advances past every record handed over: the caller cannot
+        // reject one back into the journal, and re-reading a consumed record
+        // would replay a status transition the daemon already resolved.
+        if let Some((_, last_offset)) = records.last() {
+            cursor.offset = *last_offset;
+        }
+        records.into_iter().map(|(record, _)| record).collect()
+    }
+
+    fn retain(&mut self, live: &[model::ChatId]) {
+        self.journals.retain(|chat, _| live.contains(chat));
     }
 }
 
@@ -275,7 +345,7 @@ pub fn run(
     let mut pty_runtime =
         PtyRuntime::with_socket_path(mult_protocol::default_socket_path(), SpawnPolicy::Autospawn);
     let mut agent_backend = RuntimeAgentBackend::from_env();
-    let mut agent_status_bridges = AgentStatusBridgeState::default();
+    let mut agent_status_bridge = AgentStatusBridge::<JournalStatusSource>::default();
     let mut save_schedule = SaveSchedule::default();
     let size = terminal.size()?;
     let mut frame_area = Rect::new(0, 0, size.width, size.height);
@@ -341,7 +411,7 @@ pub fn run(
         needs_redraw |= drain_mult_agent_status_events(
             &mut app,
             &mut pty_runtime,
-            &mut agent_status_bridges,
+            &mut agent_status_bridge,
             now,
         );
         needs_redraw |= save_content_if_due(&mut app, &mut save_schedule, now, save);
@@ -504,7 +574,7 @@ fn classify_host_terminal_error(error: io::Error) -> HostTerminalFailure {
 fn finish_after_host_terminal_error_with(
     app: &mut App,
     error: io::Error,
-    saver: impl FnMut(&model::ProjectState) -> io::Result<()>,
+    saver: impl FnMut(&model::ProjectState) -> storage::StateResult<()>,
 ) -> io::Result<()> {
     save_if_dirty_with(app, true, saver);
     Err(error)
@@ -555,8 +625,12 @@ fn restore_persisted_sessions(
         .workspaces
         .iter()
         .flat_map(|workspace| {
+            // Persisted *intent*: the terminals the user meant to have
+            // running. Whether a pane is actually live is the daemon's answer,
+            // which the `attach_existing` below asks for (F16). A `Command`
+            // whose pane is gone is still never re-executed (C1).
             workspace.terminals.iter().filter_map(|terminal| {
-                (terminal.status == TerminalStatus::Running).then_some((
+                terminal.restore_on_launch.then_some((
                     workspace.id,
                     terminal.id,
                     terminal.name.clone(),
@@ -570,9 +644,9 @@ fn restore_persisted_sessions(
         let key = PtyKey::Terminal(terminal);
         let size = terminal_dimensions(app, frame_area);
         match pty_runtime.attach_existing(key, size) {
-            Ok(AttachExistingResult::Attached) => app.mark_terminal_running(terminal),
+            Ok(AttachExistingResult::Attached) => app.record_terminal_started(terminal),
             Ok(AttachExistingResult::Missing) => {
-                app.mark_terminal_stopped(terminal);
+                app.record_terminal_stopped(terminal);
                 if is_command {
                     app.mark_terminal_recoverable(terminal);
                     pty_runtime.append_terminal_system_line(
@@ -588,7 +662,7 @@ fn restore_persisted_sessions(
                 }
             }
             Err(error) if is_command => {
-                app.mark_terminal_stopped(terminal);
+                app.record_terminal_stopped(terminal);
                 app.mark_terminal_recoverable(terminal);
                 pty_runtime.append_terminal_system_line(
                     key,
@@ -596,7 +670,7 @@ fn restore_persisted_sessions(
                 );
             }
             Err(_) => {
-                app.mark_terminal_stopped(terminal);
+                app.record_terminal_stopped(terminal);
                 start_terminal(app, pty_runtime, config, frame_area, workspace, terminal);
             }
         }
@@ -1257,8 +1331,12 @@ fn confirm_pending_delete(app: &mut App, pty_runtime: &mut PtyRuntime) {
         )),
         PtyKey::Terminal(_) => None,
     });
-    let removed =
-        confirm_pending_delete_with(app, |_, terminal| pty_runtime.stop(terminal).map(|_| ()));
+    let removed = confirm_pending_delete_with(app, |_, terminal| {
+        pty_runtime
+            .stop(terminal)
+            .map(|_| ())
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
+    });
     for terminal in &removed {
         pty_runtime.remove_terminal(*terminal);
     }
@@ -1271,7 +1349,7 @@ fn confirm_pending_delete(app: &mut App, pty_runtime: &mut PtyRuntime) {
 
 fn confirm_pending_delete_with(
     app: &mut App,
-    mut stop: impl FnMut(&App, PtyKey) -> io::Result<()>,
+    mut stop: impl FnMut(&App, PtyKey) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Vec<PtyKey> {
     if let Some(terminal) = app.pending_delete_pty() {
         // The target is still present here. Durable state is mutated only after
@@ -1615,7 +1693,7 @@ fn start_terminal(
 
     match pty_runtime.start(spawn) {
         Ok(()) => {
-            app.mark_terminal_running(terminal_id);
+            app.record_terminal_started(terminal_id);
             true
         }
         Err(error) => {
@@ -1623,7 +1701,7 @@ fn start_terminal(
                 key,
                 format!("failed to start terminal `{terminal_name}`: {error}"),
             );
-            app.mark_terminal_stopped(terminal_id);
+            app.record_terminal_stopped(terminal_id);
             false
         }
     }
@@ -2376,7 +2454,7 @@ fn apply_pty_event(app: &mut App, pty_runtime: &mut PtyRuntime, event: PtyEvent)
                         app.mark_chat_status_by_id(chat_id, ChatStatus::Failed);
                     }
                     PtyKey::Terminal(terminal_id) => {
-                        app.mark_terminal_stopped(terminal_id);
+                        app.record_terminal_stopped(terminal_id);
                     }
                 }
                 if app.pty_input_target() == Some(terminal) {
@@ -2411,7 +2489,7 @@ fn apply_pty_event(app: &mut App, pty_runtime: &mut PtyRuntime, event: PtyEvent)
                     pty_runtime.append_terminal_system_line(terminal, exit_message.as_str());
                 }
                 PtyKey::Terminal(terminal_id) => {
-                    app.mark_terminal_stopped(terminal_id);
+                    app.record_terminal_stopped(terminal_id);
                     if app.terminal_input_target() == Some(terminal_id) {
                         app.end_pty_input();
                     }
@@ -2611,13 +2689,13 @@ fn drain_agent_events(app: &mut App, backend: &mut impl AgentBackend) -> bool {
 fn drain_mult_agent_status_events(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
-    bridges: &mut AgentStatusBridgeState,
+    bridge: &mut AgentStatusBridge<impl AgentStatusSource>,
     now: Instant,
 ) -> bool {
-    if !bridges.is_due(now) {
+    if !bridge.is_due(now) {
         return false;
     }
-    bridges.last_poll = Some(now);
+    bridge.last_poll = Some(now);
 
     let chats = app
         .project
@@ -2631,29 +2709,16 @@ fn drain_mult_agent_status_events(
             })
         })
         .collect::<Vec<_>>();
-    // A chat that stopped, or was deleted, keeps no cursor: the journal it named
-    // is gone, and a later chat must never inherit a stale read offset.
-    bridges
-        .sources
-        .retain(|chat, _| chats.iter().any(|(live, ..)| live == chat));
+    let live = chats.iter().map(|(chat, ..)| *chat).collect::<Vec<_>>();
+    bridge.source.retain(&live);
 
     let mut changed = false;
     for (chat, agent, identity, generation) in chats {
-        // Borrowed for the whole chat: `app` and `pty_runtime` are distinct, so
-        // the cursor can be advanced in place as records are consumed.
-        let source = bridges.source_for(chat, identity, generation);
-        let AgentStatusSource { path, cursor, .. } = source;
-        let records = match read_mult_agent_status_records(path, cursor) {
-            Ok(records) => records,
-            Err(_) => continue,
-        };
-        for (record, consumed_offset) in records {
+        for record in bridge.source.poll(chat, identity, generation) {
             if !status_record_matches(&record, chat, agent, identity, generation) {
-                cursor.offset = consumed_offset;
                 continue;
             }
             let Some(status) = mult_agent_status(&record.status) else {
-                cursor.offset = consumed_offset;
                 continue;
             };
             let Some(wire_identity) =
@@ -2682,7 +2747,6 @@ fn drain_mult_agent_status_events(
                     reconcile_agent_status(app, pty_runtime, chat, agent, generation);
                 }
             }
-            cursor.offset = consumed_offset;
         }
     }
     changed
@@ -2901,7 +2965,7 @@ fn save_content_if_due(
     app: &mut App,
     schedule: &mut SaveSchedule,
     now: Instant,
-    saver: impl FnMut(&model::ProjectState) -> io::Result<()>,
+    saver: impl FnMut(&model::ProjectState) -> storage::StateResult<()>,
 ) -> bool {
     if !app.is_dirty() || (!app.has_structural_change() && !schedule.is_due(now)) {
         return false;
@@ -2913,7 +2977,7 @@ fn save_content_if_due(
 fn save_if_dirty_with(
     app: &mut App,
     force_retry: bool,
-    mut saver: impl FnMut(&model::ProjectState) -> io::Result<()>,
+    mut saver: impl FnMut(&model::ProjectState) -> storage::StateResult<()>,
 ) -> bool {
     if !app.is_dirty() || (!force_retry && app.save_error().is_some()) {
         return false;
@@ -3245,7 +3309,7 @@ mod tests {
         let session = state
             .terminal_mut_by_id(terminal)
             .expect("default terminal exists");
-        session.status = TerminalStatus::Running;
+        session.restore_on_launch = true;
         session.launch = TerminalLaunch::Command(command);
         let mut app = App::new(state);
         app.select_item(NavItem::Terminal {
@@ -3275,9 +3339,11 @@ mod tests {
             ClientMessage::Attach { session, .. } if session == SessionId(terminal.0)
         ));
         assert!(runtime.is_running(PtyKey::Terminal(terminal)));
-        assert_eq!(
-            app.project.terminal_mut_by_id(terminal).unwrap().status,
-            TerminalStatus::Running
+        assert!(
+            app.project
+                .terminal_mut_by_id(terminal)
+                .unwrap()
+                .restore_on_launch
         );
         assert!(!app.terminal_requires_recovery(terminal));
         server.join().expect("restoration server exits");
@@ -3313,13 +3379,15 @@ mod tests {
             !side_effect.exists(),
             "restoration must not execute the command"
         );
-        assert_eq!(
-            app.project.terminal(workspace, terminal).unwrap().status,
-            TerminalStatus::Stopped
+        assert!(
+            !app.project
+                .terminal(workspace, terminal)
+                .unwrap()
+                .restore_on_launch
         );
         assert!(app.terminal_requires_recovery(terminal));
 
-        // Saving the Stopped status and loading it again remains conservative:
+        // Saving the cleared restore intent and loading it again remains conservative:
         // a blank pane still cannot auto-start until deliberate user input.
         let mut reloaded = App::new(app.project.clone());
         reloaded.select_item(NavItem::Terminal {
@@ -3417,7 +3485,7 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&fs::read(state_path).unwrap()).unwrap()
                 ["version"],
-            2
+            model::STATE_VERSION
         );
 
         server.join().unwrap();
@@ -3445,9 +3513,11 @@ mod tests {
             Rect::new(0, 0, 120, 40),
         );
 
-        assert_eq!(
-            app.project.terminal(workspace, terminal).unwrap().status,
-            TerminalStatus::Stopped
+        assert!(
+            !app.project
+                .terminal(workspace, terminal)
+                .unwrap()
+                .restore_on_launch
         );
         assert!(app.terminal_requires_recovery(terminal));
         assert!(!side_effect.exists());
@@ -3461,7 +3531,7 @@ mod tests {
         let mut saver = |_: &model::ProjectState| {
             attempts.set(attempts.get() + 1);
             if attempts.get() == 1 {
-                Err(io::Error::other("disk full"))
+                Err(storage::StateError::Io(io::Error::other("disk full")))
             } else {
                 Ok(())
             }
@@ -3479,27 +3549,150 @@ mod tests {
         assert_eq!(app.save_error(), None);
     }
 
+    /// An [`AgentStatusSource`] double (F10).
+    ///
+    /// The bridge's own logic — when it polls, which chats it keeps read state
+    /// for, what it does with a record — has nothing to do with files, but
+    /// testing it used to mean writing real journals with real modes into a
+    /// real temporary directory. Records are queued per `(chat, generation)`,
+    /// so a restarted agent is a fresh queue exactly as it is a fresh journal.
+    #[derive(Default)]
+    struct FakeAgentStatusSource {
+        queued: HashMap<(model::ChatId, model::AgentGeneration), Vec<MultAgentStatusRecord>>,
+        /// Chats this source is still holding read state for, newest call last.
+        retained: Vec<model::ChatId>,
+        polls: usize,
+    }
+
+    impl FakeAgentStatusSource {
+        fn queue(
+            &mut self,
+            chat: model::ChatId,
+            generation: model::AgentGeneration,
+            record: MultAgentStatusRecord,
+        ) {
+            self.queued
+                .entry((chat, generation))
+                .or_default()
+                .push(record);
+        }
+    }
+
+    impl AgentStatusSource for FakeAgentStatusSource {
+        fn poll(
+            &mut self,
+            chat: model::ChatId,
+            _identity: model::SessionIdentity,
+            generation: model::AgentGeneration,
+        ) -> Vec<MultAgentStatusRecord> {
+            self.polls += 1;
+            self.queued.remove(&(chat, generation)).unwrap_or_default()
+        }
+
+        fn retain(&mut self, live: &[model::ChatId]) {
+            self.queued.retain(|(chat, _), _| live.contains(chat));
+            self.retained = live.to_vec();
+        }
+    }
+
     /// S3/B3: the status bridge used to `open`+`fstat`+`seek`+`read`+`close`
-    /// every journal on every ~16 ms tick, after rebuilding each journal path
-    /// from scratch (four allocations per chat per tick). Both are now bounded:
-    /// the poll is on a timer and the path is cached per agent session.
+    /// every journal on every ~16 ms tick. The poll is now on a timer, and with
+    /// the source behind a seam the timer can be tested without a filesystem
+    /// at all (F10).
     #[test]
-    fn agent_status_polling_is_timed_and_journal_paths_are_cached() {
+    fn agent_status_polling_is_timed() {
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
-        let mut bridges = AgentStatusBridgeState::default();
+        let mut bridge = AgentStatusBridge::<FakeAgentStatusSource>::default();
         let start = Instant::now();
 
-        assert!(bridges.is_due(start), "the first tick always polls");
-        drain_mult_agent_status_events(&mut app, &mut pty_runtime, &mut bridges, start);
+        assert!(bridge.is_due(start), "the first tick always polls");
+        drain_mult_agent_status_events(&mut app, &mut pty_runtime, &mut bridge, start);
         assert!(
-            !bridges.is_due(start + AGENT_STATUS_POLL_INTERVAL / 2),
-            "a tick inside the interval must not touch the filesystem"
+            !bridge.is_due(start + AGENT_STATUS_POLL_INTERVAL / 2),
+            "a tick inside the interval must not touch the source"
         );
-        assert!(bridges.is_due(start + AGENT_STATUS_POLL_INTERVAL));
+        assert!(bridge.is_due(start + AGENT_STATUS_POLL_INTERVAL));
+    }
 
-        // The cache is keyed by the agent session, so a restart (new
-        // generation) re-derives the path and starts reading from zero again.
+    /// A chat that stops, or is deleted, must not leave read state behind for a
+    /// later chat to inherit. The double records exactly which chats the bridge
+    /// declared live, which the file-backed source used to hide behind a
+    /// `HashMap` of paths.
+    #[test]
+    fn a_chat_without_a_live_agent_session_keeps_no_read_state() {
+        let mut app = App::default();
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let mut bridge = AgentStatusBridge::<FakeAgentStatusSource>::default();
+        let (_, chat) = app
+            .add_chat_to_selected_workspace_and_return(model::AgentKind::Pi)
+            .or_else(|| {
+                app.select_next();
+                app.add_chat_to_selected_workspace_and_return(model::AgentKind::Pi)
+            })
+            .expect("a chat in the default project");
+
+        // No generation yet: the chat exists but owns no agent session.
+        drain_mult_agent_status_events(&mut app, &mut pty_runtime, &mut bridge, Instant::now());
+        assert!(
+            bridge.source.retained.is_empty(),
+            "a chat with no active generation is not a live source"
+        );
+
+        let generation = app
+            .begin_agent_generation(chat)
+            .expect("allocate generation")
+            .expect("a generation for a known chat");
+        drain_mult_agent_status_events(
+            &mut app,
+            &mut pty_runtime,
+            &mut bridge,
+            Instant::now() + AGENT_STATUS_POLL_INTERVAL,
+        );
+        assert_eq!(bridge.source.retained, vec![chat]);
+
+        // A queued record for a *different* generation belongs to a restarted
+        // agent and is never read as this session's.
+        let other = model::AgentGeneration::from_bytes([9; 16]).expect("non-zero generation");
+        assert_ne!(other, generation);
+        bridge.source.queue(chat, other, status_record("running"));
+        drain_mult_agent_status_events(
+            &mut app,
+            &mut pty_runtime,
+            &mut bridge,
+            Instant::now() + AGENT_STATUS_POLL_INTERVAL * 2,
+        );
+        assert_eq!(
+            app.project
+                .workspaces
+                .iter()
+                .flat_map(|workspace| workspace.chats.iter())
+                .find(|session| session.id == chat)
+                .map(|session| session.status),
+            Some(ChatStatus::Idle),
+            "another generation's record cannot move this chat"
+        );
+    }
+
+    fn status_record(status: &str) -> MultAgentStatusRecord {
+        MultAgentStatusRecord {
+            version: mult_protocol::AGENT_STATUS_SCHEMA_VERSION,
+            namespace: String::new(),
+            session_token: String::new(),
+            chat_id: String::new(),
+            agent_kind: "pi".to_string(),
+            generation: String::new(),
+            status: status.to_string(),
+        }
+    }
+
+    /// The file-backed source keeps its own tests against a real filesystem:
+    /// symlink refusal, mode and size limits are a security boundary, and a
+    /// double would test nothing about them. What moved to the double is the
+    /// bridge logic above, which never had any business opening a file.
+    #[test]
+    fn the_journal_source_caches_a_path_per_agent_session() {
+        let mut source = JournalStatusSource::default();
         let chat = model::ChatId(7);
         let identity = model::ProjectState::try_first_run()
             .expect("first-run project")
@@ -3508,32 +3701,35 @@ mod tests {
         let first_generation = model::AgentGeneration::from_bytes([3; 16]).unwrap();
         let second_generation = model::AgentGeneration::from_bytes([4; 16]).unwrap();
 
-        let path = bridges
-            .source_for(chat, identity, first_generation)
+        let path = source
+            .journal_for(chat, identity, first_generation)
             .path
             .clone();
-        bridges
-            .source_for(chat, identity, first_generation)
+        source
+            .journal_for(chat, identity, first_generation)
             .cursor
             .offset = 42;
         assert_eq!(
-            bridges.source_for(chat, identity, first_generation).path,
+            source.journal_for(chat, identity, first_generation).path,
             path,
             "an unchanged session reuses the cached path"
         );
         assert_eq!(
-            bridges
-                .source_for(chat, identity, first_generation)
+            source
+                .journal_for(chat, identity, first_generation)
                 .cursor
                 .offset,
             42,
             "and keeps its read cursor"
         );
 
-        let restarted = bridges.source_for(chat, identity, second_generation);
+        let restarted = source.journal_for(chat, identity, second_generation);
         assert_ne!(restarted.path, path, "a new generation names a new journal");
         assert_eq!(restarted.cursor.offset, 0, "and is read from the beginning");
-        assert_eq!(bridges.sources.len(), 1, "one entry per chat, not per tick");
+        assert_eq!(source.journals.len(), 1, "one entry per chat, not per tick");
+
+        source.retain(&[]);
+        assert!(source.journals.is_empty(), "a dead chat keeps no cursor");
     }
 
     /// B9: a save is a full re-serialize plus `fsync`, rename and directory
@@ -3629,7 +3825,7 @@ mod tests {
         };
 
         app.project.workspaces[0].name = "renamed".to_string();
-        app.mark_terminal_running(app.project.workspaces[0].terminals[0].id);
+        app.record_terminal_started(app.project.workspaces[0].terminals[0].id);
         assert!(app.is_dirty());
         schedule.record(start);
         assert!(
@@ -3787,7 +3983,9 @@ mod tests {
         app.quit();
 
         assert!(save_if_dirty_with(&mut app, true, |_| {
-            Err(io::Error::other("read-only filesystem"))
+            Err(storage::StateError::Io(io::Error::other(
+                "read-only filesystem",
+            )))
         }));
         assert!(!app.should_quit);
         assert!(app.is_dirty());
@@ -3818,7 +4016,7 @@ mod tests {
         let removed = confirm_pending_delete_with(&mut app, |current, key| {
             assert_eq!(key, PtyKey::Terminal(terminal));
             assert!(current.project.terminal(workspace, terminal).is_some());
-            Err(io::Error::other("daemon refused stop"))
+            Err(Box::new(io::Error::other("daemon refused stop")))
         });
 
         assert!(removed.is_empty());

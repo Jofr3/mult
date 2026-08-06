@@ -8,6 +8,61 @@ and the project aims to adhere to
 
 ## [Unreleased]
 
+### Wire protocol 11 and state schema 3 (R10a)
+
+**Breaking (daemon):** the wire protocol moves from 10 to 11. Stop any running
+`mult-server` and start the new binary; a client and daemon at different
+versions refuse each other at the hello, now with a `RejectCode::ProtocolMismatch`
+that names the remedy.
+
+**Breaking (state file):** `STATE_VERSION` moves from 2 to 3. Version 1 and 2
+files migrate automatically on load and are rewritten before anything attaches
+or launches. The change is invisible in use; a version-3 file cannot be read by
+an older `mult`, which refuses it without rewriting it.
+
+### Added
+
+- `RejectCode` on the wire: a 17-variant classification every daemon rejection
+  carries. `CreateError`, `AttachError`, `StopError`, `AgentStatusError` and
+  `LeaseRejectionReason` each map onto exactly one, so a client switches on one
+  exhaustive enum instead of parsing English. Documented in `docs/DAEMON.md`.
+- `LeaseRejectionReason::WriteRefused` — a dedicated reason for a pane's
+  bounded writer queue refusing input. The daemon previously had to reuse
+  `NotOwner`, which made a wedged child indistinguishable from a lost lease.
+- Hand-written `PtyError` and `StateError` (with `Display` and
+  `std::error::Error`, and no new dependency). `io::Result` is now confined to
+  the true I/O boundary: sockets, files, and the framing helpers.
+- `TerminalSession::restore_on_launch` — persisted *intent* replacing the
+  persisted `TerminalStatus`, plus `ChatStatus::DoneSeen`.
+- A seam for the agent status bridge (`trait AgentStatusSource`) with a
+  file-backed implementation and an in-memory double.
+
+### Changed
+
+- Input refused by a full writer queue no longer tears down the client's
+  attachment. The lease is still valid and the queue will drain, so the client
+  keeps the pane instead of trading a wedged child for a full re-attach and
+  replay. This was not expressible before protocol 11.
+- Displayed terminal liveness is derived solely from `PtyRuntime`. The state
+  file no longer records whether a pane is live — only whether the user meant
+  it to be running — so the two can no longer disagree and leave a terminal
+  rendered live forever, or auto-restart one unexpectedly.
+- A finished chat's "seen" bit lives in `ChatStatus` rather than in a runtime
+  side table keyed by chat ID, and is resolved in the same assignment as the
+  status. Restoring a persisted command terminal is still attach-only and never
+  re-executes it.
+- `PtyOutput` and `ReplayChunk` carry `Arc<[u8]>` instead of `Vec<u8>`, so the
+  daemon serializes a pane's retained chunk straight out of the allocation the
+  PTY reader produced. No copy of a PTY byte remains anywhere on the broadcast
+  path.
+
+### Removed
+
+- `ClientMessage::Scroll`, `ClientMessage::ScrollToTop` and
+  `ClientMessage::ScrollToBottom`. No client ever sent them: scrolling is
+  entirely local to the client's terminal parser.
+- `TerminalStatus` from the persisted model (see `restore_on_launch` above).
+
 ### Added
 
 - Claude Code as a second chat-agent backend alongside `pi`. `Ctrl+x` (and the

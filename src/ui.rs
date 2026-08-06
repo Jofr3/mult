@@ -17,7 +17,7 @@ use crate::{
     config::{self, ColorSchemeConfig},
     model::{
         ChatId, ChatSession, ChatStatus, PtyKey, TerminalId, TerminalLaunch, TerminalSession,
-        TerminalStatus, Workspace, WorkspaceId,
+        Workspace, WorkspaceId,
     },
     pty::PtyRuntime,
 };
@@ -489,8 +489,7 @@ fn sidebar_items(
             SidebarRow::Nav(NavItem::Chat { workspace, chat }) => {
                 match app.project.chat(*workspace, *chat) {
                     Some(chat) => {
-                        let done_seen = app.chat_done_seen(chat.id);
-                        let (glyph, style) = chat_status_marker(chat.status, done_seen, palette);
+                        let (glyph, style) = chat_status_marker(chat.status, palette);
                         ListItem::new(Line::from(vec![
                             Span::raw("  "),
                             Span::styled(glyph, style),
@@ -917,15 +916,13 @@ fn draw_terminal_details(
             Line::from(
                 "Command was not restored or auto-started. Type or use Start selected PTY to run it deliberately.",
             )
+        // Liveness has exactly one source: the runtime's attachment. The
+        // persisted `TerminalStatus` this used to read was a second one, and
+        // the two could disagree indefinitely (F16).
+        } else if pty_runtime.is_running(PtyKey::Terminal(terminal_id)) {
+            Line::from("Terminal is running; waiting for output. Type to send PTY input.")
         } else {
-            match terminal.status {
-                TerminalStatus::Running => {
-                    Line::from("Terminal is running; waiting for output. Type to send PTY input.")
-                }
-                TerminalStatus::Stopped => {
-                    Line::from("Terminal is stopped. Type to start it and send input.")
-                }
-            }
+            Line::from("Terminal is stopped. Type to start it and send input.")
         }];
         if let TerminalLaunch::Command(command) = &terminal.launch {
             lines.push(Line::from(""));
@@ -1803,11 +1800,7 @@ fn command_label_or_default(command: &str) -> String {
 /// agent has been seen (`done_seen`); yellow and red persist until the status
 /// itself changes — i.e. until a new prompt or an answered option moves the
 /// agent back to running.
-fn chat_status_marker(
-    status: ChatStatus,
-    done_seen: bool,
-    palette: Palette,
-) -> (&'static str, Style) {
+fn chat_status_marker(status: ChatStatus, palette: Palette) -> (&'static str, Style) {
     let (glyph, color, emphatic) = match status {
         // half-filled: work in progress
         ChatStatus::Thinking => ("◐ ", palette.pine, false),
@@ -1815,9 +1808,9 @@ fn chat_status_marker(
         ChatStatus::Waiting => ("? ", palette.gold, true),
         ChatStatus::Failed => ("✗ ", palette.love, true),
         // a tick only while the finish has not been acknowledged
-        ChatStatus::Done if !done_seen => ("✓ ", palette.success, true),
+        ChatStatus::Done => ("✓ ", palette.success, true),
         // settled: filled for a seen finish, hollow for never-started
-        ChatStatus::Done => ("● ", palette.muted, false),
+        ChatStatus::DoneSeen => ("● ", palette.muted, false),
         ChatStatus::Idle => ("○ ", palette.muted, false),
     };
 
@@ -1917,13 +1910,13 @@ mod tests {
         let command_terminal = TerminalSession {
             id: TerminalId(99),
             name: "cmd: ping".to_string(),
-            status: TerminalStatus::Running,
+            restore_on_launch: true,
             launch: TerminalLaunch::Command("ping example.com".to_string()),
         };
         let shell_terminal = TerminalSession {
             id: TerminalId(100),
             name: "shell".to_string(),
-            status: TerminalStatus::Stopped,
+            restore_on_launch: false,
             launch: TerminalLaunch::Shell,
         };
 
@@ -1943,7 +1936,7 @@ mod tests {
         let clear_terminal = TerminalSession {
             id: TerminalId(101),
             name: "clear".to_string(),
-            status: TerminalStatus::Stopped,
+            restore_on_launch: false,
             launch: TerminalLaunch::Command("clear".to_string()),
         };
         assert_eq!(
@@ -1959,7 +1952,7 @@ mod tests {
         let mut shell_terminal = TerminalSession {
             id: TerminalId(99),
             name: "shell".to_string(),
-            status: TerminalStatus::Stopped,
+            restore_on_launch: false,
             launch: TerminalLaunch::Shell,
         };
 
@@ -1968,7 +1961,7 @@ mod tests {
             ("$ ", Style::default().fg(palette.muted))
         );
 
-        shell_terminal.status = TerminalStatus::Running;
+        shell_terminal.restore_on_launch = true;
         assert_eq!(
             terminal_icon_marker(&shell_terminal, &pty_runtime, false, palette),
             ("$ ", Style::default().fg(palette.muted))
@@ -1977,7 +1970,7 @@ mod tests {
         let command_terminal = TerminalSession {
             id: TerminalId(100),
             name: "test".to_string(),
-            status: TerminalStatus::Running,
+            restore_on_launch: true,
             launch: TerminalLaunch::Command("cargo test".to_string()),
         };
         let mut running_runtime = PtyRuntime::new_offline();
@@ -2024,28 +2017,28 @@ mod tests {
         let palette = test_palette();
 
         assert_eq!(
-            chat_status_marker(ChatStatus::Thinking, false, palette),
+            chat_status_marker(ChatStatus::Thinking, palette),
             ("\u{25d0} ", Style::default().fg(palette.pine))
         );
         assert_eq!(
-            chat_status_marker(ChatStatus::Waiting, false, palette),
+            chat_status_marker(ChatStatus::Waiting, palette),
             ("? ", Style::default().fg(palette.gold))
         );
         assert_eq!(
-            chat_status_marker(ChatStatus::Failed, false, palette),
+            chat_status_marker(ChatStatus::Failed, palette),
             ("\u{2717} ", Style::default().fg(palette.love))
         );
         // Green only while the finished agent has not been seen; gray once seen.
         assert_eq!(
-            chat_status_marker(ChatStatus::Done, false, palette),
+            chat_status_marker(ChatStatus::Done, palette),
             ("\u{2713} ", Style::default().fg(palette.success))
         );
         assert_eq!(
-            chat_status_marker(ChatStatus::Done, true, palette),
+            chat_status_marker(ChatStatus::DoneSeen, palette),
             ("\u{25cf} ", Style::default().fg(palette.muted))
         );
         assert_eq!(
-            chat_status_marker(ChatStatus::Idle, false, palette),
+            chat_status_marker(ChatStatus::Idle, palette),
             ("\u{25cb} ", Style::default().fg(palette.muted))
         );
     }
@@ -2058,12 +2051,12 @@ mod tests {
         // that one row.
         let palette = test_palette();
         let markers = [
-            chat_status_marker(ChatStatus::Idle, false, palette).0,
-            chat_status_marker(ChatStatus::Thinking, false, palette).0,
-            chat_status_marker(ChatStatus::Waiting, false, palette).0,
-            chat_status_marker(ChatStatus::Done, false, palette).0,
-            chat_status_marker(ChatStatus::Done, true, palette).0,
-            chat_status_marker(ChatStatus::Failed, false, palette).0,
+            chat_status_marker(ChatStatus::Idle, palette).0,
+            chat_status_marker(ChatStatus::Thinking, palette).0,
+            chat_status_marker(ChatStatus::Waiting, palette).0,
+            chat_status_marker(ChatStatus::Done, palette).0,
+            chat_status_marker(ChatStatus::DoneSeen, palette).0,
+            chat_status_marker(ChatStatus::Failed, palette).0,
         ];
         let unique = markers.iter().collect::<std::collections::BTreeSet<_>>();
         assert_eq!(

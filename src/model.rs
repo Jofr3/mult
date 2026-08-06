@@ -8,7 +8,11 @@ use std::{
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
-pub const STATE_VERSION: u32 = 2;
+/// Version 3 replaced the terminals' persisted `status` (liveness, which the
+/// daemon actually owns) with `restore_on_launch` (intent, which only the state
+/// file can hold) and folded the "user has seen this Done" bit into
+/// [`ChatStatus`] itself (F16). See `storage::migrate_v2_to_v3`.
+pub const STATE_VERSION: u32 = 3;
 pub const DEFAULT_AGENT_CHAT_TITLE: &str = "agent";
 /// Upper bound on the text of a single persisted [`ChatMessage`].
 ///
@@ -143,10 +147,6 @@ impl SessionIdentities {
 
     fn len(&self) -> usize {
         self.chats.len() + self.terminals.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.chats.is_empty() && self.terminals.is_empty()
     }
 }
 
@@ -295,10 +295,21 @@ pub enum ChatMessageRole {
 pub struct TerminalSession {
     pub id: TerminalId,
     pub name: String,
-    /// Runtime-derived: the daemon is authoritative about whether a pane is
-    /// live, so a missing status resolves itself on the first poll.
+    /// **Intent, not liveness.** Whether this terminal was meant to be running
+    /// when the state was last written, and should therefore be reattached the
+    /// next time the client starts.
+    ///
+    /// Version 2 persisted a `TerminalStatus` here instead, which duelled with
+    /// `PtyRuntime`'s actual attachment state: the two were reconciled by hand
+    /// from several call sites, so missing one rendered a terminal live forever
+    /// or auto-restarted it unexpectedly (F16). Displayed liveness now comes
+    /// only from `PtyRuntime::is_running`, and this field answers the one
+    /// question the runtime cannot: what the user wanted.
+    ///
+    /// It is **not** an authorization to relaunch. A [`TerminalLaunch::Command`]
+    /// is restored attach-only and never re-executed, whatever this says (C1).
     #[serde(default, deserialize_with = "null_or_default")]
-    pub status: TerminalStatus,
+    pub restore_on_launch: bool,
     #[serde(default, deserialize_with = "null_or_default")]
     pub launch: TerminalLaunch,
 }
@@ -329,14 +340,40 @@ pub enum ChatStatus {
     Thinking,
     Waiting,
     Failed,
+    /// One agent turn finished and the user has not looked at the chat since:
+    /// the sidebar renders it as an unseen "finished" notification.
     Done,
+    /// Finished, and the user has since selected the chat. Renders inactive.
+    ///
+    /// The seen bit used to live in an `App`-side `seen_done: BTreeSet<ChatId>`
+    /// — a side table qualifying a status it was not part of, kept in sync by
+    /// hand at five call sites (F16). Folding it in makes "which Done is this"
+    /// unrepresentable-wrong: there is one value, and it changes atomically.
+    DoneSeen,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TerminalStatus {
-    #[default]
-    Stopped,
-    Running,
+impl ChatStatus {
+    /// Whether one agent turn has finished, seen or not.
+    pub const fn is_done(self) -> bool {
+        matches!(self, Self::Done | Self::DoneSeen)
+    }
+
+    /// Whether the user has looked at this chat since it finished. Only
+    /// meaningful for a finished chat; the renderer uses it to choose between
+    /// the green notification and the gray inactive icon.
+    pub const fn done_seen(self) -> bool {
+        matches!(self, Self::DoneSeen)
+    }
+
+    /// The same status with its seen bit set as requested. A status that is not
+    /// finished has no seen bit and is returned unchanged.
+    pub const fn with_done_seen(self, seen: bool) -> Self {
+        match (self, seen) {
+            (Self::Done | Self::DoneSeen, true) => Self::DoneSeen,
+            (Self::Done | Self::DoneSeen, false) => Self::Done,
+            (other, _) => other,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -401,7 +438,6 @@ impl ProjectState {
             .add_terminal_with_source(
                 mult,
                 "dev server".to_string(),
-                TerminalStatus::Stopped,
                 TerminalLaunch::Shell,
                 source,
             )
@@ -411,13 +447,7 @@ impl ProjectState {
             .add_workspace("website".to_string(), None)
             .expect("initial workspace ID is available");
         state
-            .add_terminal_with_source(
-                website,
-                "shell".to_string(),
-                TerminalStatus::Stopped,
-                TerminalLaunch::Shell,
-                source,
-            )
+            .add_terminal_with_source(website, "shell".to_string(), TerminalLaunch::Shell, source)
             .map_err(allocation_io_error)?;
 
         Ok(state)
@@ -527,56 +557,14 @@ impl ProjectState {
         Ok(())
     }
 
-    pub(crate) fn assign_session_identities(
-        &mut self,
-        source: &mut impl IdentitySource,
-    ) -> io::Result<()> {
-        if !self.session_identities.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "session identity table must be empty before assignment",
-            ));
-        }
-
-        let chat_ids = self
-            .workspaces
-            .iter()
-            .flat_map(|workspace| workspace.chats.iter().map(|chat| chat.id))
-            .collect::<Vec<_>>();
-        for id in chat_ids {
-            let token = self
-                .allocate_session_token(source)
-                .map_err(allocation_io_error)?;
-            self.session_identities.chats.insert(id, token);
-        }
-
-        let terminal_ids = self
-            .workspaces
-            .iter()
-            .flat_map(|workspace| workspace.terminals.iter().map(|terminal| terminal.id))
-            .collect::<Vec<_>>();
-        for id in terminal_ids {
-            let token = self
-                .allocate_session_token(source)
-                .map_err(allocation_io_error)?;
-            self.session_identities.terminals.insert(id, token);
-        }
-        Ok(())
-    }
-
-    /// Reconciles the identity and generation tables with the sessions that are
-    /// actually present, returning whether anything changed.
+    /// Reconciles the identity table against the sessions that are actually
+    /// present: drops entries for sessions that are gone or share a token, and
+    /// mints a token for every session that has none.
     ///
-    /// `validate_session_identities` demands an exact correspondence, so a
-    /// state file that lost a chat — a renamed field, a `null` where an array
-    /// belonged, a hand edit that added a terminal — failed startup outright
-    /// even when everything else in it was intact. Reconciling keeps what
-    /// decoded: entries for sessions that are gone are dropped, a duplicated
-    /// token is re-minted, and a session with no token gets a fresh one.
-    ///
-    /// Minting is the fail-safe direction. A fresh token cannot claim the
-    /// daemon session the old one owned, so the pane comes back stopped instead
-    /// of adopting a session it cannot prove it owns (C12).
+    /// This is the only way tokens are assigned. There used to be a second,
+    /// `assign_session_identities`, which refused to run unless the table was
+    /// empty — usable by the V1 migration and nothing else. The V2->V3 migration
+    /// has to *keep* an existing table, so the two collapsed into this one (F16).
     pub(crate) fn normalize_session_identities(
         &mut self,
         source: &mut impl IdentitySource,
@@ -975,41 +963,41 @@ impl ProjectState {
         }
     }
 
+    /// Adds a terminal. A new terminal is never already running, and nothing
+    /// has yet expressed an intent to restore it, so it starts with
+    /// `restore_on_launch` clear — the old `status: TerminalStatus` parameter
+    /// was `Stopped` at every call site (F16).
     pub fn add_terminal(
         &mut self,
         workspace_id: WorkspaceId,
         name: String,
-        status: TerminalStatus,
     ) -> Result<Option<TerminalId>, IdAllocationError> {
-        self.add_terminal_with_launch(workspace_id, name, status, TerminalLaunch::Shell)
+        self.add_terminal_with_launch(workspace_id, name, TerminalLaunch::Shell)
     }
 
     pub fn add_command_terminal(
         &mut self,
         workspace_id: WorkspaceId,
         name: String,
-        status: TerminalStatus,
         command: String,
     ) -> Result<Option<TerminalId>, IdAllocationError> {
-        self.add_terminal_with_launch(workspace_id, name, status, TerminalLaunch::Command(command))
+        self.add_terminal_with_launch(workspace_id, name, TerminalLaunch::Command(command))
     }
 
     fn add_terminal_with_launch(
         &mut self,
         workspace_id: WorkspaceId,
         name: String,
-        status: TerminalStatus,
         launch: TerminalLaunch,
     ) -> Result<Option<TerminalId>, IdAllocationError> {
         let mut source = SecureIdentitySource::new().map_err(identity_allocation_error)?;
-        self.add_terminal_with_source(workspace_id, name, status, launch, &mut source)
+        self.add_terminal_with_source(workspace_id, name, launch, &mut source)
     }
 
     fn add_terminal_with_source(
         &mut self,
         workspace_id: WorkspaceId,
         name: String,
-        status: TerminalStatus,
         launch: TerminalLaunch,
         source: &mut impl IdentitySource,
     ) -> Result<Option<TerminalId>, IdAllocationError> {
@@ -1027,7 +1015,7 @@ impl ProjectState {
             .push(TerminalSession {
                 id,
                 name,
-                status,
+                restore_on_launch: false,
                 launch,
             });
         self.session_identities.terminals.insert(id, token);
@@ -1211,7 +1199,7 @@ fn decode_hex_digit(byte: u8) -> Option<u8> {
 /// to cost a user their whole state file (E11). A wrong *type* is still an
 /// error: `"workspaces": "nonsense"` carries data this code cannot interpret,
 /// and quietly treating it as empty would destroy it rather than report it.
-fn null_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+pub(crate) fn null_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de> + Default,
@@ -1376,7 +1364,7 @@ impl ChatStatus {
             Self::Thinking => "thinking",
             Self::Waiting => "waiting",
             Self::Failed => "failed",
-            Self::Done => "done",
+            Self::Done | Self::DoneSeen => "done",
         }
     }
 }
@@ -1742,11 +1730,7 @@ mod tests {
             )
             .expect("chat allocation should succeed");
         let max_terminal = state
-            .add_terminal(
-                workspace,
-                "max terminal".to_string(),
-                TerminalStatus::Stopped,
-            )
+            .add_terminal(workspace, "max terminal".to_string())
             .expect("terminal allocation should succeed");
         let wrapped_chat = state
             .add_chat(
@@ -1757,11 +1741,7 @@ mod tests {
             )
             .expect("chat allocation should wrap");
         let wrapped_terminal = state
-            .add_terminal(
-                workspace,
-                "wrapped terminal".to_string(),
-                TerminalStatus::Stopped,
-            )
+            .add_terminal(workspace, "wrapped terminal".to_string())
             .expect("terminal allocation should wrap");
 
         assert_eq!(max_chat, Some(ChatId(MAX_DURABLE_SESSION_ID)));
@@ -1788,7 +1768,7 @@ mod tests {
         workspace.terminals.push(TerminalSession {
             id: TerminalId(MAX_DURABLE_SESSION_ID),
             name: "terminal".to_string(),
-            status: TerminalStatus::Stopped,
+            restore_on_launch: false,
             launch: TerminalLaunch::Shell,
         });
         state.workspaces.push(workspace);
@@ -1953,9 +1933,9 @@ mod tests {
         assert_eq!(missing, nulled);
         assert!(missing.chats.is_empty() && missing.terminals.is_empty());
 
-        let terminal: TerminalSession =
-            serde_json::from_str(r#"{"id":1,"name":"t"}"#).expect("missing status defaults");
-        assert_eq!(terminal.status, TerminalStatus::Stopped);
+        let terminal: TerminalSession = serde_json::from_str(r#"{"id":1,"name":"t"}"#)
+            .expect("missing restore intent defaults");
+        assert!(!terminal.restore_on_launch);
         assert_eq!(terminal.launch, TerminalLaunch::Shell);
 
         // Wrong type, not absent: this carries data, and treating it as empty

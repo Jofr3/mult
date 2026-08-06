@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "namespace": "future-namespace-format",
   "session_identities": {
     "chats": {},

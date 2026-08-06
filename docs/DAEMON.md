@@ -38,7 +38,35 @@ An autospawned daemon does **not** inherit the client's environment. It is spawn
 
 ## Protocol and compatibility
 
-The current wire protocol is **version 10**. Version 10 is intentionally incompatible with version 9: it preserves version 9's request correlation, resumable scopes, attachment leases, ordered replay, and lifecycle guarantees while adding durable state namespaces, immutable logical session tokens, and generation-safe daemon agent status. Client and server exchange a hello and require the same `PROTOCOL_VERSION`. After upgrading, stop any old daemon and start the new `mult-server` binary.
+The current wire protocol is **version 11**. Version 11 is intentionally incompatible with version 10: it preserves everything version 10 guaranteed — request correlation, resumable scopes, attachment leases, ordered replay, lifecycle, durable state namespaces, immutable logical session tokens, and generation-safe agent status — while making every rejection machine-readable, giving a refused PTY write its own reason, and carrying PTY payloads without an extra copy. Client and server exchange a hello and require the same `PROTOCOL_VERSION`. After upgrading, stop any old daemon and start the new `mult-server` binary.
+
+Version 11 also removes three client messages that no client ever sent: `Scroll`, `ScrollToTop` and `ScrollToBottom`. Scrolling is entirely local to the client's terminal parser and never involved the daemon.
+
+### Rejection codes
+
+Every refusal the daemon can produce carries a `RejectCode`, and every error the wire defines maps onto exactly one of them. **The code is the contract; the accompanying `message` is diagnostic text for a human and must never be parsed.** Before version 11 a rejection reached the client only as English prose, so a reworded message silently changed client behaviour — which is exactly what happened once during development, when an `"already attached"` substring match went dead unnoticed.
+
+| Code | Meaning |
+|---|---|
+| `ProtocolMismatch` | The peer's `PROTOCOL_VERSION` differs. Restart the daemon. |
+| `ProtocolOrder` | No hello first, or a second hello on one connection. |
+| `RequestCollision` | The request ID was reused with a different operation or body. |
+| `RetryExpired` | The request ID predates the retained-result window. |
+| `TooManyPendingRequests` | The scope's in-flight request bound was reached. |
+| `ResourceExhausted` | A daemon identifier space ran out (leases, session IDs, output sequences). |
+| `UnknownSession` | No session or pane exists for that coordinate. |
+| `SessionAlreadyExists` | The numeric ID or logical identity is already taken. |
+| `IdentityMismatch` | Namespace or token did not match the session's stored identity. |
+| `NotOwner` | The caller does not hold the pane's lease, or the pane is not accepting mutations. |
+| `StaleLease` | The lease belongs to an older attachment generation. |
+| `Superseded` | The attachment was displaced by a takeover. |
+| `InputRefused` | The pane's bounded writer queue refused the bytes; they were not delivered. |
+| `AgentStatusRejected` | An agent-status precondition failed (schema, chat, kind, generation, final status). |
+| `ShuttingDown` | The daemon is draining and accepts no new work. |
+| `LaunchFailed` | Spawning or configuring the PTY child failed. |
+| `DaemonInternal` | A poisoned lock, a failed `ioctl`, or another unexpected OS error. |
+
+`TooManyPendingRequests`, `InputRefused` and `ShuttingDown` are the only transient codes: repeating an identical request may succeed once the condition clears. Every other code will keep failing until the request or the daemon changes.
 
 The server hello identifies both the daemon instance and a server-issued client request scope. A reconnect may resume its previous scope only when the same daemon still retains it. An idempotent request may be retransmitted only after the client confirms both the same daemon instance and the same resumed scope.
 
@@ -124,11 +152,15 @@ Replay holds the pane barrier — that is what makes the transaction ordered —
 
 Retained raw history is bounded by the client's scrollback need (5 000 lines at a 512-byte-per-line budget, ~2.4 MiB per pane), not by the wire frame limit. Replay chunks are the retained chunks themselves, so a queued replay does not make the history resident a second time.
 
+Since version 11 `PtyOutput` and `ReplayChunk` carry `Arc<[u8]>` rather than `Vec<u8>`. The pane's retained chunk is serialized straight out of the allocation the PTY reader produced, so there is now **no copy of a PTY byte anywhere on the daemon's broadcast path** — the last one existed only to change container type at the wire boundary.
+
 ## PTY input queueing
 
 Client input and paste are handed to a per-pane writer thread through a bounded queue and are never written from the connection's own thread. A PTY write blocks as soon as the child stops reading its standard input, and a blocking write on the routing path would stall every pane and every client.
 
-The queue is bounded (1 MiB per pane) and refuses rather than drops or blocks. A refused write is reported as a pane-scoped `LeaseRejected`, which does not close the connection: the bytes were definitely not delivered, and the client treats the rejection as conclusive instead of assuming they landed. A write error on the master closes the queue, so subsequent writes are refused rather than silently discarded.
+The queue is bounded (1 MiB per pane) and refuses rather than drops or blocks. A refused write is reported as a pane-scoped `LeaseRejected` with reason `WriteRefused` (`RejectCode::InputRefused`), which does not close the connection: the bytes were definitely not delivered, and the client treats the rejection as conclusive instead of assuming they landed. A write error on the master closes the queue, so subsequent writes are refused rather than silently discarded.
+
+`WriteRefused` is distinct from `NotOwner`, which the daemon had to reuse for a full queue before version 11. The distinction matters to the client: `NotOwner` means the attachment is gone and must be rebuilt, whereas a full queue leaves the lease valid and the client keeps its attachment rather than trading a wedged child for a full re-attach and replay.
 
 ## PTY and child lifecycle
 
