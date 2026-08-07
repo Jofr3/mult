@@ -31,8 +31,10 @@ handed to `$SHELL -lc` and auto-started by default, so whoever controls those
 bytes runs code as you without a keystroke — and both environment variables
 above steer the path there. A config is read only when:
 
-- it is a **regular file** reached **without traversing a symlink** — neither
-  `config.json` itself nor any directory component above it may be one;
+Symlinks are **resolved first**, and every check below is then applied to the
+file the path resolved *to*:
+
+- it is a **regular file**;
 - it is **owned by you** and has exactly one hard link;
 - its **directory is owned by you** and is not group- or other-writable;
 - it is **under 1 MiB**.
@@ -40,13 +42,18 @@ above steer the path there. A config is read only when:
 The file's own mode is repaired rather than refused: a `0644` config is
 `chmod`ed to `0600` as it is read, and only a mode that could not be tightened
 fails. Anything else on that list is a startup error, not a quiet fall back to
-the defaults — a rejected config is a signal.
+the defaults — a rejected config is a signal. A link that points at nothing
+counts as a missing file, so it means defaults rather than an error.
 
-**This refuses the usual dotfile-manager layout.** GNU stow and friends leave
-`~/.config/mult/config.json` as a link into a repository, and such a config no
-longer loads. See
-[Too many levels of symbolic links](TROUBLESHOOTING.md#too-many-levels-of-symbolic-links-at-startup-symlinked-config)
-for the messages and the workaround.
+**The usual dotfile-manager layout works.** `home-manager`, GNU stow and
+chezmoi all leave `~/.config/mult` or `~/.config/mult/config.json` as a link
+into a repository; `mult` follows it and checks the repository copy. What it
+still refuses is a config whose *resolved* directory anyone else can write, so
+a link aimed into `/tmp` gains nothing. The property being enforced is that the
+bytes came from a file only you can write, not that no link was traversed —
+`SECURITY.md` has the reasoning. See
+[the config is refused at startup](TROUBLESHOOTING.md#the-config-is-refused-at-startup)
+for the messages.
 
 ## What is an error and what is a warning
 

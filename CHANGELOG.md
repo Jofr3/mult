@@ -8,6 +8,33 @@ and the project aims to adhere to
 
 ## [Unreleased]
 
+### Symlinked configs load again (C14)
+
+- `config.json` reached through a symlink is **read** rather than refused. C2
+  had opened every path component with `O_NOFOLLOW`, which rejected the layout
+  every dotfile manager produces — and the only one `home-manager`'s
+  `xdg.configFile` can produce, since it links `~/.config/<name>` into the
+  repository through two root-owned `/nix/store` hops. There was no fix
+  available on the dotfiles side.
+- The checks are unchanged; they moved. `load_from_path` resolves the path
+  first and then applies the same `SecureDirectory` and `read_private_file`
+  discipline to what it resolved to: a regular, singly-linked, owner-only file
+  under 1 MiB, in a directory owned by this user and not group- or
+  other-writable. Resolution selects a path and grants nothing — the resolved
+  path holds no symlinks by construction, so the `O_NOFOLLOW` walk still
+  refuses a component swapped for a link mid-read, and a redirected link must
+  still land on this user's own `0600`, single-link file inside a directory
+  only this user can write. A config linked into `/tmp` is still refused.
+- Errors name both paths — `config file {typed} (resolved to {real})` — because
+  the file whose mode has to be fixed is the far end, not the link. Parse
+  errors and config warnings name the resolved file alone, which is the one to
+  open in an editor.
+- A **dangling** link is now treated as a missing config, so it starts on the
+  defaults instead of failing. `ELOOP` and `ENOTDIR` still fail, but now mean
+  what they say: a genuine link cycle, and a path routed through a plain file.
+- The **state** path is unchanged and still refuses symlinks outright: it holds
+  a lock inode, not a file anyone edits.
+
 ### Module structure (R10b)
 
 Behaviour-preserving throughout: no wire, state, config or rendering change.

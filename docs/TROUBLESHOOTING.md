@@ -383,90 +383,82 @@ MULT_STATE_PATH=/var/lib/mult/state.json MULT_CONFIG_PATH=/etc/mult/config.json 
 
 ---
 
-## "symlinked config files are not supported" at startup
+## The config is refused at startup
 
-> `mult: config error at {path}: the file is a symbolic link, and symlinked
-> config files are not supported — every path component is opened with
-> O_NOFOLLOW because the commands in this file are shell-evaluated and
-> auto-started. Copy the file instead of linking it, or point --config /
-> $MULT_CONFIG_PATH at a real file`
+**Symlinked configs are supported** (C14). If you are on a build that prints
 
-or, when a **directory** on the way to the config is the link:
+> `mult: config error at {path}: … symlinked config files are not supported — …`
 
-> `mult: config error at {path}: a directory component of the path is a symbolic
-> link, or is not a directory, and symlinked config files are not supported — …`
+you are on a build from between C2 and C14, where a link anywhere on the way to
+`config.json` was refused outright. Upgrade; nothing needs to change in your
+dotfiles. The layout every dotfile manager produces now loads —
+`home-manager`'s `xdg.configFile`, which has no non-symlink mode at all, along
+with GNU stow and chezmoi.
 
-(Before E5 these were the raw `openat` failures — `Error: Os { code: 40, kind:
-FilesystemLoop, … }` and `Error: Os { code: 20, kind: NotADirectory, … }` — which
-named neither the config nor the reason. If you see *those*, you are on an older
-build.)
+**What is still checked.** `pi_agent_command` and `claude_code_command` are
+handed to `$SHELL -lc` and auto-started by default, so whoever controls those
+bytes runs code as you with no keystroke. `mult` resolves the path through
+symlinks and then applies every check to the file it resolved *to*: it must be
+a regular, singly-linked file owned by you, under 1 MiB, in a directory owned
+by you that is not group- or other-writable. Following the link does not
+launder the target — see `SECURITY.md` for why resolving first still enforces
+"only you could have written these bytes".
 
-**Cause.** `config.json` is now read with the same discipline as the state file,
-and for a sharper reason: `pi_agent_command` and `claude_code_command` are handed
-to `$SHELL -lc` and auto-started by default, so whoever controls those bytes runs
-code as you with no keystroke. Every path component is opened with `O_NOFOLLOW`,
-so a symlinked `config.json` — or a symlinked directory anywhere above it — is
-refused, and the link's target is never read. Neither `$MULT_CONFIG_PATH` nor
-`$XDG_CONFIG_HOME` is a way around this; both steer the same checked path.
+So the rejections you can still hit name the **resolved** file, not the link:
 
-The two cases are distinguished by what the kernel reports: an `O_NOFOLLOW` open
-of a symlink is `ELOOP`, and an `O_NOFOLLOW|O_DIRECTORY` open of one is `ENOTDIR`
-— which a plain file used as a directory also produces, hence the "or is not a
-directory" in the second message.
-
-**Symlinked config files are no longer supported.** That is the layout most
-dotfile managers produce — GNU stow always links, and a bare-repo setup or
-chezmoi in symlink mode can — so a config that worked before this change now
-fails startup instead of being read.
-
-**Fix.** Copy the file rather than linking it, and keep the directory private:
-
-```sh
-namei -l ~/.config/mult/config.json    # shows which component is the link
-
-rm ~/.config/mult/config.json
-cp ~/dotfiles/mult/config.json ~/.config/mult/config.json
-chmod 700 ~/.config/mult
-chmod 600 ~/.config/mult/config.json
-```
-
-Or leave the repository copy authoritative and point at it as a real file:
-
-```sh
-MULT_CONFIG_PATH=~/dotfiles/mult/config.json mult
-```
-
-That works as long as the repository copy is itself a regular file of yours in a
-directory of yours that is not group- or other-writable. For stow, the practical
-answer is to stop stowing this one file.
-
-**The other rejections on the same read**, all startup errors and all quoted from
-source:
-
-> `config file {path} is not a regular file`
+> `config file {path} (resolved to {target}) is not owned by the effective user`
 >
-> `config file {path} is not owned by the effective user`
+> `config file {path} (resolved to {target}) has multiple hard links` — a hard
+> link, unlike a symlink, is indistinguishable from the file, so link count is
+> checked instead.
 >
-> `config file {path} has multiple hard links` — a hard link, unlike a symlink,
-> is indistinguishable from the file, so link count is checked instead.
+> `config file {path} (resolved to {target}) is not a regular file`
 >
-> `config file {path} could not be restricted to owner-only access`
+> `config file {path} (resolved to {target}) could not be restricted to owner-only access`
 >
-> `config file {path} exceeds 1048576 bytes`
+> `config file {path} (resolved to {target}) exceeds 1048576 bytes`
 
-and, for the containing directory:
+and, for the directory the link lands in:
 
 > `config parent is writable by group or others, so the config it holds is replaceable, and its commands are shell-evaluated: {path}`
 >
 > `private config directory is not owned by the effective user: {path}`
->
-> `config parent is not a directory: {path}`
+
+`(resolved to …)` is omitted when no link was involved. Parse errors name the
+resolved file only — that is the one to open in an editor.
+
+**Fix.** Point `namei` at the path to see what it resolves to, then fix the
+file at the far end rather than the link:
+
+```sh
+namei -l ~/.config/mult/config.json    # follows the whole chain
+
+chmod 600 ~/dotfiles/config/mult/config.json
+chmod 755 ~/dotfiles/config/mult       # any mode without group/other write
+```
+
+A link that points at nothing is treated as a missing config, so it starts on
+the defaults rather than failing.
+
+**Two errors that survive resolution:**
+
+> `mult: config error at {path}: too many levels of symbolic links`
+
+a genuine link *cycle* — `a -> b -> a`. `namei -l` shows it.
+
+> `mult: config error at {path}: a component of the path is not a directory`
+
+something on the way is a plain file, as in `--config /etc/passwd/config.json`.
 
 State and config share one hardened read implementation, so the *state* file
-produces the same three with `state` in place of `config` (and "its lock inode is
-replaceable" as the reason). Older builds said **state** in both cases; if a
-message names `state` while the path is clearly your config, you are on a build
-from before E5.
+produces the same messages with `state` in place of `config` (and "its lock
+inode is replaceable" as the reason), plus `state parent is not a directory`.
+Older builds said **state** in both cases; if a message names `state` while the
+path is clearly your config, you are on a build from before E5.
+
+The state path is the one place the old rule still applies in full: it is
+refused if any component is a symlink. It holds a lock inode rather than a file
+you edit, so no dotfile manager has a reason to link it.
 
 Note that the mode of the config file itself is repaired rather than refused — a
 `0644` config is `chmod`ed to `0600` as it is read — so only a mode that could

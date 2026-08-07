@@ -183,7 +183,7 @@ Config path:
 - otherwise `$XDG_CONFIG_HOME/mult/config.json`
 - otherwise the effective user's passwd home at `~/.config/mult/config.json`; startup fails clearly if no durable home can be resolved
 
-Whichever path is used, the config must be a regular file owned by you, reached without traversing a symlink, in a directory of yours that is not group- or other-writable, and under 1 MiB — the commands it carries are shell-evaluated and auto-started, so a path anyone else can steer is code execution. A **symlinked** `config.json`, which is what most dotfile managers leave behind, is refused rather than read: see [docs/CONFIG.md](docs/CONFIG.md#the-file) and [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#too-many-levels-of-symbolic-links-at-startup-symlinked-config).
+Whichever path is used, the config must be a regular file owned by you, in a directory of yours that is not group- or other-writable, and under 1 MiB — the commands it carries are shell-evaluated and auto-started, so a path anyone else can steer is code execution. Symlinks are **resolved first** and those checks then apply to the file at the far end, so the layout dotfile managers leave behind — a `~/.config/mult` or `config.json` linked into a repository, which is all `home-manager`'s `xdg.configFile` can produce — loads fine, while a link aimed into a directory others can write is still refused: see [docs/CONFIG.md](docs/CONFIG.md#the-file) and [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#the-config-is-refused-at-startup).
 
 Example:
 

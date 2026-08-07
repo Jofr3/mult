@@ -1,7 +1,7 @@
 use std::{
     env,
     ffi::OsStr,
-    fmt, io,
+    fmt, fs, io,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
@@ -470,25 +470,51 @@ pub fn config_path() -> PathBuf {
 /// auto-started by default, so *whoever controls these bytes runs code as this
 /// user without a keystroke*. Two environment variables steer the path there
 /// (`$MULT_CONFIG_PATH`, and `$XDG_CONFIG_HOME` via [`paths::config_home`],
-/// which accepts any absolute value), so the path is treated as untrusted:
+/// which accepts any absolute value), so the path is treated as untrusted.
 ///
-/// - every parent component is opened with `O_NOFOLLOW` and the final parent
-///   must be owned by this user and not group/other-writable (that ownership
-///   check is what makes a redirected `$XDG_CONFIG_HOME` useless to an
-///   attacker — S7);
-/// - the file itself must be a regular, singly-linked, owner-only file, opened
-///   without following a symlink, and is read under a size cap.
+/// The invariant enforced is *not* "no symlink was traversed" — it is **the
+/// bytes came from a file only this user can write, in a directory only this
+/// user can write**. So the path is resolved through symlinks first and the
+/// checks are applied to what it resolved *to* (C14):
 ///
-/// A missing file — or a missing config directory — still means "use defaults".
-/// Anything else fails loudly rather than silently running with defaults,
-/// because a rejected config is a signal, not a fallback.
+/// - resolution is an untrusted hint. It picks the path; it grants nothing.
+/// - the resolved path contains no symlinks by construction, so the existing
+///   fd-walk still opens every component with `O_NOFOLLOW` — a component
+///   swapped for a link mid-walk is still refused — and the final parent must
+///   be owned by this user and not group/other-writable (that ownership check
+///   is what makes a redirected `$XDG_CONFIG_HOME` useless to an attacker —
+///   S7).
+/// - the file itself must be a regular, singly-linked, owner-only file, and is
+///   read under a size cap.
+///
+/// Racing the resolution therefore buys an attacker nothing they did not
+/// already have: the redirected target must still be *this user's* own
+/// `0600`, single-link file inside a directory only this user can write, which
+/// is a strictly narrower position than the write access to that directory
+/// they would need to plant the link in the first place.
+///
+/// A missing file — a missing config directory, or a link that points nowhere
+/// — still means "use defaults". Anything else fails loudly rather than
+/// silently running with defaults, because a rejected config is a signal, not
+/// a fallback.
 fn load_from_path(path: &Path) -> io::Result<Config> {
-    let directory = match SecureDirectory::open_parent_for(path, false, false, CONFIG_DIRECTORY) {
-        Ok(directory) => directory,
+    // Untrusted: this only decides *which* path the checks below are applied
+    // to. `canonicalize` reports `NotFound` for a missing file and for a
+    // dangling link alike, which is the same "use defaults" as a missing
+    // config directory.
+    let resolved = match fs::canonicalize(path) {
+        Ok(resolved) => resolved,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(error) => return Err(describe_read_failure(path, error)),
     };
-    let name = path.file_name().ok_or_else(|| {
+
+    let directory =
+        match SecureDirectory::open_parent_for(&resolved, false, false, CONFIG_DIRECTORY) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
+            Err(error) => return Err(describe_read_failure(path, error)),
+        };
+    let name = resolved.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("config path must name a file: {}", path.display()),
@@ -498,19 +524,39 @@ fn load_from_path(path: &Path) -> io::Result<Config> {
     let bytes = read_private_file(
         &directory,
         name,
-        &format!("config file {}", path.display()),
+        &describe_config_file(path, &resolved),
         MAX_CONFIG_FILE_BYTES,
     )
     .map_err(|error| describe_read_failure(path, error))?;
 
     match bytes {
         Some(bytes) => {
+            // Parse failures and warnings name the *resolved* file: that is the
+            // one to open in an editor, and for a linked config it is not the
+            // path the user typed.
             let mut config: Config = serde_json::from_slice(&bytes)
-                .map_err(|error| describe_parse_failure(path, error))?;
-            config.collect_warnings(path);
+                .map_err(|error| describe_parse_failure(&resolved, error))?;
+            config.collect_warnings(&resolved);
             Ok(config)
         }
         None => Ok(Config::default()),
+    }
+}
+
+/// Names the file the ownership and mode checks actually ran against.
+///
+/// For a linked config the path the user typed and the file that has to be
+/// `chmod`ed are different files, and only naming one of them sends them to
+/// the wrong place.
+fn describe_config_file(path: &Path, resolved: &Path) -> String {
+    if resolved == path {
+        format!("config file {}", path.display())
+    } else {
+        format!(
+            "config file {} (resolved to {})",
+            path.display(),
+            resolved.display()
+        )
     }
 }
 
@@ -536,35 +582,27 @@ fn describe_parse_failure(path: &Path, error: serde_json::Error) -> io::Error {
     )
 }
 
-/// Names the config file on the failures that happen *below* `mult`, inside the
-/// `O_NOFOLLOW` opens.
+/// Names the config file on the failures that happen *below* `mult`, inside
+/// `canonicalize` or the `O_NOFOLLOW` opens.
 ///
-/// A symlinked config is the common one: the open fails with `ELOOP` (or
-/// `ENOTDIR`, when a *directory* on the way is the link) before any of this
-/// module's own descriptions are attached, so the user saw a bare
-/// `Os { code: 40, kind: FilesystemLoop, … }` naming neither the file nor the
-/// reason. That is the layout most dotfile managers produce, so it needs to say
-/// what happened and what to do instead.
+/// These used to arrive as a bare `Os { code: 40, kind: FilesystemLoop, … }`
+/// naming neither the file nor the reason (E5). Since C14 resolves the path
+/// through symlinks, a linked config is no longer one of them — `ELOOP` now
+/// means a genuine link *cycle*, and `ENOTDIR` a path routed through something
+/// that is not a directory.
 fn describe_read_failure(path: &Path, error: io::Error) -> io::Error {
     let cause = match error.raw_os_error() {
-        Some(libc::ELOOP) => "the file is a symbolic link",
-        // An `O_NOFOLLOW|O_DIRECTORY` open of a symlinked directory reports
-        // exactly this, as does a plain file used as a directory.
-        Some(libc::ENOTDIR) => {
-            "a directory component of the path is a symbolic link, or is not a directory"
-        }
+        Some(libc::ELOOP) => "too many levels of symbolic links",
+        // From `canonicalize` when a component is a plain file, and from the
+        // fd-walk's `O_NOFOLLOW|O_DIRECTORY` open if a component is swapped
+        // for a link after resolution.
+        Some(libc::ENOTDIR) => "a component of the path is not a directory",
         _ => return error,
     };
 
     io::Error::new(
         error.kind(),
-        format!(
-            "config error at {}: {cause}, and symlinked config files are not supported — every \
-             path component is opened with O_NOFOLLOW because the commands in this file are \
-             shell-evaluated and auto-started. Copy the file instead of linking it, or point \
-             --config / $MULT_CONFIG_PATH at a real file",
-            path.display()
-        ),
+        format!("config error at {}: {cause}", path.display()),
     )
 }
 
@@ -987,35 +1025,56 @@ mod tests {
         assert!(warnings[0].contains("is not a directory"), "{warnings:?}");
     }
 
-    /// E5: `O_NOFOLLOW` rejects a symlinked config inside `openat`, so the user
-    /// used to see a bare `Os { code: 40, kind: FilesystemLoop, … }` that
-    /// mentioned neither the config file nor the fact that this is now the
-    /// rule. Both the path and the workaround have to be in the message.
+    /// C14: a symlinked `config.json` is the layout every dotfile manager
+    /// produces — home-manager's `xdg.configFile` has no other mode — so it is
+    /// resolved and read, not refused.
     #[test]
-    fn a_symlinked_config_names_the_path_and_the_workaround() {
+    fn a_symlinked_config_is_resolved_and_read() {
         let directory = unique_temp_dir();
         let target = directory.join("dotfiles-config.json");
         fs::write(&target, r#"{"pi_agent_command":"linked"}"#).expect("write target");
         let path = directory.join(CONFIG_FILE_NAME);
         symlink(&target, &path).expect("link config path");
 
-        let error = load_from_path(&path).expect_err("a symlinked config must be refused");
+        let config = load_from_path(&path).expect("a symlinked config is followed");
 
-        let message = error.to_string();
-        assert!(
-            message.starts_with(&format!("config error at {}: ", path.display())),
-            "{message}"
-        );
-        assert!(message.contains("the file is a symbolic link"), "{message}");
-        assert!(
-            message.contains("symlinked config files are not supported"),
-            "{message}"
-        );
-        assert!(
-            message.contains("Copy the file instead of linking it"),
-            "the workaround has to be in the message: {message}"
-        );
-        assert!(message.contains("$MULT_CONFIG_PATH"), "{message}");
+        assert_eq!(config.pi_agent_command, "linked");
+    }
+
+    /// C14, the case that actually bites: home-manager links the config
+    /// *directory*, not the file, so the link is a component on the way rather
+    /// than the leaf.
+    #[test]
+    fn a_symlinked_config_directory_is_resolved_and_read() {
+        let directory = unique_temp_dir();
+        let real = directory.join("dotfiles");
+        fs::create_dir(&real).expect("create target directory");
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).expect("restrict target");
+        fs::write(
+            real.join(CONFIG_FILE_NAME),
+            r#"{"pi_agent_command":"linked-directory"}"#,
+        )
+        .expect("write target");
+        let linked = directory.join("config");
+        symlink(&real, &linked).expect("link config directory");
+
+        let config = load_from_path(&linked.join(CONFIG_FILE_NAME))
+            .expect("a symlinked config directory is followed");
+
+        assert_eq!(config.pi_agent_command, "linked-directory");
+    }
+
+    /// A link pointing nowhere is indistinguishable from no config at all, and
+    /// a missing config has always meant defaults rather than a startup error.
+    #[test]
+    fn a_dangling_config_symlink_falls_back_to_defaults() {
+        let directory = unique_temp_dir();
+        let path = directory.join(CONFIG_FILE_NAME);
+        symlink(directory.join("never-created.json"), &path).expect("link config path");
+
+        let config = load_from_path(&path).expect("a dangling link is not a startup error");
+
+        assert_eq!(config.pi_agent_command, default_pi_agent_command());
     }
 
     /// E5: the shared reader's directory checks used to say "state" even when
@@ -1038,18 +1097,53 @@ mod tests {
         assert!(!message.contains("state"), "{message}");
     }
 
+    /// C14 moved the checks from the path the user typed to the path it
+    /// resolves to, so this is the planted-symlink route to a shell-evaluated
+    /// `pi_agent_command`: the link is private, but it aims at a directory
+    /// anyone can write. Following the link must not launder the target.
     #[test]
-    fn config_symlink_is_refused_and_its_target_is_not_read() {
-        // The planted-symlink route to shell-evaluated `pi_agent_command`.
+    fn a_symlink_into_a_world_writable_directory_is_refused() {
         let directory = unique_temp_dir();
-        let target = directory.join("planted.json");
+        let reachable = directory.join("reachable");
+        fs::create_dir(&reachable).expect("create target directory");
+        fs::set_permissions(&reachable, fs::Permissions::from_mode(0o777)).expect("widen target");
+        let target = reachable.join("planted.json");
         fs::write(&target, r#"{"pi_agent_command":"attacker"}"#).expect("write target");
         let path = directory.join(CONFIG_FILE_NAME);
         symlink(&target, &path).expect("link config path");
 
-        let error = load_from_path(&path).expect_err("a symlinked config must be refused");
+        let error = load_from_path(&path).expect_err("a replaceable target must be refused");
 
-        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let message = error.to_string();
+        assert!(
+            message.starts_with("config parent is writable"),
+            "{message}"
+        );
+    }
+
+    /// The path the user typed and the file whose mode has to be fixed are
+    /// different files once a link is involved; naming only one sends them to
+    /// the wrong place.
+    #[test]
+    fn a_rejected_symlinked_config_names_both_paths() {
+        let directory = unique_temp_dir();
+        let target = directory.join("dotfiles-config.json");
+        fs::write(&target, "{}").expect("write target");
+        // A second hard link is the one file property `chmod` cannot repair.
+        fs::hard_link(&target, directory.join("second-link.json")).expect("hard link target");
+        let path = directory.join(CONFIG_FILE_NAME);
+        symlink(&target, &path).expect("link config path");
+
+        let error = load_from_path(&path).expect_err("a multiply-linked config must be refused");
+
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(
+            message.contains(&target.display().to_string()),
+            "the resolved file is the one to fix: {message}"
+        );
+        assert!(message.contains("multiple hard links"), "{message}");
     }
 
     #[test]
