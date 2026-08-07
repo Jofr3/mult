@@ -26,7 +26,7 @@ symbols:
 |      │any other key              start the selected chat/terminal PTY and send the key to it│      |
 |      │                                                                                      │      |
 |      │Prompts and the command palette                                                       │      |
-|      │Enter                      Submit, or confirm a deletion                              │      |
+|      │Enter                      Submit                                                     │      |
 |      │Esc or Ctrl+c              Cancel                                                     │      |
 |      │Left/Right                 Move the cursor one character                              │      |
 |      │Home/End or Ctrl+a/Ctrl+e  Move the cursor to the start/end                           │      |

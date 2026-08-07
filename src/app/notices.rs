@@ -74,7 +74,7 @@ impl App {
         self.save_error.as_deref()
     }
 
-    pub(super) fn record_operation_failure(&mut self, message: impl Into<String>) {
+    pub fn record_operation_failure(&mut self, message: impl Into<String>) {
         self.clear_operation_error();
         self.push_notice(
             NoticeLevel::Error,

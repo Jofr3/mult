@@ -192,7 +192,7 @@ pub const BINDINGS: &[BindingEntry] = &[
     BindingEntry::global(
         Some("Ctrl+q"),
         "Delete selected item",
-        "delete the selected chat/terminal or an empty workspace",
+        "delete the selected chat/terminal or an empty workspace, immediately",
         Some(CommandAction::DeleteSelected),
         BindingAvailability::DeletableSelection,
     ),
@@ -242,11 +242,7 @@ pub const BINDINGS: &[BindingEntry] = &[
         "start the selected chat/terminal PTY and send the key to it",
         BindingScope::Global,
     ),
-    BindingEntry::reference(
-        "Enter",
-        "Submit, or confirm a deletion",
-        BindingScope::Prompt,
-    ),
+    BindingEntry::reference("Enter", "Submit", BindingScope::Prompt),
     BindingEntry::reference("Esc or Ctrl+c", "Cancel", BindingScope::Prompt),
     BindingEntry::reference(
         "Left/Right",

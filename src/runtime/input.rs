@@ -27,8 +27,8 @@ use super::keymap::{
 };
 use super::mouse::handle_mouse;
 use super::prompt::{
-    handle_command_palette_key, handle_delete_confirmation_key, handle_open_workspace_key,
-    handle_search_key, handle_terminal_command_key,
+    delete_selected, handle_command_palette_key, handle_open_workspace_key, handle_search_key,
+    handle_terminal_command_key,
 };
 use super::session::{start_or_focus_selected_terminal, start_terminal};
 
@@ -77,7 +77,6 @@ pub(super) fn handle_key(
             handle_command_palette_key(app, pty_runtime, config, store, key, layout);
         }
         Some(Prompt::Search(_)) => handle_search_key(app, key),
-        Some(Prompt::ConfirmDelete(_)) => handle_delete_confirmation_key(app, pty_runtime, key),
         None => handle_unprompted_key(app, pty_runtime, config, store, key, layout),
     }
 }
@@ -181,7 +180,7 @@ fn handle_control_key(
         return true;
     }
     if is_unshifted_control_char(key, 'q') {
-        app.begin_delete_selected();
+        delete_selected(app, pty_runtime);
         return true;
     }
     if is_unshifted_control_char(key, 'p') {
@@ -478,6 +477,8 @@ mod tests {
             initial_terminals + 1
         );
 
+        // Ctrl+q deletes the selected item there and then: no prompt is opened
+        // and nothing else has to be pressed.
         app.cancel_quit();
         handle_unprompted_key(
             &mut app,
@@ -485,42 +486,6 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
-            layout,
-        );
-        assert!(matches!(app.prompt(), Some(Prompt::ConfirmDelete(_))));
-        assert_eq!(
-            app.project.workspaces[0].terminals.len(),
-            initial_terminals + 1
-        );
-
-        handle_key(
-            &mut app,
-            &mut pty_runtime,
-            &config,
-            &store,
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            layout,
-        );
-        assert_eq!(app.prompt(), None);
-        assert_eq!(
-            app.project.workspaces[0].terminals.len(),
-            initial_terminals + 1
-        );
-
-        handle_unprompted_key(
-            &mut app,
-            &mut pty_runtime,
-            &config,
-            &store,
-            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
-            layout,
-        );
-        handle_key(
-            &mut app,
-            &mut pty_runtime,
-            &config,
-            &store,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             layout,
         );
         assert_eq!(app.prompt(), None);

@@ -9,7 +9,6 @@ pub enum Prompt {
     NewTerminalCommand(TerminalCommandPrompt),
     CommandPalette(CommandPalettePrompt),
     Search(SearchPrompt),
-    ConfirmDelete(DeleteConfirmationPrompt),
 }
 
 /// A prompt's text together with its cursor.
@@ -251,13 +250,6 @@ pub struct SearchPrompt {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeleteConfirmationPrompt {
-    pub(super) target: DeleteTarget,
-    pub description: String,
-    pub error: Option<String>,
-}
-
 impl App {
     pub fn begin_command_palette(&mut self) {
         self.set_prompt(Prompt::CommandPalette(CommandPalettePrompt {
@@ -387,7 +379,7 @@ impl App {
             Some(Prompt::NewTerminalCommand(prompt)) => Some(&prompt.input),
             Some(Prompt::CommandPalette(prompt)) => Some(&prompt.input),
             Some(Prompt::Search(prompt)) => Some(&prompt.input),
-            Some(Prompt::ConfirmDelete(_)) | None => None,
+            None => None,
         }
     }
 

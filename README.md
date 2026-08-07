@@ -133,7 +133,7 @@ Global controls when no prompt is open:
 | `Ctrl+f` | Open/import a workspace |
 | `Ctrl+p` | Open the command palette |
 | `Ctrl+s` | Search the selected terminal pane (see the note below for chats) |
-| `Ctrl+q` | Ask to delete the selected chat/terminal, or an empty workspace |
+| `Ctrl+q` | Delete the selected chat/terminal, or an empty workspace — immediately, with no confirmation |
 | `Ctrl+n` | Dismiss the status notices |
 | `?` or `F1` | Show every key and command in an overlay |
 | `Ctrl+Esc` | Quit |
@@ -150,8 +150,8 @@ Prompt controls:
 
 | Key | Action |
 | --- | --- |
-| `Enter` | Submit or confirm a pending deletion |
-| `Esc` or `Ctrl+c` | Cancel, including a pending deletion |
+| `Enter` | Submit |
+| `Esc` or `Ctrl+c` | Cancel |
 | `Left`/`Right` | Move the cursor one character |
 | `Home`/`End` or `Ctrl+a`/`Ctrl+e` | Move the cursor to the start/end |
 | `Backspace`/`Delete` | Delete the character before/after the cursor |

@@ -318,8 +318,8 @@ mod tests {
         app.select_item(items[0]);
         assert_eq!(app.selected_item(), Some(items[0]));
 
-        assert!(app.begin_delete_selected());
-        app.confirm_delete();
+        let target = app.selected_delete_target().expect("a target is selected");
+        app.delete_target(target);
 
         // The item that shifts into the vacated slot becomes selected (the old
         // second item), matching the position-stable behavior.

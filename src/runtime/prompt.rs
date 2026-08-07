@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::layout::AppLayout;
 use crate::{
-    app::{App, CommandAction, PromptEdit},
+    app::{App, CommandAction, DeleteTarget, PromptEdit},
     config::Config,
     model::{AgentKind, PtyKey},
     pty::PtyRuntime,
@@ -19,15 +19,26 @@ use super::agent_status::mult_agent_status_path;
 use super::input::focus_selected_input;
 use super::keymap::is_unshifted_control_char;
 
-fn confirm_pending_delete(app: &mut App, pty_runtime: &mut PtyRuntime) {
-    let status_file = app.pending_delete_pty().and_then(|key| match key {
-        PtyKey::ChatAgent(chat) => Some(mult_agent_status_path(
-            app.project.session_identity(key)?,
-            app.project.active_agent_generation(chat)?,
-        )),
-        PtyKey::Terminal(_) => None,
-    });
-    let removed = confirm_pending_delete_with(app, |_, terminal| {
+/// Deletes the selected chat, terminal or empty workspace outright.
+///
+/// There is no confirmation step: `Ctrl+q` and the palette's "Delete selected"
+/// both land here and act immediately. What survives from the old confirmation
+/// prompt is the *ordering* — the PTY is stopped first, and durable state is
+/// mutated only once the daemon accepted the stop — so a refused stop leaves
+/// the item in place and reports why, instead of dropping an item that is still
+/// attached to a live pane.
+pub(super) fn delete_selected(app: &mut App, pty_runtime: &mut PtyRuntime) {
+    let status_file = app
+        .selected_delete_target()
+        .and_then(DeleteTarget::pty_key)
+        .and_then(|key| match key {
+            PtyKey::ChatAgent(chat) => Some(mult_agent_status_path(
+                app.project.session_identity(key)?,
+                app.project.active_agent_generation(chat)?,
+            )),
+            PtyKey::Terminal(_) => None,
+        });
+    let removed = delete_selected_with(app, |_, terminal| {
         pty_runtime
             .stop(terminal)
             .map(|_| ())
@@ -43,20 +54,26 @@ fn confirm_pending_delete(app: &mut App, pty_runtime: &mut PtyRuntime) {
     }
 }
 
-fn confirm_pending_delete_with(
+fn delete_selected_with(
     app: &mut App,
     mut stop: impl FnMut(&App, PtyKey) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Vec<PtyKey> {
-    if let Some(terminal) = app.pending_delete_pty() {
+    let Some(target) = app.selected_delete_target() else {
+        return Vec::new();
+    };
+
+    if let Some(terminal) = target.pty_key() {
         // The target is still present here. Durable state is mutated only after
         // the daemon accepted the stop request (or no attachment existed).
         if let Err(error) = stop(app, terminal) {
-            app.set_delete_error(format!("failed to stop PTY; item was not deleted: {error}"));
+            app.record_operation_failure(format!(
+                "failed to stop PTY; item was not deleted: {error}"
+            ));
             return Vec::new();
         }
     }
 
-    app.confirm_delete()
+    app.delete_target(target)
 }
 
 /// What a key means inside a prompt, independent of which prompt it is.
@@ -166,19 +183,6 @@ pub(super) fn handle_search_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-pub(super) fn handle_delete_confirmation_key(
-    app: &mut App,
-    pty_runtime: &mut PtyRuntime,
-    key: KeyEvent,
-) {
-    match key.code {
-        KeyCode::Esc => app.cancel_prompt(),
-        KeyCode::Enter => confirm_pending_delete(app, pty_runtime),
-        _ if is_unshifted_control_char(key, 'c') => app.cancel_prompt(),
-        _ => {}
-    }
-}
-
 fn execute_command_action(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
@@ -216,9 +220,7 @@ fn execute_command_action(
             app.begin_new_terminal_command();
         }
         CommandAction::OpenWorkspace => app.begin_open_workspace(&config.projects),
-        CommandAction::DeleteSelected => {
-            app.begin_delete_selected();
-        }
+        CommandAction::DeleteSelected => delete_selected(app, pty_runtime),
         CommandAction::SearchSelectedPane => {
             app.begin_search();
         }
@@ -237,8 +239,12 @@ mod tests {
     use ratatui::layout::Rect;
     use std::io;
 
+    /// Deleting is immediate now, but a refused stop must still cost nothing:
+    /// the item stays, durable state stays clean, and the reason is reported on
+    /// the status surface — which is where it goes now that there is no prompt
+    /// left open to carry it.
     #[test]
-    fn delete_stop_failure_keeps_the_target_and_confirmation_open() {
+    fn delete_stop_failure_keeps_the_target_and_reports_why() {
         let mut app = App::default();
         let workspace = app.project.workspaces[0].id;
         let terminal = app.project.workspaces[0].terminals[0].id;
@@ -247,9 +253,8 @@ mod tests {
             terminal,
         });
         app.mark_clean();
-        assert!(app.begin_delete_selected());
 
-        let removed = confirm_pending_delete_with(&mut app, |current, key| {
+        let removed = delete_selected_with(&mut app, |current, key| {
             assert_eq!(key, PtyKey::Terminal(terminal));
             assert!(current.project.terminal(workspace, terminal).is_some());
             Err(Box::new(io::Error::other("daemon refused stop")))
@@ -258,11 +263,11 @@ mod tests {
         assert!(removed.is_empty());
         assert!(app.project.terminal(workspace, terminal).is_some());
         assert!(!app.is_dirty());
-        assert!(matches!(
-            app.prompt(),
-            Some(Prompt::ConfirmDelete(ref prompt))
-                if prompt.error.as_deref().is_some_and(|error| error.contains("daemon refused stop"))
-        ));
+        assert_eq!(app.prompt(), None);
+        assert!(app
+            .notices()
+            .iter()
+            .any(|notice| notice.text().contains("daemon refused stop")));
     }
 
     #[test]
@@ -274,9 +279,8 @@ mod tests {
             workspace,
             terminal,
         });
-        assert!(app.begin_delete_selected());
 
-        let removed = confirm_pending_delete_with(&mut app, |current, key| {
+        let removed = delete_selected_with(&mut app, |current, key| {
             assert_eq!(key, PtyKey::Terminal(terminal));
             assert!(current.project.terminal(workspace, terminal).is_some());
             Ok(())
@@ -284,6 +288,21 @@ mod tests {
 
         assert_eq!(removed, vec![PtyKey::Terminal(terminal)]);
         assert!(app.project.terminal(workspace, terminal).is_none());
+    }
+
+    /// Nothing selected and no empty workspace: the immediate delete must find
+    /// no target and stop there, rather than reaching for a neighbour.
+    #[test]
+    fn delete_with_nothing_selected_stops_nothing_and_deletes_nothing() {
+        let mut state = crate::model::ProjectState::try_first_run().expect("first-run project");
+        state.workspaces.clear();
+        let mut app = App::new(state);
+        app.mark_clean();
+
+        let removed = delete_selected_with(&mut app, |_, _| panic!("nothing should be stopped"));
+
+        assert!(removed.is_empty());
+        assert!(!app.is_dirty());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! The prompt surface at the bottom of the frame: the text prompts, the
-//! command palette, the workspace picker and the delete confirmation.
+//! command palette and the workspace picker.
 
 use ratatui::{
     layout::Rect,
@@ -77,42 +77,7 @@ pub(super) fn draw_prompt_area(
             prompt.error.as_deref(),
             "enter applies filter • empty enter clears • esc/ctrl-c cancels",
         ),
-        Prompt::ConfirmDelete(prompt) => draw_delete_confirmation_prompt(
-            frame,
-            area,
-            palette,
-            &prompt.description,
-            prompt.error.as_deref(),
-        ),
     }
-}
-
-fn draw_delete_confirmation_prompt(
-    frame: &mut Frame,
-    area: Rect,
-    palette: Palette,
-    description: &str,
-    error: Option<&str>,
-) {
-    let mut lines = vec![Line::from(vec![
-        Span::styled("Delete ", Style::default().fg(palette.love)),
-        Span::raw(description.to_string()),
-        Span::raw("?"),
-    ])];
-    if let Some(error) = error {
-        lines.push(Line::from(Span::styled(
-            error.to_string(),
-            Style::default().fg(palette.love),
-        )));
-    }
-    lines.push(Line::from(Span::styled(
-        "enter confirms • esc/ctrl-c cancels",
-        Style::default().fg(palette.muted),
-    )));
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().fg(palette.text).bg(palette.base)),
-        area,
-    );
 }
 
 fn search_prompt_label(scope: SearchScope) -> &'static str {
@@ -306,29 +271,8 @@ fn draw_text_prompt(
 mod tests {
 
     use super::*;
-    use crate::app::NavItem;
-
-    use crate::pty::PtyRuntime;
     use crate::ui::test_support::*;
     use crate::ui::text::text_width;
-
-    #[test]
-    fn delete_confirmation_names_the_target_and_controls() {
-        let mut app = App::default();
-        let workspace = app.project.workspaces[0].id;
-        let terminal = app.project.workspaces[0].terminals[0].id;
-        app.select_item(NavItem::Terminal {
-            workspace,
-            terminal,
-        });
-        assert!(app.begin_delete_selected());
-
-        let text = draw_text(&app, &PtyRuntime::new_offline(), 100, 30);
-
-        assert!(text.contains("Delete terminal"));
-        assert!(text.contains("enter confirms"));
-        assert!(text.contains("esc/ctrl-c cancels"));
-    }
 
     #[test]
     fn a_prompt_cursor_styles_a_wide_character_without_rewriting_the_text() {

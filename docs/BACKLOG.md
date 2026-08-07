@@ -155,8 +155,12 @@ C12 (`SessionIdentity` capability gate). **Obsolete:** C5, C11 (the predictable-
 | E9 | L | `app.rs:158-175`; `main.rs:35` | No config reload; `config` moved into `runtime::run`. **Fixed (R7b):** a "Reload config" palette entry sets a flag the event loop takes, because the palette handler holds only `&Config` while the loop owns it. On success the new warnings go to the status surface and a notice states what did *not* change — `mouse_capture` is a terminal mode set once per session, and a running PTY keeps the command it started with — so an applied reload never looks like a no-op. A failed reload keeps the previous config and says so, rather than ending a session holding live PTYs over a colorscheme typo. `--config` is deliberately not re-resolved (it is `main`'s, and threading it through the loop for this is not worth it); `$MULT_CONFIG_PATH` and the default path still apply. | done |
 | E10 | L | `ui.rs` | `NO_COLOR` appears nowhere in the repo. **Fixed (R7b):** read once into a `OnceLock` (it is a process global, and G7 forbids a test mutating one), selecting `Palette::monochrome()` where every colour is `Color::Reset`. Emphasis that would have been a background colour becomes reverse video, which every terminal has, and E8's glyphs mean status still reads with no colour at all. Pinned by `snapshot_no_color_frame`, whose style legend is the assertion, plus `no_color_emits_no_color_at_all_and_keeps_overlays_distinguishable`. | done |
 
-**Fixed by `main`:** E3 (`Prompt::ConfirmDelete` — and `main` always prompts, with no empty-item
-skip, so it is strictly safer than v1's).
+**Fixed by `main`, then deliberately reverted:** E3 (`Prompt::ConfirmDelete`). The prompt is gone —
+`Ctrl+q` and the palette's "Delete selected" now delete immediately, by owner request. What E3's
+fix left behind and is *kept*: `Ctrl+q` acts only on a deletable selection, the PTY is stopped
+before durable state is mutated, and a refused stop leaves the item in place with a notice saying
+why. Do not re-add the prompt without asking; if the concern resurfaces, an undo buffer (E3's other
+option) is the open avenue.
 
 ## F. Architecture
 

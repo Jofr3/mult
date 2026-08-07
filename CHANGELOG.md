@@ -8,6 +8,26 @@ and the project aims to adhere to
 
 ## [Unreleased]
 
+### Deleting no longer asks (reverts E3)
+
+- `Ctrl+q` and the command palette's "Delete selected item" now delete the
+  selected chat, terminal or empty workspace **immediately**. The
+  `Prompt::ConfirmDelete` step — one prompt, answered with `Enter` or `Esc` —
+  is gone, along with its renderer and its key handler. This is a deliberate
+  reversal of backlog item E3, which had added the prompt because a destructive
+  key sits next to three constructive ones (`Ctrl+a`/`Ctrl+t`/`Ctrl+x`).
+  **There is no undo:** a deleted chat or terminal, and the workspace that
+  becomes empty behind it, are gone at the keystroke.
+- The safety that was *not* in the prompt is unchanged. `Ctrl+q` still acts
+  only on a deletable selection and does nothing when there is none. The PTY is
+  still stopped first and durable state is mutated only once the daemon
+  accepted the stop, so a refused stop still deletes nothing.
+- The one thing that moved is where that refusal is reported: with no prompt
+  left open to carry the text, "failed to stop PTY; item was not deleted" now
+  goes to the status surface as an ordinary operation failure.
+- The prompt help reads `Enter — Submit` rather than "Submit, or confirm a
+  deletion", in the `?`/`F1` overlay and in the README.
+
 ### Symlinked configs load again (C14)
 
 - `config.json` reached through a symlink is **read** rather than refused. C2

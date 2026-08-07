@@ -20,49 +20,26 @@ pub enum DeleteTarget {
     },
 }
 
+impl DeleteTarget {
+    /// The PTY this target owns, if any. A workspace is deletable only once it
+    /// holds no chats and no terminals, so it never owns one itself.
+    pub fn pty_key(self) -> Option<PtyKey> {
+        match self {
+            Self::Workspace(_) => None,
+            Self::Chat { chat, .. } => Some(PtyKey::ChatAgent(chat)),
+            Self::Terminal { terminal, .. } => Some(PtyKey::Terminal(terminal)),
+        }
+    }
+}
+
 impl App {
-    pub fn begin_delete_selected(&mut self) -> bool {
-        let Some(target) = self.selected_delete_target() else {
-            return false;
-        };
-        let description = self.delete_target_description(target);
-        self.set_prompt(Prompt::ConfirmDelete(DeleteConfirmationPrompt {
-            target,
-            description,
-            error: None,
-        }));
-        true
-    }
-
-    pub fn pending_delete_target(&self) -> Option<DeleteTarget> {
-        match self.prompt() {
-            Some(Prompt::ConfirmDelete(prompt)) => Some(prompt.target),
-            _ => None,
-        }
-    }
-
-    pub fn pending_delete_pty(&self) -> Option<PtyKey> {
-        match self.pending_delete_target()? {
-            DeleteTarget::Workspace(_) => None,
-            DeleteTarget::Chat { chat, .. } => Some(PtyKey::ChatAgent(chat)),
-            DeleteTarget::Terminal { terminal, .. } => Some(PtyKey::Terminal(terminal)),
-        }
-    }
-
-    pub fn set_delete_error(&mut self, message: impl Into<String>) {
-        if let Some(Prompt::ConfirmDelete(prompt)) = self.prompt_mut() {
-            prompt.error = Some(message.into());
-        }
-    }
-
-    pub fn confirm_delete(&mut self) -> Vec<PtyKey> {
-        let Some(Prompt::ConfirmDelete(prompt)) = self.take_prompt() else {
-            return Vec::new();
-        };
-        self.delete_target(prompt.target)
-    }
-
-    fn delete_target(&mut self, target: DeleteTarget) -> Vec<PtyKey> {
+    /// Removes `target` and reports the PTYs whose durable state went with it.
+    ///
+    /// Deletion is immediate — there is no confirmation step. Callers that own
+    /// a `PtyRuntime` stop the target's PTY *before* calling this, because this
+    /// mutates durable state and must not run ahead of the daemon (see
+    /// `runtime::prompt::delete_selected`).
+    pub fn delete_target(&mut self, target: DeleteTarget) -> Vec<PtyKey> {
         // Remember where the selection sat so that, if the selected item is the
         // one being removed, the selection lands on whatever shifts into its slot.
         let previous_index = self.selected_index();
@@ -106,30 +83,7 @@ impl App {
         runtime_terminals
     }
 
-    fn delete_target_description(&self, target: DeleteTarget) -> String {
-        match target {
-            DeleteTarget::Workspace(workspace) => self
-                .project
-                .workspace(workspace)
-                .map(|workspace| format!("empty workspace `{}`", workspace.name))
-                .unwrap_or_else(|| "missing workspace".to_string()),
-            DeleteTarget::Chat { workspace, chat } => self
-                .project
-                .chat(workspace, chat)
-                .map(|chat| format!("{} chat `{}`", chat.agent.display_name(), chat.name))
-                .unwrap_or_else(|| "missing chat".to_string()),
-            DeleteTarget::Terminal {
-                workspace,
-                terminal,
-            } => self
-                .project
-                .terminal(workspace, terminal)
-                .map(|terminal| format!("terminal `{}`", terminal.name))
-                .unwrap_or_else(|| "missing terminal".to_string()),
-        }
-    }
-
-    pub(super) fn selected_delete_target(&self) -> Option<DeleteTarget> {
+    pub fn selected_delete_target(&self) -> Option<DeleteTarget> {
         match self.selected_item() {
             Some(NavItem::Chat { workspace, chat }) => Some(DeleteTarget::Chat { workspace, chat }),
             Some(NavItem::Terminal {
@@ -365,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_selected_terminal_requires_confirmation() {
+    fn deleting_the_selected_terminal_removes_it_outright() {
         let mut app = App::default();
         let workspace = app.project.workspaces[0].id;
         let terminal = app.project.workspaces[0].terminals[0].id;
@@ -374,33 +328,25 @@ mod tests {
             terminal,
         });
 
-        assert!(app.begin_delete_selected());
-        assert_eq!(app.pending_delete_pty(), Some(PtyKey::Terminal(terminal)));
-        assert!(app.project.terminal(workspace, terminal).is_some());
+        let target = app.selected_delete_target().expect("a target is selected");
+        assert_eq!(target.pty_key(), Some(PtyKey::Terminal(terminal)));
 
-        let runtime_terminals = app.confirm_delete();
+        let runtime_terminals = app.delete_target(target);
         assert_eq!(runtime_terminals, vec![PtyKey::Terminal(terminal)]);
         assert!(app.project.terminal(workspace, terminal).is_none());
         assert!(app.is_dirty());
     }
 
+    /// With nothing selected and no empty workspace to close, there is nothing
+    /// for `Ctrl+q` to delete — and, now that the key deletes immediately, that
+    /// has to be a no-op rather than a nearby item.
     #[test]
-    fn delete_confirmation_can_be_cancelled_without_mutation() {
+    fn nothing_deletable_selects_no_target() {
         let mut app = App::default();
-        let workspace = app.project.workspaces[0].id;
-        let terminal = app.project.workspaces[0].terminals[0].id;
-        app.select_item(NavItem::Terminal {
-            workspace,
-            terminal,
-        });
-        app.mark_clean();
+        app.project.workspaces.clear();
+        app.reconcile_selection(None);
 
-        assert!(app.begin_delete_selected());
-        app.cancel_prompt();
-
-        assert!(app.project.terminal(workspace, terminal).is_some());
-        assert_eq!(app.prompt(), None);
-        assert!(!app.is_dirty());
+        assert_eq!(app.selected_delete_target(), None);
     }
 
     #[test]
@@ -411,8 +357,8 @@ mod tests {
         app.select_item(NavItem::Chat { workspace, chat });
         app.chat_buffers.insert(chat, ChatBuffer::default());
         let pi_terminal = PtyKey::ChatAgent(chat);
-        assert!(app.begin_delete_selected());
-        let runtime_terminals = app.confirm_delete();
+        let target = app.selected_delete_target().expect("a target is selected");
+        let runtime_terminals = app.delete_target(target);
 
         assert_eq!(runtime_terminals, vec![pi_terminal]);
         assert!(app.project.chat(workspace, chat).is_none());
@@ -430,8 +376,8 @@ mod tests {
         let chat = app.project.workspaces[0].chats[0].id;
         app.select_item(NavItem::Chat { workspace, chat });
 
-        assert!(app.begin_delete_selected());
-        let runtime_terminals = app.confirm_delete();
+        let target = app.selected_delete_target().expect("a target is selected");
+        let runtime_terminals = app.delete_target(target);
 
         assert_eq!(runtime_terminals, vec![PtyKey::ChatAgent(chat)]);
         assert!(app.project.workspace(workspace).is_none());
@@ -447,8 +393,9 @@ mod tests {
         let workspace = app.project.workspaces[0].id;
         app.reconcile_selection(None);
 
-        assert!(app.begin_delete_selected());
-        let runtime_terminals = app.confirm_delete();
+        let target = app.selected_delete_target().expect("the empty workspace");
+        assert_eq!(target.pty_key(), None);
+        let runtime_terminals = app.delete_target(target);
 
         assert!(runtime_terminals.is_empty());
         assert!(app.project.workspace(workspace).is_none());

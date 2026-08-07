@@ -223,14 +223,6 @@ impl App {
         };
     }
 
-    fn take_prompt(&mut self) -> Option<Prompt> {
-        let focus = self.browse_focus();
-        match std::mem::replace(&mut self.mode, InteractionMode::Browsing { focus }) {
-            InteractionMode::Prompting { prompt, .. } => Some(prompt),
-            InteractionMode::Browsing { .. } => None,
-        }
-    }
-
     /// The live keyboard focus, or `None` while a prompt owns the keyboard.
     ///
     /// `SelectedPane` resolves through the selection, so a pane focus with
@@ -596,8 +588,8 @@ mod tests {
         assert!(!app.has_structural_change());
 
         // Deleting is structural too, in both directions.
-        assert!(app.begin_delete_selected());
-        assert!(!app.confirm_delete().is_empty());
+        let target = app.selected_delete_target().expect("a target is selected");
+        assert!(!app.delete_target(target).is_empty());
         assert!(app.has_structural_change());
     }
 

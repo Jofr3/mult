@@ -147,7 +147,7 @@ without failing the build.
 | `base` | `#232136` | Background of the **focused** pane, of every prompt/overlay, and of the cell under the terminal cursor. |
 | `muted` | `#6e6a86` | Secondary text: field labels (`Command: `, `Search `), hints, help text in the command palette, workspace paths, and the status dot for an idle chat, a finished-and-seen chat, and a stopped or shell terminal. |
 | `text` | `#e0def4` | Primary foreground for pane and overlay text. |
-| `love` | `#eb6f92` | Errors and destructive intent: save-failure text, the delete-confirmation prompt, invalid prompt input, and the status dot of a failed chat. |
+| `love` | `#eb6f92` | Errors and destructive intent: save-failure text, invalid prompt input, and the status dot of a failed chat. |
 | `gold` | `#f6c177` | The active search query, and the status dot of a chat waiting on you. |
 | `pine` | `#3e8fb0` | Work in progress: the status dot of a thinking chat and of a running command terminal. |
 | `foam` | `#9ccfd8` | Workspace icon and name in the sidebar, the search-scope label, and the background of the mouse text selection. |
