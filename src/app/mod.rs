@@ -70,6 +70,13 @@ pub struct App {
     /// which owns the `Config` (E9). The action itself cannot swap it: the
     /// handler only has `&Config`.
     config_reload_requested: bool,
+    /// Whether the host terminal window has the keyboard, as reported by the
+    /// focus events `terminal_guard` asks for.
+    ///
+    /// Starts `true`: a session begins because the user did something in this
+    /// window, and a host that never sends focus events must not leave every
+    /// pane believing it is permanently unfocused.
+    host_focused: bool,
 }
 
 /// Which surface the keyboard is talking to, as the renderer sees it.
@@ -188,6 +195,7 @@ impl App {
             notices: Vec::new(),
             help_visible: false,
             config_reload_requested: false,
+            host_focused: true,
         };
         app.reconcile_selection(None);
         app.sync_focus_to_selection();

@@ -3,7 +3,22 @@
 //!
 //! This is pure translation: no `App`, no `PtyRuntime`, nothing to mock.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventState, KeyModifiers};
+
+/// The input modes a PTY program has switched on, which change what bytes a
+/// key must produce.
+///
+/// Both default to off, which is the state of a freshly opened terminal and the
+/// state a shell leaves it in; a full-screen program sets one or both and is
+/// entitled to expect the encoding it asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct PtyKeyModes {
+    /// DECCKM: cursor keys arrive as SS3 (`ESC O A`) rather than CSI.
+    pub(super) application_cursor: bool,
+    /// DECKPAM: the numeric keypad sends its own SS3 sequences rather than the
+    /// digits and operators printed on the keys.
+    pub(super) application_keypad: bool,
+}
 
 pub(super) fn is_quit_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Esc) && is_control_key(key)
@@ -44,10 +59,10 @@ fn is_control_key(key: KeyEvent) -> bool {
 
 #[cfg(test)]
 pub(super) fn key_to_pty_bytes(key: KeyEvent) -> Vec<u8> {
-    key_to_pty_bytes_in_mode(key, false)
+    key_to_pty_bytes_in_mode(key, PtyKeyModes::default())
 }
 
-pub(super) fn key_to_pty_bytes_in_mode(key: KeyEvent, application_cursor: bool) -> Vec<u8> {
+pub(super) fn key_to_pty_bytes_in_mode(key: KeyEvent, modes: PtyKeyModes) -> Vec<u8> {
     // Keys that emit their own escape sequence must use xterm's CSI modifier
     // encoding (`CSI 1 ; <mod> <final>` or `CSI <n> ; <mod> ~`) when a modifier
     // is held. Prefixing such a sequence with ESC — the meta convention for
@@ -63,7 +78,7 @@ pub(super) fn key_to_pty_bytes_in_mode(key: KeyEvent, application_cursor: bool) 
         }
     }
 
-    let Some(mut bytes) = base_key_to_pty_bytes(key, application_cursor) else {
+    let Some(mut bytes) = base_key_to_pty_bytes(key, modes) else {
         return Vec::new();
     };
 
@@ -142,8 +157,17 @@ fn csi_tilde_key(code: KeyCode) -> Option<u8> {
     })
 }
 
-fn base_key_to_pty_bytes(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
+fn base_key_to_pty_bytes(key: KeyEvent, modes: PtyKeyModes) -> Option<Vec<u8>> {
+    if let Some(bytes) = application_keypad_bytes(key, modes) {
+        return Some(bytes);
+    }
+
+    let application_cursor = modes.application_cursor;
     Some(match key.code {
+        // xterm's Ctrl+Backspace is BS, distinct from the DEL that Backspace
+        // alone sends; readline and every shell bind the two separately
+        // (delete character vs. delete word).
+        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => vec![0x08],
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Esc => b"\x1b".to_vec(),
@@ -153,6 +177,9 @@ fn base_key_to_pty_bytes(key: KeyEvent, application_cursor: bool) -> Option<Vec<
         KeyCode::Down => cursor_key_bytes(application_cursor, 'B'),
         KeyCode::Home => cursor_key_bytes(application_cursor, 'H'),
         KeyCode::End => cursor_key_bytes(application_cursor, 'F'),
+        // The keypad's centre key has no glyph to fall back on, so it keeps its
+        // CSI form outside application-keypad mode.
+        KeyCode::KeypadBegin => b"\x1b[E".to_vec(),
         KeyCode::PageUp => b"\x1b[5~".to_vec(),
         KeyCode::PageDown => b"\x1b[6~".to_vec(),
         KeyCode::Tab => b"\t".to_vec(),
@@ -175,7 +202,14 @@ fn base_key_to_pty_bytes(key: KeyEvent, application_cursor: bool) -> Option<Vec<
         KeyCode::F(11) => b"\x1b[23~".to_vec(),
         KeyCode::F(12) => b"\x1b[24~".to_vec(),
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            vec![control_byte(c)?]
+            match control_byte(c) {
+                Some(byte) => vec![byte],
+                // A Ctrl combination with no control code of its own (Ctrl+1,
+                // Ctrl+9, Ctrl+;) sends the bare character in xterm. Returning
+                // `None` here instead would swallow the keypress: the user would
+                // press a key and watch nothing happen.
+                None => c.to_string().into_bytes(),
+            }
         }
         // Under the Kitty disambiguate protocol the host reports Shift combined
         // with Alt/Super as the unshifted base key plus a separate Shift bit
@@ -193,19 +227,75 @@ fn base_key_to_pty_bytes(key: KeyEvent, application_cursor: bool) -> Option<Vec<
     })
 }
 
+/// The control code xterm sends for `Ctrl+<c>`, or `None` when the combination
+/// has none.
+///
+/// The digit rows exist because the control codes below `Ctrl+A` have no letter
+/// to be built from, so terminals have always reached them through the digits
+/// and punctuation that share a key with the symbol: `Ctrl+2` and `Ctrl+@` are
+/// both NUL, `Ctrl+6` and `Ctrl+^` are both RS, and `Ctrl+/` is US. Losing them
+/// is not cosmetic — `Ctrl+_` is undo in readline and emacs, and `Ctrl+@` is
+/// set-mark.
 fn control_byte(c: char) -> Option<u8> {
     let c = c.to_ascii_lowercase();
     match c {
         'a'..='z' => Some(c as u8 - b'a' + 1),
-        '@' | ' ' => Some(0x00),
-        '[' => Some(0x1b),
-        '\\' => Some(0x1c),
-        ']' => Some(0x1d),
-        '^' => Some(0x1e),
-        '_' => Some(0x1f),
-        '?' => Some(0x7f),
+        '@' | ' ' | '2' => Some(0x00),
+        '[' | '3' => Some(0x1b),
+        '\\' | '4' => Some(0x1c),
+        ']' | '5' => Some(0x1d),
+        '^' | '6' => Some(0x1e),
+        '_' | '7' | '/' => Some(0x1f),
+        '?' | '8' => Some(0x7f),
         _ => None,
     }
+}
+
+/// The SS3 sequence a keypad key sends while the program has DECKPAM on.
+///
+/// Only unmodified presses take this path: a held modifier selects the CSI or
+/// meta encoding as it does everywhere else, and no terminal has ever had an
+/// application-keypad form for a modified key. `None` means "not a keypad key,
+/// or the program never asked", and the ordinary encoding applies — which for
+/// every key here is the glyph printed on it.
+///
+/// Recognising the keypad at all depends on the host terminal telling us it was
+/// the keypad (the kitty protocol's `KEYPAD` state, which
+/// [`crate::terminal_guard`] asks for); a terminal that does not report it
+/// simply keeps the numeric encoding, which is what it would have sent anyway.
+fn application_keypad_bytes(key: KeyEvent, modes: PtyKeyModes) -> Option<Vec<u8>> {
+    if !modes.application_keypad
+        || !key.state.contains(KeyEventState::KEYPAD)
+        || key.modifiers.intersects(
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT | KeyModifiers::SUPER,
+        )
+    {
+        return None;
+    }
+
+    let final_byte = match key.code {
+        KeyCode::Char('0') => 'p',
+        KeyCode::Char('1') => 'q',
+        KeyCode::Char('2') => 'r',
+        KeyCode::Char('3') => 's',
+        KeyCode::Char('4') => 't',
+        KeyCode::Char('5') => 'u',
+        KeyCode::Char('6') => 'v',
+        KeyCode::Char('7') => 'w',
+        KeyCode::Char('8') => 'x',
+        KeyCode::Char('9') => 'y',
+        KeyCode::Char('*') => 'j',
+        KeyCode::Char('+') => 'k',
+        KeyCode::Char(',') => 'l',
+        KeyCode::Char('-') => 'm',
+        KeyCode::Char('.') => 'n',
+        KeyCode::Char('/') => 'o',
+        KeyCode::Char('=') => 'X',
+        KeyCode::Enter => 'M',
+        KeyCode::KeypadBegin => 'E',
+        _ => return None,
+    };
+    Some(format!("\x1bO{final_byte}").into_bytes())
 }
 
 #[cfg(test)]
@@ -376,20 +466,46 @@ mod tests {
         );
     }
 
+    const APPLICATION_CURSOR: PtyKeyModes = PtyKeyModes {
+        application_cursor: true,
+        application_keypad: false,
+    };
+    const APPLICATION_KEYPAD: PtyKeyModes = PtyKeyModes {
+        application_cursor: false,
+        application_keypad: true,
+    };
+
+    /// A keypad press, as the host reports one under the kitty protocol: the
+    /// glyph printed on the key plus the `KEYPAD` state bit.
+    fn keypad(code: KeyCode) -> KeyEvent {
+        let mut key = KeyEvent::new(code, KeyModifiers::NONE);
+        key.state = KeyEventState::KEYPAD;
+        key
+    }
+
     #[test]
     fn application_cursor_mode_uses_ss3_for_unmodified_cursor_keys() {
         // DECCKM: full-screen apps (vim, less, fzf) expect SS3 (`ESC O <dir>`)
         // arrows rather than the CSI (`ESC [ <dir>`) form used by the shell.
         assert_eq!(
-            key_to_pty_bytes_in_mode(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), true),
+            key_to_pty_bytes_in_mode(
+                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                APPLICATION_CURSOR
+            ),
             b"\x1bOA".to_vec()
         );
         assert_eq!(
-            key_to_pty_bytes_in_mode(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), true),
+            key_to_pty_bytes_in_mode(
+                KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+                APPLICATION_CURSOR
+            ),
             b"\x1bOD".to_vec()
         );
         assert_eq!(
-            key_to_pty_bytes_in_mode(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), true),
+            key_to_pty_bytes_in_mode(
+                KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+                APPLICATION_CURSOR
+            ),
             b"\x1bOH".to_vec()
         );
     }
@@ -398,13 +514,157 @@ mod tests {
     fn application_cursor_mode_keeps_csi_for_modified_and_non_cursor_keys() {
         // A held modifier always selects the CSI form, even under DECCKM.
         assert_eq!(
-            key_to_pty_bytes_in_mode(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), true),
+            key_to_pty_bytes_in_mode(
+                KeyEvent::new(KeyCode::Up, KeyModifiers::ALT),
+                APPLICATION_CURSOR
+            ),
             b"\x1b[1;3A".to_vec()
         );
         // Paging keys are not cursor keys, so DECCKM leaves them untouched.
         assert_eq!(
-            key_to_pty_bytes_in_mode(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), true),
+            key_to_pty_bytes_in_mode(
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                APPLICATION_CURSOR
+            ),
             b"\x1b[6~".to_vec()
+        );
+    }
+
+    #[test]
+    fn application_keypad_mode_sends_ss3_for_the_keypad_only() {
+        // DECKPAM: the keypad stops sending its glyphs and sends its own SS3
+        // sequences, which is how a program tells `Enter` from `KP_Enter` and
+        // `5` from `KP_5`.
+        for (code, expected) in [
+            (KeyCode::Char('0'), "\x1bOp"),
+            (KeyCode::Char('5'), "\x1bOu"),
+            (KeyCode::Char('9'), "\x1bOy"),
+            (KeyCode::Char('.'), "\x1bOn"),
+            (KeyCode::Char('+'), "\x1bOk"),
+            (KeyCode::Char('-'), "\x1bOm"),
+            (KeyCode::Char('*'), "\x1bOj"),
+            (KeyCode::Char('/'), "\x1bOo"),
+            (KeyCode::Enter, "\x1bOM"),
+            (KeyCode::KeypadBegin, "\x1bOE"),
+        ] {
+            assert_eq!(
+                key_to_pty_bytes_in_mode(keypad(code), APPLICATION_KEYPAD),
+                expected.as_bytes(),
+                "keypad {code:?} under DECKPAM",
+            );
+        }
+
+        // The same keys on the main keyboard are untouched: they carry no
+        // `KEYPAD` state, so nothing distinguishes them from ordinary typing.
+        assert_eq!(
+            key_to_pty_bytes_in_mode(
+                KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE),
+                APPLICATION_KEYPAD
+            ),
+            b"5".to_vec()
+        );
+        assert_eq!(
+            key_to_pty_bytes_in_mode(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                APPLICATION_KEYPAD
+            ),
+            b"\r".to_vec()
+        );
+    }
+
+    #[test]
+    fn the_keypad_sends_its_glyphs_when_the_program_did_not_ask() {
+        // Without DECKPAM the keypad is just keys: a program that never asked
+        // must not be handed sequences it will render as garbage.
+        assert_eq!(
+            key_to_pty_bytes_in_mode(keypad(KeyCode::Char('5')), PtyKeyModes::default()),
+            b"5".to_vec()
+        );
+        assert_eq!(
+            key_to_pty_bytes_in_mode(keypad(KeyCode::Enter), PtyKeyModes::default()),
+            b"\r".to_vec()
+        );
+        // A modifier selects the ordinary encoding even under DECKPAM — no
+        // terminal has an application-keypad form for a modified key.
+        let mut ctrl_keypad = keypad(KeyCode::Char('5'));
+        ctrl_keypad.modifiers = KeyModifiers::CONTROL;
+        assert_eq!(
+            key_to_pty_bytes_in_mode(ctrl_keypad, APPLICATION_KEYPAD),
+            vec![0x1d]
+        );
+    }
+
+    #[test]
+    fn control_digits_and_punctuation_reach_their_control_codes() {
+        // The control codes below Ctrl+A have no letter to be built from, so
+        // terminals reach them through the digits and punctuation sharing a key
+        // with the symbol. `Ctrl+_` is undo in readline; losing it is not
+        // cosmetic.
+        for (ch, expected) in [
+            ('2', 0x00),
+            ('@', 0x00),
+            (' ', 0x00),
+            ('3', 0x1b),
+            ('[', 0x1b),
+            ('4', 0x1c),
+            ('5', 0x1d),
+            ('6', 0x1e),
+            ('^', 0x1e),
+            ('7', 0x1f),
+            ('_', 0x1f),
+            ('/', 0x1f),
+            ('8', 0x7f),
+            ('?', 0x7f),
+        ] {
+            assert_eq!(
+                key_to_pty_bytes(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)),
+                vec![expected],
+                "Ctrl+{ch}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_control_combination_without_a_control_code_still_sends_its_character() {
+        // xterm sends the bare character for Ctrl+1 or Ctrl+9. Sending nothing
+        // — which is what a missing table entry used to mean — is a keypress
+        // the user watches vanish.
+        assert_eq!(
+            key_to_pty_bytes(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL)),
+            b"1".to_vec()
+        );
+        assert_eq!(
+            key_to_pty_bytes(KeyEvent::new(KeyCode::Char('9'), KeyModifiers::CONTROL)),
+            b"9".to_vec()
+        );
+        // The one deliberate exception stays: Ctrl+Shift+C is `mult`'s copy
+        // shortcut and must never reach the PTY as anything.
+        assert!(key_to_pty_bytes(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .is_empty());
+    }
+
+    #[test]
+    fn ctrl_backspace_is_distinct_from_backspace() {
+        // Backspace is DEL and Ctrl+Backspace is BS; readline binds them to
+        // delete-char and delete-word, so collapsing them loses word deletion.
+        assert_eq!(
+            key_to_pty_bytes(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            vec![0x7f]
+        );
+        assert_eq!(
+            key_to_pty_bytes(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)),
+            vec![0x08]
+        );
+        // Alt still prefixes whichever of the two it is applied to.
+        assert_eq!(
+            key_to_pty_bytes(KeyEvent::new(
+                KeyCode::Backspace,
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            vec![0x1b, 0x08]
         );
     }
 }

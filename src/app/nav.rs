@@ -46,6 +46,30 @@ impl App {
         }
     }
 
+    /// The pane that currently holds the keyboard, for the purposes of the
+    /// focus reports a program can ask for (DECSET 1004).
+    ///
+    /// This is narrower than [`Self::pty_input_target`] on purpose. A pane is
+    /// focused only when the host window is focused *and* nothing modal is in
+    /// front of it: while the command palette or the help overlay is up, every
+    /// key belongs to that surface, so telling a program it still has the
+    /// keyboard would be a lie it acts on — an editor keeps its cursor
+    /// blinking, an agent keeps polling for input that cannot arrive.
+    pub fn focused_pty(&self) -> Option<PtyKey> {
+        if !self.host_focused || self.is_prompt_active() || self.is_help_visible() {
+            return None;
+        }
+        self.pty_input_target()
+    }
+
+    /// Record whether the host terminal window has focus, returning whether
+    /// that changed.
+    pub fn set_host_focused(&mut self, focused: bool) -> bool {
+        let changed = self.host_focused != focused;
+        self.host_focused = focused;
+        changed
+    }
+
     /// The single source of truth for the sidebar: a blank row between
     /// workspaces, then each workspace's header, its chats and its terminals.
     ///
@@ -272,6 +296,41 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pane_is_focused_only_when_this_window_is_and_nothing_is_in_front_of_it() {
+        let mut app = App::default();
+        let selected = app.pty_input_target().expect("seed state selects a pane");
+        assert_eq!(app.focused_pty(), Some(selected));
+
+        // A modal surface owns the keyboard, so the pane behind it does not
+        // have it — telling its program otherwise is a claim it acts on.
+        app.begin_command_palette();
+        assert_eq!(app.focused_pty(), None);
+        app.cancel_prompt();
+        assert_eq!(app.focused_pty(), Some(selected));
+
+        app.show_help();
+        assert_eq!(app.focused_pty(), None);
+        app.hide_help();
+        assert_eq!(app.focused_pty(), Some(selected));
+
+        // ...and neither does it when the window itself has lost focus.
+        assert!(app.set_host_focused(false));
+        assert_eq!(app.focused_pty(), None);
+        assert!(
+            !app.set_host_focused(false),
+            "an unchanged state is not news"
+        );
+        assert!(app.set_host_focused(true));
+        assert_eq!(app.focused_pty(), Some(selected));
+
+        // Selecting another pane moves the focus with it.
+        app.select_next();
+        let moved = app.pty_input_target().expect("another pane is selectable");
+        assert_ne!(moved, selected);
+        assert_eq!(app.focused_pty(), Some(moved));
+    }
 
     #[test]
     fn workspaces_are_not_selectable_nav_items() {

@@ -51,6 +51,74 @@ pub struct PtyDimensions {
     pub cols: u16,
 }
 
+/// A pointer button, as a program that enabled mouse reporting understands it.
+///
+/// The wheel is a set of buttons in every xterm mouse protocol, not a separate
+/// event kind, which is why the notches live here alongside the physical
+/// buttons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtyMouseButton {
+    Left,
+    Middle,
+    Right,
+    WheelUp,
+    WheelDown,
+    WheelLeft,
+    WheelRight,
+}
+
+impl PtyMouseButton {
+    /// The button field of the xterm report, before motion and modifier bits.
+    fn code(self) -> u8 {
+        match self {
+            Self::Left => MOUSE_BUTTON_LEFT,
+            Self::Middle => MOUSE_BUTTON_MIDDLE,
+            Self::Right => MOUSE_BUTTON_RIGHT,
+            Self::WheelUp => WHEEL_UP_BUTTON,
+            Self::WheelDown => WHEEL_DOWN_BUTTON,
+            Self::WheelLeft => WHEEL_LEFT_BUTTON,
+            Self::WheelRight => WHEEL_RIGHT_BUTTON,
+        }
+    }
+
+    /// A wheel notch is reported as a press and never as a release or a drag —
+    /// there is no such thing as letting go of the wheel.
+    fn is_wheel(self) -> bool {
+        matches!(
+            self,
+            Self::WheelUp | Self::WheelDown | Self::WheelLeft | Self::WheelRight
+        )
+    }
+}
+
+/// What the pointer did, in the vocabulary the mouse protocols distinguish.
+///
+/// `Drag` is motion with a button held (DECSET 1002) and `Move` is motion with
+/// none (DECSET 1003); the two are separate because a program can ask for the
+/// first without the second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtyMouseAction {
+    Press(PtyMouseButton),
+    Release(PtyMouseButton),
+    Drag(PtyMouseButton),
+    Move,
+}
+
+/// One mouse event addressed to the program running in a pane.
+///
+/// `col`/`row` are 1-based and screen-relative — the coordinate space of the
+/// pane's own emulator, not of the host terminal — so the caller is responsible
+/// for hit-testing the pane before building one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtyMouseReport {
+    pub action: PtyMouseAction,
+    pub col: u16,
+    pub row: u16,
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+}
+
 /// Notifications drained by the render loop. `Scrollback` and `Output` report
 /// only *how much* arrived: the bytes themselves are already committed to the
 /// terminal's parser by the time the event is queued, so carrying a copy of
@@ -324,6 +392,11 @@ pub struct PtyRuntime {
     // Set when the last `drain_events` stopped short of an empty queue, or left
     // re-attachments queued, so the render loop knows to come back for the rest.
     work_remaining: bool,
+    // The pane this runtime last told it had the keyboard, so the transition —
+    // not the state — is what generates a focus report. Held here rather than in
+    // `App` because it is a record of what was *sent*, and only this type sends
+    // it; a second copy of that answer could disagree with the wire.
+    focused_pane: Option<PtyKey>,
 }
 
 const SERVER_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -370,10 +443,33 @@ const MAX_TERMINAL_QUERY_RESPONSE_BYTES: usize = 256;
 const MAX_HOST_TERMINAL_WRITE_BYTES: usize = 1024 * 1024;
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
-/// xterm button bytes reported for the scroll wheel (bit 6 set marks a wheel
-/// event; the low bit distinguishes up from down).
+/// Ceiling on the characters kept from a program-supplied window title. Far
+/// past any sidebar width, so it costs nothing legitimate; see
+/// [`sanitize_pane_title`].
+const MAX_PANE_TITLE_CHARS: usize = 128;
+/// DECSET parameter for focus reporting: the program asks to be told when the
+/// terminal window gains (`CSI I`) or loses (`CSI O`) focus.
+const FOCUS_REPORTING_MODE: usize = 1004;
+const FOCUS_IN_REPORT: &[u8] = b"\x1b[I";
+const FOCUS_OUT_REPORT: &[u8] = b"\x1b[O";
+/// xterm mouse button bits. The low two bits number the button, bit 5 marks a
+/// motion event, and bit 6 marks a wheel notch; the modifier bits are added on
+/// top by [`MouseReport::modifier_bits`].
+const MOUSE_BUTTON_LEFT: u8 = 0;
+const MOUSE_BUTTON_MIDDLE: u8 = 1;
+const MOUSE_BUTTON_RIGHT: u8 = 2;
+/// "No button": what a bare motion event reports, and what the legacy
+/// encodings report on *any* release, since they cannot say which button was
+/// let go.
+const MOUSE_BUTTON_NONE: u8 = 3;
+const MOUSE_MOTION_BIT: u8 = 32;
 const WHEEL_UP_BUTTON: u8 = 64;
 const WHEEL_DOWN_BUTTON: u8 = 65;
+const WHEEL_LEFT_BUTTON: u8 = 66;
+const WHEEL_RIGHT_BUTTON: u8 = 67;
+const MOUSE_SHIFT_BIT: u8 = 4;
+const MOUSE_ALT_BIT: u8 = 8;
+const MOUSE_CTRL_BIT: u8 = 16;
 
 struct ServerConnection {
     writer: Arc<Mutex<UnixStream>>,
@@ -438,9 +534,28 @@ struct EstablishedConnection {
     hello: ServerHello,
 }
 
+/// Who produced the bytes being written to a pane.
+///
+/// The distinction is not cosmetic. Typing ends a scrollback view and feeds the
+/// command tracker; a mouse report, a focus notification or an answer to the
+/// program's own `CSI 6n` does neither, because the user did not type it. A
+/// program polling the cursor position used to yank the reader back to the
+/// bottom of the scrollback for exactly that reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputOrigin {
+    /// The user typed or pasted it at the pane.
+    User,
+    /// The client generated it on the program's behalf.
+    Synthetic,
+}
+
 #[derive(Debug)]
 struct TerminalResponseDetector {
     state: TerminalResponseState,
+    /// Whether the program has enabled focus reporting (DECSET 1004). Tracked
+    /// here because `vt100` does not model the mode, and this detector is
+    /// already scanning every escape sequence the program emits.
+    focus_reporting: bool,
     /// Parameter and intermediate bytes of the CSI sequence being scanned.
     ///
     /// Held here rather than inside [`TerminalResponseState::Csi`] so entering
@@ -456,6 +571,7 @@ impl Default for TerminalResponseDetector {
     fn default() -> Self {
         Self {
             state: TerminalResponseState::default(),
+            focus_reporting: false,
             csi: [0; TERMINAL_MAX_CSI_SEQUENCE_BYTES],
             csi_len: 0,
         }
@@ -572,6 +688,7 @@ impl PtyRuntime {
             retry_backoff: RECONNECT_BACKOFF_MIN,
             disconnect_reported: false,
             work_remaining: false,
+            focused_pane: None,
         }
     }
 }
@@ -746,6 +863,37 @@ impl PtyRuntime {
             .and_then(TerminalCommandTracker::last_command)
     }
 
+    /// The window title the program in `terminal` set for itself (OSC 0/2),
+    /// ready to be shown as a label — or `None` when it never set one, or set
+    /// one that is blank.
+    ///
+    /// This is the program's own statement of what it is doing, and it is the
+    /// only such statement `mult` has: everything else about a pane is either
+    /// what the user launched it as or what
+    /// [`Self::terminal_last_command`] guessed by watching the keystrokes go
+    /// past. A shell writes its `cwd` here on every prompt, an editor writes
+    /// the file it is on, and Claude Code writes what it is working on.
+    ///
+    /// The string is program-supplied, so it is sanitized on the way out; see
+    /// [`sanitize_pane_title`].
+    pub fn terminal_title(&self, terminal: PtyKey) -> Option<String> {
+        let title = sanitize_pane_title(self.parser(terminal)?.screen().title());
+        (!title.is_empty()).then_some(title)
+    }
+
+    /// Seed the command tracker without an attached pane.
+    ///
+    /// Production reaches it only through [`Self::send_input`], which needs a
+    /// daemon; a caller that just wants to know what the tracker *would* say —
+    /// the sidebar's label precedence, say — should not have to stand one up.
+    #[cfg(test)]
+    pub fn record_command_for_test(&mut self, terminal: PtyKey, input: &[u8]) {
+        self.pane_entry(terminal)
+            .command_tracker
+            .get_or_insert_with(Default::default)
+            .record_input(input);
+    }
+
     #[cfg(test)]
     pub fn mark_running_for_test(&mut self, terminal: PtyKey) {
         self.bind_pane(terminal, pane_for_key(terminal));
@@ -830,7 +978,7 @@ impl PtyRuntime {
         // render thread, where every `Input` message is a blocking socket
         // write.
         if let Some(pane) = self.attached_pane(terminal) {
-            let _ = self.send_input_inner(terminal, pane, &response, false);
+            let _ = self.send_input_inner(terminal, pane, &response, InputOrigin::Synthetic);
         }
     }
 
@@ -1104,7 +1252,7 @@ impl PtyRuntime {
         let Some(pane) = self.attached_pane(terminal) else {
             return Ok(false);
         };
-        self.send_input_inner(terminal, pane, input, true)?;
+        self.send_input_inner(terminal, pane, input, InputOrigin::User)?;
         Ok(true)
     }
 
@@ -1113,16 +1261,16 @@ impl PtyRuntime {
         terminal: PtyKey,
         pane: PaneId,
         input: &[u8],
-        track_command: bool,
+        origin: InputOrigin,
     ) -> PtyResult<()> {
-        if !input.is_empty() {
+        if !input.is_empty() && origin == InputOrigin::User {
             let alternate_screen = self
                 .parser(terminal)
                 .is_some_and(|parser| parser.screen().alternate_screen());
             if let Some(parser) = self.parser_mut(terminal) {
                 parser.set_scrollback(0);
             }
-            if track_command && !alternate_screen && self.terminal_accepts_shell_input(terminal) {
+            if !alternate_screen && self.terminal_accepts_shell_input(terminal) {
                 self.pane_entry(terminal)
                     .command_tracker
                     .get_or_insert_with(Default::default)
@@ -1188,37 +1336,100 @@ impl PtyRuntime {
     }
 
     /// Whether the program in `terminal` has switched on xterm mouse
-    /// reporting. When it has, the wheel belongs to the program (it scrolls its
-    /// own view) rather than to our local scrollback — which for an
-    /// alternate-screen app like Claude Code holds nothing to scroll anyway.
+    /// reporting. When it has, the pointer belongs to the program rather than
+    /// to our own selection and scrollback — which for an alternate-screen app
+    /// like Claude Code holds nothing to scroll anyway.
     pub fn terminal_reports_mouse(&self, terminal: PtyKey) -> bool {
         self.parser(terminal)
             .is_some_and(|parser| parser.screen().mouse_protocol_mode() != MouseProtocolMode::None)
     }
 
-    /// Forward one scroll-wheel notch to a mouse-reporting program, encoded in
-    /// the protocol it requested. `col`/`row` are 1-based, screen-relative cell
-    /// coordinates. Returns false when the terminal has no live parser/pane or
-    /// is not reporting the mouse.
-    pub fn forward_wheel(&mut self, terminal: PtyKey, up: bool, col: u16, row: u16) -> bool {
+    /// Forward one mouse event to a mouse-reporting program, encoded in the
+    /// protocol *and* the encoding it asked for.
+    ///
+    /// Returns false — sending nothing — when the terminal has no live
+    /// parser/pane, when it is not reporting the mouse, or when the program
+    /// asked for a narrower mode than this event belongs to: a program in
+    /// press-only X10 mode must not be told about releases, and one that never
+    /// enabled motion tracking must not be flooded with pointer movement.
+    pub fn forward_mouse(&mut self, terminal: PtyKey, report: PtyMouseReport) -> bool {
         let Some(parser) = self.parser(terminal) else {
             return false;
         };
         let screen = parser.screen();
-        if screen.mouse_protocol_mode() == MouseProtocolMode::None {
+        let Some(bytes) = mouse_report_bytes(
+            screen.mouse_protocol_mode(),
+            screen.mouse_protocol_encoding(),
+            report,
+        ) else {
             return false;
-        }
-        let encoding = screen.mouse_protocol_encoding();
-        let button = if up {
-            WHEEL_UP_BUTTON
-        } else {
-            WHEEL_DOWN_BUTTON
         };
-        let bytes = encode_mouse_event(encoding, button, col.max(1), row.max(1));
         let Some(pane) = self.attached_pane(terminal) else {
             return false;
         };
-        match self.send_input_inner(terminal, pane, &bytes, false) {
+        match self.send_input_inner(terminal, pane, &bytes, InputOrigin::Synthetic) {
+            Ok(()) => true,
+            Err(error) => {
+                self.pending_events.push(PtyEvent::Error {
+                    terminal,
+                    message: error.to_string(),
+                });
+                false
+            }
+        }
+    }
+
+    /// Whether the program in `terminal` asked to be told when it gains and
+    /// loses focus (DECSET 1004).
+    ///
+    /// `vt100` does not track this mode, so it is observed by the same detector
+    /// that recognises terminal queries — see
+    /// [`TerminalResponseDetector::observe_mode_change`].
+    pub fn terminal_reports_focus(&self, terminal: PtyKey) -> bool {
+        self.pane(terminal)
+            .and_then(|pane| pane.responder.as_ref())
+            .is_some_and(|responder| responder.focus_reporting)
+    }
+
+    /// Move the keyboard to `terminal`, telling the panes on either side of the
+    /// move about it.
+    ///
+    /// This is the only caller that decides *when* a focus report goes out, and
+    /// it does so on the transition: the render loop can hand it the same
+    /// answer every tick and nothing is written. A pane that never enabled
+    /// DECSET 1004 is silently skipped by [`Self::send_focus`], so this costs a
+    /// hash lookup per tick on an ordinary session.
+    pub fn set_focused_pane(&mut self, terminal: Option<PtyKey>) {
+        if self.focused_pane == terminal {
+            return;
+        }
+        if let Some(previous) = self.focused_pane.take() {
+            self.send_focus(previous, false);
+        }
+        self.focused_pane = terminal;
+        if let Some(terminal) = terminal {
+            self.send_focus(terminal, true);
+        }
+    }
+
+    /// Tell a focus-reporting program that it just gained or lost the keyboard.
+    ///
+    /// In a multiplexer the focused pane is the selected one, so this fires on
+    /// a selection change as well as when the host terminal window itself
+    /// gains or loses focus. Returns false when the program did not ask.
+    pub fn send_focus(&mut self, terminal: PtyKey, gained: bool) -> bool {
+        if !self.terminal_reports_focus(terminal) {
+            return false;
+        }
+        let Some(pane) = self.attached_pane(terminal) else {
+            return false;
+        };
+        let bytes = if gained {
+            FOCUS_IN_REPORT
+        } else {
+            FOCUS_OUT_REPORT
+        };
+        match self.send_input_inner(terminal, pane, bytes, InputOrigin::Synthetic) {
             Ok(()) => true,
             Err(error) => {
                 self.pending_events.push(PtyEvent::Error {
@@ -2567,19 +2778,144 @@ fn repair_wide_cells_before_narrowing(parser: &mut Parser, size: PtyDimensions) 
     parser.set_scrollback(scrollback);
 }
 
+impl PtyMouseReport {
+    /// The button this event is about, if it has one. Bare motion does not.
+    fn button(self) -> Option<PtyMouseButton> {
+        match self.action {
+            PtyMouseAction::Press(button)
+            | PtyMouseAction::Release(button)
+            | PtyMouseAction::Drag(button) => Some(button),
+            PtyMouseAction::Move => None,
+        }
+    }
+
+    /// xterm's modifier bits. X10 (`MouseProtocolMode::Press`) predates them
+    /// and carries none, so the caller passes the mode in rather than this
+    /// deciding on its own.
+    fn modifier_bits(self) -> u8 {
+        let mut bits = 0;
+        if self.shift {
+            bits |= MOUSE_SHIFT_BIT;
+        }
+        if self.alt {
+            bits |= MOUSE_ALT_BIT;
+        }
+        if self.ctrl {
+            bits |= MOUSE_CTRL_BIT;
+        }
+        bits
+    }
+
+    /// Whether a program in `mode` asked to hear about this event at all.
+    ///
+    /// A wheel notch is always a press, so it survives every mode including
+    /// press-only X10; a release does not exist in X10; and motion needs the
+    /// mode that asked for it — with a button held (1002) or without (1003).
+    fn is_wanted_in(self, mode: MouseProtocolMode) -> bool {
+        match self.action {
+            PtyMouseAction::Press(_) => mode != MouseProtocolMode::None,
+            PtyMouseAction::Release(button) => {
+                !button.is_wheel()
+                    && matches!(
+                        mode,
+                        MouseProtocolMode::PressRelease
+                            | MouseProtocolMode::ButtonMotion
+                            | MouseProtocolMode::AnyMotion
+                    )
+            }
+            PtyMouseAction::Drag(button) => {
+                !button.is_wheel()
+                    && matches!(
+                        mode,
+                        MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion
+                    )
+            }
+            PtyMouseAction::Move => mode == MouseProtocolMode::AnyMotion,
+        }
+    }
+}
+
+/// Encode one mouse event for a program that has enabled mouse reporting, or
+/// `None` when the program's mode does not want it.
+///
+/// The two families differ in more than syntax. SGR (DECSET 1006) reports the
+/// button on release and marks the release with a lowercase `m`; the legacy
+/// encodings have no room for either, so every release is the anonymous
+/// "button 3" press-shaped report and the program is left to infer which
+/// button it was. Getting that backwards leaves a program believing a button
+/// is still held.
+fn mouse_report_bytes(
+    mode: MouseProtocolMode,
+    encoding: MouseProtocolEncoding,
+    report: PtyMouseReport,
+) -> Option<Vec<u8>> {
+    if !report.is_wanted_in(mode) {
+        return None;
+    }
+
+    let motion = match report.action {
+        PtyMouseAction::Drag(_) | PtyMouseAction::Move => MOUSE_MOTION_BIT,
+        _ => 0,
+    };
+    let modifiers = if mode == MouseProtocolMode::Press {
+        0
+    } else {
+        report.modifier_bits()
+    };
+    let button = report
+        .button()
+        .map_or(MOUSE_BUTTON_NONE, |button| button.code())
+        | motion
+        | modifiers;
+    let release = matches!(report.action, PtyMouseAction::Release(_));
+    let legacy_button = if release {
+        MOUSE_BUTTON_NONE | modifiers
+    } else {
+        button
+    };
+
+    Some(encode_mouse_event(
+        encoding,
+        MouseEventCode {
+            button,
+            legacy_button,
+            release,
+        },
+        report.col.max(1),
+        report.row.max(1),
+    ))
+}
+
+/// The button field of one mouse report, in both of the forms the encodings
+/// need. See [`mouse_report_bytes`] for why they differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MouseEventCode {
+    button: u8,
+    legacy_button: u8,
+    release: bool,
+}
+
 /// Encode a single mouse event for a program that has enabled mouse
-/// reporting. `button` is the xterm button byte; `col`/`row` are 1-based,
-/// screen-relative cell coordinates.
-fn encode_mouse_event(encoding: MouseProtocolEncoding, button: u8, col: u16, row: u16) -> Vec<u8> {
+/// reporting. `col`/`row` are 1-based, screen-relative cell coordinates.
+fn encode_mouse_event(
+    encoding: MouseProtocolEncoding,
+    code: MouseEventCode,
+    col: u16,
+    row: u16,
+) -> Vec<u8> {
     match encoding {
-        // SGR (DECSET 1006): `ESC [ < b ; x ; y M`. Coordinates are unbounded
-        // here, and a wheel notch is always a press, so terminate with `M`.
-        MouseProtocolEncoding::Sgr => format!("\x1b[<{button};{col};{row}M").into_bytes(),
+        // SGR (DECSET 1006): `ESC [ < b ; x ; y M`, or `m` for a release.
+        // Coordinates are unbounded here and the button survives the release,
+        // which is why every modern program asks for this encoding.
+        MouseProtocolEncoding::Sgr => {
+            let final_char = if code.release { 'm' } else { 'M' };
+            format!("\x1b[<{};{col};{row}{final_char}", code.button).into_bytes()
+        }
         // UTF-8 (1005): `ESC [ M` then button and coordinates as `value + 32`,
         // each written as a UTF-8 code point.
         MouseProtocolEncoding::Utf8 => {
             let mut bytes = b"\x1b[M".to_vec();
-            bytes.push(button.wrapping_add(32));
+            bytes.push(code.legacy_button.wrapping_add(32));
             push_utf8_mouse_coord(&mut bytes, col);
             push_utf8_mouse_coord(&mut bytes, row);
             bytes
@@ -2588,7 +2924,7 @@ fn encode_mouse_event(encoding: MouseProtocolEncoding, button: u8, col: u16, row
         // column/row 223 cannot be represented — clamp rather than wrap.
         MouseProtocolEncoding::Default => {
             let mut bytes = b"\x1b[M".to_vec();
-            bytes.push(button.wrapping_add(32));
+            bytes.push(code.legacy_button.wrapping_add(32));
             bytes.push(default_mouse_coord(col));
             bytes.push(default_mouse_coord(row));
             bytes
@@ -2689,6 +3025,32 @@ impl TerminalResponseDetector {
         matches!(self.state, TerminalResponseState::Ground)
     }
 
+    /// Record the private modes this client implements itself, on the way past.
+    ///
+    /// Only DECSET/DECRST (`CSI ? … h` / `CSI ? … l`) is inspected, and only
+    /// for [`FOCUS_REPORTING_MODE`] — every other mode is `vt100`'s business
+    /// and is left to it. The sequence is still handed to the parser
+    /// unchanged; this is an observation, not an interception.
+    ///
+    /// Called with the sequence's final byte while the parameters are still in
+    /// [`Self::csi`], so it costs one scan of a short buffer and no allocation
+    /// unless the sequence is a private mode change.
+    fn observe_mode_change(&mut self, final_char: char) {
+        let set = match final_char {
+            'h' => true,
+            'l' => false,
+            _ => return,
+        };
+        let sequence = &self.csi[..self.csi_len];
+        if !sequence.contains(&b'?') {
+            return;
+        }
+        // `CSI ? 1004 ; 1006 h` sets both, so every parameter is checked.
+        if parse_csi_params(sequence).contains(&FOCUS_REPORTING_MODE) {
+            self.focus_reporting = set;
+        }
+    }
+
     /// Step the detector over one byte, reporting any query it completed.
     ///
     /// Deliberately free of the screen: a query's *content* may depend on it
@@ -2718,6 +3080,7 @@ impl TerminalResponseDetector {
             },
             TerminalResponseState::Csi => {
                 if (0x40..=0x7e).contains(&byte) {
+                    self.observe_mode_change(byte as char);
                     let query = csi_terminal_query(&self.csi[..self.csi_len], byte as char);
                     (TerminalResponseState::Ground, query)
                 } else if self.csi_len >= TERMINAL_MAX_CSI_SEQUENCE_BYTES {
@@ -2762,6 +3125,34 @@ fn sanitize_system_line(message: &str) -> String {
         .chars()
         .map(|ch| if ch.is_control() { '\u{fffd}' } else { ch })
         .collect()
+}
+
+/// Make a program-supplied window title safe to render as a label.
+///
+/// `vt100` stores an OSC 0/2 payload verbatim once it is valid UTF-8 — any
+/// length, any control character — so neither bound can be assumed here.
+///
+/// The treatment deliberately differs from [`sanitize_system_line`]'s. That one
+/// replaces each control with U+FFFD because its text is fed back *into an
+/// emulator*, where a smuggled escape sequence could repaint the pane, and the
+/// visible replacement is what makes the attempt show up. A title is only ever
+/// drawn as text in a widget, cell by cell, so there is no sequence to
+/// neutralize — only characters that would break the row it is drawn in. Those
+/// are dropped, which is what a terminal does to a tab title, and it does not
+/// disfigure the common legitimate case of a prompt escape leaving a stray
+/// `\r` behind.
+///
+/// [`MAX_PANE_TITLE_CHARS`] is the second bound: the label is truncated to the
+/// sidebar's width anyway, but this runs every frame, so a program that sets a
+/// megabyte title must not cost a megabyte copy each time.
+fn sanitize_pane_title(title: &str) -> String {
+    title
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(MAX_PANE_TITLE_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// An answer this client sends back to a program that queried the terminal.
@@ -3997,25 +4388,52 @@ mod tests {
         );
     }
 
+    /// A press of `button` at 12,5 with no modifier held.
+    fn press_at(button: PtyMouseButton, col: u16, row: u16) -> PtyMouseReport {
+        PtyMouseReport {
+            action: PtyMouseAction::Press(button),
+            col,
+            row,
+            shift: false,
+            alt: false,
+            ctrl: false,
+        }
+    }
+
+    fn sgr_bytes(mode: MouseProtocolMode, report: PtyMouseReport) -> Option<String> {
+        mouse_report_bytes(mode, MouseProtocolEncoding::Sgr, report)
+            .map(|bytes| String::from_utf8(bytes).expect("SGR reports are ASCII"))
+    }
+
     #[test]
     fn encode_mouse_event_covers_each_protocol_encoding() {
+        let wheel_up = MouseEventCode {
+            button: WHEEL_UP_BUTTON,
+            legacy_button: WHEEL_UP_BUTTON,
+            release: false,
+        };
+        let wheel_down = MouseEventCode {
+            button: WHEEL_DOWN_BUTTON,
+            legacy_button: WHEEL_DOWN_BUTTON,
+            release: false,
+        };
         // SGR: human-readable decimal coordinates, terminated with `M`.
         assert_eq!(
-            encode_mouse_event(MouseProtocolEncoding::Sgr, WHEEL_UP_BUTTON, 12, 5),
+            encode_mouse_event(MouseProtocolEncoding::Sgr, wheel_up, 12, 5),
             b"\x1b[<64;12;5M".to_vec()
         );
         // X10/Default: one byte per field as `value + 32`, clamped at 223.
         assert_eq!(
-            encode_mouse_event(MouseProtocolEncoding::Default, WHEEL_DOWN_BUTTON, 1, 1),
+            encode_mouse_event(MouseProtocolEncoding::Default, wheel_down, 1, 1),
             vec![0x1b, b'[', b'M', 65 + 32, 1 + 32, 1 + 32]
         );
         assert_eq!(
-            encode_mouse_event(MouseProtocolEncoding::Default, WHEEL_UP_BUTTON, 1000, 1),
+            encode_mouse_event(MouseProtocolEncoding::Default, wheel_up, 1000, 1),
             vec![0x1b, b'[', b'M', 64 + 32, 223 + 32, 1 + 32]
         );
         // UTF-8: `value + 32` written as a code point (multi-byte past 223).
         assert_eq!(
-            encode_mouse_event(MouseProtocolEncoding::Utf8, WHEEL_UP_BUTTON, 300, 1),
+            encode_mouse_event(MouseProtocolEncoding::Utf8, wheel_up, 300, 1),
             {
                 let mut expected = vec![0x1b, b'[', b'M', 64 + 32];
                 let mut buf = [0u8; 4];
@@ -4032,7 +4450,178 @@ mod tests {
     }
 
     #[test]
-    fn wheel_is_forwarded_to_a_mouse_reporting_program() {
+    fn mouse_reports_encode_every_button_motion_and_modifier() {
+        let mode = MouseProtocolMode::AnyMotion;
+        // Buttons are numbered from zero; the wheel sets bit 6.
+        assert_eq!(
+            sgr_bytes(mode, press_at(PtyMouseButton::Left, 12, 5)).as_deref(),
+            Some("\x1b[<0;12;5M")
+        );
+        assert_eq!(
+            sgr_bytes(mode, press_at(PtyMouseButton::Middle, 1, 1)).as_deref(),
+            Some("\x1b[<1;1;1M")
+        );
+        assert_eq!(
+            sgr_bytes(mode, press_at(PtyMouseButton::Right, 1, 1)).as_deref(),
+            Some("\x1b[<2;1;1M")
+        );
+        assert_eq!(
+            sgr_bytes(mode, press_at(PtyMouseButton::WheelDown, 1, 1)).as_deref(),
+            Some("\x1b[<65;1;1M")
+        );
+        // Horizontal wheel notches are buttons 66/67, not a separate protocol.
+        assert_eq!(
+            sgr_bytes(mode, press_at(PtyMouseButton::WheelLeft, 1, 1)).as_deref(),
+            Some("\x1b[<66;1;1M")
+        );
+
+        // Motion sets bit 5 on top of the button, and bare motion reports the
+        // "no button" code 3 — so a drag with the left button is 32 and a
+        // pointer move with nothing held is 35.
+        assert_eq!(
+            sgr_bytes(
+                mode,
+                PtyMouseReport {
+                    action: PtyMouseAction::Drag(PtyMouseButton::Left),
+                    ..press_at(PtyMouseButton::Left, 4, 9)
+                }
+            )
+            .as_deref(),
+            Some("\x1b[<32;4;9M")
+        );
+        assert_eq!(
+            sgr_bytes(
+                mode,
+                PtyMouseReport {
+                    action: PtyMouseAction::Move,
+                    ..press_at(PtyMouseButton::Left, 4, 9)
+                }
+            )
+            .as_deref(),
+            Some("\x1b[<35;4;9M")
+        );
+
+        // Shift 4, Alt 8, Ctrl 16, added to the button field.
+        assert_eq!(
+            sgr_bytes(
+                mode,
+                PtyMouseReport {
+                    shift: true,
+                    alt: true,
+                    ctrl: true,
+                    ..press_at(PtyMouseButton::Left, 1, 1)
+                }
+            )
+            .as_deref(),
+            Some("\x1b[<28;1;1M")
+        );
+        // ...except in X10, which predates them entirely.
+        assert_eq!(
+            sgr_bytes(
+                MouseProtocolMode::Press,
+                PtyMouseReport {
+                    ctrl: true,
+                    ..press_at(PtyMouseButton::Left, 1, 1)
+                }
+            )
+            .as_deref(),
+            Some("\x1b[<0;1;1M")
+        );
+    }
+
+    #[test]
+    fn a_release_keeps_its_button_in_sgr_and_loses_it_in_the_legacy_encodings() {
+        let release = PtyMouseReport {
+            action: PtyMouseAction::Release(PtyMouseButton::Right),
+            ..press_at(PtyMouseButton::Right, 3, 7)
+        };
+
+        // SGR says which button, and marks the release with a lowercase `m`.
+        assert_eq!(
+            sgr_bytes(MouseProtocolMode::PressRelease, release).as_deref(),
+            Some("\x1b[<2;3;7m")
+        );
+        // The legacy encodings have neither, so a release is the anonymous
+        // "button 3" report. A program told `2` here would believe the right
+        // button is still down.
+        assert_eq!(
+            mouse_report_bytes(
+                MouseProtocolMode::PressRelease,
+                MouseProtocolEncoding::Default,
+                release
+            ),
+            Some(vec![0x1b, b'[', b'M', 3 + 32, 3 + 32, 7 + 32])
+        );
+        // Modifiers still ride along on the anonymous release.
+        assert_eq!(
+            mouse_report_bytes(
+                MouseProtocolMode::PressRelease,
+                MouseProtocolEncoding::Default,
+                PtyMouseReport {
+                    ctrl: true,
+                    ..release
+                }
+            ),
+            Some(vec![0x1b, b'[', b'M', 3 + 16 + 32, 3 + 32, 7 + 32])
+        );
+    }
+
+    #[test]
+    fn each_mouse_mode_gets_only_the_events_it_asked_for() {
+        let left = PtyMouseButton::Left;
+        let press = press_at(left, 1, 1);
+        let release = PtyMouseReport {
+            action: PtyMouseAction::Release(left),
+            ..press
+        };
+        let drag = PtyMouseReport {
+            action: PtyMouseAction::Drag(left),
+            ..press
+        };
+        let moved = PtyMouseReport {
+            action: PtyMouseAction::Move,
+            ..press
+        };
+        let wheel = press_at(PtyMouseButton::WheelUp, 1, 1);
+
+        // A program that never enabled the mouse hears nothing at all.
+        for report in [press, release, drag, moved, wheel] {
+            assert_eq!(sgr_bytes(MouseProtocolMode::None, report), None);
+        }
+        // X10 (mode 9) is press-only: a release or a drag sent here is a
+        // sequence the program never asked to parse.
+        assert!(sgr_bytes(MouseProtocolMode::Press, press).is_some());
+        assert!(sgr_bytes(MouseProtocolMode::Press, wheel).is_some());
+        assert_eq!(sgr_bytes(MouseProtocolMode::Press, release), None);
+        assert_eq!(sgr_bytes(MouseProtocolMode::Press, drag), None);
+        assert_eq!(sgr_bytes(MouseProtocolMode::Press, moved), None);
+        // VT200 (1000) adds releases but not motion.
+        assert!(sgr_bytes(MouseProtocolMode::PressRelease, release).is_some());
+        assert_eq!(sgr_bytes(MouseProtocolMode::PressRelease, drag), None);
+        assert_eq!(sgr_bytes(MouseProtocolMode::PressRelease, moved), None);
+        // Button-motion (1002) adds drags but still not free movement — this is
+        // the mode most editors use, and reporting every pointer move to one
+        // would be a stream of input it does not expect.
+        assert!(sgr_bytes(MouseProtocolMode::ButtonMotion, drag).is_some());
+        assert_eq!(sgr_bytes(MouseProtocolMode::ButtonMotion, moved), None);
+        // Any-motion (1003) takes everything.
+        assert!(sgr_bytes(MouseProtocolMode::AnyMotion, moved).is_some());
+
+        // A wheel notch is a press in every mode and never has a release.
+        assert_eq!(
+            sgr_bytes(
+                MouseProtocolMode::AnyMotion,
+                PtyMouseReport {
+                    action: PtyMouseAction::Release(PtyMouseButton::WheelUp),
+                    ..wheel
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn mouse_events_are_forwarded_to_a_mouse_reporting_program() {
         let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
         let (_sender, receiver) = mpsc::channel();
         let terminal = PtyKey::Terminal(TerminalId(7));
@@ -4040,32 +4629,241 @@ mod tests {
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
         runtime.ensure_parser(terminal, PtyDimensions { rows: 24, cols: 80 });
         // Claude Code's startup: enter the alternate screen and request SGR
-        // mouse reporting. After this the program owns the wheel.
-        runtime.process_terminal_output(terminal, b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+        // mouse reporting with drag tracking. After this the program owns the
+        // pointer.
+        runtime.process_terminal_output(terminal, b"\x1b[?1049h\x1b[?1002h\x1b[?1006h");
         assert!(runtime.terminal_reports_mouse(terminal));
 
-        assert!(runtime.forward_wheel(terminal, true, 12, 5));
-
-        let message = read_client_message(&mut server_stream, "reading forwarded wheel");
+        assert!(runtime.forward_mouse(terminal, press_at(PtyMouseButton::WheelUp, 12, 5)));
         assert_eq!(
-            message,
+            read_client_message(&mut server_stream, "reading forwarded wheel"),
             ClientMessage::Input {
                 pane,
                 lease: test_lease(),
                 bytes: b"\x1b[<64;12;5M".to_vec(),
             }
         );
+
+        assert!(runtime.forward_mouse(terminal, press_at(PtyMouseButton::Left, 3, 4)));
+        assert_eq!(
+            read_client_message(&mut server_stream, "reading forwarded press"),
+            ClientMessage::Input {
+                pane,
+                lease: test_lease(),
+                bytes: b"\x1b[<0;3;4M".to_vec(),
+            }
+        );
+
+        assert!(runtime.forward_mouse(
+            terminal,
+            PtyMouseReport {
+                action: PtyMouseAction::Release(PtyMouseButton::Left),
+                ..press_at(PtyMouseButton::Left, 3, 4)
+            }
+        ));
+        assert_eq!(
+            read_client_message(&mut server_stream, "reading forwarded release"),
+            ClientMessage::Input {
+                pane,
+                lease: test_lease(),
+                bytes: b"\x1b[<0;3;4m".to_vec(),
+            }
+        );
+
+        // The program asked for 1002, not 1003, so a bare pointer move is not
+        // written at all — not even an empty message.
+        assert!(!runtime.forward_mouse(
+            terminal,
+            PtyMouseReport {
+                action: PtyMouseAction::Move,
+                ..press_at(PtyMouseButton::Left, 3, 5)
+            }
+        ));
     }
 
     #[test]
-    fn wheel_is_not_forwarded_when_the_program_ignores_the_mouse() {
+    fn mouse_events_are_not_forwarded_when_the_program_ignores_the_mouse() {
         let mut runtime = PtyRuntime::new_offline();
         let terminal = PtyKey::Terminal(TerminalId(7));
         runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
         runtime.process_terminal_output(terminal, b"one\r\ntwo\r\nthree");
 
         assert!(!runtime.terminal_reports_mouse(terminal));
-        assert!(!runtime.forward_wheel(terminal, true, 1, 1));
+        assert!(!runtime.forward_mouse(terminal, press_at(PtyMouseButton::WheelUp, 1, 1)));
+    }
+
+    #[test]
+    fn a_forwarded_mouse_event_does_not_leave_the_scrollback_view() {
+        // A synthetic write is not typing: it must not yank a reader who is
+        // scrolled back down to the bottom the way a keystroke does.
+        let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::Terminal(TerminalId(7));
+        let pane = PaneId(7);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 2, cols: 8 });
+        runtime.process_terminal_output(terminal, b"one\r\ntwo\r\nthree\r\nfour");
+        // Mouse reporting without the alternate screen: a program can grab the
+        // pointer and still have real scrollback behind it.
+        runtime.process_terminal_output(terminal, b"\x1b[?1000h\x1b[?1006h");
+        assert!(runtime.scroll_up(terminal, 2).expect("scroll up"));
+
+        assert!(runtime.forward_mouse(terminal, press_at(PtyMouseButton::Left, 1, 1)));
+        assert_eq!(runtime.parser(terminal).unwrap().screen().scrollback(), 2);
+
+        // Typing, by contrast, still returns to the bottom.
+        assert!(runtime.send_input(terminal, b"x").expect("send input"));
+        assert_eq!(runtime.parser(terminal).unwrap().screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn focus_reporting_is_tracked_and_only_sent_when_the_program_asked() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::Terminal(TerminalId(7));
+        let pane = PaneId(7);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 24, cols: 80 });
+
+        // Nothing is sent to a program that never enabled DECSET 1004.
+        assert!(!runtime.terminal_reports_focus(terminal));
+        assert!(!runtime.send_focus(terminal, true));
+
+        // `process_terminal_output` does not run the responder; only real
+        // daemon output does, which is what `feed_terminal_output` models.
+        runtime.feed_terminal_output(terminal, b"\x1b[?1004h", true);
+        assert!(runtime.terminal_reports_focus(terminal));
+
+        assert!(runtime.send_focus(terminal, false));
+        assert_eq!(
+            read_client_message(&mut server_stream, "reading focus out"),
+            ClientMessage::Input {
+                pane,
+                lease: test_lease(),
+                bytes: b"\x1b[O".to_vec(),
+            }
+        );
+        assert!(runtime.send_focus(terminal, true));
+        assert_eq!(
+            read_client_message(&mut server_stream, "reading focus in"),
+            ClientMessage::Input {
+                pane,
+                lease: test_lease(),
+                bytes: b"\x1b[I".to_vec(),
+            }
+        );
+
+        // A program that turns the mode back off stops being told.
+        runtime.feed_terminal_output(terminal, b"\x1b[?1004l", true);
+        assert!(!runtime.terminal_reports_focus(terminal));
+        assert!(!runtime.send_focus(terminal, true));
+    }
+
+    #[test]
+    fn a_pane_title_is_read_from_osc_and_sanitized_before_it_is_shown() {
+        let mut runtime = PtyRuntime::new_offline();
+        let terminal = PtyKey::Terminal(TerminalId(7));
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 24, cols: 80 });
+
+        // A pane nobody has titled has no title, rather than an empty one.
+        assert_eq!(runtime.terminal_title(terminal), None);
+
+        // OSC 0 sets icon name and title together; OSC 2 sets the title alone.
+        // Both terminate with BEL or with ST.
+        runtime.process_terminal_output(terminal, b"\x1b]0;~/projects/mult\x07");
+        assert_eq!(
+            runtime.terminal_title(terminal).as_deref(),
+            Some("~/projects/mult")
+        );
+        runtime.process_terminal_output(terminal, b"\x1b]2;nvim: pty.rs\x1b\\");
+        assert_eq!(
+            runtime.terminal_title(terminal).as_deref(),
+            Some("nvim: pty.rs")
+        );
+
+        // A title blanked by the program reads as absent, so a label falls back
+        // instead of rendering nothing.
+        runtime.process_terminal_output(terminal, b"\x1b]2;   \x07");
+        assert_eq!(runtime.terminal_title(terminal), None);
+
+        // `vt100` keeps whatever payload reaches it verbatim, so neither bound
+        // holds by itself. A newline or a tab inside a title would break the
+        // row the label is drawn in, so the controls are dropped.
+        runtime.process_terminal_output(terminal, b"\x1b]2;one\ntwo\tthree\x07");
+        assert_eq!(
+            runtime.terminal_title(terminal).as_deref(),
+            Some("onetwothree")
+        );
+        // An embedded escape sequence never gets that far: ESC begins ST, so
+        // the parser ends the OSC there and what follows is an ordinary CSI
+        // aimed at the screen. The title keeps only what preceded it.
+        runtime.process_terminal_output(terminal, b"\x1b]2;title\x1b[31mred\x07");
+        assert_eq!(runtime.terminal_title(terminal).as_deref(), Some("title"));
+
+        // ...and an unbounded title is cut to a bound, not copied whole on
+        // every frame.
+        let huge = format!("\x1b]2;{}\x07", "t".repeat(4096));
+        runtime.process_terminal_output(terminal, huge.as_bytes());
+        assert_eq!(
+            runtime
+                .terminal_title(terminal)
+                .map(|title| title.chars().count()),
+            Some(MAX_PANE_TITLE_CHARS)
+        );
+    }
+
+    #[test]
+    fn only_a_focus_change_is_reported_not_the_state_every_tick() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::Terminal(TerminalId(7));
+        let pane = PaneId(7);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 24, cols: 80 });
+        runtime.feed_terminal_output(terminal, b"\x1b[?1004h", true);
+
+        // The render loop hands the same answer over every tick; only the first
+        // is a transition.
+        runtime.set_focused_pane(Some(terminal));
+        runtime.set_focused_pane(Some(terminal));
+        runtime.set_focused_pane(Some(terminal));
+        runtime.set_focused_pane(None);
+
+        // Exactly one focus-in then one focus-out: a repeat would show up here
+        // as a second `\x1b[I` ahead of the `\x1b[O`.
+        for expected in [b"\x1b[I".to_vec(), b"\x1b[O".to_vec()] {
+            assert_eq!(
+                read_client_message(&mut server_stream, "reading focus report"),
+                ClientMessage::Input {
+                    pane,
+                    lease: test_lease(),
+                    bytes: expected,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn focus_reporting_is_recognised_beside_other_modes_and_not_confused_with_them() {
+        fn feed(detector: &mut TerminalResponseDetector, bytes: &[u8]) {
+            for byte in bytes {
+                detector.advance(*byte);
+            }
+        }
+
+        let mut detector = TerminalResponseDetector::default();
+        // A neighbouring mode number must not set it...
+        feed(&mut detector, b"\x1b[?1049h\x1b[?1000h\x1b[?10041h");
+        assert!(!detector.focus_reporting);
+        // ...nor may the non-private form, which is a different mode space.
+        feed(&mut detector, b"\x1b[1004h");
+        assert!(!detector.focus_reporting);
+        // A single DECSET setting several modes at once still counts.
+        feed(&mut detector, b"\x1b[?1004;1006h");
+        assert!(detector.focus_reporting);
+        // And the matching reset clears it, whichever position it is in.
+        feed(&mut detector, b"\x1b[?1006;1004l");
+        assert!(!detector.focus_reporting);
     }
 
     #[test]

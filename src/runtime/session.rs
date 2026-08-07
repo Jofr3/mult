@@ -6,6 +6,17 @@ use std::fs;
 use ratatui::layout::Rect;
 
 use crate::layout::AppLayout;
+
+/// Tell the panes on either side of a focus change about it (DECSET 1004).
+///
+/// Called once per tick rather than from each handler that can move the
+/// selection, because *every* path into a new selection — a key, the command
+/// palette, an auto-start, a pane exiting under the cursor — has to be covered,
+/// and a missed one leaves a program believing it still has the keyboard. The
+/// call is a no-op unless the focused pane actually changed.
+pub(super) fn sync_pane_focus(app: &App, pty_runtime: &mut PtyRuntime) {
+    pty_runtime.set_focused_pane(app.focused_pty());
+}
 use crate::{
     app::{App, NoticeLevel, NoticeSource},
     config::Config,

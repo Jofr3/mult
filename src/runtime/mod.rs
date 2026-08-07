@@ -49,6 +49,7 @@ use self::save::{save_content_if_due, save_if_dirty_with, SaveSchedule};
 use self::session::{
     auto_start_selected_terminal, drain_pty_events, register_project_session_identities,
     resize_visible_chat_agent, resize_visible_terminal, restore_persisted_sessions,
+    sync_pane_focus,
 };
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
@@ -162,6 +163,11 @@ pub fn run(
         needs_redraw |= auto_start_selected_terminal(&mut app, &mut pty_runtime, &config, layout);
         needs_redraw |=
             auto_start_selected_chat_agent(&mut app, &mut pty_runtime, &config, store, layout);
+        // After everything that can move the selection or start a pane, and
+        // before the draw: a program told it has the keyboard should have been
+        // told by the time its pane is painted as the focused one. Writes
+        // nothing unless the focused pane changed, so it is not a redraw reason.
+        sync_pane_focus(&app, &mut pty_runtime);
 
         if needs_redraw {
             // A retried draw keeps `needs_redraw` set so the frame is rebuilt on

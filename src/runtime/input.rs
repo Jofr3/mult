@@ -23,7 +23,7 @@ use super::agent_launch::{
 use super::clipboard::copy_current_text_selection;
 use super::keymap::{
     is_control_down_key, is_control_up_key, is_quit_key, is_shifted_control_char,
-    is_unshifted_control_char, key_to_pty_bytes_in_mode,
+    is_unshifted_control_char, key_to_pty_bytes_in_mode, PtyKeyModes,
 };
 use super::mouse::handle_mouse;
 use super::prompt::{
@@ -41,11 +41,26 @@ pub(super) fn handle_event(
     layout: AppLayout,
 ) {
     match event {
-        Event::Key(key) if key.kind == KeyEventKind::Press => {
+        // A repeat is a keypress: an auto-repeating arrow or character must
+        // reach the pane as many times as the host reported it. Only the
+        // *release* half of the kitty protocol's event reporting is dropped,
+        // because no PTY encoding has anything to say about it.
+        Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
             handle_key(app, pty_runtime, config, store, key, layout);
         }
         Event::Mouse(mouse) => handle_mouse(app, pty_runtime, config, mouse, layout),
         Event::Paste(text) => handle_paste(app, pty_runtime, config, store, text, layout),
+        // Focus belongs to a *pane*, not to the client: a program that enabled
+        // DECSET 1004 is asking whether it has the keyboard, and inside a
+        // multiplexer it only does when its pane is selected and this window is
+        // focused. Recorded here; the loop's `sync_pane_focus` turns the
+        // combined answer into the reports that go out.
+        Event::FocusGained => {
+            app.set_host_focused(true);
+        }
+        Event::FocusLost => {
+            app.set_host_focused(false);
+        }
         _ => {}
     }
 }
@@ -230,9 +245,11 @@ fn handle_selected_pty_input_key(
     key: KeyEvent,
     layout: AppLayout,
 ) {
-    // Emptiness does not depend on cursor-key mode, so this also avoids starting
-    // a PTY for keys that map to nothing (e.g. shortcuts handled elsewhere).
-    if key_to_pty_bytes_in_mode(key, false).is_empty() {
+    // Emptiness does not depend on the input modes — they change which bytes a
+    // key produces, never whether it produces any — so this also avoids
+    // starting a PTY for keys that map to nothing (e.g. shortcuts handled
+    // elsewhere).
+    if key_to_pty_bytes_in_mode(key, PtyKeyModes::default()).is_empty() {
         return;
     }
 
@@ -241,12 +258,16 @@ fn handle_selected_pty_input_key(
         return;
     };
 
-    // Honour the application cursor-key mode (DECCKM) the PTY program requested,
-    // so arrows reach full-screen apps in the SS3 form they expect.
-    let application_cursor = pty_runtime
+    // Honour the input modes the PTY program requested: DECCKM so arrows reach
+    // full-screen apps in the SS3 form they expect, DECKPAM so the keypad does.
+    let modes = pty_runtime
         .parser(terminal_id)
-        .is_some_and(|parser| parser.screen().application_cursor());
-    let bytes = key_to_pty_bytes_in_mode(key, application_cursor);
+        .map(|parser| PtyKeyModes {
+            application_cursor: parser.screen().application_cursor(),
+            application_keypad: parser.screen().application_keypad(),
+        })
+        .unwrap_or_default();
+    let bytes = key_to_pty_bytes_in_mode(key, modes);
 
     match pty_runtime.send_input(terminal_id, &bytes) {
         Ok(true) => {}

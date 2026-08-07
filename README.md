@@ -13,9 +13,13 @@ The current implementation is a Ratatui/Crossterm client plus a small `mult-serv
 - Auto-start for the selected terminal or selected agent chat.
 - Two agent backends per chat — `pi` (via a bundled status extension) and
   Claude Code (via generated lifecycle hooks) — chosen when the chat is created,
-  shown in the sidebar as `agent: pi` / `agent: cc`, and both reporting live
+  tagged in the sidebar as `: pi` / `: cc`, and both reporting live
   status into the sidebar dot.
-- Terminal scrollback, paste handling, mouse wheel scrolling, mouse text selection, and OSC52 clipboard copy (opt-out via `clipboard_osc52`).
+- Sidebar rows follow the pane's own window title (OSC 0/2) where the label
+  would otherwise be a guess: what an agent says it is working on, and a
+  shell's `cwd` or the file an editor is on.
+- Terminal scrollback, paste handling, mouse text selection, and OSC52 clipboard copy (opt-out via `clipboard_osc52`).
+- Full xterm mouse reporting to programs that ask for it (press/release/drag/motion, every protocol mode and encoding, modifier bits), with `Shift` reserved for `mult`'s own selection; cursor-key, keypad, bracketed-paste and focus-reporting modes honoured.
 - Configurable project shortcuts and colorscheme.
 
 ## Quick start
@@ -165,6 +169,49 @@ Mouse support:
 - Drag over terminal/chat-agent output to select visible text and copy it through OSC52.
 - `Ctrl+Shift+C` copies the active `mult` text selection when the terminal forwards that key to `mult`.
 - Both copy paths are gated by `clipboard_osc52` (default `true`). Set it to `false` and `mult` never writes an OSC 52 escape: selection still highlights and `Ctrl+Shift+C` is still consumed, but nothing reaches the clipboard.
+- **A program that has grabbed the mouse gets the pointer.** When the program
+  running in the selected pane (Claude Code, `nvim`, `less`, a TUI file
+  manager) enables mouse reporting, clicks, drags, releases, pointer movement
+  and wheel notches are forwarded to *it* — encoded in the protocol and
+  encoding it asked for, with the Shift/Alt/Ctrl bits — instead of driving
+  `mult`'s own selection and scrollback. Only what its mode asked for is sent:
+  a press-only program is never told about releases, and one that did not
+  enable motion tracking is not sent pointer movement.
+- **Hold `Shift` to take the pointer back.** As in every xterm-descended
+  terminal, `Shift` bypasses the program's grab, so `Shift`+drag selects text
+  and `Shift`+wheel scrolls `mult`'s own scrollback even inside a full-screen
+  program. A pane whose program has exited needs no `Shift`: the pointer
+  returns to `mult` on its own.
+
+Sidebar labels:
+
+- A pane's row follows the **window title its program sets** (OSC 0/2) wherever
+  the label would otherwise be derived. An agent chat reads `<title>: cc` once
+  the agent sets one — which is what tells several Claude Code chats apart,
+  since they are all created with the same name and none can be renamed — and a
+  shell terminal shows its title in place of the last command `mult` scraped
+  from your keystrokes. The `: pi` / `: cc` tag always survives; a title too
+  long for the sidebar is what gets truncated.
+- A **command terminal keeps its command**. That is what you typed to create the
+  pane, so it stays your landmark for it however the program renames its window.
+- A title is program-supplied, so control characters are stripped from it and
+  its length is capped before it is drawn.
+
+Terminal emulation notes:
+
+- Cursor-key mode (DECCKM) and keypad mode (DECKPAM) are honoured, so arrows
+  and the numeric keypad reach a full-screen program in the SS3 form it asked
+  for. Bracketed paste (DECSET 2004) is honoured on paste.
+- Focus reporting (DECSET 1004) is honoured. The pane holding the keyboard is
+  the selected one, so a program is told it lost focus when you switch panes,
+  open the command palette or the help overlay, or when the terminal window
+  `mult` itself runs in loses focus — and told it regained it on the way back.
+- `Ctrl` with a digit or punctuation key reaches its control code (`Ctrl+2` is
+  NUL, `Ctrl+/` and `Ctrl+_` are US, `Ctrl+8` is DEL), and `Ctrl+Backspace` is
+  BS rather than the DEL that plain `Backspace` sends.
+- Answers `mult` generates on a program's behalf — a mouse report, a focus
+  notification, a cursor-position report — do not count as typing: they do not
+  end a scrollback view the way a keystroke does.
 
 The command palette includes discoverable actions for focus changes, starting input, adding/deleting sessions, opening workspaces, search, clearing search, showing the keybinding overlay, dismissing notices, reloading the config, and quitting. The palette and the overlay are generated from one binding table, so neither can drift from the other.
 
@@ -285,10 +332,10 @@ src/runtime/                (lib) the TUI event loop and its wiring
   mod.rs                            the loop itself: per-tick ordering, config reload, host-terminal failure policy
   input.rs                          key and paste dispatch, global control-key shortcuts
   prompt.rs                         prompt key handlers and the command-palette actions
-  keymap.rs                         key -> PTY byte encoder and the control-key predicates
-  mouse.rs                          mouse hit-testing, text selection, scrollback
+  keymap.rs                         key -> PTY byte encoder (cursor/keypad modes) and the control-key predicates
+  mouse.rs                          mouse hit-testing, xterm mouse forwarding, text selection, scrollback
   clipboard.rs                      OSC 52 clipboard writes, base64, tmux passthrough
-  session.rs                        PTY restore/start/resize and drained PTY events
+  session.rs                        PTY restore/start/resize, pane focus reports, drained PTY events
   agent_launch.rs                   starting and focusing chat agents; the process-agent backend
   agent_command.rs                  agent command lines and the generated extension/hook files
   agent_status.rs                   the per-chat agent status journals and the daemon reconciliation

@@ -97,7 +97,13 @@ fn sidebar_items(
                         ListItem::new(Line::from(vec![
                             Span::raw("  "),
                             Span::styled(glyph, style),
-                            Span::raw(chat_sidebar_label(chat)),
+                            // The same four columns the terminal rows subtract:
+                            // two of indent plus the two-column status glyph.
+                            Span::raw(chat_sidebar_label(
+                                chat,
+                                pty_runtime,
+                                item_width.saturating_sub(4),
+                            )),
                         ]))
                     }
                     None => ListItem::new(Line::from("")),
@@ -219,8 +225,23 @@ fn workspace_sidebar_line(
 
 /// Sidebar label for a chat, tagged with the agent backing it so running
 /// agents are distinguishable at a glance, e.g. `agent: pi` or `agent: cc`.
-fn chat_sidebar_label(chat: &ChatSession) -> String {
-    format!("{}: {}", chat.name, chat.agent.label())
+///
+/// The name half is the agent's own window title (OSC 0/2) once it sets one.
+/// Nothing is overridden by that: every chat is created with the same
+/// `DEFAULT_AGENT_CHAT_TITLE` and there is no way to rename one, so before this
+/// three Claude Code chats in a workspace all read `agent: cc` and the sidebar
+/// could not tell them apart. What the agent says it is working on can.
+///
+/// The tag is preserved whatever the title costs: it is what says *which*
+/// backend the row is, it is a fixed four columns, and a title truncated to
+/// nothing still leaves the row identifiable.
+fn chat_sidebar_label(chat: &ChatSession, pty_runtime: &PtyRuntime, max_width: usize) -> String {
+    let name = pty_runtime
+        .terminal_title(PtyKey::ChatAgent(chat.id))
+        .unwrap_or_else(|| chat.name.clone());
+    let tag = format!(": {}", chat.agent.label());
+    let name = truncate_text(&name, max_width.saturating_sub(text_width(&tag)));
+    format!("{name}{tag}")
 }
 
 fn terminal_display_label(
@@ -231,12 +252,30 @@ fn terminal_display_label(
     truncate_text(&terminal_command_label(terminal, pty_runtime), max_width)
 }
 
+/// What a terminal row is called.
+///
+/// A **command** terminal keeps the command it was created with. That string is
+/// the user's own answer to "which pane is this", typed into the new-terminal
+/// prompt, and a program that renames its window every rebuild would move the
+/// landmark out from under them. The command is theirs; it is not `mult`'s to
+/// replace.
+///
+/// A **shell** terminal has no such answer, so its label was already derived
+/// and already changed under the user — [`PtyRuntime::terminal_last_command`]
+/// guesses it by watching keystrokes go past. The program's own window title is
+/// a better source for the same slot: a shell writes its `cwd` there on every
+/// prompt and an editor writes the file it is on, and neither is a guess.
 fn terminal_command_label(terminal: &TerminalSession, pty_runtime: &PtyRuntime) -> String {
+    let key = PtyKey::Terminal(terminal.id);
     match &terminal.launch {
         TerminalLaunch::Command(command) => command_label_or_default(command),
         TerminalLaunch::Shell => pty_runtime
-            .terminal_last_command(PtyKey::Terminal(terminal.id))
-            .map(command_label_or_default)
+            .terminal_title(key)
+            .or_else(|| {
+                pty_runtime
+                    .terminal_last_command(key)
+                    .map(command_label_or_default)
+            })
             .unwrap_or_else(|| "terminal".to_string()),
     }
 }
@@ -326,19 +365,49 @@ mod tests {
     use crate::model::ChatId;
     use crate::ui::test_support::*;
 
-    #[test]
-    fn chat_sidebar_label_tags_the_agent_kind() {
-        let mut chat = ChatSession {
+    fn test_chat(agent: AgentKind) -> ChatSession {
+        ChatSession {
             id: ChatId(1),
             name: "agent".to_string(),
             status: ChatStatus::Idle,
-            agent: AgentKind::Pi,
+            agent,
             messages: Vec::new(),
-        };
-        assert_eq!(chat_sidebar_label(&chat), "agent: pi");
+        }
+    }
+
+    #[test]
+    fn chat_sidebar_label_tags_the_agent_kind() {
+        let pty_runtime = PtyRuntime::new_offline();
+        let mut chat = test_chat(AgentKind::Pi);
+        assert_eq!(chat_sidebar_label(&chat, &pty_runtime, 40), "agent: pi");
 
         chat.agent = AgentKind::ClaudeCode;
-        assert_eq!(chat_sidebar_label(&chat), "agent: cc");
+        assert_eq!(chat_sidebar_label(&chat, &pty_runtime, 40), "agent: cc");
+    }
+
+    #[test]
+    fn a_chat_row_follows_the_agents_own_window_title() {
+        // Every chat is created with the same name and none can be renamed, so
+        // three Claude Code chats used to be three identical `agent: cc` rows.
+        let chat = test_chat(AgentKind::ClaudeCode);
+        let key = PtyKey::ChatAgent(chat.id);
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime.ensure_parser(key, crate::pty::PtyDimensions { rows: 24, cols: 80 });
+        pty_runtime.process_terminal_output(key, b"\x1b]0;fix the parser\x07");
+
+        assert_eq!(
+            chat_sidebar_label(&chat, &pty_runtime, 40),
+            "fix the parser: cc"
+        );
+
+        // The tag is what says which backend the row is, so it survives a
+        // title too long for the sidebar; the title is what gives way.
+        assert_eq!(chat_sidebar_label(&chat, &pty_runtime, 12), "fix the…: cc");
+
+        // A title the program blanks out returns the row to the chat's name
+        // rather than leaving a bare `: cc`.
+        pty_runtime.process_terminal_output(key, b"\x1b]0;\x07");
+        assert_eq!(chat_sidebar_label(&chat, &pty_runtime, 40), "agent: cc");
     }
 
     #[test]
@@ -379,6 +448,62 @@ mod tests {
         assert_eq!(
             terminal_display_label(&clear_terminal, &pty_runtime, 80),
             "terminal"
+        );
+    }
+
+    #[test]
+    fn a_shell_row_prefers_the_programs_window_title_over_the_scraped_command() {
+        let shell_terminal = TerminalSession {
+            id: TerminalId(100),
+            name: "shell".to_string(),
+            restore_on_launch: false,
+            launch: TerminalLaunch::Shell,
+        };
+        let key = PtyKey::Terminal(shell_terminal.id);
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime.ensure_parser(key, crate::pty::PtyDimensions { rows: 24, cols: 80 });
+
+        // Nothing to go on yet.
+        assert_eq!(
+            terminal_display_label(&shell_terminal, &pty_runtime, 80),
+            "terminal"
+        );
+
+        // The scrape is the fallback it always was...
+        pty_runtime.record_command_for_test(key, b"htop\r");
+        assert_eq!(
+            terminal_display_label(&shell_terminal, &pty_runtime, 80),
+            "htop"
+        );
+
+        // ...but the program's own statement wins, because it is not a guess.
+        // OSC 2 and OSC 0 both set the window title; ST terminates as well as
+        // BEL.
+        pty_runtime.process_terminal_output(key, b"\x1b]2;~/projects/mult\x1b\\");
+        assert_eq!(
+            terminal_display_label(&shell_terminal, &pty_runtime, 80),
+            "~/projects/mult"
+        );
+
+        // A command terminal keeps the command the user created it with: that
+        // string is their landmark for the pane, not `mult`'s to overwrite.
+        let command_terminal = TerminalSession {
+            id: TerminalId(99),
+            name: "cmd: ping".to_string(),
+            restore_on_launch: true,
+            launch: TerminalLaunch::Command("ping example.com".to_string()),
+        };
+        pty_runtime.ensure_parser(
+            PtyKey::Terminal(command_terminal.id),
+            crate::pty::PtyDimensions { rows: 24, cols: 80 },
+        );
+        pty_runtime.process_terminal_output(
+            PtyKey::Terminal(command_terminal.id),
+            b"\x1b]0;something else\x07",
+        );
+        assert_eq!(
+            terminal_display_label(&command_terminal, &pty_runtime, 80),
+            "ping example.com"
         );
     }
 

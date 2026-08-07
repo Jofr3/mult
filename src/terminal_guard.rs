@@ -2,8 +2,9 @@ use std::io;
 
 use crossterm::{
     event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
@@ -24,6 +25,7 @@ pub(crate) struct TerminalGuard<C: TerminalControl = CrosstermControl> {
     enhanced_keyboard: bool,
     mouse_capture: bool,
     bracketed_paste: bool,
+    focus_change: bool,
 }
 
 impl TerminalGuard<CrosstermControl> {
@@ -42,6 +44,7 @@ impl<C: TerminalControl> TerminalGuard<C> {
             enhanced_keyboard: false,
             mouse_capture: false,
             bracketed_paste: false,
+            focus_change: false,
         };
 
         let setup_result: io::Result<()> = (|| {
@@ -64,6 +67,12 @@ impl<C: TerminalControl> TerminalGuard<C> {
 
             guard.control.enable_bracketed_paste()?;
             guard.bracketed_paste = true;
+
+            // A pane's program can ask to be told when it gains or loses focus
+            // (DECSET 1004). It only ever has the keyboard when this window
+            // does, so the answer has to come from here.
+            guard.control.enable_focus_change()?;
+            guard.focus_change = true;
 
             guard.terminal = Some(guard.control.create_terminal()?);
             Ok(())
@@ -95,6 +104,10 @@ impl<C: TerminalControl> TerminalGuard<C> {
 
         if let Some(terminal) = self.terminal.take() {
             record_first_error(&mut first_error, self.control.release_terminal(terminal));
+        }
+        if self.focus_change {
+            self.focus_change = false;
+            record_first_error(&mut first_error, self.control.disable_focus_change());
         }
         if self.bracketed_paste {
             self.bracketed_paste = false;
@@ -143,9 +156,11 @@ pub(crate) trait TerminalControl {
     fn push_enhanced_keyboard(&mut self) -> io::Result<()>;
     fn enable_mouse_capture(&mut self) -> io::Result<()>;
     fn enable_bracketed_paste(&mut self) -> io::Result<()>;
+    fn enable_focus_change(&mut self) -> io::Result<()>;
     fn create_terminal(&mut self) -> io::Result<Self::Terminal>;
 
     fn release_terminal(&mut self, terminal: Self::Terminal) -> io::Result<()>;
+    fn disable_focus_change(&mut self) -> io::Result<()>;
     fn disable_bracketed_paste(&mut self) -> io::Result<()>;
     fn disable_mouse_capture(&mut self) -> io::Result<()>;
     fn pop_enhanced_keyboard(&mut self) -> io::Result<()>;
@@ -181,12 +196,20 @@ impl TerminalControl for CrosstermControl {
         execute!(io::stdout(), EnableBracketedPaste)
     }
 
+    fn enable_focus_change(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), EnableFocusChange)
+    }
+
     fn create_terminal(&mut self) -> io::Result<Self::Terminal> {
         Terminal::new(CrosstermBackend::new(io::stdout()))
     }
 
     fn release_terminal(&mut self, mut terminal: Self::Terminal) -> io::Result<()> {
         terminal.show_cursor()
+    }
+
+    fn disable_focus_change(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), DisableFocusChange)
     }
 
     fn disable_bracketed_paste(&mut self) -> io::Result<()> {
@@ -226,10 +249,12 @@ mod tests {
         "push_enhanced_keyboard",
         "enable_mouse_capture",
         "enable_bracketed_paste",
+        "enable_focus_change",
         "create_terminal",
     ];
     const CLEANUP_STAGES: &[&str] = &[
         "release_terminal",
+        "disable_focus_change",
         "disable_bracketed_paste",
         "disable_mouse_capture",
         "pop_enhanced_keyboard",
@@ -295,12 +320,20 @@ mod tests {
             self.setup("enable_bracketed_paste")
         }
 
+        fn enable_focus_change(&mut self) -> io::Result<()> {
+            self.setup("enable_focus_change")
+        }
+
         fn create_terminal(&mut self) -> io::Result<Self::Terminal> {
             self.setup("create_terminal")
         }
 
         fn release_terminal(&mut self, _terminal: Self::Terminal) -> io::Result<()> {
             self.cleanup("release_terminal")
+        }
+
+        fn disable_focus_change(&mut self) -> io::Result<()> {
+            self.cleanup("disable_focus_change")
         }
 
         fn disable_bracketed_paste(&mut self) -> io::Result<()> {

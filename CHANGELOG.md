@@ -8,6 +8,109 @@ and the project aims to adhere to
 
 ## [Unreleased]
 
+### Sidebar rows follow the pane's own window title (OSC 0/2)
+
+A program's window title is its own statement of what it is doing, and until
+now `mult` parsed it and threw it away. It was the only such statement
+available: everything else in the sidebar is either what the user launched a
+pane as, or what the command tracker guessed by watching keystrokes go past.
+
+- **Agent chats.** Every chat is created with the same name
+  (`DEFAULT_AGENT_CHAT_TITLE`) and nothing can rename one, so three Claude Code
+  chats in a workspace were three identical `agent: cc` rows. The row now reads
+  `<title>: cc` once the agent sets one — what it is working on, in the place
+  that could not previously tell the three apart. The `: pi` / `: cc` tag is
+  never what gives way to a long title: it is fixed-width, it is what says
+  which backend the row is, and a title truncated to nothing still leaves the
+  row identifiable.
+- **Shell terminals** prefer the title over the scraped last command, which was
+  already a derived, already-changing label — a shell writes its `cwd` there on
+  every prompt and an editor writes the file it is on, and neither is a guess.
+  The scrape remains the fallback, and `terminal` the fallback to that.
+- **Command terminals keep their command.** That string is the user's own
+  answer to "which pane is this", typed into the new-terminal prompt, and a
+  program that renames its window on every rebuild would move the landmark out
+  from under them.
+
+The title is program-supplied, so `PtyRuntime::terminal_title` sanitizes it:
+control characters are dropped (a newline or a tab inside a title would break
+the row it is drawn in) and it is cut to `MAX_PANE_TITLE_CHARS`, since `vt100`
+stores an OSC payload verbatim at any length and this runs every frame. The
+treatment deliberately differs from `sanitize_system_line`'s U+FFFD
+replacement, which exists because *that* text is fed back into an emulator
+where a smuggled sequence could repaint the pane; a title is only ever drawn as
+text in a widget. An escape sequence cannot reach a title in any case — ESC
+begins ST, so the parser ends the OSC there.
+
+### More accurate terminal emulation in panes
+
+`mult` already parsed what a program *printed* faithfully. What it sent back was
+narrower than what a real terminal sends, and a program cannot tell the
+difference between "the user did not do that" and "the multiplexer did not
+forward it". Four gaps are closed.
+
+**The whole pointer reaches a program that asked for it.** Only the scroll
+wheel was forwarded before, so a click inside Claude Code, `nvim` or a TUI file
+manager did nothing at all — worse, it started `mult`'s own text selection over
+an alternate screen the program was busy repainting, which is neither what the
+click meant nor a selection that survives the next redraw. Presses, releases,
+drags and pointer motion now go to the program too:
+
+- Every button is encoded, not just the wheel: left/middle/right, both wheel
+  axes (`ScrollLeft`/`ScrollRight` are buttons 66/67), and the "no button" code
+  a bare motion event carries.
+- The Shift (4), Alt (8) and Ctrl (16) modifier bits ride along, except under
+  X10, which predates them.
+- Releases are encoded correctly *per encoding*. SGR keeps the button number
+  and marks the release with a lowercase `m`; the legacy encodings have room
+  for neither, so a release there is the anonymous "button 3" report. Sending
+  the SGR shape to a legacy program leaves it believing the button is still
+  held.
+- The program's mode is respected rather than its mere existence: press-only
+  X10 (mode 9) is never sent a release or a drag, VT200 (1000) is never sent
+  motion, and button-motion (1002) — what most editors enable — is never sent
+  the free pointer movement that only any-motion (1003) asked for.
+- **`Shift` takes the pointer back**, as it does in every xterm-descended
+  terminal: `Shift`+drag selects text and `Shift`+wheel scrolls `mult`'s own
+  scrollback even inside a full-screen program. A pane whose program has
+  *exited* needs no `Shift` — the grab is ignored once nobody is there to
+  receive the click, so the screen it left behind is still selectable.
+
+**Focus reporting (DECSET 1004).** A program that asks to be told when it gains
+and loses focus was never told anything. `vt100` does not model the mode, so it
+is now observed by the same detector that already recognises terminal queries,
+and the client sends `CSI I` / `CSI O` on the transition. The focused pane is
+the selected one *and* nothing modal in front of it: switching panes, opening
+the command palette or the help overlay, or the host terminal window itself
+losing focus all take the keyboard away from a pane and give it back
+afterwards. `TerminalGuard` gained the matching host-terminal mode, set and
+restored with the rest.
+
+**Keyboard encoding.**
+
+- Application keypad mode (DECKPAM) is honoured, so the numeric keypad sends
+  `ESC O q`-style sequences to a program that asked for them and its printed
+  glyphs to one that did not — the companion to the cursor-key mode (DECCKM)
+  that was already handled. Keypad presses are distinguished by the kitty
+  protocol's `KEYPAD` state; a host terminal that does not report it keeps the
+  numeric encoding, which is what it would have sent anyway.
+- `Ctrl` with a digit or punctuation key reaches its control code: `Ctrl+2` is
+  NUL, `Ctrl+3`–`Ctrl+7` are ESC/FS/GS/RS/US, `Ctrl+8` is DEL, and `Ctrl+/`
+  is US. These are how terminals have always reached the control codes below
+  `Ctrl+A`, and `Ctrl+_` is undo in readline and emacs.
+- A `Ctrl` combination with no control code of its own (`Ctrl+1`, `Ctrl+9`) now
+  sends the bare character, as xterm does, instead of being silently swallowed.
+- `Ctrl+Backspace` is BS, distinct from the DEL that plain `Backspace` sends —
+  readline binds the two to delete-char and delete-word.
+- An auto-repeated key is a keypress: `KeyEventKind::Repeat` reaches the pane
+  instead of being dropped.
+
+**Synthetic writes are not typing.** Bytes `mult` generates on a program's
+behalf — a mouse report, a focus notification, the answer to the program's own
+`CSI 6n` — no longer end a scrollback view or feed the command tracker. A
+program polling the cursor position used to yank the reader back to the bottom
+of the scrollback for no reason they could see.
+
 ### Deleting no longer asks (reverts E3)
 
 - `Ctrl+q` and the command palette's "Delete selected item" now delete the
