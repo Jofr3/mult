@@ -1122,7 +1122,7 @@ impl PtyRuntime {
             agent,
             name,
             cwd: spawn.cwd.clone(),
-            env: spawn.env.clone(),
+            env: pane_environment(&spawn.env),
             launch,
             rows: spawn.size.rows,
             cols: spawn.size.cols,
@@ -3599,6 +3599,50 @@ const SERVER_ENV_ALLOW_LIST: &[&str] =
 /// Prefixes forwarded wholesale: locale categories, and `mult`'s own settings
 /// (including `MULT_SOCKET_PATH`, which is also set explicitly below).
 const SERVER_ENV_ALLOW_PREFIXES: &[&str] = &["LC_", "MULT_"];
+
+/// Handles to the user's current graphical session, forwarded per spawn.
+///
+/// Without these, nothing in a pane can reach the compositor: `wl-paste`,
+/// `wl-copy` and `xclip` all fail to connect, which silently breaks every
+/// clipboard read a pane's program attempts.
+///
+/// They deliberately do not go through [`SERVER_ENV_ALLOW_LIST`]. The daemon
+/// outlives its client, so a value captured at autospawn would still name a
+/// dead compositor socket after the next login, and every pane of every later
+/// client would inherit that corpse. Sending them with each spawn request
+/// instead means a pane always gets the session of the client that asked for
+/// it. This is only display plumbing — no credential belongs on this list, and
+/// `SSH_AUTH_SOCK` is left off deliberately.
+const PANE_SESSION_ENV: &[&str] = &[
+    "DBUS_SESSION_BUS_ADDRESS",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_RUNTIME_DIR",
+    "XDG_SESSION_TYPE",
+];
+
+/// This client's session variables, overlaid with the caller's explicit `env`.
+///
+/// Explicit wins: a caller that set `DISPLAY` for a particular pane meant it.
+fn pane_environment(explicit: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut env: BTreeMap<String, String> = PANE_SESSION_ENV
+        .iter()
+        .filter_map(|key| {
+            let value = env::var(key).ok()?;
+            // An exported-but-empty handle names nothing; forwarding it only
+            // shadows whatever the pane's own login shell would have set.
+            (!value.is_empty()).then(|| ((*key).to_string(), value))
+        })
+        .collect();
+    env.extend(
+        explicit
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    env
+}
 
 fn spawn_server(socket_path: &Path) -> io::Result<()> {
     let server = server_executable().ok_or_else(|| {
@@ -6323,6 +6367,63 @@ mod tests {
                 !server_env_is_allowed(OsStr::new(denied)),
                 "{denied} must not reach the daemon"
             );
+        }
+
+        // The session handles a pane needs are the client's to send, not the
+        // daemon's to remember; they must not leak into the allow list and go
+        // stale there.
+        for per_spawn in PANE_SESSION_ENV {
+            assert!(
+                !server_env_is_allowed(OsStr::new(per_spawn)),
+                "{per_spawn} is forwarded per spawn, not frozen onto the daemon"
+            );
+        }
+    }
+
+    #[test]
+    fn pane_environment_forwards_the_live_session_under_explicit_values() {
+        // SAFETY: `set_var`/`remove_var` are unsound only against concurrent
+        // readers of the environment; this is confined to values no other test
+        // in this binary touches.
+        unsafe {
+            env::set_var("WAYLAND_DISPLAY", "wayland-9");
+            env::set_var("XDG_RUNTIME_DIR", "/run/user/4242");
+            env::set_var("DISPLAY", "");
+        }
+
+        let explicit = BTreeMap::from([
+            ("MULT_AGENT_KIND".to_string(), "cc".to_string()),
+            (
+                "WAYLAND_DISPLAY".to_string(),
+                "wayland-explicit".to_string(),
+            ),
+        ]);
+        let env = pane_environment(&explicit);
+
+        assert_eq!(
+            env.get("XDG_RUNTIME_DIR").map(String::as_str),
+            Some("/run/user/4242"),
+            "a pane cannot reach the compositor without the runtime dir"
+        );
+        assert_eq!(
+            env.get("MULT_AGENT_KIND").map(String::as_str),
+            Some("cc"),
+            "the caller's own variables survive the overlay"
+        );
+        assert_eq!(
+            env.get("WAYLAND_DISPLAY").map(String::as_str),
+            Some("wayland-explicit"),
+            "an explicitly requested value wins over the ambient session"
+        );
+        assert!(
+            !env.contains_key("DISPLAY"),
+            "an exported-but-empty handle names nothing and must not shadow the login shell"
+        );
+
+        unsafe {
+            env::remove_var("WAYLAND_DISPLAY");
+            env::remove_var("XDG_RUNTIME_DIR");
+            env::remove_var("DISPLAY");
         }
     }
 

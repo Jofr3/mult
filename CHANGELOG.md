@@ -35,6 +35,26 @@ is never handed half a gesture, so nothing is left believing a button is still
 down. Panes that do track motion (1002/1003) are unchanged and still own the
 whole pointer.
 
+### Panes reach the user's graphical session again
+
+Nothing in a pane could talk to the compositor. `wl-paste`, `wl-copy` and
+`xclip` all failed to connect, so every clipboard read a pane's program
+attempted came back empty — pasting an image into a coding agent, most
+visibly, but the breakage was general and silent.
+
+The daemon is autospawned with a deliberately tight environment allow list,
+because it outlives the client that started it and hands its own environment to
+every pane of every client that connects later; inheriting the first shell's
+full environment would re-export that shell's secrets forever. The session
+handles (`WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, `DISPLAY`, …) were casualties of
+that list, and they cannot simply be added to it: a value captured at autospawn
+would still name a dead compositor socket after the next login.
+
+They are now sent with each spawn request instead, so a pane gets the session
+of the client that asked for it and never a stale one. Explicitly requested
+values still win over the ambient session, and the list carries display
+plumbing only — no credential, and `SSH_AUTH_SOCK` deliberately not among them.
+
 ### Sidebar rows follow the pane's own window title (OSC 0/2)
 
 A program's window title is its own statement of what it is doing, and until
