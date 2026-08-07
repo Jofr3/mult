@@ -7,7 +7,7 @@ use ratatui::layout::Rect;
 
 use crate::layout::AppLayout;
 use crate::{
-    app::{App, SelectionCell},
+    app::{App, HeldPaneClick, SelectionCell},
     config::Config,
     model::PtyKey,
     pty::{PtyMouseAction, PtyMouseButton, PtyMouseReport, PtyRuntime},
@@ -41,6 +41,9 @@ pub(super) fn handle_mouse(
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            // A press held over some pane is not what this one is: whatever it
+            // was there, it is over.
+            flush_held_pane_click(app, pty_runtime);
             begin_text_selection_at_mouse(app, layout, mouse);
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -48,6 +51,11 @@ pub(super) fn handle_mouse(
         }
         MouseEventKind::Up(MouseButton::Left) => {
             finish_text_selection_at_mouse(app, pty_runtime, config, layout, mouse);
+            // The button is up with a press still held, which means the gesture
+            // left the pane before it ever became a drag there. It was a click:
+            // deliver it now rather than leaving it to be resolved by whatever
+            // the pointer does next.
+            flush_held_pane_click(app, pty_runtime);
         }
         MouseEventKind::ScrollUp => {
             scroll_output_at_mouse(app, pty_runtime, layout, mouse, ScrollDirection::Up);
@@ -62,11 +70,23 @@ pub(super) fn handle_mouse(
 /// Hand one mouse event to the program in the pane under the pointer, if it
 /// asked for the mouse. Returns whether the event was consumed.
 ///
-/// "Consumed" is decided by the program's mode, not by ours: an event a
-/// narrower mode does not want (a release under X10, a pointer move under
-/// 1002) is dropped rather than falling through to local selection, because
-/// starting a selection over an alternate screen the program is repainting is
-/// not what the click meant either.
+/// "Consumed" is decided by the program's mode, not by ours — with one
+/// exception, which is the whole of [`HeldPaneClick`]. An event a narrower mode
+/// does not want is normally dropped rather than falling through to local
+/// selection, because starting a selection over an alternate screen the program
+/// is repainting is not what the click meant either. That reasoning holds for a
+/// program tracking motion (1002/1003): it sees the drag and is entitled to
+/// decide the pointer means nothing there. It does not hold for a program that
+/// never asked for motion at all, which is what Claude Code does — DECSET 1000
+/// is clicks and releases, no drags. Such a program cannot act on a drag under
+/// any interpretation, so dropping it left highlight-to-copy dead over its pane
+/// with no way back: the conventional Shift override is eaten by the host
+/// terminal (foot, xterm, kitty — all of them force their *own* selection on
+/// Shift and never forward the event), so the pointer had nowhere to go.
+///
+/// So under a no-motion mode the left button is routed by gesture: the press is
+/// held, a drag claims it for our selection, and a release without a drag
+/// replays press and release together as the click it turned out to be.
 fn forward_mouse_to_program(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
@@ -83,12 +103,81 @@ fn forward_mouse_to_program(
     if !pty_runtime.is_running(terminal) || !pty_runtime.terminal_reports_mouse(terminal) {
         return false;
     }
-    let Some(action) = pty_mouse_action(mouse.kind) else {
-        return true;
-    };
     let Some(cell) = mouse_cell_in_area(area, mouse.column, mouse.row) else {
         return true;
     };
+    let action = pty_mouse_action(mouse.kind);
+
+    // A press held for another pane cannot be resolved by a gesture that has
+    // moved on, and it must not be silently discarded either: whatever it was,
+    // it was a click there.
+    if app
+        .held_pane_click()
+        .is_some_and(|held| held.terminal != terminal)
+    {
+        flush_held_pane_click(app, pty_runtime);
+    }
+
+    if !pty_runtime
+        .terminal_wants_mouse_action(terminal, PtyMouseAction::Drag(PtyMouseButton::Left))
+    {
+        match action {
+            PtyMouseAction::Press(PtyMouseButton::Left) => {
+                // A leftover highlight from before the program grabbed the
+                // mouse would otherwise sit on top of a screen it is driving.
+                app.clear_text_selection();
+                app.hold_pane_click(HeldPaneClick {
+                    terminal,
+                    cell,
+                    shift: mouse.modifiers.contains(KeyModifiers::SHIFT),
+                    alt: mouse.modifiers.contains(KeyModifiers::ALT),
+                    ctrl: mouse.modifiers.contains(KeyModifiers::CONTROL),
+                });
+                return true;
+            }
+            PtyMouseAction::Drag(PtyMouseButton::Left) => {
+                // The gesture is ours. The program is told nothing — not even
+                // the press, which never left.
+                if let Some(held) = app.take_held_pane_click(terminal) {
+                    app.begin_text_selection(terminal, held.cell);
+                }
+                // Falls through to the local `Drag` arm, which extends the
+                // selection to `cell`.
+                return false;
+            }
+            PtyMouseAction::Release(PtyMouseButton::Left) => {
+                let Some(held) = app.take_held_pane_click(terminal) else {
+                    // The press became a selection on the first drag, so this
+                    // release is ours too — and the program is owed nothing,
+                    // having never been told the button went down.
+                    return false;
+                };
+                if held.cell != cell {
+                    // A drag whose intermediate motion the host never reported
+                    // is still a drag; the local `Up` arm copies it.
+                    app.begin_text_selection(terminal, held.cell);
+                    return false;
+                }
+                // Pressed and released on one cell: a click after all, and the
+                // program gets the gesture whole and in order.
+                pty_runtime.forward_mouse(
+                    terminal,
+                    held_click_report(PtyMouseAction::Press(PtyMouseButton::Left), held),
+                );
+                pty_runtime.forward_mouse(
+                    terminal,
+                    held_click_report(PtyMouseAction::Release(PtyMouseButton::Left), held),
+                );
+                return true;
+            }
+            // Anything else the program actually wants — a wheel notch, another
+            // button — must not overtake a press being held on its behalf.
+            _ if pty_runtime.terminal_wants_mouse_action(terminal, action) => {
+                flush_held_pane_click(app, pty_runtime);
+            }
+            _ => {}
+        }
+    }
 
     // A leftover highlight from before the program grabbed the mouse would
     // otherwise sit on top of a screen it is now driving.
@@ -98,22 +187,66 @@ fn forward_mouse_to_program(
 
     pty_runtime.forward_mouse(
         terminal,
-        PtyMouseReport {
+        pane_mouse_report(
             action,
-            // The wire is 1-based, and a negative row cannot occur: the pointer
-            // was hit-tested inside the visible pane.
-            col: cell.col.saturating_add(1),
-            row: u16::try_from(cell.row).unwrap_or(0).saturating_add(1),
-            shift: mouse.modifiers.contains(KeyModifiers::SHIFT),
-            alt: mouse.modifiers.contains(KeyModifiers::ALT),
-            ctrl: mouse.modifiers.contains(KeyModifiers::CONTROL),
-        },
+            cell,
+            mouse.modifiers.contains(KeyModifiers::SHIFT),
+            mouse.modifiers.contains(KeyModifiers::ALT),
+            mouse.modifiers.contains(KeyModifiers::CONTROL),
+        ),
     );
     true
 }
 
-fn pty_mouse_action(kind: MouseEventKind) -> Option<PtyMouseAction> {
-    Some(match kind {
+/// Send a held press on its way as the click it was.
+///
+/// Press *and* release, always: a press delivered alone would leave the program
+/// believing the button is still down, which is exactly the state holding it
+/// back was meant to avoid. Under X10, which has no releases, the second write
+/// encodes to nothing and the program correctly hears only the press.
+fn flush_held_pane_click(app: &mut App, pty_runtime: &mut PtyRuntime) {
+    let Some(held) = app.take_any_held_pane_click() else {
+        return;
+    };
+    pty_runtime.forward_mouse(
+        held.terminal,
+        held_click_report(PtyMouseAction::Press(PtyMouseButton::Left), held),
+    );
+    pty_runtime.forward_mouse(
+        held.terminal,
+        held_click_report(PtyMouseAction::Release(PtyMouseButton::Left), held),
+    );
+}
+
+/// One event addressed to a pane's own screen, in that screen's coordinates.
+///
+/// The wire is 1-based, and a negative row cannot occur: the cell came from
+/// hit-testing the pointer inside the visible pane.
+fn pane_mouse_report(
+    action: PtyMouseAction,
+    cell: SelectionCell,
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+) -> PtyMouseReport {
+    PtyMouseReport {
+        action,
+        col: cell.col.saturating_add(1),
+        row: u16::try_from(cell.row).unwrap_or(0).saturating_add(1),
+        shift,
+        alt,
+        ctrl,
+    }
+}
+
+/// A held press, or the release that completes it, carrying the modifiers that
+/// were down when the button went down rather than whatever is down now.
+fn held_click_report(action: PtyMouseAction, held: HeldPaneClick) -> PtyMouseReport {
+    pane_mouse_report(action, held.cell, held.shift, held.alt, held.ctrl)
+}
+
+fn pty_mouse_action(kind: MouseEventKind) -> PtyMouseAction {
+    match kind {
         MouseEventKind::Down(button) => PtyMouseAction::Press(pty_mouse_button(button)),
         MouseEventKind::Up(button) => PtyMouseAction::Release(pty_mouse_button(button)),
         MouseEventKind::Drag(button) => PtyMouseAction::Drag(pty_mouse_button(button)),
@@ -122,7 +255,7 @@ fn pty_mouse_action(kind: MouseEventKind) -> Option<PtyMouseAction> {
         MouseEventKind::ScrollDown => PtyMouseAction::Press(PtyMouseButton::WheelDown),
         MouseEventKind::ScrollLeft => PtyMouseAction::Press(PtyMouseButton::WheelLeft),
         MouseEventKind::ScrollRight => PtyMouseAction::Press(PtyMouseButton::WheelRight),
-    })
+    }
 }
 
 fn pty_mouse_button(button: MouseButton) -> PtyMouseButton {
@@ -408,7 +541,20 @@ mod tests {
     }
 
     impl GrabbedMouseSession {
+        /// A pane whose program tracks button motion (DECSET 1002): it owns the
+        /// whole pointer, drags included.
         fn new(label: &str, screen: PtyDimensions) -> Self {
+            Self::with_mouse_modes(label, screen, b"\x1b[?1002h\x1b[?1006h")
+        }
+
+        /// A pane whose program asked for clicks only (DECSET 1000) — what
+        /// Claude Code enables. It hears presses and releases and has no way to
+        /// interpret a drag.
+        fn clicks_only(label: &str, screen: PtyDimensions) -> Self {
+            Self::with_mouse_modes(label, screen, b"\x1b[?1000h\x1b[?1006h")
+        }
+
+        fn with_mouse_modes(label: &str, screen: PtyDimensions, modes: &[u8]) -> Self {
             let store = test_state_store(label);
             let (mut app, _, terminal) = running_command_app("echo grabbed".to_string());
             let (mut pty_runtime, observed, server, socket_path) =
@@ -431,9 +577,9 @@ mod tests {
                 .resize(terminal, screen)
                 .expect("size the pane's screen");
             pty_runtime.process_terminal_output(terminal, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
-            // The program turns on SGR mouse reporting with drag tracking: from
-            // here the pointer is its input, not ours.
-            pty_runtime.process_terminal_output(terminal, b"\x1b[?1002h\x1b[?1006h");
+            // The program turns on SGR mouse reporting: from here the pointer is
+            // its input, as far as the mode it asked for reaches.
+            pty_runtime.process_terminal_output(terminal, modes);
 
             let (_, output_area) = layout
                 .selected_terminal_output(&app)
@@ -538,6 +684,111 @@ mod tests {
                 b"\x1b[<0;5;2m".to_vec(),
             ],
             "press, drag and release reach the program; a bare move does not",
+        );
+    }
+
+    #[test]
+    fn a_drag_over_a_clicks_only_program_selects_locally_and_tells_it_nothing() {
+        let mut session = GrabbedMouseSession::clicks_only(
+            "drag-over-a-clicks-only-program",
+            PtyDimensions { rows: 24, cols: 80 },
+        );
+        let area = session.output_area;
+
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), area.x + 1),
+            (MouseEventKind::Drag(MouseButton::Left), area.x + 3),
+            (MouseEventKind::Up(MouseButton::Left), area.x + 5),
+        ] {
+            session.mouse(kind, column, area.y, KeyModifiers::NONE);
+        }
+
+        let selection = session
+            .app
+            .text_selection_for(session.terminal)
+            .expect("a plain drag selects over a program that never asked for motion");
+        assert_eq!(
+            selection.anchor.col, 1,
+            "the selection starts where the button went down, not where the drag was first reported"
+        );
+        assert_eq!(selection.focus.col, 5);
+
+        assert!(
+            session.recorded_input().is_empty(),
+            "the program hears nothing: not the drag it cannot read, and not the press that became one",
+        );
+    }
+
+    #[test]
+    fn a_click_over_a_clicks_only_program_still_reaches_it_whole() {
+        let mut session = GrabbedMouseSession::clicks_only(
+            "click-over-a-clicks-only-program",
+            PtyDimensions { rows: 24, cols: 80 },
+        );
+        let area = session.output_area;
+
+        session.mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            area.x + 2,
+            area.y + 1,
+            KeyModifiers::NONE,
+        );
+        // Held, not dropped: at this point the gesture is equally a click and
+        // the first frame of a selection.
+        assert_eq!(session.app.text_selection_for(session.terminal), None);
+
+        session.mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            area.x + 2,
+            area.y + 1,
+            KeyModifiers::NONE,
+        );
+
+        assert_eq!(
+            session.app.text_selection_for(session.terminal),
+            None,
+            "a click is not a selection"
+        );
+        assert_eq!(
+            session.recorded_input(),
+            vec![b"\x1b[<0;3;2M".to_vec(), b"\x1b[<0;3;2m".to_vec()],
+            "press and release arrive together and in order, at the cell pressed",
+        );
+    }
+
+    #[test]
+    fn a_wheel_notch_never_overtakes_a_press_held_for_the_program() {
+        let mut session = GrabbedMouseSession::clicks_only(
+            "wheel-notch-never-overtakes-a-held-press",
+            // Short enough that the fixture's five lines leave scrollback to
+            // move, had the notch been ours.
+            PtyDimensions { rows: 2, cols: 8 },
+        );
+        let area = session.output_area;
+
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            // A wheel notch is a press under every mode, so this one is the
+            // program's — and it must not arrive before the press it followed.
+            MouseEventKind::ScrollUp,
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            session.mouse(kind, area.x + 1, area.y, KeyModifiers::NONE);
+        }
+
+        assert_eq!(
+            session.scrollback(),
+            0,
+            "the notch went to the program, not to our own view"
+        );
+        assert_eq!(
+            session.recorded_input(),
+            vec![
+                b"\x1b[<0;2;1M".to_vec(),
+                b"\x1b[<0;2;1m".to_vec(),
+                b"\x1b[<64;2;1M".to_vec(),
+            ],
+            "the held press is completed as a click before the notch that followed it",
         );
     }
 

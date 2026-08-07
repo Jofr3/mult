@@ -1344,6 +1344,20 @@ impl PtyRuntime {
             .is_some_and(|parser| parser.screen().mouse_protocol_mode() != MouseProtocolMode::None)
     }
 
+    /// Whether the program in `terminal` asked to hear about this *kind* of
+    /// event, without an event in hand to send.
+    ///
+    /// [`Self::forward_mouse`] answers the same question, but only by trying:
+    /// it either writes the event or silently drops it. The router needs the
+    /// answer up front, because "the program does not want this" is not the
+    /// same as "nothing happens". A program that never enabled motion tracking
+    /// cannot interpret a drag at all, so a drag over its pane is our own text
+    /// selection rather than an event dropped on its behalf.
+    pub fn terminal_wants_mouse_action(&self, terminal: PtyKey, action: PtyMouseAction) -> bool {
+        self.parser(terminal)
+            .is_some_and(|parser| action.is_wanted_in(parser.screen().mouse_protocol_mode()))
+    }
+
     /// Forward one mouse event to a mouse-reporting program, encoded in the
     /// protocol *and* the encoding it asked for.
     ///
@@ -2805,14 +2819,20 @@ impl PtyMouseReport {
         }
         bits
     }
+}
 
+impl PtyMouseAction {
     /// Whether a program in `mode` asked to hear about this event at all.
     ///
     /// A wheel notch is always a press, so it survives every mode including
     /// press-only X10; a release does not exist in X10; and motion needs the
     /// mode that asked for it — with a button held (1002) or without (1003).
+    ///
+    /// This hangs off the action rather than off a whole [`PtyMouseReport`]
+    /// because the routing layer has to ask the question *before* it has an
+    /// event to send — see [`PtyRuntime::terminal_wants_mouse_action`].
     fn is_wanted_in(self, mode: MouseProtocolMode) -> bool {
-        match self.action {
+        match self {
             PtyMouseAction::Press(_) => mode != MouseProtocolMode::None,
             PtyMouseAction::Release(button) => {
                 !button.is_wheel()
@@ -2849,7 +2869,7 @@ fn mouse_report_bytes(
     encoding: MouseProtocolEncoding,
     report: PtyMouseReport,
 ) -> Option<Vec<u8>> {
-    if !report.is_wanted_in(mode) {
+    if !report.action.is_wanted_in(mode) {
         return None;
     }
 

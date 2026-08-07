@@ -26,6 +26,29 @@ pub struct TextSelectionRange {
     pub end: SelectionCell,
 }
 
+/// A left press over a pane that reports the mouse but never asked for motion
+/// tracking, held back until the gesture says which of us it belongs to.
+///
+/// Such a program — Claude Code, in DECSET 1000 — has no way to interpret a
+/// drag, so a drag over its pane is our own selection. But the press that
+/// begins one is indistinguishable from the press that begins a click, and a
+/// click *is* the program's. Holding the press until the first drag or the
+/// release decides is what lets the one gesture serve both, and it is why the
+/// program is never handed half of one: it gets the press and the release
+/// together or neither.
+///
+/// The modifiers travel with it so the press is replayed as it happened rather
+/// than as a bare click. `shift` is among them for completeness only — Shift
+/// takes the pointer back before routing ever reaches this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeldPaneClick {
+    pub terminal: PtyKey,
+    pub cell: SelectionCell,
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+}
+
 impl TextSelection {
     pub fn normalized_range(self) -> TextSelectionRange {
         let anchor_key = (self.anchor.row, self.anchor.col);
@@ -110,6 +133,28 @@ impl App {
         self.text_selection
             .as_ref()
             .filter(|selection| selection.terminal == terminal)
+    }
+
+    pub fn hold_pane_click(&mut self, held: HeldPaneClick) {
+        self.held_pane_click = Some(held);
+    }
+
+    pub fn held_pane_click(&self) -> Option<HeldPaneClick> {
+        self.held_pane_click
+    }
+
+    /// Take the held press, but only if it belongs to `terminal`: a gesture
+    /// that has crossed into another pane no longer resolves this one.
+    pub fn take_held_pane_click(&mut self, terminal: PtyKey) -> Option<HeldPaneClick> {
+        let held = self
+            .held_pane_click
+            .filter(|held| held.terminal == terminal)?;
+        self.held_pane_click = None;
+        Some(held)
+    }
+
+    pub fn take_any_held_pane_click(&mut self) -> Option<HeldPaneClick> {
+        self.held_pane_click.take()
     }
 }
 

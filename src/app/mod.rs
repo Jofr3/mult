@@ -46,6 +46,12 @@ pub struct App {
     pub workspace_git_branches: BTreeMap<WorkspaceId, String>,
     pub active_search: Option<SearchState>,
     pub text_selection: Option<TextSelection>,
+    /// A left press over a mouse-reporting pane that has not yet revealed
+    /// whether it is that program's click or the start of our own selection.
+    /// Private: the routing layer resolves it through the [`HeldPaneClick`]
+    /// accessors, which are what keep a press from being handed over without
+    /// its release.
+    held_pane_click: Option<HeldPaneClick>,
     pub should_quit: bool,
     dirty: bool,
     /// Set alongside `dirty` when the change altered the *structure* of the
@@ -187,6 +193,7 @@ impl App {
             workspace_git_branches: BTreeMap::new(),
             active_search: None,
             text_selection: None,
+            held_pane_click: None,
             should_quit: false,
             dirty: titles_normalized,
             structural_dirty: false,

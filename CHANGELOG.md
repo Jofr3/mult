@@ -8,6 +8,33 @@ and the project aims to adhere to
 
 ## [Unreleased]
 
+### Highlight-to-copy works again over Claude Code and other click-only panes
+
+Dragging to select text over a Claude Code pane did nothing at all — no
+selection, and nothing the program could act on either.
+
+Forwarding the pointer to panes (B17-B21) hands an event to the program
+whenever that pane reports the mouse, and drops the ones the program's mode is
+too narrow to want rather than falling back to our own selection. That is right
+for a program tracking motion: it sees the drag and is entitled to decide the
+pointer means nothing there. Claude Code enables DECSET 1000 — clicks and
+releases, no motion — so it never sees the drag and cannot interpret one under
+any reading. The gesture went nowhere.
+
+The documented way back, Shift, does not exist in practice: every
+xterm-descended terminal forces its *own* selection on Shift and never forwards
+the event, so the override was unreachable from inside a host terminal by
+design.
+
+The left button is now routed by gesture over a pane that asked for clicks but
+not motion. The press is held rather than sent, because at that moment it is
+equally the start of a click and the start of a selection; a drag claims the
+gesture for `mult` and the program hears nothing, and a release without a drag
+replays press and release together as the click it turned out to be. A program
+is never handed half a gesture, so nothing is left believing a button is still
+down. Panes that do track motion (1002/1003) are unchanged and still own the
+whole pointer.
+
 ### Sidebar rows follow the pane's own window title (OSC 0/2)
 
 A program's window title is its own statement of what it is doing, and until
