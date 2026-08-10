@@ -8,6 +8,36 @@ and the project aims to adhere to
 
 ## [Unreleased]
 
+### A shell row says what it is running, without the flags
+
+Every shell row read `~/projects/mult`. That is the pane's window title, which
+a shell rewrites with its `cwd` on every prompt, and it is the right answer
+while the shell is at that prompt — but it stayed the answer while a command
+was running, so a sidebar of four shells in one workspace was four identical
+rows and no way to tell the one building from the one testing.
+
+A shell row now names the command it is running, for as long as it runs, and
+returns to the window title when the shell is back at its prompt. Which of the
+two is showing is the daemon's foreground-process report, not the command
+tracker alone: the tracker keeps the last command *seen*, which outlives it by
+the whole idle stretch afterwards, so without the gate a row would go on
+claiming to run `cargo test` until something else was typed.
+
+The command is cut back to the part that names it — everything before its first
+flag, with any leading `KEY=value` dropped. `cargo test --workspace` is `cargo
+test`, `ls -la` is `ls`, `ls -la | wc -l` is `ls`, and `RUST_LOG=debug cargo
+run` is `cargo run`. Cutting at the first flag rather than deleting flags in
+place is what keeps the subcommand: deletion strands the flag's *value*, since
+`git commit -m 'msg'` holds the message in a token that does not start with
+`-`, and the row would read `git commit 'msg'`. It also means a command with no
+flags is kept whole, because there is nothing to cut and every token is
+load-bearing — `sudo apt update` stays itself, and so does the file an editor
+was opened on, with no wrapper needing a special case.
+
+A `TerminalLaunch::Command` terminal is untouched, for the reason it was
+untouched by B21: that command is the user's own answer to "which pane is
+this", and abbreviating their landmark is not `mult`'s call.
+
 ### Highlight-to-copy works again over Claude Code and other click-only panes
 
 Dragging to select text over a Claude Code pane did nothing at all — no

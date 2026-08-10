@@ -260,33 +260,111 @@ fn terminal_display_label(
 /// landmark out from under them. The command is theirs; it is not `mult`'s to
 /// replace.
 ///
-/// A **shell** terminal has no such answer, so its label was already derived
-/// and already changed under the user — [`PtyRuntime::terminal_last_command`]
-/// guesses it by watching keystrokes go past. The program's own window title is
-/// a better source for the same slot: a shell writes its `cwd` there on every
-/// prompt and an editor writes the file it is on, and neither is a guess.
+/// A **shell** terminal has no such answer, so its label is derived, and the
+/// three sources it is derived from answer different questions. While a command
+/// is running, what the pane *is* is that command, so [`base_command`] of it
+/// wins: a row reading `~/projects/mult` says nothing a user watching one pane
+/// build and another test can use. At the prompt there is no command to name,
+/// and the program's own window title is the better answer — a shell writes its
+/// `cwd` there on every prompt and an editor writes the file it is on, and
+/// neither is a guess, unlike [`PtyRuntime::terminal_last_command`], which
+/// guesses by watching keystrokes go past. The scrape stays last, for the shell
+/// that never sets a title at all.
 fn terminal_command_label(terminal: &TerminalSession, pty_runtime: &PtyRuntime) -> String {
     let key = PtyKey::Terminal(terminal.id);
     match &terminal.launch {
         TerminalLaunch::Command(command) => command_label_or_default(command),
-        TerminalLaunch::Shell => pty_runtime
-            .terminal_title(key)
+        TerminalLaunch::Shell => running_command_label(key, pty_runtime)
+            .or_else(|| pty_runtime.terminal_title(key))
             .or_else(|| {
                 pty_runtime
                     .terminal_last_command(key)
-                    .map(command_label_or_default)
+                    .and_then(reduced_command_label)
             })
             .unwrap_or_else(|| "terminal".to_string()),
     }
 }
 
+/// The command a shell pane is running right now, reduced to its base, or
+/// `None` when the shell is at its prompt.
+///
+/// Gated on the daemon's foreground-process report rather than on the tracker
+/// alone: the tracker keeps the last command *seen*, which outlives it by the
+/// whole idle stretch after it exits, so without the gate a pane would keep
+/// claiming to run `cargo test` until something else was typed.
+fn running_command_label(key: PtyKey, pty_runtime: &PtyRuntime) -> Option<String> {
+    if !pty_runtime.terminal_runs_child_command(key) {
+        return None;
+    }
+    pty_runtime
+        .terminal_last_command(key)
+        .and_then(reduced_command_label)
+}
+
+/// [`base_command`] as a label, or `None` when what is left says nothing worth
+/// displacing the window title for.
+fn reduced_command_label(command: &str) -> Option<String> {
+    let label = base_command(command);
+    (!is_uninformative_command(&label)).then_some(label)
+}
+
+/// A command line reduced to the part that names what is running: everything
+/// before its first flag, with any leading `KEY=value` dropped.
+///
+/// The sidebar has room for a word or two, and the flags are the part a user
+/// scanning rows already knows — `cargo test --workspace --all-targets` and
+/// `cargo test -p mult` are both "the tests". Cutting at the first flag rather
+/// than deleting flags in place is what keeps a subcommand: deletion strands
+/// the flag's *value*, since `git commit -m 'msg'` holds the message in a token
+/// that does not start with `-`, and would render as `git commit 'msg'`. The
+/// cut takes the tail with it, so a pipeline (`ls -la | wc -l`) goes too.
+///
+/// A command with no flags is kept whole, because then there is nothing to cut
+/// and every token is load-bearing: `sudo apt update` stays itself, and so does
+/// the file an editor was opened on. Width is [`truncate_text`]'s job, not this
+/// one's.
+fn base_command(command: &str) -> String {
+    command
+        .split_whitespace()
+        .skip_while(|token| is_env_assignment(token))
+        .take_while(|token| !token.starts_with('-'))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether `token` is a `KEY=value` prefix rather than the command itself.
+///
+/// `FOO=1 cargo test` is `cargo test` with an environment set for it, and the
+/// assignment is exactly the noise this is here to drop. A quote anywhere in
+/// the token disqualifies it: `FOO='a b'` was split across two tokens by
+/// whitespace before it got here, and half an assignment is not one.
+fn is_env_assignment(token: &str) -> bool {
+    if token.contains('\'') || token.contains('"') {
+        return false;
+    }
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && !name.starts_with(|ch: char| ch.is_ascii_digit())
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
 fn command_label_or_default(command: &str) -> String {
     let command = command.trim();
-    if command.is_empty() || command == "clear" {
+    if is_uninformative_command(command) {
         "terminal".to_string()
     } else {
         command.to_string()
     }
+}
+
+/// A command that names nothing: the empty string, and `clear`, which every
+/// pane runs and no pane is.
+fn is_uninformative_command(command: &str) -> bool {
+    command.is_empty() || command == "clear"
 }
 
 /// The agent status marker in the sidebar: glyph first, colour second (E8).
@@ -359,6 +437,8 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     use super::*;
+
+    use mult_protocol::ForegroundProcessInfo;
 
     use crate::config;
     use crate::model::AgentKind;
@@ -476,9 +556,9 @@ mod tests {
             "htop"
         );
 
-        // ...but the program's own statement wins, because it is not a guess.
-        // OSC 2 and OSC 0 both set the window title; ST terminates as well as
-        // BEL.
+        // ...but at the prompt the program's own statement wins, because it is
+        // not a guess. OSC 2 and OSC 0 both set the window title; ST terminates
+        // as well as BEL.
         pty_runtime.process_terminal_output(key, b"\x1b]2;~/projects/mult\x1b\\");
         assert_eq!(
             terminal_display_label(&shell_terminal, &pty_runtime, 80),
@@ -505,6 +585,95 @@ mod tests {
             terminal_display_label(&command_terminal, &pty_runtime, 80),
             "ping example.com"
         );
+    }
+
+    #[test]
+    fn a_shell_row_names_the_command_it_is_running_over_the_window_title() {
+        let shell_terminal = TerminalSession {
+            id: TerminalId(100),
+            name: "shell".to_string(),
+            restore_on_launch: false,
+            launch: TerminalLaunch::Shell,
+        };
+        let key = PtyKey::Terminal(shell_terminal.id);
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime.ensure_parser(key, crate::pty::PtyDimensions { rows: 24, cols: 80 });
+        pty_runtime.process_terminal_output(key, b"\x1b]2;~/projects/mult\x1b\\");
+
+        // At the prompt the title is the whole answer.
+        assert_eq!(
+            terminal_display_label(&shell_terminal, &pty_runtime, 80),
+            "~/projects/mult"
+        );
+
+        // Running something, the row is that something — and the flags are the
+        // part the user scanning rows already knows.
+        pty_runtime.record_foreground_process_for_test(
+            key,
+            ForegroundProcessInfo {
+                root_pid: Some(10),
+                foreground_pid: Some(20),
+                command: Some("ls -la".to_string()),
+            },
+        );
+        assert_eq!(
+            terminal_display_label(&shell_terminal, &pty_runtime, 80),
+            "ls"
+        );
+
+        // Back at the prompt the command is over, and the title — which the
+        // shell has been keeping current all along — takes the row back. The
+        // tracker still holds `ls -la`, so nothing but the gate stops the row
+        // claiming to run it forever.
+        pty_runtime.record_foreground_process_for_test(
+            key,
+            ForegroundProcessInfo {
+                root_pid: Some(10),
+                foreground_pid: Some(10),
+                command: Some("bash".to_string()),
+            },
+        );
+        assert_eq!(pty_runtime.terminal_last_command(key), Some("ls -la"));
+        assert_eq!(
+            terminal_display_label(&shell_terminal, &pty_runtime, 80),
+            "~/projects/mult"
+        );
+    }
+
+    #[test]
+    fn a_base_command_is_everything_before_the_first_flag() {
+        // Cut at the first flag, not "delete the flags": deletion would strand
+        // `-m`'s value and render `git commit 'msg'`.
+        assert_eq!(base_command("ls -la"), "ls");
+        assert_eq!(base_command("git commit -m 'msg'"), "git commit");
+        assert_eq!(base_command("cargo test --workspace"), "cargo test");
+        assert_eq!(base_command("docker run -it ubuntu bash"), "docker run");
+
+        // The cut takes the tail with it, pipeline included.
+        assert_eq!(base_command("ls -la | wc -l"), "ls");
+
+        // Nothing to cut: every token is load-bearing, and no wrapper needs a
+        // special case to survive.
+        assert_eq!(base_command("sudo apt update"), "sudo apt update");
+        assert_eq!(base_command("nvim src/pty.rs"), "nvim src/pty.rs");
+
+        // A leading environment is set *for* the command; it is not the command.
+        assert_eq!(base_command("RUST_LOG=debug cargo run"), "cargo run");
+        assert_eq!(base_command("A=1 B=2 make"), "make");
+        // ...but a token that only looks like one is left alone: `=` inside an
+        // argument is not an assignment, and a quoted value the whitespace
+        // split already cut in half is not one either. Keeping the line whole
+        // is the readable failure there; dropping `FOO='a` would leave the row
+        // reading `b' cargo run`.
+        assert_eq!(base_command("./configure=x"), "./configure=x");
+        assert_eq!(base_command("FOO='a b' cargo run"), "FOO='a b' cargo run");
+
+        // Nothing left to name falls through to the caller's fallback.
+        assert_eq!(base_command("-la"), "");
+        assert_eq!(base_command("   "), "");
+        assert_eq!(reduced_command_label("clear"), None);
+        assert_eq!(reduced_command_label("-x"), None);
+        assert_eq!(reduced_command_label("htop -d 5"), Some("htop".to_string()));
     }
 
     #[test]

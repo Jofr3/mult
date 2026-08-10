@@ -894,6 +894,19 @@ impl PtyRuntime {
             .record_input(input);
     }
 
+    /// Report a foreground process without a daemon, for the same reason as
+    /// [`Self::record_command_for_test`]: a caller that only wants to know what
+    /// the sidebar calls a pane with a command running should not have to stand
+    /// a server up to say so.
+    #[cfg(test)]
+    pub fn record_foreground_process_for_test(
+        &mut self,
+        terminal: PtyKey,
+        process: ForegroundProcessInfo,
+    ) {
+        self.record_foreground_process(terminal, process);
+    }
+
     #[cfg(test)]
     pub fn mark_running_for_test(&mut self, terminal: PtyKey) {
         self.bind_pane(terminal, pane_for_key(terminal));
@@ -1291,16 +1304,19 @@ impl PtyRuntime {
     }
 
     fn terminal_accepts_shell_input(&self, terminal: PtyKey) -> bool {
-        let Some(process) = self
-            .pane(terminal)
+        !self.terminal_runs_child_command(terminal)
+    }
+
+    /// Whether the pane's own process has handed the terminal to a child — a
+    /// shell running a command rather than sitting at its prompt.
+    ///
+    /// Unknown counts as "at the prompt": a pane the daemon has not reported a
+    /// foreground process for yet, or one it reported without pids, is not
+    /// evidence that anything is running.
+    pub fn terminal_runs_child_command(&self, terminal: PtyKey) -> bool {
+        self.pane(terminal)
             .and_then(|pane| pane.foreground_process.as_ref())
-        else {
-            return true;
-        };
-        match (process.root_pid, process.foreground_pid) {
-            (Some(root_pid), Some(foreground_pid)) => root_pid == foreground_pid,
-            _ => true,
-        }
+            .is_some_and(foreground_is_child)
     }
 
     pub fn send_paste(&mut self, terminal: PtyKey, text: &str) -> PtyResult<bool> {
@@ -2143,11 +2159,7 @@ impl PtyRuntime {
     }
 
     fn record_foreground_process(&mut self, terminal: PtyKey, process: ForegroundProcessInfo) {
-        let foreground_is_child = matches!(
-            (process.root_pid, process.foreground_pid),
-            (Some(root_pid), Some(foreground_pid)) if root_pid != foreground_pid
-        );
-        if foreground_is_child {
+        if foreground_is_child(&process) {
             if let Some(command) = process.command.as_deref() {
                 self.pane_entry(terminal)
                     .command_tracker
@@ -2964,6 +2976,19 @@ fn push_utf8_mouse_coord(bytes: &mut Vec<u8>, coord: u16) {
         }
         None => bytes.push(b' '),
     }
+}
+
+/// Whether `process` says the foreground of the pane is a child of the pane's
+/// own process, rather than that process itself.
+///
+/// The one reading of a `ForegroundProcessInfo`, shared by everything that acts
+/// on it: what the command tracker records, whether shell-level input is
+/// accepted, and what the sidebar calls the row.
+fn foreground_is_child(process: &ForegroundProcessInfo) -> bool {
+    matches!(
+        (process.root_pid, process.foreground_pid),
+        (Some(root_pid), Some(foreground_pid)) if root_pid != foreground_pid
+    )
 }
 
 fn terminal_paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
