@@ -39,11 +39,21 @@ was running, so a sidebar of four shells in one workspace was four identical
 rows and no way to tell the one building from the one testing.
 
 A shell row now names the command it is running, for as long as it runs, and
-returns to the window title when the shell is back at its prompt. Which of the
-two is showing is the daemon's foreground-process report, not the command
+falls back to the window title. Which of the two is showing while a program
+holds the terminal is the daemon's foreground-process report, not the command
 tracker alone: the tracker keeps the last command *seen*, which outlives it by
 the whole idle stretch afterwards, so without the gate a row would go on
-claiming to run `cargo test` until something else was typed.
+claiming to run `htop` once you had quit it and the pane was back to naming the
+file it is on.
+
+A title that is *only* the pane's `cwd` is the exception, and it is the title
+an idle shell has. It repeats the workspace row directly above it, so it ranks
+below the tracker's guess and the row keeps naming the last command until the
+next one is typed. That is also the only way a short command is ever seen at
+all: the daemon first samples the foreground process 25 ms after you press
+Enter, and an `ls` is long over by then, so gating it on "still running" meant
+it never appeared. A shell that has not run anything yet still shows its `cwd`,
+and so does one whose last command was `clear`, which names nothing.
 
 The command is cut back to the part that names it — everything before its first
 flag, with any leading `KEY=value` dropped. `cargo test --workspace` is `cargo

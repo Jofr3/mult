@@ -17,10 +17,11 @@ The current implementation is a Ratatui/Crossterm client plus a small `mult-serv
 - Sidebar rows follow the pane's own window title (OSC 0/2) where the label
   would otherwise be a guess: what an agent says it is working on, and a
   shell's `cwd` or the file an editor is on.
-- A shell row names the command it is running while it runs, cut back to the
-  part that names it — `cargo test --workspace` reads `cargo test`, `ls -la`
-  reads `ls` — and returns to the window title at the prompt. A command
-  terminal keeps the command it was created with, unabbreviated.
+- A shell row names the command it ran, cut back to the part that names it —
+  `cargo test --workspace` reads `cargo test`, `ls -la` reads `ls`. A window
+  title that is only the shell's `cwd` ranks below that, since it repeats the
+  workspace row; any other title outranks it once the command is over. A
+  command terminal keeps the command it was created with, unabbreviated.
 - Terminal scrollback, paste handling, mouse text selection, and OSC52 clipboard copy (opt-out via `clipboard_osc52`).
 - Full xterm mouse reporting to programs that ask for it (press/release/drag/motion, every protocol mode and encoding, modifier bits), with `Shift` reserved for `mult`'s own selection; cursor-key, keypad, bracketed-paste and focus-reporting modes honoured.
 - Configurable project shortcuts and colorscheme.

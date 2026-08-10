@@ -257,23 +257,27 @@ fn terminal_display_label(
 /// three sources it is derived from answer different questions. While a command
 /// is running, what the pane *is* is that command, so [`base_command`] of it
 /// wins: a row reading `~/projects/mult` says nothing a user watching one pane
-/// build and another test can use. At the prompt there is no command to name,
-/// and the program's own window title is the better answer — a shell writes its
-/// `cwd` there on every prompt and an editor writes the file it is on, and
-/// neither is a guess, unlike [`PtyRuntime::terminal_last_command`], which
-/// guesses by watching keystrokes go past. The scrape stays last, for the shell
-/// that never sets a title at all.
+/// build and another test can use. Otherwise the program's own window title is
+/// the better answer — an editor writes the file it is on and Claude Code
+/// writes what it is working on, and neither is a guess, unlike
+/// [`PtyRuntime::terminal_last_command`], which guesses by watching keystrokes
+/// go past.
+///
+/// A title that is *only* the pane's `cwd` is the exception, and it is the
+/// title an idle shell has: it repeats the workspace row above it, and it
+/// outlived even a scraped `ls` — which finishes far inside the daemon's 25 ms
+/// foreground poll, so it never once showed as running. Such a title drops
+/// below the scrape and the row keeps naming the last command until the next
+/// one is typed. The title is still the fallback under that, for the shell that
+/// has not run anything yet.
 fn terminal_command_label(terminal: &TerminalSession, pty_runtime: &PtyRuntime) -> String {
     let key = PtyKey::Terminal(terminal.id);
     match &terminal.launch {
         TerminalLaunch::Command(command) => command_label_or_default(command),
         TerminalLaunch::Shell => running_command_label(key, pty_runtime)
+            .or_else(|| program_title(key, pty_runtime))
+            .or_else(|| last_command_label(key, pty_runtime))
             .or_else(|| pty_runtime.terminal_title(key))
-            .or_else(|| {
-                pty_runtime
-                    .terminal_last_command(key)
-                    .and_then(reduced_command_label)
-            })
             .unwrap_or_else(|| "terminal".to_string()),
     }
 }
@@ -282,16 +286,47 @@ fn terminal_command_label(terminal: &TerminalSession, pty_runtime: &PtyRuntime) 
 /// `None` when the shell is at its prompt.
 ///
 /// Gated on the daemon's foreground-process report rather than on the tracker
-/// alone: the tracker keeps the last command *seen*, which outlives it by the
-/// whole idle stretch after it exits, so without the gate a pane would keep
-/// claiming to run `cargo test` until something else was typed.
+/// alone. What the gate buys is the ordering against a *program's* title: a
+/// pane that ran `htop` and quit it should read whatever set the title, not go
+/// on claiming to run `htop`. Against a `cwd` title it decides nothing, since
+/// [`terminal_command_label`] falls through to the same scrape either way.
 fn running_command_label(key: PtyKey, pty_runtime: &PtyRuntime) -> Option<String> {
-    if !pty_runtime.terminal_runs_child_command(key) {
-        return None;
-    }
+    pty_runtime
+        .terminal_runs_child_command(key)
+        .then(|| last_command_label(key, pty_runtime))
+        .flatten()
+}
+
+/// The last command the tracker saw in this pane, reduced to its base.
+fn last_command_label(key: PtyKey, pty_runtime: &PtyRuntime) -> Option<String> {
     pty_runtime
         .terminal_last_command(key)
         .and_then(reduced_command_label)
+}
+
+/// The pane's window title, but only when it is a program saying what it is
+/// doing rather than a shell repeating where it stands.
+fn program_title(key: PtyKey, pty_runtime: &PtyRuntime) -> Option<String> {
+    pty_runtime
+        .terminal_title(key)
+        .filter(|title| !title_is_directory(title))
+}
+
+/// Whether a window title says nothing but which directory the pane is in.
+///
+/// The shape is a path as the last token — `~/p/mult`, `/home/jofre/src`, `~` —
+/// with at most a `user@host:` style label in front of it, which is what `bash`
+/// and `zsh` write by default where `fish` writes the bare path. Anything else
+/// in the title makes it a program's statement: `src/pty.rs - NVIM` and `fix
+/// the parser` are not directories, and neither is a relative `src/ui`, which
+/// is left alone because nothing distinguishes it from a filename.
+fn title_is_directory(title: &str) -> bool {
+    let mut tokens = title.split_whitespace().rev();
+    let Some(path) = tokens.next() else {
+        return false;
+    };
+    (path.starts_with('~') || path.starts_with('/'))
+        && tokens.all(|label| label.ends_with(':') && !label.contains('/'))
 }
 
 /// [`base_command`] as a label, or `None` when what is left says nothing worth
@@ -538,10 +573,23 @@ mod tests {
         // ...but at the prompt the program's own statement wins, because it is
         // not a guess. OSC 2 and OSC 0 both set the window title; ST terminates
         // as well as BEL.
+        pty_runtime.process_terminal_output(key, b"\x1b]2;fix the parser\x1b\\");
+        assert_eq!(
+            terminal_display_label(&shell_terminal, &pty_runtime, 80),
+            "fix the parser"
+        );
+        pty_runtime.process_terminal_output(key, b"\x1b]0;build the docs\x07");
+        assert_eq!(
+            terminal_display_label(&shell_terminal, &pty_runtime, 80),
+            "build the docs"
+        );
+
+        // A title that is only the `cwd` is the one exception: it says nothing
+        // the workspace row does not, so the guess outranks it.
         pty_runtime.process_terminal_output(key, b"\x1b]2;~/projects/mult\x1b\\");
         assert_eq!(
             terminal_display_label(&shell_terminal, &pty_runtime, 80),
-            "~/projects/mult"
+            "htop"
         );
 
         // A command terminal keeps the command the user created it with: that
@@ -600,10 +648,11 @@ mod tests {
             "ls"
         );
 
-        // Back at the prompt the command is over, and the title — which the
-        // shell has been keeping current all along — takes the row back. The
-        // tracker still holds `ls -la`, so nothing but the gate stops the row
-        // claiming to run it forever.
+        // Back at the prompt the command is over, but the title the shell has
+        // been keeping current is the `cwd` again, and that repeats the
+        // workspace row. The row keeps the last command instead — the only
+        // reason `ls`, which is over long before the daemon's first 25 ms
+        // foreground poll, is ever seen at all.
         pty_runtime.record_foreground_process_for_test(
             key,
             ForegroundProcessInfo {
@@ -613,6 +662,62 @@ mod tests {
             },
         );
         assert_eq!(pty_runtime.terminal_last_command(key), Some("ls -la"));
+        assert_eq!(
+            terminal_display_label(&shell_terminal, &pty_runtime, 80),
+            "ls"
+        );
+
+        // A title that is a program's own is not the `cwd`, and it outranks the
+        // scrape: the command is over, so what the pane *is* is what the
+        // program says it is.
+        pty_runtime.process_terminal_output(key, b"\x1b]2;src/pty.rs - NVIM\x1b\\");
+        assert_eq!(
+            terminal_display_label(&shell_terminal, &pty_runtime, 80),
+            "src/pty.rs - NVIM"
+        );
+    }
+
+    #[test]
+    fn a_cwd_title_is_told_from_a_programs_own() {
+        // What every shell writes on every prompt, and the one title worth less
+        // than a guess at the last command.
+        assert!(title_is_directory("~/p/mult"));
+        assert!(title_is_directory("~"));
+        assert!(title_is_directory("/home/jofre/projects/mult"));
+        // `bash` and `zsh` label the path with the host they are on.
+        assert!(title_is_directory("jofre@nixos: ~/projects/mult"));
+
+        // A program's statement of what it is doing, which outranks the guess.
+        assert!(!title_is_directory("src/pty.rs - NVIM"));
+        assert!(!title_is_directory("fix the parser"));
+        assert!(!title_is_directory("nvim ~/p/mult/src/pty.rs"));
+        assert!(!title_is_directory(""));
+        // A relative path is left alone: nothing tells it from a filename.
+        assert!(!title_is_directory("src/ui"));
+    }
+
+    #[test]
+    fn a_shell_row_that_has_run_nothing_keeps_its_cwd_title() {
+        let shell_terminal = TerminalSession {
+            id: TerminalId(101),
+            name: "shell".to_string(),
+            restore_on_launch: false,
+            launch: TerminalLaunch::Shell,
+        };
+        let key = PtyKey::Terminal(shell_terminal.id);
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime.ensure_parser(key, crate::pty::PtyDimensions { rows: 24, cols: 80 });
+        pty_runtime.process_terminal_output(key, b"\x1b]2;~/projects/mult\x1b\\");
+
+        // Nothing has been typed, so the `cwd` is all there is — it is the
+        // fallback under the scrape, not something the scrape replaced.
+        assert_eq!(
+            terminal_display_label(&shell_terminal, &pty_runtime, 80),
+            "~/projects/mult"
+        );
+
+        // `clear` names nothing, so it does not displace the title either.
+        pty_runtime.record_command_for_test(key, b"clear\r");
         assert_eq!(
             terminal_display_label(&shell_terminal, &pty_runtime, 80),
             "~/projects/mult"
