@@ -488,6 +488,11 @@ const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 /// past any sidebar width, so it costs nothing legitimate; see
 /// [`sanitize_pane_title`].
 const MAX_PANE_TITLE_CHARS: usize = 128;
+/// Ceiling on the command line [`TerminalCommandTracker`] is holding. Past it
+/// the *tail* is dropped rather than the head, because the label is the front of
+/// the line. Only a program that takes raw keys without ever seeing an `Enter`
+/// can reach it, and one line of a shell never does.
+const TERMINAL_MAX_TRACKED_COMMAND_BYTES: usize = 512;
 /// DECSET parameter for focus reporting: the program asks to be told when the
 /// terminal window gains (`CSI I`) or loses (`CSI O`) focus.
 const FOCUS_REPORTING_MODE: usize = 1004;
@@ -923,17 +928,15 @@ impl PtyRuntime {
         (!title.is_empty()).then_some(title)
     }
 
-    /// Seed the command tracker without an attached pane.
+    /// Seed the command tracker without an attached pane, as if `input` were
+    /// typed at the pane's prompt.
     ///
     /// Production reaches it only through [`Self::send_input`], which needs a
     /// daemon; a caller that just wants to know what the tracker *would* say —
     /// the sidebar's label precedence, say — should not have to stand one up.
     #[cfg(test)]
     pub fn record_command_for_test(&mut self, terminal: PtyKey, input: &[u8]) {
-        self.pane_entry(terminal)
-            .command_tracker
-            .get_or_insert_with(Default::default)
-            .record_input(input);
+        self.command_tracker_mut(terminal).record_input(input, true);
     }
 
     /// Report a foreground process without a daemon, for the same reason as
@@ -1415,12 +1418,7 @@ impl PtyRuntime {
             if let Some(parser) = self.parser_mut(terminal) {
                 parser.set_scrollback(0);
             }
-            if !alternate_screen && self.terminal_accepts_shell_input(terminal) {
-                self.pane_entry(terminal)
-                    .command_tracker
-                    .get_or_insert_with(Default::default)
-                    .record_input(input);
-            }
+            self.track_shell_input(terminal, input, alternate_screen);
         }
         self.ensure_connected()?;
         let lease = self.lease_for_pane(pane)?;
@@ -1437,6 +1435,31 @@ impl PtyRuntime {
 
     fn terminal_accepts_shell_input(&self, terminal: PtyKey) -> bool {
         !self.terminal_runs_child_command(terminal)
+    }
+
+    /// Show one batch of the user's keystrokes to the pane's command tracker.
+    ///
+    /// A full-screen program's keys are not tracked at all. That gate can stay a
+    /// gate on tracking where the foreground report cannot (see
+    /// [`TerminalCommandTracker::record_input`]): the alternate screen is this
+    /// client's own parser state, read from the output it has already applied,
+    /// so it is never behind the pane. The line the tracker was holding still
+    /// goes, because a program on the alternate screen is one the shell was
+    /// given a line to start.
+    fn track_shell_input(&mut self, terminal: PtyKey, input: &[u8], alternate_screen: bool) {
+        if alternate_screen {
+            self.command_tracker_mut(terminal).discard_input();
+            return;
+        }
+        let at_prompt = self.terminal_accepts_shell_input(terminal);
+        self.command_tracker_mut(terminal)
+            .record_input(input, at_prompt);
+    }
+
+    fn command_tracker_mut(&mut self, terminal: PtyKey) -> &mut TerminalCommandTracker {
+        self.pane_entry(terminal)
+            .command_tracker
+            .get_or_insert_with(Default::default)
     }
 
     /// Whether the pane's own process has handed the terminal to a child — a
@@ -1466,12 +1489,7 @@ impl PtyRuntime {
             if let Some(parser) = self.parser_mut(terminal) {
                 parser.set_scrollback(0);
             }
-            if !alternate_screen && self.terminal_accepts_shell_input(terminal) {
-                self.pane_entry(terminal)
-                    .command_tracker
-                    .get_or_insert_with(Default::default)
-                    .record_input(&bytes);
-            }
+            self.track_shell_input(terminal, &bytes, alternate_screen);
         }
         self.ensure_connected()?;
         let lease = self.lease_for_pane(pane)?;
@@ -2400,13 +2418,19 @@ impl PtyRuntime {
         self.pane_index.get(&pane).copied()
     }
 
+    /// Apply the daemon's report of what holds `terminal`'s foreground.
+    ///
+    /// A child holding it means the shell's line was submitted, so the tracker's
+    /// half-typed line goes even when the daemon could not name the process —
+    /// which is the common case for a command fast enough to be gone before its
+    /// `/proc` entry is read. Keeping it would leave it as a prefix for the next
+    /// command to be appended to.
     fn record_foreground_process(&mut self, terminal: PtyKey, process: ForegroundProcessInfo) {
         if foreground_is_child(&process) {
-            if let Some(command) = process.command.as_deref() {
-                self.pane_entry(terminal)
-                    .command_tracker
-                    .get_or_insert_with(Default::default)
-                    .record_process_command(command);
+            let tracker = self.command_tracker_mut(terminal);
+            match process.command.as_deref() {
+                Some(command) => tracker.record_process_command(command),
+                None => tracker.discard_input(),
             }
         }
         self.pane_entry(terminal).foreground_process = Some(process);
@@ -3264,13 +3288,30 @@ fn terminal_paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
 }
 
 impl TerminalCommandTracker {
-    fn record_input(&mut self, bytes: &[u8]) {
+    /// Track one batch of the user's keystrokes.
+    ///
+    /// `at_prompt` is whether the pane looked like a shell waiting for a command
+    /// when the keys were sent, and it decides one thing only: whether the line
+    /// may *become* the last command. Every key is tracked either way, and every
+    /// `Enter` ends the line either way.
+    ///
+    /// Keeping those apart is what stops two commands rendering as one. The gate
+    /// is the daemon's foreground-process report, which is a 25 ms poll and so is
+    /// always a little behind the pane; a gate on *tracking* dropped the `Enter`
+    /// that ends a command exactly as readily as the characters in it, and a
+    /// dropped `Enter` left the line half-typed for the next command to be
+    /// appended to — `mkdir chronos` and `ls` came out as one `mkdir chronosls`.
+    /// It also dropped the first characters typed after a command finished,
+    /// since the report saying it finished had not arrived yet. Tracking
+    /// unconditionally and gating the commit costs neither: by the time `Enter`
+    /// ends a line, the report the poll owed us has long landed.
+    fn record_input(&mut self, bytes: &[u8], at_prompt: bool) {
         for byte in bytes {
             let state = std::mem::take(&mut self.state);
             self.state = match state {
                 TerminalInputTrackState::Ground => match *byte {
                     b'\r' | b'\n' => {
-                        self.commit_input();
+                        self.commit_input(at_prompt);
                         TerminalInputTrackState::Ground
                     }
                     0x03 | 0x15 => {
@@ -3283,7 +3324,11 @@ impl TerminalCommandTracker {
                     }
                     0x1b => TerminalInputTrackState::Escape,
                     0x20..=0x7e => {
-                        self.input.push(*byte as char);
+                        // Every tracked byte is ASCII, so the byte cap is a
+                        // character cap.
+                        if self.input.len() < TERMINAL_MAX_TRACKED_COMMAND_BYTES {
+                            self.input.push(*byte as char);
+                        }
                         TerminalInputTrackState::Ground
                     }
                     _ => TerminalInputTrackState::Ground,
@@ -3312,14 +3357,26 @@ impl TerminalCommandTracker {
         if !command.is_empty() {
             self.last = Some(command.to_string());
         }
-        self.input.clear();
+        self.discard_input();
     }
 
-    fn commit_input(&mut self) {
+    /// End the line being typed, because `Enter` was pressed.
+    ///
+    /// The line becomes the pane's last command only when it was typed at a
+    /// prompt: keys aimed at a program the shell is running are a line of *its*
+    /// input, and `print('hi')` is not a command. The line is cleared either
+    /// way, since either way the shell is no longer holding it.
+    fn commit_input(&mut self, at_prompt: bool) {
         let command = self.input.trim();
-        if !command.is_empty() {
+        if at_prompt && !command.is_empty() {
             self.last = Some(command.to_string());
         }
+        self.discard_input();
+    }
+
+    /// Forget the line being typed without committing it: something other than
+    /// an `Enter` we saw has taken it.
+    fn discard_input(&mut self) {
         self.input.clear();
     }
 }
@@ -5544,6 +5601,128 @@ mod tests {
             .expect("send shell input"));
         let _ = read_client_message(&mut server_stream, "reading shell input");
         assert_eq!(runtime.terminal_last_command(terminal), Some("cargo test"));
+    }
+
+    /// The reported bug: a row read `mkdir chronosls`, two commands in one
+    /// label. The foreground report is a poll, so it can say "a child is
+    /// running" about a command that is already over — and while it said so,
+    /// every keystroke was dropped, the `Enter` ending the line with them. The
+    /// line stayed half-typed and the next command was appended to it.
+    #[test]
+    fn terminal_last_command_does_not_merge_a_command_whose_enter_arrived_late() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::Terminal(TerminalId(9));
+        let pane = PaneId(9);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+
+        assert!(runtime
+            .send_input(terminal, b"mkdir chronos")
+            .expect("send command"));
+        let _ = read_client_message(&mut server_stream, "reading command input");
+
+        // A poll lands mid-line: the pane's foreground is a process group the
+        // shell handed off to, and it exited before `/proc` could name it.
+        sender
+            .send(ServerMessage::ForegroundProcess {
+                pane,
+                lease: test_lease(),
+                process: ForegroundProcessInfo {
+                    root_pid: Some(10),
+                    foreground_pid: Some(20),
+                    command: None,
+                },
+            })
+            .expect("send foreground process");
+        assert!(runtime.drain_events().is_empty());
+
+        assert!(runtime.send_input(terminal, b"\r").expect("send enter"));
+        let _ = read_client_message(&mut server_stream, "reading enter input");
+
+        sender
+            .send(ServerMessage::ForegroundProcess {
+                pane,
+                lease: test_lease(),
+                process: ForegroundProcessInfo {
+                    root_pid: Some(10),
+                    foreground_pid: Some(10),
+                    command: Some("fish".to_string()),
+                },
+            })
+            .expect("send shell foreground process");
+        assert!(runtime.drain_events().is_empty());
+
+        assert!(runtime.send_input(terminal, b"ls\r").expect("send next"));
+        let _ = read_client_message(&mut server_stream, "reading next input");
+
+        assert_eq!(runtime.terminal_last_command(terminal), Some("ls"));
+    }
+
+    /// The same lag on the way back: the report that a command has finished
+    /// arrives after the user has started typing the next one. Those characters
+    /// are the command's own, and the `Enter` that ends the line — by which time
+    /// the report has landed — is what decides they were typed at a prompt.
+    #[test]
+    fn terminal_last_command_keeps_typing_that_beat_the_foreground_report() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::Terminal(TerminalId(9));
+        let pane = PaneId(9);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+
+        sender
+            .send(ServerMessage::ForegroundProcess {
+                pane,
+                lease: test_lease(),
+                process: ForegroundProcessInfo {
+                    root_pid: Some(10),
+                    foreground_pid: Some(20),
+                    command: None,
+                },
+            })
+            .expect("send foreground process");
+        assert!(runtime.drain_events().is_empty());
+
+        assert!(runtime
+            .send_input(terminal, b"cargo test")
+            .expect("send command"));
+        let _ = read_client_message(&mut server_stream, "reading command input");
+
+        sender
+            .send(ServerMessage::ForegroundProcess {
+                pane,
+                lease: test_lease(),
+                process: ForegroundProcessInfo {
+                    root_pid: Some(10),
+                    foreground_pid: Some(10),
+                    command: Some("fish".to_string()),
+                },
+            })
+            .expect("send shell foreground process");
+        assert!(runtime.drain_events().is_empty());
+
+        assert!(runtime.send_input(terminal, b"\r").expect("send enter"));
+        let _ = read_client_message(&mut server_stream, "reading enter input");
+
+        assert_eq!(runtime.terminal_last_command(terminal), Some("cargo test"));
+    }
+
+    /// A program that takes raw keys and never sees an `Enter` cannot grow the
+    /// line without bound. The head is what a label is made of, so the head is
+    /// what the cap keeps.
+    #[test]
+    fn terminal_last_command_caps_a_line_that_is_never_submitted() {
+        let mut tracker = TerminalCommandTracker::default();
+        let typed = "a".repeat(TERMINAL_MAX_TRACKED_COMMAND_BYTES * 2);
+
+        tracker.record_input(typed.as_bytes(), true);
+        assert_eq!(tracker.input.len(), TERMINAL_MAX_TRACKED_COMMAND_BYTES);
+
+        tracker.record_input(b"\r", true);
+        assert_eq!(
+            tracker.last_command(),
+            Some("a".repeat(TERMINAL_MAX_TRACKED_COMMAND_BYTES).as_str())
+        );
     }
 
     #[test]

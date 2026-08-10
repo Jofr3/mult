@@ -8,6 +8,29 @@ and the project aims to adhere to
 
 ## [Unreleased]
 
+### A shell row no longer runs two commands together
+
+A shell row could name something nobody typed: `mkdir chronos` followed by `ls`
+came out as one `mkdir chronosls`, and a command typed straight after another
+finished could lose its first characters.
+
+Both were the same gate. `mult` guesses the command a shell is running by
+watching the keystrokes go past, and it only watched while the daemon's
+foreground-process report said the pane was at its prompt. That report is a
+25 ms poll, so it is always a little behind what the pane is actually doing —
+and the gate dropped the `Enter` that ends a command as readily as the
+characters in it. A dropped `Enter` left the line half-typed, with nothing to
+end it, so the next command was appended to what was already there.
+
+Keystrokes are now always watched, and the report decides only whether the line
+may *become* the row's label — a decision made when `Enter` ends the line, by
+which point the poll has caught up. Input meant for a program the shell is
+running still never becomes a command: a line typed into `python` is that
+program's input, and the row goes on saying `python`. A report that a child
+holds the terminal now also drops the half-typed line even when it could not
+name the child, which is the usual answer for a command fast enough to be gone
+before `/proc` is read.
+
 ### Copying a selection keeps the part that scrolled out of view
 
 Selecting more than a screenful copied only the rows that happened to be on
