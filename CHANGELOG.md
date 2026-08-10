@@ -94,12 +94,10 @@ pane as, or what the command tracker guessed by watching keystrokes go past.
 
 - **Agent chats.** Every chat is created with the same name
   (`DEFAULT_AGENT_CHAT_TITLE`) and nothing can rename one, so three Claude Code
-  chats in a workspace were three identical `agent: cc` rows. The row now reads
-  `<title>: cc` once the agent sets one — what it is working on, in the place
-  that could not previously tell the three apart. The `: pi` / `: cc` tag is
-  never what gives way to a long title: it is fixed-width, it is what says
-  which backend the row is, and a title truncated to nothing still leaves the
-  row identifiable.
+  chats in a workspace were three identical `agent` rows. The row now reads the
+  title the agent sets — what it is working on, in the place that could not
+  previously tell the three apart. A title too long for the sidebar is
+  truncated; a title the agent blanks out returns the row to the chat's name.
 - **Shell terminals** prefer the title over the scraped last command, which was
   already a derived, already-changing label — a shell writes its `cwd` there on
   every prompt and an editor writes the file it is on, and neither is a guess.
@@ -338,9 +336,9 @@ an older `mult`, which refuses it without rewriting it.
 - Claude Code as a second chat-agent backend alongside `pi`. `Ctrl+x` (and the
   "New Claude Code chat" command-palette entry) opens a Claude Code agent chat,
   while `Ctrl+a` still opens a `pi` chat. The chosen backend is stored on the
-  chat (`AgentKind`, defaulting to `pi` for pre-existing state) and shown in the
-  sidebar as `agent: pi` / `agent: cc`. New `claude_code_command` and
-  `auto_start_claude_code_agent` config options mirror the `pi` ones.
+  chat (`AgentKind`, defaulting to `pi` for pre-existing state). New
+  `claude_code_command` and `auto_start_claude_code_agent` config options mirror
+  the `pi` ones.
 - Live sidebar status for Claude Code chats. `mult` generates a per-session
   Claude Code hooks file (passed via `--settings`, merged over the user's config
   without touching it on disk) whose `SessionStart` / `UserPromptSubmit` /

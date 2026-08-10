@@ -1,12 +1,12 @@
 ---
-source: src/ui.rs
+source: src/ui/mod.rs
 expression: "buffer_snapshot(&render_buffer_with_palette(&app, &PtyRuntime::new_offline(),\n&config::Config::default(), Palette::monochrome(), 100, 30,))"
 ---
 size: 100x30
 
 symbols:
 | ▣ mult                           Terminal is stopped. Type to start it and send input.             |
-|   ? agent: pi                                                                                      |
+|   ? agent                                                                                          |
 |   $ terminal                                                                                       |
 |                                                                                                    |
 | ▣ website                                                                                          |

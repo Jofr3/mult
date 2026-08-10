@@ -13,8 +13,7 @@ The current implementation is a Ratatui/Crossterm client plus a small `mult-serv
 - Auto-start for the selected terminal or selected agent chat.
 - Two agent backends per chat — `pi` (via a bundled status extension) and
   Claude Code (via generated lifecycle hooks) — chosen when the chat is created,
-  tagged in the sidebar as `: pi` / `: cc`, and both reporting live
-  status into the sidebar dot.
+  and both reporting live status into the sidebar dot.
 - Sidebar rows follow the pane's own window title (OSC 0/2) where the label
   would otherwise be a guess: what an agent says it is working on, and a
   shell's `cwd` or the file an editor is on.
@@ -190,12 +189,11 @@ Mouse support:
 Sidebar labels:
 
 - A pane's row follows the **window title its program sets** (OSC 0/2) wherever
-  the label would otherwise be derived. An agent chat reads `<title>: cc` once
-  the agent sets one — which is what tells several Claude Code chats apart,
-  since they are all created with the same name and none can be renamed — and a
-  shell terminal shows its title in place of the last command `mult` scraped
-  from your keystrokes. The `: pi` / `: cc` tag always survives; a title too
-  long for the sidebar is what gets truncated.
+  the label would otherwise be derived. An agent chat reads the title the agent
+  sets — which is what tells several Claude Code chats apart, since they are all
+  created with the same name and none can be renamed — and a shell terminal
+  shows its title in place of the last command `mult` scraped from your
+  keystrokes.
 - A **command terminal keeps its command**. That is what you typed to create the
   pane, so it stays your landmark for it however the program renames its window.
 - A title is program-supplied, so control characters are stripped from it and

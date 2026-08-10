@@ -272,9 +272,8 @@ exists on the `PATH` set in `~/.bashrc` will not be found. See
 
 The idle placeholder in an *empty* chat pane names the chat's own agent and its
 own two config keys — `pi_agent_command`/`auto_start_pi_agent` for a pi chat,
-`claude_code_command`/`auto_start_claude_code_agent` for a Claude Code one (the
-sidebar shows which with `agent: pi` or `agent: cc`). It used to say "Pi agent"
-and name pi's keys for every chat; that was `F18`.
+`claude_code_command`/`auto_start_claude_code_agent` for a Claude Code one. It
+used to say "Pi agent" and name pi's keys for every chat; that was `F18`.
 
 ---
 

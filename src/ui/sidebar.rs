@@ -223,25 +223,18 @@ fn workspace_sidebar_line(
     ])
 }
 
-/// Sidebar label for a chat, tagged with the agent backing it so running
-/// agents are distinguishable at a glance, e.g. `agent: pi` or `agent: cc`.
+/// Sidebar label for a chat: the agent's own window title (OSC 0/2) once it
+/// sets one, and the chat's name until then.
 ///
-/// The name half is the agent's own window title (OSC 0/2) once it sets one.
-/// Nothing is overridden by that: every chat is created with the same
-/// `DEFAULT_AGENT_CHAT_TITLE` and there is no way to rename one, so before this
-/// three Claude Code chats in a workspace all read `agent: cc` and the sidebar
-/// could not tell them apart. What the agent says it is working on can.
-///
-/// The tag is preserved whatever the title costs: it is what says *which*
-/// backend the row is, it is a fixed four columns, and a title truncated to
-/// nothing still leaves the row identifiable.
+/// Nothing is overridden by that title. Every chat is created with the same
+/// `DEFAULT_AGENT_CHAT_TITLE` and there is no way to rename one, so three
+/// Claude Code chats in a workspace would otherwise be three identical rows.
+/// What the agent says it is working on is what tells them apart.
 fn chat_sidebar_label(chat: &ChatSession, pty_runtime: &PtyRuntime, max_width: usize) -> String {
     let name = pty_runtime
         .terminal_title(PtyKey::ChatAgent(chat.id))
         .unwrap_or_else(|| chat.name.clone());
-    let tag = format!(": {}", chat.agent.label());
-    let name = truncate_text(&name, max_width.saturating_sub(text_width(&tag)));
-    format!("{name}{tag}")
+    truncate_text(&name, max_width)
 }
 
 fn terminal_display_label(
@@ -456,19 +449,9 @@ mod tests {
     }
 
     #[test]
-    fn chat_sidebar_label_tags_the_agent_kind() {
-        let pty_runtime = PtyRuntime::new_offline();
-        let mut chat = test_chat(AgentKind::Pi);
-        assert_eq!(chat_sidebar_label(&chat, &pty_runtime, 40), "agent: pi");
-
-        chat.agent = AgentKind::ClaudeCode;
-        assert_eq!(chat_sidebar_label(&chat, &pty_runtime, 40), "agent: cc");
-    }
-
-    #[test]
     fn a_chat_row_follows_the_agents_own_window_title() {
         // Every chat is created with the same name and none can be renamed, so
-        // three Claude Code chats used to be three identical `agent: cc` rows.
+        // three Claude Code chats would otherwise be three identical rows.
         let chat = test_chat(AgentKind::ClaudeCode);
         let key = PtyKey::ChatAgent(chat.id);
         let mut pty_runtime = PtyRuntime::new_offline();
@@ -477,17 +460,13 @@ mod tests {
 
         assert_eq!(
             chat_sidebar_label(&chat, &pty_runtime, 40),
-            "fix the parser: cc"
+            "fix the parser"
         );
+        assert_eq!(chat_sidebar_label(&chat, &pty_runtime, 12), "fix the par…");
 
-        // The tag is what says which backend the row is, so it survives a
-        // title too long for the sidebar; the title is what gives way.
-        assert_eq!(chat_sidebar_label(&chat, &pty_runtime, 12), "fix the…: cc");
-
-        // A title the program blanks out returns the row to the chat's name
-        // rather than leaving a bare `: cc`.
+        // A title the program blanks out returns the row to the chat's name.
         pty_runtime.process_terminal_output(key, b"\x1b]0;\x07");
-        assert_eq!(chat_sidebar_label(&chat, &pty_runtime, 40), "agent: cc");
+        assert_eq!(chat_sidebar_label(&chat, &pty_runtime, 40), "agent");
     }
 
     #[test]
