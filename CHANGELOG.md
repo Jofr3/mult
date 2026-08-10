@@ -8,6 +8,28 @@ and the project aims to adhere to
 
 ## [Unreleased]
 
+### Closing an item is instant
+
+Deleting a chat or terminal took up to a second, and the whole UI was frozen
+for it — no redraw, no keys. The cause was the shape of a stop: the daemon
+signals the pane's process group with `SIGTERM`, waits out a 750 ms grace
+period, then `SIGKILL`s it, and only answers once the child has been reaped and
+its output drained. The client waited for that answer on the thread that reads
+your keyboard.
+
+The grace period was not the exceptional case it looks like. An interactive
+shell *ignores* `SIGTERM` — `bash`, `zsh` and `fish` all do — so a shell pane
+could only ever be finished off by the `SIGKILL`, and closing one paid the full
+750 ms every single time. A chat agent that handles the signal exited at once
+and closed instantly, which is why the delay seemed to come and go.
+
+The item now goes as soon as the stop request is on the wire. What has not
+changed is that a stop which cannot be *sent* still leaves the item in place and
+says why: deleting it would strand a running pane with nothing left to reach it
+by. Only the outcome is awaited in the background, and if it comes back a
+failure — or does not come back — that is reported as a notice, since by then
+there is no row left to write it into.
+
 ### A shell row says what it is running, without the flags
 
 Every shell row read `~/projects/mult`. That is the pane's window title, which

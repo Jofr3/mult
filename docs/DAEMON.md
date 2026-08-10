@@ -175,7 +175,9 @@ Running -> Stopping -> Exited -> Removed
 
 Finalization occurs only after the direct child is reaped **and** PTY output is drained. Under one exactly-once transition it removes the session, emits one definitive `PaneExited` to the current lease, and completes every pending correlated stop. Natural exit and manual stop cannot steal the child handle from each other. Interrupted or recoverable wait failures retain the sole handle and session for retry rather than fabricating an exit.
 
-The client waits for attach confirmation and replay completion before considering a pane attached. Startup restoration uses attach-only and never sends `CreateSession`, so a missing persisted command cannot relaunch. Deletion waits for a correlated `StopResult`; rejected, timed-out, or disconnected stops leave local state intact pending reconciliation.
+The client waits for attach confirmation and replay completion before considering a pane attached. Startup restoration uses attach-only and never sends `CreateSession`, so a missing persisted command cannot relaunch.
+
+Deletion waits for the `Stop` to reach the daemon, not for the correlated `StopResult`. A stop that cannot be sent leaves local state intact — a deleted item could not reach the pane it orphaned — but the answer is collected asynchronously, because it arrives only after finalization: a `SIGTERM` grace the pane's shell typically ignores, then a `SIGKILL`, a reap and a drain. Waiting for it froze the client's input thread for that whole period on every delete. The local attachment is cleared with the request, so the pane's own `PaneExited` no longer matches a lease and cannot be mistaken for a later incarnation. A `StopResult` reporting a failure, or no answer within the client's stop timeout, is surfaced as a notice; a disconnection abandons outstanding stops rather than reporting each one, since the disconnection is itself reported. The one ordering that is still synchronous is creating a session whose ID has a stop in flight: the client waits that stop out, because the daemon rejects a create for a session it has not yet removed.
 
 ## Process-group termination and daemon shutdown
 

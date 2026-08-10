@@ -261,7 +261,7 @@ fn reconnect_replays_raw_scrollback_into_fresh_parser() {
     );
     wait_for_output(&mut reconnected, terminal, "replayed")
         .expect("reattach should replay buffered raw PTY output");
-    assert!(reconnected.stop(terminal).expect("stop replayed terminal"));
+    stop_and_confirm(&mut reconnected, terminal);
 }
 
 #[test]
@@ -296,7 +296,7 @@ fn second_client_takes_over_session_from_a_still_attached_client() {
     wait_for_output(&mut client_b, terminal, "takeover")
         .expect("takeover should replay buffered output to client B");
 
-    assert!(client_b.stop(terminal).expect("stop after takeover"));
+    stop_and_confirm(&mut client_b, terminal);
 }
 
 #[test]
@@ -411,7 +411,7 @@ fn server_ignores_sighup_and_keeps_sessions_running() {
     wait_for_output(&mut runtime, terminal, "after")
         .expect("server should keep PTY command running after SIGHUP");
 
-    assert!(runtime.stop(terminal).expect("stop terminal after SIGHUP"));
+    stop_and_confirm(&mut runtime, terminal);
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -427,7 +427,11 @@ fn rapid_stop_restart_and_chat_runtime_ids_keep_client_registry_consistent() {
 
     start_short_lived_command(&mut runtime, terminal, "while true; do sleep 1; done");
     assert!(runtime.is_running(terminal));
-    assert!(runtime.stop(terminal).expect("stop running terminal"));
+    // Deliberately *not* `stop_and_confirm`: "rapid" is the point. The stop is
+    // only submitted here, so the restart below reuses a session id the daemon
+    // may still be draining — which it would reject as `SessionAlreadyExists`
+    // if `start` did not wait out that pane first (B22).
+    assert!(runtime.stop_async(terminal).expect("submit stop"));
     assert!(!runtime.is_running(terminal));
 
     start_short_lived_command(&mut runtime, terminal, "printf restarted; exit 0");
@@ -445,6 +449,72 @@ fn rapid_stop_restart_and_chat_runtime_ids_keep_client_registry_consistent() {
     assert!(chat.output.contains("chat-agent"));
     assert!(!runtime.is_running(chat_terminal));
 }
+
+/// B22: closing an item must not cost the daemon's `SIGTERM` grace period on the
+/// caller's thread, which is the input thread.
+///
+/// The pane here ignores `SIGTERM` and so can only be finalized by the follow-up
+/// `SIGKILL` — which is the *ordinary* case for a shell pane, not a contrived
+/// one, because interactive shells ignore `SIGTERM` too. That is what made every
+/// delete freeze the UI for the better part of a second.
+#[test]
+fn stopping_a_sigterm_ignoring_pane_returns_before_the_pane_dies() {
+    if integration_tests_are_skipped() {
+        return;
+    }
+    let server = start_isolated_server().expect("start isolated mult-server fixture");
+    let mut runtime = PtyRuntime::connect_to_socket(server.socket_path.clone())
+        .expect("connect to isolated mult-server");
+    let terminal = PtyKey::Terminal(TerminalId(7009));
+
+    start_short_lived_command(
+        &mut runtime,
+        terminal,
+        "trap '' TERM; printf entrenched; while :; do sleep 60; done",
+    );
+    wait_for_output(&mut runtime, terminal, "entrenched").expect("command should be running");
+
+    let submitted = Instant::now();
+    assert!(runtime.stop_async(terminal).expect("submit stop"));
+    let submit_cost = submitted.elapsed();
+
+    assert!(
+        submit_cost < STOP_SUBMIT_BUDGET,
+        "submitting the stop blocked for {submit_cost:?}, which is the grace period the caller \
+         must no longer pay"
+    );
+    assert!(
+        !runtime.is_running(terminal),
+        "the item is deleted on submission, so the attachment must go with it"
+    );
+
+    // The daemon still finishes the job, and only the SIGKILL can finish it.
+    // Reaching this point well after the call returned is the whole claim: the
+    // work was deferred, not merely fast.
+    let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    while runtime.has_pending_stops() {
+        assert!(
+            Instant::now() < deadline,
+            "mult-server never confirmed the stop"
+        );
+        for event in runtime.drain_events() {
+            if let PtyEvent::StopFailed { message } = event {
+                panic!("stopping the entrenched pane failed: {message}");
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        submitted.elapsed() > STOP_SUBMIT_BUDGET,
+        "the pane died too quickly for this test to prove anything; it was supposed to ignore \
+         SIGTERM and wait out the daemon's grace"
+    );
+}
+
+/// Comfortably under the daemon's 750 ms `STOP_TERM_GRACE` and comfortably over
+/// a local socket write, so it separates "submitted the stop" from "waited for
+/// the stop" without being tight enough to flake on a loaded machine.
+const STOP_SUBMIT_BUDGET: Duration = Duration::from_millis(300);
 
 #[test]
 fn state_namespace_collision_is_rejected_without_relaunching() {
@@ -2209,6 +2279,36 @@ fn start_short_lived_command(runtime: &mut PtyRuntime, terminal: PtyKey, command
     let mut spawn = PtySpawn::command_line(terminal, command.to_string(), None, BTreeMap::new());
     spawn.size = PtyDimensions { rows: 6, cols: 40 };
     runtime.start(spawn).expect("start PTY command");
+}
+
+/// Stop a terminal and wait for the daemon to finish tearing it down.
+///
+/// `stop_async` returns as soon as the request is on the wire (B22) — the UI
+/// must not pay the `SIGTERM` grace period on the input thread — so a test that
+/// wants the pane *actually* gone, or that wants a rejected stop to fail the
+/// test rather than pass silently, has to drain until the answer lands.
+fn stop_and_confirm(runtime: &mut PtyRuntime, terminal: PtyKey) {
+    assert!(
+        runtime.stop_async(terminal).expect("submit stop"),
+        "an attached terminal should have had something to stop"
+    );
+    assert!(
+        !runtime.is_running(terminal),
+        "the local attachment must go with the request, not with the answer"
+    );
+    let deadline = Instant::now() + INTEGRATION_TIMEOUT;
+    while runtime.has_pending_stops() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for mult-server to confirm the stop of {terminal:?}"
+        );
+        for event in runtime.drain_events() {
+            if let PtyEvent::StopFailed { message } = event {
+                panic!("stopping {terminal:?} failed: {message}");
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn wait_for_output(runtime: &mut PtyRuntime, terminal: PtyKey, needle: &str) -> Result<(), String> {

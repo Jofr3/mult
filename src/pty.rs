@@ -148,6 +148,18 @@ pub enum PtyEvent {
         terminal: PtyKey,
         message: String,
     },
+    /// A stop that was submitted optimistically failed *after* the item it
+    /// belonged to was already gone from the UI.
+    ///
+    /// Deleting an item does not wait for the daemon to finish terminating the
+    /// pane (that costs a `SIGTERM` grace period the user experiences as a
+    /// frozen key press), so a failure can only be reported once the row it
+    /// would have been written into no longer exists. Like
+    /// [`Self::ConnectionError`] it carries no pane and must not invent one:
+    /// the render loop routes it to the notice surface.
+    StopFailed {
+        message: String,
+    },
     /// A failure that belongs to the *connection*, not to any one pane: the
     /// daemon could not be reached, its protocol version does not match, the
     /// socket went away, or it sent a connection-wide `ServerMessage::Error`
@@ -360,6 +372,12 @@ pub struct PtyRuntime {
     server_instance: Option<ServerInstanceId>,
     next_request_id: Option<RequestId>,
     pending_requests: HashSet<RequestId>,
+    // Stops that were submitted but whose `StopResult` has not been collected
+    // yet. Deliberately *not* in `pending_requests`: that set means "a
+    // `perform_*` loop owns the receiver right now", and an in-flight stop
+    // outlives the call that sent it, so parking it there would stall
+    // `service_reattachments` for the whole termination grace period.
+    pending_stops: Vec<PendingStop>,
     deferred_messages: VecDeque<ServerMessage>,
     // Escape sequences addressed to the *user's own* terminal rather than to a
     // pane — today only OSC 52 clipboard writes. They are queued here because
@@ -397,6 +415,29 @@ pub struct PtyRuntime {
     // `App` because it is a record of what was *sent*, and only this type sends
     // it; a second copy of that answer could disagree with the wire.
     focused_pane: Option<PtyKey>,
+}
+
+/// A `Stop` that has been written to the daemon but not yet answered.
+///
+/// The local attachment is already gone by the time one of these exists, so
+/// nothing here is needed to keep the client consistent — it only exists so the
+/// eventual `StopResult` can be recognised, pruned from `deferred_messages`,
+/// and turned into a notice if it reports a failure.
+#[derive(Debug)]
+struct PendingStop {
+    request_id: RequestId,
+    /// The daemon-side session being torn down. Recreating this id before the
+    /// teardown finishes is rejected, so [`PtyRuntime::await_stop_for_session`]
+    /// matches on it.
+    session: SessionId,
+    /// What to call the item in a failure notice. The pane it named is already
+    /// deleted, so the message cannot be routed to it and must say which one it
+    /// was instead.
+    label: String,
+    /// When to give up. The daemon's own termination driver is bounded by a
+    /// `SIGTERM` grace plus a `SIGKILL` finalize timeout, so a stop that
+    /// outlives this deadline is a daemon that stopped answering.
+    deadline: Instant,
 }
 
 const SERVER_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -679,6 +720,7 @@ impl PtyRuntime {
             server_instance: None,
             next_request_id: Some(RequestId::MIN),
             pending_requests: HashSet::new(),
+            pending_stops: Vec::new(),
             deferred_messages: VecDeque::new(),
             host_terminal_writes: Vec::new(),
             starting: None,
@@ -1125,6 +1167,7 @@ impl PtyRuntime {
         let pane = pane_for_key(spawn.terminal);
         let launch = launch_spec(&spawn);
         let name = session_name(&spawn, &launch);
+        self.await_stop_for_session(session);
         self.bind_pane(spawn.terminal, pane);
 
         let create_id = self.allocate_request()?;
@@ -1167,26 +1210,115 @@ impl PtyRuntime {
         result
     }
 
-    pub fn stop(&mut self, terminal: PtyKey) -> PtyResult<bool> {
+    /// Ask the daemon to stop `terminal`, without waiting for it to die.
+    ///
+    /// Termination is not instantaneous and must not pretend to be: the daemon
+    /// signals the pane's process group with `SIGTERM`, waits out a grace
+    /// period, then `SIGKILL`s it, and only answers once the child is reaped
+    /// and its output drained. An interactive shell *ignores* `SIGTERM`, so
+    /// paying the full grace is the ordinary case for a shell pane rather than
+    /// the worst one. Waiting for the answer here spent it on the caller's
+    /// thread, which is the input thread: closing an item froze the UI for the
+    /// better part of a second, every time (B22).
+    ///
+    /// Submission stays synchronous, so this still fails loudly for the one
+    /// failure the caller can act on: a stop that could not be handed to the
+    /// daemon at all returns `Err`, and the item must then be kept rather than
+    /// deleted into an orphaned pane the user can no longer see. Only the
+    /// *outcome* is deferred; a failing one is reported by
+    /// [`Self::drain_events`] as [`PtyEvent::StopFailed`].
+    ///
+    /// Returns whether a stop was sent. A terminal with no attachment has
+    /// nothing to stop, which is not an error.
+    pub fn stop_async(&mut self, terminal: PtyKey) -> PtyResult<bool> {
         let Some(pane) = self.attached_pane(terminal) else {
             return Ok(false);
         };
         self.ensure_connected()?;
         let lease = self.lease_for_pane(pane)?;
         let identity = self.identity_for_key(terminal)?;
-        let request_id = self.allocate_request()?;
+        let request_id = self.allocate_stop_request()?;
         let request = ClientMessage::Stop {
             request_id,
             identity,
             pane,
             lease,
         };
-        let result = self.perform_stop(request_id, request);
-        self.finish_request(request_id);
-        result?;
+        let label = self.stop_label(terminal);
+        self.write_idempotent_request(&request)?;
+        // The attachment goes now, not when the answer arrives. It is what
+        // makes the pane's own `PaneExited` a no-op (`lease_of` no longer
+        // matches), which is the guarantee the synchronous path used to get by
+        // consuming that message inside its wait loop: a later incarnation
+        // reusing this pane id cannot be mistaken for this one.
         self.clear_attachment(pane);
         self.pane_entry(terminal).exit_status = None;
+        self.pending_stops.push(PendingStop {
+            request_id,
+            session: session_for_key(terminal),
+            label,
+            deadline: Instant::now() + STOP_ACK_TIMEOUT,
+        });
         Ok(true)
+    }
+
+    /// Wait out an outstanding stop for `session` before recreating it.
+    ///
+    /// This is the one thing the synchronous stop was load-bearing for, and the
+    /// only place [`Self::stop_async`]'s deferral is not free: the daemon keys
+    /// sessions by id and refuses to create one that still exists, so reusing an
+    /// id whose pane is still draining is a `SessionAlreadyExists` rejection.
+    /// Pinning the wait to that exact condition keeps the cost where it belongs
+    /// — a create that reuses a just-stopped id — instead of on every delete.
+    /// Nothing is waited for when no stop is pending, which is the normal case.
+    fn await_stop_for_session(&mut self, session: SessionId) {
+        loop {
+            let mut events = Vec::new();
+            self.reap_pending_stops(&mut events);
+            self.pending_events.extend(events);
+            let Some(deadline) = self
+                .pending_stops
+                .iter()
+                .find(|stop| stop.session == session)
+                .map(|stop| stop.deadline)
+            else {
+                return;
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // Expired: the reap at the top of the next turn retires it and
+                // reports it, and the create then proceeds and fails on its own
+                // terms rather than being stalled twice for the same daemon.
+                continue;
+            }
+            let Some(connection) = self.connection.as_ref() else {
+                return;
+            };
+            match connection.receiver.recv_timeout(remaining) {
+                Ok(message) => self.route_during_request(message),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.disconnect();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// How a failed stop names the item it belonged to.
+    ///
+    /// Resolved at submission time because that is the last moment the pane
+    /// still exists: by the time the failure is known, the row, its title and
+    /// its parser are all gone.
+    fn stop_label(&self, terminal: PtyKey) -> String {
+        let kind = match terminal {
+            PtyKey::ChatAgent(_) => "agent",
+            PtyKey::Terminal(_) => "terminal",
+        };
+        match self.terminal_title(terminal) {
+            Some(title) => format!("{kind} \"{title}\""),
+            None => format!("the deleted {kind}"),
+        }
     }
 
     pub fn list_sessions(&mut self, namespace: StateNamespace) -> PtyResult<Vec<SessionInfo>> {
@@ -1546,6 +1678,7 @@ impl PtyRuntime {
         if was_connected && self.connection.is_none() {
             self.reconnect_or_report();
         }
+        self.reap_pending_stops(&mut events);
         self.service_reattachments();
         self.retry_connection_if_due();
         events.append(&mut self.pending_events);
@@ -1558,6 +1691,17 @@ impl PtyRuntime {
     /// rather than stalling it.
     pub fn has_pending_work(&self) -> bool {
         self.work_remaining || !self.pending_reattach.is_empty()
+    }
+
+    /// Whether any [`Self::stop_async`] is still awaiting its answer.
+    ///
+    /// Deliberately not part of [`Self::has_pending_work`]: that asks for a
+    /// redraw, and a stop resolves on its own within a few ticks the loop was
+    /// going to run anyway, so folding it in would spin the renderer for the
+    /// whole grace period on every delete. This is for a caller that has to know
+    /// the daemon is finished with a pane before doing something else with it.
+    pub fn has_pending_stops(&self) -> bool {
+        !self.pending_stops.is_empty()
     }
 
     fn allocate_request(&mut self) -> PtyResult<RequestId> {
@@ -1578,6 +1722,73 @@ impl PtyRuntime {
         self.pending_requests.remove(&request_id);
         self.deferred_messages
             .retain(|message| message_request_id(message) != Some(request_id));
+    }
+
+    /// Reserve a request id for a stop nobody is going to wait on.
+    ///
+    /// It comes from the same monotonic space as [`Self::allocate_request`] —
+    /// the daemon keys its idempotency cache on it, so ids must not repeat —
+    /// but it is deliberately kept out of `pending_requests`, which means "a
+    /// `perform_*` loop owns the receiver right now" and gates
+    /// [`Self::service_reattachments`]. `pending_stops` carries its own ceiling
+    /// instead, so a daemon that stopped answering stops accepting deletes
+    /// rather than growing the list without bound.
+    fn allocate_stop_request(&mut self) -> PtyResult<RequestId> {
+        if self.pending_stops.len() >= MAX_PENDING_REQUESTS_PER_CLIENT {
+            return Err(PtyError::Invalid(
+                "too many PTY stops are still awaiting confirmation".to_string(),
+            ));
+        }
+        let request_id = self
+            .next_request_id
+            .ok_or_else(|| io::Error::other("PTY request ID space exhausted"))?;
+        self.next_request_id = request_id.checked_next();
+        Ok(request_id)
+    }
+
+    /// Collect the answers to stops submitted by [`Self::stop_async`].
+    ///
+    /// This never waits: it takes only what has already arrived. A `StopResult`
+    /// is queued into `deferred_messages` like every other correlated response,
+    /// and with no `perform_*` loop to claim it nothing else would ever take it
+    /// out, so this is also what keeps that queue from growing by one entry per
+    /// delete.
+    fn reap_pending_stops(&mut self, events: &mut Vec<PtyEvent>) {
+        if self.pending_stops.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut unanswered = Vec::new();
+        for stop in std::mem::take(&mut self.pending_stops) {
+            let answer = self
+                .deferred_messages
+                .iter()
+                .position(|message| message_request_id(message) == Some(stop.request_id))
+                .and_then(|index| self.deferred_messages.remove(index));
+            match answer {
+                Some(ServerMessage::StopResult {
+                    outcome: StopOutcome::Error(error),
+                    ..
+                }) => events.push(PtyEvent::StopFailed {
+                    message: format!(
+                        "{} was deleted, but stopping it failed: {}",
+                        stop.label,
+                        stop_error(error)
+                    ),
+                }),
+                // `Stopped` and `AlreadyAbsent` both mean the pane is gone,
+                // which is what the delete already assumed.
+                Some(_) => {}
+                None if now >= stop.deadline => events.push(PtyEvent::StopFailed {
+                    message: format!(
+                        "{} was deleted, but mult-server never confirmed it stopped; it may still be running",
+                        stop.label
+                    ),
+                }),
+                None => unanswered.push(stop),
+            }
+        }
+        self.pending_stops = unanswered;
     }
 
     fn perform_create(&mut self, request_id: RequestId, request: ClientMessage) -> PtyResult<()> {
@@ -1818,55 +2029,6 @@ impl PtyRuntime {
                     request_id: received,
                     outcome,
                 } if received == request_id => return Ok(outcome),
-                ServerMessage::Error { code, message } => {
-                    return Err(PtyError::Rejected {
-                        code,
-                        detail: message,
-                    })
-                }
-                message => self.route_during_request(message),
-            }
-        }
-    }
-
-    fn perform_stop(&mut self, request_id: RequestId, request: ClientMessage) -> PtyResult<()> {
-        let (stop_pane, stop_lease) = match &request {
-            ClientMessage::Stop { pane, lease, .. } => (*pane, *lease),
-            _ => unreachable!("perform_stop requires Stop"),
-        };
-        self.write_idempotent_request(&request)?;
-        let deadline = Instant::now() + STOP_ACK_TIMEOUT;
-        loop {
-            let message = match self.receive_for_request(request_id, deadline) {
-                Ok(message) => message,
-                Err(error) if error.is_disconnected() => {
-                    self.resume_and_resend(&request)?;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            match message {
-                ServerMessage::StopResult {
-                    request_id: received,
-                    outcome,
-                } if received == request_id => {
-                    return match outcome {
-                        StopOutcome::Stopped { .. } | StopOutcome::AlreadyAbsent => Ok(()),
-                        StopOutcome::Error(error @ StopError::LeaseRejected(_)) => {
-                            self.clear_attachment(stop_pane);
-                            Err(stop_error(error))
-                        }
-                        StopOutcome::Error(error) => Err(stop_error(error)),
-                    };
-                }
-                ServerMessage::PaneExited { pane, lease, .. }
-                    if pane == stop_pane && lease == stop_lease =>
-                {
-                    // The correlated StopResult is the synchronous completion.
-                    // Consume its definitive lifecycle event here so it cannot
-                    // be mistaken for a later incarnation reusing this pane ID.
-                    self.clear_attachment(pane);
-                }
                 ServerMessage::Error { code, message } => {
                     return Err(PtyError::Rejected {
                         code,
@@ -2445,6 +2607,11 @@ impl PtyRuntime {
             && self.server_instance == Some(hello.server_instance);
         if self.client_scope.is_some() && !resumed_same {
             self.pending_requests.clear();
+            // Must go with the id reset below, not merely because their answers
+            // are unreachable: ids restart at `MIN` here, so a stop left over
+            // from the previous scope would match some unrelated future
+            // request's result.
+            self.pending_stops.clear();
             self.deferred_messages.clear();
             self.next_request_id = Some(RequestId::MIN);
             for pane in self.panes.values_mut() {
@@ -2504,6 +2671,18 @@ impl PtyRuntime {
     /// the shutdown: the lock only guards frame interleaving, and there is
     /// nothing left to interleave with.
     fn disconnect(&mut self) {
+        // Stops in flight are abandoned rather than reported. Their answers
+        // lived on the socket that just went away, and the daemon does not
+        // resend an unsolicited result, so waiting for them would turn every
+        // reconnect into a run of "never confirmed" notices about panes the
+        // daemon most likely did stop. The disconnect itself is already
+        // reported, once, by `reconnect_or_report`. An answer that did arrive
+        // but was never reaped goes with them: nothing claims a deferred message
+        // whose stop is no longer tracked.
+        for stop in std::mem::take(&mut self.pending_stops) {
+            self.deferred_messages
+                .retain(|message| message_request_id(message) != Some(stop.request_id));
+        }
         let Some(connection) = self.connection.take() else {
             return;
         };
@@ -4381,26 +4560,20 @@ mod tests {
         server.join().expect("server thread should finish");
     }
 
+    /// B22: the local attachment goes as soon as the request is on the wire,
+    /// *before* any answer, which is what makes deleting an item instant. The
+    /// daemon takes up to a `SIGTERM` grace plus a `SIGKILL` finalize timeout to
+    /// answer, and this runs on the input thread.
     #[test]
-    fn pty_stop_sends_stop_message_and_clears_local_attachment() {
+    fn pty_stop_sends_stop_message_and_clears_local_attachment_without_waiting() {
         let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
         let (sender, receiver) = mpsc::channel();
         let terminal = PtyKey::Terminal(TerminalId(7));
         let pane = PaneId(7);
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
-        sender
-            .send(ServerMessage::StopResult {
-                request_id: RequestId::MIN,
-                outcome: StopOutcome::Stopped {
-                    exit: mult_protocol::ExitInfo {
-                        code: 0,
-                        signal: None,
-                    },
-                },
-            })
-            .expect("send stop confirmation");
 
-        assert!(runtime.stop(terminal).expect("stop terminal"));
+        // Nothing is queued: an answer that has not arrived must not stall this.
+        assert!(runtime.stop_async(terminal).expect("stop terminal"));
 
         let message = read_client_message(&mut server_stream, "reading Stop");
         assert_eq!(
@@ -4414,15 +4587,38 @@ mod tests {
         );
         assert!(!runtime.is_running(terminal));
         assert_eq!(runtime.key_for_pane(pane), None);
+
+        sender
+            .send(ServerMessage::StopResult {
+                request_id: RequestId::MIN,
+                outcome: StopOutcome::Stopped {
+                    exit: mult_protocol::ExitInfo {
+                        code: 0,
+                        signal: None,
+                    },
+                },
+            })
+            .expect("send stop confirmation");
+
+        // A success says only what the delete already assumed, so it is reaped
+        // silently — and reaped it must be, or `deferred_messages` grows by one
+        // entry per delete with no request loop left to claim them.
+        assert_eq!(runtime.drain_events(), Vec::new());
+        assert!(runtime.deferred_messages.is_empty());
+        assert!(runtime.pending_stops.is_empty());
     }
 
+    /// The item is already gone when a rejection lands, so the failure cannot be
+    /// written into its pane and becomes a notice instead.
     #[test]
-    fn pty_stop_keeps_local_attachment_when_server_rejects_stop() {
-        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+    fn pty_stop_reports_a_rejection_that_arrives_after_the_item_is_gone() {
+        let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
         let (sender, receiver) = mpsc::channel();
         let terminal = PtyKey::Terminal(TerminalId(7));
         let pane = PaneId(7);
         let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+
+        assert!(runtime.stop_async(terminal).expect("submit stop"));
         sender
             .send(ServerMessage::StopResult {
                 request_id: RequestId::MIN,
@@ -4433,22 +4629,45 @@ mod tests {
             })
             .expect("send stop rejection");
 
-        let error = runtime.stop(terminal).expect_err("stop should fail");
+        let events = runtime.drain_events();
 
-        assert_eq!(error.code(), Some(RejectCode::DaemonInternal));
-        assert!(error.to_string().contains("failed to kill child"));
-        let message = read_client_message(&mut server_stream, "reading Stop");
-        assert_eq!(
-            message,
-            ClientMessage::Stop {
-                request_id: RequestId::MIN,
-                identity: test_wire_session_identity(terminal),
-                pane,
-                lease: test_lease(),
-            }
+        assert!(
+            matches!(
+                events.as_slice(),
+                [PtyEvent::StopFailed { message }]
+                    if message.contains("failed to kill child")
+            ),
+            "expected a StopFailed notice, got {events:?}"
         );
-        assert!(runtime.is_running(terminal));
-        assert_eq!(runtime.key_for_pane(pane), Some(terminal));
+        assert!(runtime.pending_stops.is_empty());
+    }
+
+    /// A daemon that stops answering must not leave the stop pending forever:
+    /// `pending_stops` is capped, so an un-retired entry would eventually refuse
+    /// further deletes.
+    #[test]
+    fn pty_stop_reports_an_answer_that_never_arrives() {
+        let (client_stream, _server_stream) = UnixStream::pair().expect("create socket pair");
+        let (_sender, receiver) = mpsc::channel();
+        let terminal = PtyKey::Terminal(TerminalId(7));
+        let pane = PaneId(7);
+        let mut runtime = test_runtime(client_stream, receiver, terminal, pane);
+
+        assert!(runtime.stop_async(terminal).expect("submit stop"));
+        assert_eq!(runtime.drain_events(), Vec::new());
+        assert_eq!(runtime.pending_stops.len(), 1);
+
+        runtime.pending_stops[0].deadline = Instant::now();
+        let events = runtime.drain_events();
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [PtyEvent::StopFailed { message }] if message.contains("may still be running")
+            ),
+            "expected a timeout notice, got {events:?}"
+        );
+        assert!(runtime.pending_stops.is_empty());
     }
 
     #[test]
@@ -5022,7 +5241,7 @@ mod tests {
         entry.expected_output = Some(OutputSequence::ZERO);
         entry.identity = Some(test_wire_session_identity(terminal));
 
-        let error = runtime.stop(terminal).expect_err("stop should fail");
+        let error = runtime.stop_async(terminal).expect_err("stop should fail");
 
         // A poisoned local writer lock is our own I/O failing, not the daemon
         // refusing anything, so it carries no `RejectCode`.

@@ -23,10 +23,18 @@ use super::keymap::is_unshifted_control_char;
 ///
 /// There is no confirmation step: `Ctrl+q` and the palette's "Delete selected"
 /// both land here and act immediately. What survives from the old confirmation
-/// prompt is the *ordering* — the PTY is stopped first, and durable state is
-/// mutated only once the daemon accepted the stop — so a refused stop leaves
-/// the item in place and reports why, instead of dropping an item that is still
-/// attached to a live pane.
+/// prompt is the *ordering* — the stop is issued first, and durable state is
+/// mutated only once the daemon has *accepted* it — so a stop that cannot be
+/// submitted at all leaves the item in place and reports why, instead of
+/// dropping an item that is still attached to a live pane.
+///
+/// "Accepted" is deliberately not "completed" (B22). Completing a stop means
+/// waiting out a `SIGTERM` grace period the pane's shell usually ignores, and
+/// this runs on the input thread, so waiting for it made every delete freeze
+/// the UI for the better part of a second. The item goes as soon as the request
+/// is on the wire; a stop that then fails is reported by
+/// [`PtyEvent::StopFailed`](crate::pty::PtyEvent::StopFailed) as a notice,
+/// because by then there is no row left to write it into.
 pub(super) fn delete_selected(app: &mut App, pty_runtime: &mut PtyRuntime) {
     let status_file = app
         .selected_delete_target()
@@ -40,7 +48,7 @@ pub(super) fn delete_selected(app: &mut App, pty_runtime: &mut PtyRuntime) {
         });
     let removed = delete_selected_with(app, |_, terminal| {
         pty_runtime
-            .stop(terminal)
+            .stop_async(terminal)
             .map(|_| ())
             .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
     });
@@ -64,7 +72,9 @@ fn delete_selected_with(
 
     if let Some(terminal) = target.pty_key() {
         // The target is still present here. Durable state is mutated only after
-        // the daemon accepted the stop request (or no attachment existed).
+        // the stop reached the daemon (or no attachment existed): a request
+        // that never got sent would leave a running pane behind with no item
+        // left to reach it by.
         if let Err(error) = stop(app, terminal) {
             app.record_operation_failure(format!(
                 "failed to stop PTY; item was not deleted: {error}"

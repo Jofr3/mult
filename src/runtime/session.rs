@@ -424,6 +424,11 @@ fn apply_pty_event(app: &mut App, pty_runtime: &mut PtyRuntime, event: PtyEvent)
             PtyEvent::Error { terminal, message } => {
                 pty_runtime.append_terminal_system_line(terminal, message.as_str());
             }
+            // The pane this belongs to was deleted before its stop was answered,
+            // so there is no longer a pane to write it into (B22).
+            PtyEvent::StopFailed { message } => {
+                app.push_notice(NoticeLevel::Error, NoticeSource::Report, message);
+            }
             // No pane owns this, so there is no pane to write it into: a
             // missing or protocol-incompatible daemon otherwise left the user
             // with an inert UI and the explanation queued against a terminal
