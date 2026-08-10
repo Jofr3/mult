@@ -8,6 +8,25 @@ and the project aims to adhere to
 
 ## [Unreleased]
 
+### Copying a selection keeps the part that scrolled out of view
+
+Selecting more than a screenful copied only the rows that happened to be on
+screen when you hit copy, and dropped the rest without saying so. Scrolling up
+mid-drag was the easy way to hit it: the anchor left the view, and with it
+everything above the top row.
+
+The cause was where the selection was read. A selection's rows are counted from
+the top of the *current* view, so a row above it is negative — and `vt100` only
+ever exposes the rows in view, so the copy clamped the range to the visible grid
+and took what was left. That is the whole selection whenever the selection fits
+on screen, which is why it looked right.
+
+The range is now read by the emulator layer, which walks the scrollback offset
+over it a screenful at a time and puts the view back where it was, so the copy
+is the selection whether or not it fits. Rows the scrollback no longer holds are
+skipped rather than faked: a selection older than the history yields what
+survives of it, not nothing.
+
 ### Closing an item is instant
 
 Deleting a chat or terminal took up to a second, and the whole UI was frozen

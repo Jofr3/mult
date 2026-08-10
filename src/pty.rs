@@ -1611,6 +1611,86 @@ impl PtyRuntime {
         Ok(self.scroll_parser(terminal, -(rows.min(i32::MAX as usize) as i32)))
     }
 
+    /// The text logically between two cells of a pane's grid, with rows counted
+    /// from the top of what is *currently in view*: a negative row is up in the
+    /// scrollback, a row past the last visible one is below the bottom of the
+    /// view. `end_col_exclusive` is one past the last column wanted on
+    /// `end_row`.
+    ///
+    /// `vt100` only ever exposes the rows in view, so a range that leaves it is
+    /// read a screenful at a time by walking the scrollback offset over it and
+    /// putting the offset back afterwards. Rows the history no longer holds are
+    /// skipped rather than faked, and rows below the newest one end the walk.
+    pub fn contents_between_rows(
+        &mut self,
+        terminal: PtyKey,
+        start_row: i32,
+        start_col: u16,
+        end_row: i32,
+        end_col_exclusive: u16,
+    ) -> Option<String> {
+        let parser = self.parser_mut(terminal)?;
+        let (rows, cols) = parser.screen().size();
+        if rows == 0 || cols == 0 || start_row > end_row {
+            return None;
+        }
+        let last_visible = i64::from(rows - 1);
+        let view = parser.screen().scrollback() as i64;
+        let (first_row, last_row) = (i64::from(start_row), i64::from(end_row));
+
+        let mut text = String::new();
+        let mut row = first_row;
+        while row <= last_row {
+            // Bring `row` to the top of the view, as far as the history allows.
+            let wanted = (view - row).clamp(0, parser.screen().scrollback_len() as i64);
+            parser.set_scrollback(wanted as usize);
+            let shift = parser.screen().scrollback() as i64 - view;
+
+            let top = row + shift;
+            if top > last_visible {
+                // Below the newest row the pane has: nothing further exists.
+                break;
+            }
+            if top < 0 {
+                // Older than the scrollback still holds; resume at the oldest
+                // row it does. `-shift` is that row, so the next pass lands on
+                // the same offset with `top == 0` and the walk moves on.
+                row = -shift;
+                continue;
+            }
+
+            let chunk_end = last_row.min(last_visible - shift);
+            let view_start = top as u16;
+            let view_end = (chunk_end + shift) as u16;
+            let from_col = if row == first_row {
+                start_col.min(cols - 1)
+            } else {
+                0
+            };
+            let to_col = if chunk_end == last_row {
+                end_col_exclusive.min(cols)
+            } else {
+                cols
+            };
+
+            text.push_str(
+                &parser
+                    .screen()
+                    .contents_between(view_start, from_col, view_end, to_col),
+            );
+            // `contents_between` ends its last row without a newline, so a
+            // chunk boundary mid-selection has to supply the one the row break
+            // would have had.
+            if chunk_end < last_row && !parser.screen().row_wrapped(view_end) {
+                text.push('\n');
+            }
+            row = chunk_end + 1;
+        }
+
+        parser.set_scrollback(view as usize);
+        (!text.is_empty()).then_some(text)
+    }
+
     pub fn resize(&mut self, terminal: PtyKey, size: PtyDimensions) -> PtyResult<()> {
         // Clamped once here so the parser and the daemon's PTY are driven at
         // the same size; the daemon applies the same policy independently.

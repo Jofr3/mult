@@ -36,41 +36,18 @@ pub(super) fn copy_text_selection_to_clipboard(
     copy_text_to_clipboard(pty_runtime, config, &text)
 }
 
-fn selected_text(pty_runtime: &PtyRuntime, selection: TextSelection) -> Option<String> {
-    let parser = pty_runtime.parser(selection.terminal)?;
-    let screen = parser.screen();
-    let (rows, cols) = screen.size();
-    if rows == 0 || cols == 0 {
-        return None;
-    }
-
+/// The selected text, including whatever part of it has scrolled out of the
+/// view: the rows are handed to the emulator layer as they are, and it walks
+/// the scrollback to reach the ones that are no longer on screen.
+fn selected_text(pty_runtime: &mut PtyRuntime, selection: TextSelection) -> Option<String> {
     let range = selection.normalized_range();
-    let visible_last_row = i32::from(rows.saturating_sub(1));
-    if range.end.row < 0 || range.start.row > visible_last_row {
-        return None;
-    }
-
-    let start_row = range.start.row.max(0);
-    let end_row = range.end.row.min(visible_last_row);
-    let start_col = if start_row == range.start.row {
-        range.start.col.min(cols.saturating_sub(1))
-    } else {
-        0
-    };
-    let end_col = if end_row == range.end.row {
-        range.end.col.min(cols.saturating_sub(1))
-    } else {
-        cols.saturating_sub(1)
-    };
-    let start_row = u16::try_from(start_row).unwrap_or(0);
-    let end_row = u16::try_from(end_row).unwrap_or(rows.saturating_sub(1));
-    let end_col_exclusive = end_col.saturating_add(1).min(cols);
-    if start_row == end_row && start_col >= end_col_exclusive {
-        return None;
-    }
-
-    let text = screen.contents_between(start_row, start_col, end_row, end_col_exclusive);
-    (!text.is_empty()).then_some(text)
+    pty_runtime.contents_between_rows(
+        selection.terminal,
+        range.start.row,
+        range.start.col,
+        range.end.row,
+        range.end.col.saturating_add(1),
+    )
 }
 
 /// Queue an OSC 52 clipboard write for the host terminal.
@@ -213,8 +190,66 @@ mod tests {
         };
 
         assert_eq!(
-            selected_text(&pty_runtime, selection).as_deref(),
+            selected_text(&mut pty_runtime, selection).as_deref(),
             Some("bc\nd")
+        );
+    }
+
+    #[test]
+    fn text_selection_scrolled_out_of_view_is_copied_whole() {
+        let terminal = PtyKey::Terminal(model::TerminalId(79));
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime
+            .resize(terminal, PtyDimensions { rows: 2, cols: 8 })
+            .expect("resize parser");
+        pty_runtime.process_terminal_output(terminal, b"one\r\ntwo\r\nthree\r\nfour");
+
+        // The view holds "three"/"four"; "one"/"two" are in the scrollback.
+        // Select all four rows the way a drag plus a wheel scroll leaves it:
+        // rows are relative to the current view, so the first two are negative.
+        let selection = TextSelection {
+            terminal,
+            anchor: SelectionCell { row: -2, col: 0 },
+            focus: SelectionCell { row: 1, col: 3 },
+            dragging: false,
+        };
+
+        assert_eq!(
+            selected_text(&mut pty_runtime, selection).as_deref(),
+            Some("one\ntwo\nthree\nfour")
+        );
+        assert_eq!(
+            pty_runtime
+                .parser(terminal)
+                .expect("parser")
+                .screen()
+                .scrollback(),
+            0,
+            "reading the selection leaves the view where it was"
+        );
+    }
+
+    #[test]
+    fn text_selection_older_than_the_scrollback_copies_what_survives() {
+        let terminal = PtyKey::Terminal(model::TerminalId(80));
+        let mut pty_runtime = PtyRuntime::new_offline();
+        pty_runtime
+            .resize(terminal, PtyDimensions { rows: 2, cols: 8 })
+            .expect("resize parser");
+        pty_runtime.process_terminal_output(terminal, b"one\r\ntwo");
+
+        // Rows -4 and -3 never existed; the selection still yields the rest
+        // rather than nothing.
+        let selection = TextSelection {
+            terminal,
+            anchor: SelectionCell { row: -4, col: 0 },
+            focus: SelectionCell { row: 1, col: 3 },
+            dragging: false,
+        };
+
+        assert_eq!(
+            selected_text(&mut pty_runtime, selection).as_deref(),
+            Some("one\ntwo")
         );
     }
 
@@ -229,9 +264,9 @@ mod tests {
         // at 2); 'b' at col 3.
         pty_runtime.process_terminal_output(terminal, "a你b".as_bytes());
 
-        let select = |start: u16, end: u16| {
+        let mut select = |start: u16, end: u16| {
             selected_text(
-                &pty_runtime,
+                &mut pty_runtime,
                 TextSelection {
                     terminal,
                     anchor: SelectionCell { row: 0, col: start },
