@@ -43,6 +43,10 @@ pub struct Config {
     pub pi_agent_command: String,
     #[serde(default = "default_claude_code_command")]
     pub claude_code_command: String,
+    /// The file manager `Ctrl+n` opens in the selected workspace's root
+    /// directory. Run through the login shell, like the agent commands.
+    #[serde(default = "default_file_manager_command")]
+    pub file_manager_command: String,
     #[serde(default = "default_auto_start_pi_agent")]
     pub auto_start_pi_agent: bool,
     #[serde(default = "default_auto_start_claude_code_agent")]
@@ -138,6 +142,7 @@ impl PartialEq for Config {
     fn eq(&self, other: &Self) -> bool {
         self.pi_agent_command == other.pi_agent_command
             && self.claude_code_command == other.claude_code_command
+            && self.file_manager_command == other.file_manager_command
             && self.auto_start_pi_agent == other.auto_start_pi_agent
             && self.auto_start_claude_code_agent == other.auto_start_claude_code_agent
             && self.auto_start_terminals == other.auto_start_terminals
@@ -311,6 +316,7 @@ impl Default for Config {
         Self {
             pi_agent_command: default_pi_agent_command(),
             claude_code_command: default_claude_code_command(),
+            file_manager_command: default_file_manager_command(),
             auto_start_pi_agent: default_auto_start_pi_agent(),
             auto_start_claude_code_agent: default_auto_start_claude_code_agent(),
             auto_start_terminals: default_auto_start_terminals(),
@@ -614,6 +620,10 @@ fn default_claude_code_command() -> String {
     "claude".to_string()
 }
 
+fn default_file_manager_command() -> String {
+    "yazi".to_string()
+}
+
 fn default_auto_start_pi_agent() -> bool {
     true
 }
@@ -701,6 +711,7 @@ mod tests {
 
         assert_eq!(config.pi_agent_command, "pi");
         assert_eq!(config.claude_code_command, "claude");
+        assert_eq!(config.file_manager_command, "yazi");
         assert!(config.auto_start_pi_agent);
         assert!(config.auto_start_claude_code_agent);
         assert!(config.auto_start_terminals);
@@ -824,6 +835,16 @@ mod tests {
         assert_eq!(config.pi_agent_command, "pi");
         assert_eq!(config.claude_code_command, "claude --resume");
         assert!(config.auto_start_claude_code_agent);
+    }
+
+    #[test]
+    fn config_loads_file_manager_command_from_json() {
+        let path = unique_temp_file();
+        fs::write(&path, r#"{"file_manager_command":"lf"}"#).expect("write config");
+
+        let config = load_from_path(&path).expect("load config");
+
+        assert_eq!(config.file_manager_command, "lf");
     }
 
     #[test]

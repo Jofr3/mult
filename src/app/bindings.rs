@@ -14,6 +14,7 @@ pub enum CommandAction {
     AddClaudeCodeChat,
     AddShellTerminal,
     AddCommandTerminal,
+    OpenFileManager,
     OpenWorkspace,
     DeleteSelected,
     SearchSelectedPane,
@@ -183,6 +184,13 @@ pub const BINDINGS: &[BindingEntry] = &[
         BindingAvailability::SelectedWorkspace,
     ),
     BindingEntry::global(
+        Some("Ctrl+n"),
+        "Open file manager",
+        "open the configured file manager in the selected workspace's root directory",
+        Some(CommandAction::OpenFileManager),
+        BindingAvailability::SelectedWorkspace,
+    ),
+    BindingEntry::global(
         Some("Ctrl+f"),
         "Open workspace",
         "import a workspace directory",
@@ -203,8 +211,10 @@ pub const BINDINGS: &[BindingEntry] = &[
         Some(CommandAction::ClearSearch),
         BindingAvailability::ActiveSearch,
     ),
+    // Palette-only since `Ctrl+n` went to the file manager: notices expire on
+    // their own, so losing the shortcut costs a wait, not the ability to clear.
     BindingEntry::global(
-        Some("Ctrl+n"),
+        None,
         "Dismiss notices",
         "clear the status notices without waiting for them to expire",
         Some(CommandAction::DismissNotices),
@@ -415,6 +425,7 @@ mod tests {
             "Ctrl+a",
             "Ctrl+x",
             "Ctrl+t",
+            "Ctrl+n",
             "Ctrl+f",
             "Ctrl+q",
             "? or F1",

@@ -30,7 +30,7 @@ use super::prompt::{
     delete_selected, handle_command_palette_key, handle_open_workspace_key, handle_search_key,
     handle_terminal_command_key,
 };
-use super::session::{start_or_focus_selected_terminal, start_terminal};
+use super::session::{open_file_manager, start_or_focus_selected_terminal, start_terminal};
 
 pub(super) fn handle_event(
     app: &mut App,
@@ -228,9 +228,8 @@ fn handle_control_key(
         app.begin_open_workspace(&config.projects);
         return true;
     }
-    // Only consumed when there is something to dismiss, so `Ctrl+n` still
-    // reaches a PTY on a quiet session.
-    if is_unshifted_control_char(key, 'n') && app.dismiss_notices() {
+    if is_unshifted_control_char(key, 'n') {
+        open_file_manager(app, pty_runtime, config, layout);
         return true;
     }
 
@@ -345,8 +344,6 @@ pub(super) fn focus_selected_input(
 mod tests {
 
     use super::*;
-    use crate::app::NoticeLevel;
-    use crate::app::NoticeSource;
     use crate::runtime::{keymap::key_to_pty_bytes, test_support::*};
     use ratatui::layout::Rect;
 
@@ -680,17 +677,16 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_n_dismisses_notices_but_otherwise_reaches_the_pty() {
-        let store = test_state_store("notice-dismiss");
+    fn ctrl_n_opens_one_file_manager_terminal_and_reuses_it() {
+        let store = test_state_store("file-manager");
         let config = Config::default();
         let mut app = App::default();
         let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
         let mut pty_runtime = PtyRuntime::new_offline();
-        app.push_notice(
-            NoticeLevel::Error,
-            NoticeSource::Report,
-            "daemon unreachable",
-        );
+        let workspace = app
+            .selected_workspace_id()
+            .expect("a workspace is selected");
+        let before = app.project.workspace(workspace).unwrap().terminals.len();
 
         assert!(handle_control_key(
             &mut app,
@@ -700,11 +696,26 @@ mod tests {
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
             layout,
         ));
-        assert!(app.notices().is_empty());
+        let terminals = &app.project.workspace(workspace).unwrap().terminals;
+        assert_eq!(terminals.len(), before + 1);
+        let opened = terminals.last().unwrap();
+        assert_eq!(
+            opened.launch,
+            crate::model::TerminalLaunch::Command(config.file_manager_command.clone())
+        );
+        let opened_id = opened.id;
+        assert_eq!(
+            app.selected_item(),
+            Some(NavItem::Terminal {
+                workspace,
+                terminal: opened_id,
+            })
+        );
 
-        // With nothing to dismiss the key is not consumed, so a shell behind
-        // the surface keeps its `Ctrl+n`.
-        assert!(!handle_control_key(
+        // A second press from elsewhere in the same workspace lands on the pane
+        // the first one made instead of stacking another file manager beside it.
+        app.select_previous();
+        assert!(handle_control_key(
             &mut app,
             &mut pty_runtime,
             &config,
@@ -712,5 +723,16 @@ mod tests {
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
             layout,
         ));
+        assert_eq!(
+            app.project.workspace(workspace).unwrap().terminals.len(),
+            before + 1
+        );
+        assert_eq!(
+            app.selected_item(),
+            Some(NavItem::Terminal {
+                workspace,
+                terminal: opened_id,
+            })
+        );
     }
 }

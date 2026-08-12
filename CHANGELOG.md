@@ -8,6 +8,23 @@ and the project aims to adhere to
 
 ## [Unreleased]
 
+### `Ctrl+n` opens a file manager on the workspace root
+
+A workspace knows the directory it stands for, so browsing it should not mean
+typing `cd` into a fresh shell. `Ctrl+n` — and the palette's "Open file manager"
+— runs `file_manager_command` (`yazi` by default, through `$SHELL -lc` like the
+agent commands) as a command terminal in the selected workspace, which is how it
+inherits that workspace's `cwd` and environment.
+
+The workspace keeps *one* file manager: a second `Ctrl+n` selects and, if it had
+exited, restarts the pane the first press made rather than stacking another
+beside it. Reuse is by launch command, so pointing the key at a different file
+manager gives you a pane for that one.
+
+`Ctrl+n` used to dismiss the status notices, which is now a palette-only command
+("Dismiss notices"). Notices still expire on their own after 12 seconds, so what
+the key bought was the wait, not the clearing.
+
 ### A shell row no longer runs two commands together
 
 A shell row could name something nobody typed: `mkdir chronos` followed by `ls`

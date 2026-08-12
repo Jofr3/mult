@@ -263,6 +263,71 @@ impl App {
             Err(error) => self.record_operation_failure(error.to_string()),
         }
     }
+
+    /// Selects the file manager terminal of the selected workspace, adding one
+    /// that runs `command` in the workspace root if there is none yet.
+    ///
+    /// A file manager is an ordinary command terminal, so it is recognised by
+    /// its launch command rather than by a flag of its own: pressing the key
+    /// again lands on the pane the first press made instead of stacking a
+    /// second one beside it. Starting the PTY is the caller's job — this only
+    /// touches durable state.
+    pub fn open_file_manager_in_selected_workspace(&mut self, command: &str) -> Option<TerminalId> {
+        let command = command.trim();
+        if command.is_empty() {
+            self.record_operation_failure("no file manager command is configured");
+            return None;
+        }
+        let workspace = self.selected_workspace_id()?;
+
+        if let Some(terminal) = self.command_terminal_running(workspace, command) {
+            self.select_item(NavItem::Terminal {
+                workspace,
+                terminal,
+            });
+            self.clear_operation_error();
+            return Some(terminal);
+        }
+
+        match self
+            .project
+            .add_command_terminal(workspace, command.to_string(), command.to_string())
+        {
+            Ok(Some(terminal)) => {
+                self.select_item(NavItem::Terminal {
+                    workspace,
+                    terminal,
+                });
+                self.clear_operation_error();
+                self.mark_structural_change();
+                Some(terminal)
+            }
+            Ok(None) => {
+                self.record_operation_failure("selected workspace no longer exists");
+                None
+            }
+            Err(error) => {
+                self.record_operation_failure(error.to_string());
+                None
+            }
+        }
+    }
+
+    fn command_terminal_running(
+        &self,
+        workspace: WorkspaceId,
+        command: &str,
+    ) -> Option<TerminalId> {
+        self.project
+            .workspace(workspace)?
+            .terminals
+            .iter()
+            .find(|terminal| match &terminal.launch {
+                crate::model::TerminalLaunch::Command(existing) => existing == command,
+                crate::model::TerminalLaunch::Shell => false,
+            })
+            .map(|terminal| terminal.id)
+    }
 }
 
 pub(super) fn clean_git_branch_name(branch: String) -> Option<String> {

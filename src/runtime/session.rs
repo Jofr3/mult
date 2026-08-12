@@ -284,6 +284,28 @@ pub(super) fn start_or_focus_selected_terminal(
     }
 }
 
+/// Open the configured file manager on the selected workspace's root directory.
+///
+/// The pane is a command terminal in the workspace, so it inherits the
+/// workspace `cwd` and environment the way every other terminal there does.
+/// Starting it here is the deliberate start C1 asks for: the user pressed the
+/// key, so a file manager left over from a previous session may be relaunched.
+pub(super) fn open_file_manager(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    config: &Config,
+    layout: AppLayout,
+) {
+    if app
+        .open_file_manager_in_selected_workspace(&config.file_manager_command)
+        .is_none()
+    {
+        return;
+    }
+
+    start_or_focus_selected_terminal(app, pty_runtime, config, layout);
+}
+
 pub(super) fn resize_visible_terminal(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,

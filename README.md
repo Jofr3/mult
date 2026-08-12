@@ -138,11 +138,11 @@ Global controls when no prompt is open:
 | `Ctrl+a` | Add a new `pi` agent chat to the selected workspace |
 | `Ctrl+x` | Add a new Claude Code agent chat to the selected workspace |
 | `Ctrl+t` | Add a new shell terminal to the selected workspace |
+| `Ctrl+n` | Open the file manager (`yazi` by default) in the selected workspace's root directory |
 | `Ctrl+f` | Open/import a workspace |
 | `Ctrl+p` | Open the command palette |
 | `Ctrl+s` | Search the selected terminal pane (see the note below for chats) |
 | `Ctrl+q` | Delete the selected chat/terminal, or an empty workspace — immediately, with no confirmation |
-| `Ctrl+n` | Dismiss the status notices |
 | `?` or `F1` | Show every key and command in an overlay |
 | `Ctrl+Esc` | Quit |
 
@@ -152,7 +152,8 @@ Because of that, `?` only opens the overlay when no pane would have received it;
 
 Errors with no pane to report into — a daemon that will not connect, a failed
 state save, a config warning — appear in a status surface above the prompt line.
-Notices fade after 12 seconds, at most four are shown, and `Ctrl+n` clears them.
+Notices fade after 12 seconds, at most four are shown, and the palette's
+"Dismiss notices" clears them without waiting.
 
 Prompt controls:
 
@@ -241,6 +242,7 @@ Example:
 {
   "pi_agent_command": "pi",
   "claude_code_command": "claude",
+  "file_manager_command": "yazi",
   "auto_start_pi_agent": true,
   "auto_start_claude_code_agent": true,
   "auto_start_terminals": true,
@@ -258,7 +260,7 @@ Example:
 }
 ```
 
-`pi_agent_command` and `claude_code_command` select the binary for each agent backend (`Ctrl+a` starts a `pi` chat, `Ctrl+x` a Claude Code chat); `auto_start_*` toggle whether the selected chat of that kind starts on focus. Both commands are launched through your login shell (`$SHELL -lc …`), so shell features — pipelines, `$VAR` expansion, globbing — work inside them. This is intentionally different from `MULT_AGENT_CMD` (below), which `mult` splits into arguments itself with no shell involved.
+`pi_agent_command` and `claude_code_command` select the binary for each agent backend (`Ctrl+a` starts a `pi` chat, `Ctrl+x` a Claude Code chat); `auto_start_*` toggle whether the selected chat of that kind starts on focus. Both commands are launched through your login shell (`$SHELL -lc …`), so shell features — pipelines, `$VAR` expansion, globbing — work inside them. This is intentionally different from `MULT_AGENT_CMD` (below), which `mult` splits into arguments itself with no shell involved. `file_manager_command` is the third of these: `Ctrl+n` runs it through the same login shell, in the selected workspace's root directory.
 
 The example above sets 3 of the 12 colorscheme keys. **[docs/CONFIG.md](docs/CONFIG.md) is the complete reference** — every top-level and colorscheme key with its type, default and effect, including `_nc` (the unfocused-pane background, written with a leading underscore).
 

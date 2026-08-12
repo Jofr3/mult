@@ -18,6 +18,7 @@ use super::agent_launch::add_agent_to_selected_workspace;
 use super::agent_status::mult_agent_status_path;
 use super::input::focus_selected_input;
 use super::keymap::is_unshifted_control_char;
+use super::session::open_file_manager;
 
 /// Deletes the selected chat, terminal or empty workspace outright.
 ///
@@ -229,6 +230,7 @@ fn execute_command_action(
         CommandAction::AddCommandTerminal => {
             app.begin_new_terminal_command();
         }
+        CommandAction::OpenFileManager => open_file_manager(app, pty_runtime, config, layout),
         CommandAction::OpenWorkspace => app.begin_open_workspace(&config.projects),
         CommandAction::DeleteSelected => delete_selected(app, pty_runtime),
         CommandAction::SearchSelectedPane => {

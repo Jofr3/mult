@@ -16,9 +16,9 @@ symbols:
 |      │Ctrl+a                     New pi agent chat                                          │      |
 |      │Ctrl+x                     New Claude Code chat                                       │      |
 |      │Ctrl+t                     New shell terminal                                         │      |
+|      │Ctrl+n                     Open file manager                                          │      |
 |      │Ctrl+f                     Open workspace                                             │      |
 |      │Ctrl+q                     Delete selected item                                       │      |
-|      │Ctrl+n                     Dismiss notices                                            │      |
 |      │Ctrl+Esc                   Quit mult                                                  │      |
 |      │Ctrl+j or Ctrl+Enter       Select next sidebar item                                   │      |
 |      │Ctrl+k                     Select previous sidebar item                               │      |
