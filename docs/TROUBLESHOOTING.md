@@ -173,6 +173,11 @@ process.
 **Fix.** Use the existing instance, or give the second one its own state:
 `MULT_STATE_PATH=~/.local/share/mult/second.json mult`.
 
+If no instance is visible anywhere, look for one that outlived its window —
+`ps -o pid,stat,args -C mult`. It should not be possible (B23), but a client that
+is still running with no terminal to draw on holds this lock like any other, and
+`kill` on it releases both the lock and the pane leases it is sitting on.
+
 ---
 
 ## "rejecting … uid …; expected current uid …"
@@ -206,6 +211,29 @@ effective UID, not on `$USER`.
 credential lookup currently returns "unknown" and is treated as accept, so there
 the socket's `0600` mode and its `0700` parent are the only barrier. Tracked as
 `C3`; do not put the socket somewhere world-reachable on those platforms.
+
+---
+
+## I closed the terminal window `mult` was running in
+
+**What happens.** The client ends; nothing it was running does. `mult-server`
+owns the PTYs, is its own session leader and ignores `SIGHUP`, and every pane
+child is a session leader under a pty the daemon holds — none of them is in the
+closed window's session, so none of them is signalled. Agents keep working
+through the close. Reopening `mult` reattaches to them: restoration is
+attach-only, so nothing is relaunched and no turn is restarted.
+
+The client itself does not survive, and should not: it would still hold the
+state-file `flock` and every pane's attachment lease, which is what would stop
+the next `mult` from reaching those agents. It exits on whichever comes first —
+the `SIGHUP` the kernel sends the window's foreground group, or its own
+detection of the hangup on the descriptor it polls (B23) — and one closing
+window is expected to produce both.
+
+**If a tab looks broken after reopening,** the pane is reporting something else:
+see *A pane says the session is unavailable after restarting the daemon* below
+for restoration messages, and *Agent status dots never update* for a chat whose
+dot is stale while the pane itself is fine.
 
 ---
 

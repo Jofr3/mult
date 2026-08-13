@@ -1,8 +1,13 @@
 use std::{
     env, io,
     panic::{self, AssertUnwindSafe},
-    process::ExitCode,
-    sync::{atomic::AtomicBool, Arc},
+    process::{self, ExitCode},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
 };
 
 use mult::{
@@ -126,6 +131,11 @@ fn run(options: Options) -> io::Result<()> {
     }
 }
 
+/// How long a requested shutdown may take before it is taken out of the event
+/// loop's hands. Generous: the loop acts on the flag within one ~16 ms tick, and
+/// everything after it is a state checkpoint and a terminal restore.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 fn install_shutdown_signals() -> io::Result<Arc<AtomicBool>> {
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -137,5 +147,30 @@ fn install_shutdown_signals() -> io::Result<Arc<AtomicBool>> {
         flag::register(signal, Arc::clone(&shutdown))?;
     }
 
+    watch_shutdown(Arc::clone(&shutdown));
     Ok(shutdown)
+}
+
+/// Guarantee that a shutdown signal ends the process, whether or not the event
+/// loop is in a position to notice it.
+///
+/// The escape hatch above needs a *second* signal, and a closed window only ever
+/// sends one. That was survivable for as long as the loop was certain to come
+/// back round to the flag — which is exactly what a hung-up terminal took away
+/// (see `runtime::poll_host_terminal`): the client stayed up at 100% CPU holding
+/// the state lock and every pane lease, and the agents it had launched could not
+/// be reached by any replacement client. A wedged shutdown must cost at most an
+/// unsaved checkpoint, so it is bounded here rather than trusted anywhere.
+fn watch_shutdown(shutdown: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        while !shutdown.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        thread::sleep(SHUTDOWN_GRACE);
+        // Still here: the loop never acted on the flag. `process::exit` runs no
+        // destructors, which is the point — whatever is holding it up is not
+        // something to wait on, and the descriptors that matter (the state lock,
+        // the daemon socket) are released by the kernel.
+        process::exit(128 + SIGHUP);
+    });
 }

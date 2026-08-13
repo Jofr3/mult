@@ -8,6 +8,28 @@ and the project aims to adhere to
 
 ## [Unreleased]
 
+### Closing the terminal window now ends the client
+
+The daemon and the agents always survived a closed window — `mult-server` is its
+own session leader that ignores `SIGHUP`, and every pane child is a session
+leader under a pty the daemon owns, so nothing in the closed window's session is
+signalled. The *client* was the part that did not survive correctly: it kept
+running, at 100% CPU, for as long as the machine stayed up.
+
+`crossterm::event::poll` never returns from a hung-up tty. It reads whenever the
+descriptor polls readable and only stops on `WouldBlock`, but a pty whose master
+is gone is permanently readable and answers every read with a zero-length EOF —
+neither an event nor an error. The `SIGHUP` was delivered and the shutdown flag
+was set; the loop simply never came back round to read it.
+
+That left a client with no window holding the state-file lock and every pane's
+attachment lease, so the agents were still alive in the daemon but the next
+`mult` refused to start rather than reattaching to them. `mult` now waits on the
+terminal itself and treats a hangup as the fatal host-terminal failure it is,
+which exits through the path that already checkpoints state and restores the
+TTY. A shutdown that wedges for any other reason is bounded too: five seconds
+after the flag is set, the process exits regardless.
+
 ### `Ctrl+n` opens a file manager on the workspace root
 
 A workspace knows the directory it stands for, so browsing it should not mean

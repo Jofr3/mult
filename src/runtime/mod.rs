@@ -22,6 +22,7 @@ mod test_support;
 
 use std::{
     io::{self},
+    os::fd::RawFd,
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
@@ -193,12 +194,12 @@ pub fn run(
         }
         flush_host_terminal_writes(terminal, &mut pty_runtime);
 
-        if host_terminal_io!(event::poll(EVENT_POLL_INTERVAL), false) {
+        if host_terminal_io!(poll_host_terminal(EVENT_POLL_INTERVAL), false) {
             if let Some(event) = host_terminal_io!(event::read().map(Some), None) {
                 handle_event(&mut app, &mut pty_runtime, &config, store, event, layout);
                 needs_redraw = true;
                 while !app.should_quit
-                    && host_terminal_io!(event::poll(READY_EVENT_POLL_INTERVAL), false)
+                    && host_terminal_io!(poll_host_terminal(READY_EVENT_POLL_INTERVAL), false)
                 {
                     let Some(event) = host_terminal_io!(event::read().map(Some), None) else {
                         break;
@@ -294,6 +295,93 @@ enum HostTerminalFailure {
     Fatal(io::Error),
 }
 
+/// Wait up to `timeout` for host-terminal input, reporting a hangup as the fatal
+/// error it is.
+///
+/// The waiting is done here rather than by `crossterm::event::poll`, which
+/// cannot be relied on to come back from a closed window. Crossterm's default
+/// event source reads the tty whenever `poll(2)` reports it readable and only
+/// stops on `WouldBlock` (crossterm 0.29, `event/source/unix/mio.rs`, the
+/// `TTY_TOKEN` arm) — but a hung-up pty is *permanently* readable and answers
+/// every read with a zero-length EOF, which is neither an event nor an error.
+/// The source spins there in userspace and never returns, so the loop's
+/// `shutdown` check, the `SIGHUP` handler installed in `main` and this module's
+/// own fatal-error path were all downstream of a call that never came back.
+/// Closing the terminal window left the client spinning at 100% CPU for as long
+/// as the machine stayed up, holding the state file lock and every pane's
+/// attachment lease: the daemon kept the agents alive, but no replacement client
+/// could start or take them over.
+///
+/// Crossterm is therefore only ever entered with a zero timeout, once the wait
+/// has already established that the terminal is readable and has not hung up —
+/// which is also what keeps the events crossterm has *parsed but not yet handed
+/// over* reachable, since its own queue is what a zero-timeout poll answers
+/// from first.
+fn poll_host_terminal(timeout: Duration) -> io::Result<bool> {
+    // Only stdin can be asked about: crossterm reads events from it when it is a
+    // terminal and otherwise opens `/dev/tty`, a descriptor this side has no
+    // handle on. Nothing is gained by second-guessing that case.
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+        return event::poll(timeout);
+    }
+
+    // Anything crossterm has already parsed is owed to the caller before the
+    // descriptor is consulted, and answering from that queue costs no syscall.
+    if event::poll(Duration::ZERO)? {
+        return Ok(true);
+    }
+
+    match wait_for_host_terminal(libc::STDIN_FILENO, timeout)? {
+        HostTerminalWait::Idle => Ok(false),
+        HostTerminalWait::Readable => event::poll(Duration::ZERO),
+    }
+}
+
+#[derive(Debug)]
+enum HostTerminalWait {
+    /// The wait ran out, or a signal cut it short. Either way there is nothing
+    /// to read, and the next tick asks again — which is what lets a `SIGHUP`
+    /// arriving mid-wait reach the loop's `shutdown` check.
+    Idle,
+    Readable,
+}
+
+fn wait_for_host_terminal(descriptor: RawFd, timeout: Duration) -> io::Result<HostTerminalWait> {
+    let mut polled = libc::pollfd {
+        fd: descriptor,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let milliseconds = timeout.as_millis().min(i32::MAX as u128) as i32;
+
+    if unsafe { libc::poll(&mut polled, 1, milliseconds) } < 0 {
+        let error = io::Error::last_os_error();
+        // `poll` is not restarted across a handled signal, so `EINTR` here is
+        // the ordinary way a shutdown signal ends the wait.
+        if error.kind() == io::ErrorKind::Interrupted {
+            return Ok(HostTerminalWait::Idle);
+        }
+        return Err(error);
+    }
+
+    // `POLLHUP`, `POLLERR` and `POLLNVAL` are reported whether or not they were
+    // requested, and a hung-up terminal reports `POLLIN` alongside them: the
+    // hangup has to be tested first, or the EOF it stands for would be handed
+    // to the event source that cannot cope with it.
+    if polled.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "the terminal running mult was closed",
+        ));
+    }
+
+    Ok(if polled.revents & libc::POLLIN != 0 {
+        HostTerminalWait::Readable
+    } else {
+        HostTerminalWait::Idle
+    })
+}
+
 fn classify_host_terminal_error(error: io::Error) -> HostTerminalFailure {
     match error.kind() {
         io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
@@ -357,6 +445,48 @@ mod tests {
     use super::*;
     use crate::runtime::test_support::*;
     use std::fs;
+
+    /// The one thing the event loop cannot detect for itself: `event::poll`
+    /// never returns from a hung-up terminal, so the hangup has to be seen
+    /// before the poll rather than reported by it. A real pty pair, because the
+    /// whole point is what the kernel does to a descriptor whose other end is
+    /// gone — `POLLHUP` alongside a permanently readable, EOF-returning fd.
+    #[test]
+    fn a_closed_terminal_is_detected_before_polling_it() {
+        let mut master = 0;
+        let mut slave = 0;
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(opened, 0, "open a pty pair: {}", io::Error::last_os_error());
+
+        assert!(
+            matches!(
+                wait_for_host_terminal(slave, Duration::from_millis(1)),
+                Ok(HostTerminalWait::Idle)
+            ),
+            "a live, quiet terminal simply runs the wait out"
+        );
+
+        // Exactly what closing the window does: the master side goes away.
+        assert_eq!(unsafe { libc::close(master) }, 0);
+
+        let hangup = wait_for_host_terminal(slave, Duration::from_millis(16))
+            .expect_err("a closed terminal has hung up");
+        assert_eq!(hangup.kind(), io::ErrorKind::BrokenPipe);
+        assert!(matches!(
+            classify_host_terminal_error(hangup),
+            HostTerminalFailure::Fatal(_)
+        ));
+
+        unsafe { libc::close(slave) };
+    }
 
     /// S4: the git probe runs every two seconds for every workspace, and its
     /// result is only visible in the sidebar. An unchanged branch must not
