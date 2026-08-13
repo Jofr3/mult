@@ -1,5 +1,5 @@
 ---
-source: src/ui.rs
+source: src/ui/mod.rs
 expression: "buffer_snapshot(&render_buffer(&app, &PtyRuntime::new_offline(),\n&config::Config::default(), 100, 40,))"
 ---
 size: 100x40
@@ -17,6 +17,7 @@ symbols:
 |      │Ctrl+x                     New Claude Code chat                                       │      |
 |      │Ctrl+t                     New shell terminal                                         │      |
 |      │Ctrl+n                     Open file manager                                          │      |
+|      │Ctrl+e                     Open editor                                                │      |
 |      │Ctrl+f                     Open workspace                                             │      |
 |      │Ctrl+q                     Delete selected item                                       │      |
 |      │Ctrl+Esc                   Quit mult                                                  │      |
@@ -44,7 +45,6 @@ symbols:
 |      └──────────────────────────────────────────────────────────────────────────────────────┘      |
 |                                                                                                    |
 |                                                                                                    |
-|                                                                                                    |
 
 styles:
 |abbccccaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
@@ -53,6 +53,7 @@ styles:
 |abbcccghhhhhhhhhhhdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddgdddddd|
 |aaaiiagddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddgdddddd|
 |aaaaaagjjjjjjddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddgdddddd|
+|aaaaaagkkkkkkkkkkkkkkkkkkkkkkkkkdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddgdddddd|
 |aaaaaagkkkkkkkkkkkkkkkkkkkkkkkkkdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddgdddddd|
 |aaaaaagkkkkkkkkkkkkkkkkkkkkkkkkkdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddgdddddd|
 |aaaaaagkkkkkkkkkkkkkkkkkkkkkkkkkdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddgdddddd|
@@ -84,7 +85,6 @@ styles:
 |aaaaaagddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddgdddddd|
 |aaaaaagggggggggggggggggggggggggggggggggggggggggggggggggggggggddddddddddddddddddddddddddddddddgdddddd|
 |aaaaaaggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggdddddd|
-|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
 |aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
 |aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
 

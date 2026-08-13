@@ -30,7 +30,9 @@ use super::prompt::{
     delete_selected, handle_command_palette_key, handle_open_workspace_key, handle_search_key,
     handle_terminal_command_key,
 };
-use super::session::{open_file_manager, start_or_focus_selected_terminal, start_terminal};
+use super::session::{
+    open_editor, open_file_manager, start_or_focus_selected_terminal, start_terminal,
+};
 
 pub(super) fn handle_event(
     app: &mut App,
@@ -230,6 +232,10 @@ fn handle_control_key(
     }
     if is_unshifted_control_char(key, 'n') {
         open_file_manager(app, pty_runtime, config, layout);
+        return true;
+    }
+    if is_unshifted_control_char(key, 'e') {
+        open_editor(app, pty_runtime, config, layout);
         return true;
     }
 
@@ -721,6 +727,64 @@ mod tests {
             &config,
             &store,
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            layout,
+        ));
+        assert_eq!(
+            app.project.workspace(workspace).unwrap().terminals.len(),
+            before + 1
+        );
+        assert_eq!(
+            app.selected_item(),
+            Some(NavItem::Terminal {
+                workspace,
+                terminal: opened_id,
+            })
+        );
+    }
+
+    #[test]
+    fn ctrl_e_opens_one_editor_terminal_and_reuses_it() {
+        let store = test_state_store("editor");
+        // Pinned, so the test does not depend on the `$EDITOR` of whoever runs
+        // it; the resolution chain itself is covered in `config`.
+        let config = Config {
+            editor_command: "hx".to_string(),
+            ..Config::default()
+        };
+        let mut app = App::default();
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let workspace = app
+            .selected_workspace_id()
+            .expect("a workspace is selected");
+        let before = app.project.workspace(workspace).unwrap().terminals.len();
+
+        assert!(handle_control_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &store,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            layout,
+        ));
+        let terminals = &app.project.workspace(workspace).unwrap().terminals;
+        assert_eq!(terminals.len(), before + 1);
+        let opened = terminals.last().unwrap();
+        assert_eq!(
+            opened.launch,
+            crate::model::TerminalLaunch::Command("hx".to_string())
+        );
+        let opened_id = opened.id;
+
+        // As with the file manager, a second press selects the pane the first
+        // one made rather than stacking another editor beside it.
+        app.select_previous();
+        assert!(handle_control_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &store,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
             layout,
         ));
         assert_eq!(

@@ -202,7 +202,7 @@ A serialization or size failure detected before the first frame write is an ordi
 
 ## Command execution semantics
 
-`TerminalLaunch::Command`, `pi_agent_command`, `claude_code_command`, and `file_manager_command` are user-configured command strings and intentionally run through the login shell as `$SHELL -lc <command>`. Pipelines, expansion, globbing, and shell quoting apply. This remains intentionally different from `MULT_AGENT_CMD`, which the client parses into argv without shell expansion.
+`TerminalLaunch::Command`, `pi_agent_command`, `claude_code_command`, `file_manager_command`, and `editor_command` are user-configured command strings and intentionally run through the login shell as `$SHELL -lc <command>`. Pipelines, expansion, globbing, and shell quoting apply. This remains intentionally different from `MULT_AGENT_CMD`, which the client parses into argv without shell expansion.
 
 ## Operational notes
 

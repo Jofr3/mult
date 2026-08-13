@@ -266,16 +266,34 @@ impl App {
 
     /// Selects the file manager terminal of the selected workspace, adding one
     /// that runs `command` in the workspace root if there is none yet.
-    ///
-    /// A file manager is an ordinary command terminal, so it is recognised by
-    /// its launch command rather than by a flag of its own: pressing the key
-    /// again lands on the pane the first press made instead of stacking a
-    /// second one beside it. Starting the PTY is the caller's job — this only
-    /// touches durable state.
     pub fn open_file_manager_in_selected_workspace(&mut self, command: &str) -> Option<TerminalId> {
+        self.open_tool_in_selected_workspace(command, "no file manager command is configured")
+    }
+
+    /// The same, for the editor `Ctrl+e` opens.
+    ///
+    /// The workspace keeps one editor for the same reason it keeps one file
+    /// manager: the key is "show me my editor here", not "give me another one".
+    pub fn open_editor_in_selected_workspace(&mut self, command: &str) -> Option<TerminalId> {
+        self.open_tool_in_selected_workspace(command, "no editor command is configured")
+    }
+
+    /// Selects the terminal of the selected workspace running `command`, adding
+    /// one in the workspace root if there is none yet.
+    ///
+    /// A file manager or an editor is an ordinary command terminal, so it is
+    /// recognised by its launch command rather than by a flag of its own:
+    /// pressing the key again lands on the pane the first press made instead of
+    /// stacking a second one beside it. Starting the PTY is the caller's job —
+    /// this only touches durable state.
+    fn open_tool_in_selected_workspace(
+        &mut self,
+        command: &str,
+        missing: &str,
+    ) -> Option<TerminalId> {
         let command = command.trim();
         if command.is_empty() {
-            self.record_operation_failure("no file manager command is configured");
+            self.record_operation_failure(missing);
             return None;
         }
         let workspace = self.selected_workspace_id()?;

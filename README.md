@@ -139,6 +139,7 @@ Global controls when no prompt is open:
 | `Ctrl+x` | Add a new Claude Code agent chat to the selected workspace |
 | `Ctrl+t` | Add a new shell terminal to the selected workspace |
 | `Ctrl+n` | Open the file manager (`yazi` by default) in the selected workspace's root directory |
+| `Ctrl+e` | Open your editor (`$VISUAL`, `$EDITOR`, or `editor_command`) in the selected workspace's root directory |
 | `Ctrl+f` | Open/import a workspace |
 | `Ctrl+p` | Open the command palette |
 | `Ctrl+s` | Search the selected terminal pane (see the note below for chats) |
@@ -243,6 +244,7 @@ Example:
   "pi_agent_command": "pi",
   "claude_code_command": "claude",
   "file_manager_command": "yazi",
+  "editor_command": "",
   "auto_start_pi_agent": true,
   "auto_start_claude_code_agent": true,
   "auto_start_terminals": true,
@@ -260,7 +262,7 @@ Example:
 }
 ```
 
-`pi_agent_command` and `claude_code_command` select the binary for each agent backend (`Ctrl+a` starts a `pi` chat, `Ctrl+x` a Claude Code chat); `auto_start_*` toggle whether the selected chat of that kind starts on focus. Both commands are launched through your login shell (`$SHELL -lc …`), so shell features — pipelines, `$VAR` expansion, globbing — work inside them. This is intentionally different from `MULT_AGENT_CMD` (below), which `mult` splits into arguments itself with no shell involved. `file_manager_command` is the third of these: `Ctrl+n` runs it through the same login shell, in the selected workspace's root directory.
+`pi_agent_command` and `claude_code_command` select the binary for each agent backend (`Ctrl+a` starts a `pi` chat, `Ctrl+x` a Claude Code chat); `auto_start_*` toggle whether the selected chat of that kind starts on focus. Both commands are launched through your login shell (`$SHELL -lc …`), so shell features — pipelines, `$VAR` expansion, globbing — work inside them. This is intentionally different from `MULT_AGENT_CMD` (below), which `mult` splits into arguments itself with no shell involved. `file_manager_command` and `editor_command` are the third and fourth of these: `Ctrl+n` and `Ctrl+e` run them through the same login shell, in the selected workspace's root directory. `editor_command` is empty by default, which means `mult` asks the environment instead — `$VISUAL`, then `$EDITOR`, then `vi` — so `Ctrl+e` opens whatever you already told your system your editor is. Set the key to pin one editor for `mult` regardless.
 
 The example above sets 3 of the 12 colorscheme keys. **[docs/CONFIG.md](docs/CONFIG.md) is the complete reference** — every top-level and colorscheme key with its type, default and effect, including `_nc` (the unfocused-pane background, written with a leading underscore).
 

@@ -47,6 +47,14 @@ pub struct Config {
     /// directory. Run through the login shell, like the agent commands.
     #[serde(default = "default_file_manager_command")]
     pub file_manager_command: String,
+    /// The editor `Ctrl+e` opens in the selected workspace's root directory.
+    /// Run through the login shell, like the agent commands.
+    ///
+    /// Empty — the default — means "whatever this user's editor is": see
+    /// [`Config::resolved_editor_command`]. Set it to pin one editor for
+    /// `mult` regardless of the environment it was started from.
+    #[serde(default = "default_editor_command")]
+    pub editor_command: String,
     #[serde(default = "default_auto_start_pi_agent")]
     pub auto_start_pi_agent: bool,
     #[serde(default = "default_auto_start_claude_code_agent")]
@@ -84,6 +92,19 @@ impl Config {
     /// from. See [`ColorSchemeConfig::palette`].
     pub fn palette(&self) -> Palette {
         self.colorscheme.palette()
+    }
+
+    /// The editor command `Ctrl+e` runs, with an unset `editor_command`
+    /// resolved from the environment.
+    ///
+    /// "Preferred editor" is a thing the user already told their system once,
+    /// so the default asks the environment rather than a `mult` key: `$VISUAL`
+    /// first (it is the one that means "a full-screen editor on this
+    /// terminal"), then `$EDITOR`, then `vi`, which POSIX requires to exist.
+    /// The fallback chain never yields an empty command, so `Ctrl+e` always has
+    /// something to run.
+    pub fn resolved_editor_command(&self) -> String {
+        resolve_editor_command(&self.editor_command, |name| env::var(name).ok())
     }
 
     /// Problems that did not stop startup, each a complete sentence naming the
@@ -143,6 +164,7 @@ impl PartialEq for Config {
         self.pi_agent_command == other.pi_agent_command
             && self.claude_code_command == other.claude_code_command
             && self.file_manager_command == other.file_manager_command
+            && self.editor_command == other.editor_command
             && self.auto_start_pi_agent == other.auto_start_pi_agent
             && self.auto_start_claude_code_agent == other.auto_start_claude_code_agent
             && self.auto_start_terminals == other.auto_start_terminals
@@ -317,6 +339,7 @@ impl Default for Config {
             pi_agent_command: default_pi_agent_command(),
             claude_code_command: default_claude_code_command(),
             file_manager_command: default_file_manager_command(),
+            editor_command: default_editor_command(),
             auto_start_pi_agent: default_auto_start_pi_agent(),
             auto_start_claude_code_agent: default_auto_start_claude_code_agent(),
             auto_start_terminals: default_auto_start_terminals(),
@@ -624,6 +647,30 @@ fn default_file_manager_command() -> String {
     "yazi".to_string()
 }
 
+/// Empty on purpose: the editor is resolved from the environment unless the
+/// user pins one. See [`Config::resolved_editor_command`].
+fn default_editor_command() -> String {
+    String::new()
+}
+
+/// The `$VISUAL` → `$EDITOR` → `vi` chain, with the environment injected so it
+/// can be tested without mutating the process's own.
+///
+/// A variable that is set but blank (or only spaces) is treated as unset: it
+/// would otherwise reach the login shell as an empty command line, which exits
+/// at once and leaves a pane that never says why.
+fn resolve_editor_command(configured: &str, env: impl Fn(&str) -> Option<String>) -> String {
+    let non_blank = |value: String| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(value)
+    };
+
+    non_blank(configured.to_string())
+        .or_else(|| env("VISUAL").and_then(non_blank))
+        .or_else(|| env("EDITOR").and_then(non_blank))
+        .unwrap_or_else(|| "vi".to_string())
+}
+
 fn default_auto_start_pi_agent() -> bool {
     true
 }
@@ -712,6 +759,7 @@ mod tests {
         assert_eq!(config.pi_agent_command, "pi");
         assert_eq!(config.claude_code_command, "claude");
         assert_eq!(config.file_manager_command, "yazi");
+        assert_eq!(config.editor_command, "");
         assert!(config.auto_start_pi_agent);
         assert!(config.auto_start_claude_code_agent);
         assert!(config.auto_start_terminals);
@@ -845,6 +893,56 @@ mod tests {
         let config = load_from_path(&path).expect("load config");
 
         assert_eq!(config.file_manager_command, "lf");
+    }
+
+    #[test]
+    fn config_loads_editor_command_from_json() {
+        let path = unique_temp_file();
+        fs::write(&path, r#"{"editor_command":"hx"}"#).expect("write config");
+
+        let config = load_from_path(&path).expect("load config");
+
+        assert_eq!(config.editor_command, "hx");
+        assert_eq!(config.resolved_editor_command(), "hx");
+    }
+
+    #[test]
+    fn editor_command_prefers_the_config_then_visual_then_editor() {
+        fn env(
+            visual: Option<&'static str>,
+            editor: Option<&'static str>,
+        ) -> impl Fn(&str) -> Option<String> {
+            move |name: &str| match name {
+                "VISUAL" => visual.map(str::to_string),
+                "EDITOR" => editor.map(str::to_string),
+                _ => None,
+            }
+        }
+
+        // A configured editor wins over both variables.
+        assert_eq!(
+            resolve_editor_command("hx", env(Some("nvim"), Some("vim"))),
+            "hx"
+        );
+        assert_eq!(
+            resolve_editor_command("", env(Some("nvim"), Some("vim"))),
+            "nvim"
+        );
+        assert_eq!(resolve_editor_command("", env(None, Some("vim"))), "vim");
+    }
+
+    #[test]
+    fn editor_command_falls_back_to_vi_when_nothing_is_set() {
+        // A blank variable counts as unset: `$SHELL -lc ""` would exit at once
+        // and leave a pane with nothing to say for itself.
+        assert_eq!(
+            resolve_editor_command("  ", |name| match name {
+                "VISUAL" => Some("   ".to_string()),
+                _ => None,
+            }),
+            "vi"
+        );
+        assert_eq!(resolve_editor_command("", |_| None), "vi");
     }
 
     #[test]

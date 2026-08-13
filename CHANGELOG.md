@@ -8,6 +8,23 @@ and the project aims to adhere to
 
 ## [Unreleased]
 
+### `Ctrl+e` opens your editor on the workspace root
+
+The companion to `Ctrl+n`: `Ctrl+e` — and the palette's "Open editor" — runs
+your editor as a command terminal in the selected workspace, so it starts in
+that workspace's `cwd` with its environment.
+
+Which editor that is comes from where you have already said so: `$VISUAL`
+first, then `$EDITOR`, then `vi`. The new `editor_command` config key overrides
+that chain when you want one editor for `mult` regardless of the shell it was
+started from. A variable that is set but blank counts as unset, so the key never
+runs an empty command line and leaves a pane with nothing to say for itself.
+
+As with the file manager, the workspace keeps *one* editor: a second `Ctrl+e`
+selects and, if it had exited, restarts the pane the first press made. Inside a
+prompt `Ctrl+e` still moves to end of line — the new binding is global, the way
+`Ctrl+a` is both "new `pi` chat" and "move to start of line".
+
 ### Closing the terminal window now ends the client
 
 The daemon and the agents always survived a closed window — `mult-server` is its

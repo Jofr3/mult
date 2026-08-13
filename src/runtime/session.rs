@@ -306,6 +306,28 @@ pub(super) fn open_file_manager(
     start_or_focus_selected_terminal(app, pty_runtime, config, layout);
 }
 
+/// Open the user's editor on the selected workspace's root directory.
+///
+/// Which editor that is comes from the environment unless `editor_command`
+/// pins one ([`Config::resolved_editor_command`]); the pane is a command
+/// terminal in the workspace, so the editor starts in that workspace's `cwd`
+/// with its environment, the same as the file manager.
+pub(super) fn open_editor(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    config: &Config,
+    layout: AppLayout,
+) {
+    if app
+        .open_editor_in_selected_workspace(&config.resolved_editor_command())
+        .is_none()
+    {
+        return;
+    }
+
+    start_or_focus_selected_terminal(app, pty_runtime, config, layout);
+}
+
 pub(super) fn resize_visible_terminal(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,

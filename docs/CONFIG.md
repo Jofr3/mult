@@ -75,9 +75,9 @@ Parse errors name the file and the position, and the accepted keys are listed:
 ```
 mult: config error at /home/you/.config/mult/config.json:2:23: unknown field
 `auto_start_terminal`, expected one of `pi_agent_command`, `claude_code_command`,
-`file_manager_command`, `auto_start_pi_agent`, `auto_start_claude_code_agent`,
-`auto_start_terminals`, `mouse_capture`, `clipboard_osc52`, `projects`,
-`colorscheme`
+`file_manager_command`, `editor_command`, `auto_start_pi_agent`,
+`auto_start_claude_code_agent`, `auto_start_terminals`, `mouse_capture`,
+`clipboard_osc52`, `projects`, `colorscheme`
 ```
 
 **Warnings** — `mult` starts, uses a documented fallback, and tells you. Each
@@ -102,6 +102,7 @@ default below.
 | `pi_agent_command` | string | `"pi"` | The command run for a `pi` agent chat (`Ctrl+a`). Executed as `$SHELL -lc "<command>"`, so pipelines, `$VAR` expansion, globbing and aliases from your login shell all apply. |
 | `claude_code_command` | string | `"claude"` | The command run for a Claude Code agent chat (`Ctrl+x`). Also executed through `$SHELL -lc`. |
 | `file_manager_command` | string | `"yazi"` | The command run by **Open file manager** (`Ctrl+n`), in the selected workspace's root directory. Also executed through `$SHELL -lc`. The workspace keeps one file manager pane: `Ctrl+n` reuses the terminal whose command matches this key before adding another. |
+| `editor_command` | string | `""` | The command run by **Open editor** (`Ctrl+e`), in the selected workspace's root directory. Also executed through `$SHELL -lc`. Empty means "this user's editor": `$VISUAL`, then `$EDITOR`, then `vi` — a variable that is set but blank counts as unset. Like the file manager, the workspace keeps one editor pane: `Ctrl+e` reuses the terminal whose command matches the resolved editor before adding another. |
 | `auto_start_pi_agent` | bool | `true` | Whether selecting a `pi` chat starts its PTY immediately. With `false` the chat stays idle until you type into it or run **Start selected PTY**. |
 | `auto_start_claude_code_agent` | bool | `true` | The same, for Claude Code chats. |
 | `auto_start_terminals` | bool | `true` | Whether selecting a terminal starts it. This governs *shell* terminals; a persisted **command** terminal is never relaunched during restoration regardless of this setting — see [Command terminals are not auto-relaunched](TROUBLESHOOTING.md#a-pane-says-the-session-is-unavailable-after-restarting-the-daemon). |
@@ -189,6 +190,7 @@ Every key, at its default value:
   "pi_agent_command": "pi",
   "claude_code_command": "claude",
   "file_manager_command": "yazi",
+  "editor_command": "",
   "auto_start_pi_agent": true,
   "auto_start_claude_code_agent": true,
   "auto_start_terminals": true,
