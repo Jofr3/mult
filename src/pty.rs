@@ -2972,6 +2972,17 @@ fn establish_connection(
 }
 
 impl PtyExit {
+    /// Whether the program ended by finishing rather than by failing.
+    ///
+    /// This is what decides that a pane may close itself, so it is deliberately
+    /// strict: a signal disqualifies an exit even at code 0, which is also what
+    /// keeps the *synthesized* exits out. The "server session unavailable" exit
+    /// (`code: 1`, signal set) is not a program finishing, and a pane must not
+    /// disappear because the daemon lost its session.
+    pub fn finished_cleanly(&self) -> bool {
+        self.code == 0 && self.signal.is_none()
+    }
+
     pub fn label(&self) -> String {
         match &self.signal {
             Some(signal) => format!("terminated by {signal}"),

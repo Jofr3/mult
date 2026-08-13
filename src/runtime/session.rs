@@ -20,7 +20,7 @@ pub(super) fn sync_pane_focus(app: &App, pty_runtime: &mut PtyRuntime) {
 use crate::{
     app::{App, NoticeLevel, NoticeSource},
     config::Config,
-    model::{self, ChatStatus, PtyKey, TerminalLaunch},
+    model::{self, ChatStatus, PtyKey, TerminalId, TerminalLaunch},
     pty::{AttachExistingResult, PtyDimensions, PtyEvent, PtyRuntime, PtySpawn},
 };
 
@@ -408,6 +408,22 @@ pub(super) fn drain_pty_events(app: &mut App, pty_runtime: &mut PtyRuntime) -> b
     changed || pty_runtime.has_pending_work()
 }
 
+/// Drop a terminal whose program finished, durable state and PTY state alike.
+///
+/// Reports whether the row actually went, so a terminal the model no longer
+/// knows about still gets its exit line rather than vanishing silently.
+fn close_finished_terminal(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    terminal: TerminalId,
+) -> bool {
+    let removed = app.remove_finished_terminal(terminal);
+    for key in &removed {
+        pty_runtime.remove_terminal(*key);
+    }
+    !removed.is_empty()
+}
+
 fn apply_pty_event(app: &mut App, pty_runtime: &mut PtyRuntime, event: PtyEvent) {
     {
         match event {
@@ -461,6 +477,18 @@ fn apply_pty_event(app: &mut App, pty_runtime: &mut PtyRuntime, event: PtyEvent)
                     if app.terminal_input_target() == Some(terminal_id) {
                         app.end_pty_input();
                     }
+                    // A program that finished takes its pane with it: quitting
+                    // yazi or `:q` in an editor left a row whose only content
+                    // was the note saying it had exited. A *failed* exit keeps
+                    // the pane, because there the last screen is the only
+                    // explanation the user gets — an editor command that does
+                    // not exist would otherwise close instantly and read as the
+                    // key having done nothing at all.
+                    if status.finished_cleanly()
+                        && close_finished_terminal(app, pty_runtime, terminal_id)
+                    {
+                        return;
+                    }
                     let exit_message = format!("PTY exited: {}", status.label());
                     pty_runtime.append_terminal_system_line(terminal, exit_message.as_str());
                 }
@@ -491,7 +519,7 @@ mod tests {
 
     use super::*;
     use crate::app::NavItem;
-    use crate::pty::SpawnPolicy;
+    use crate::pty::{PtyExit, SpawnPolicy};
     use crate::runtime::test_support::*;
     use crate::storage;
     use mult_protocol::shell::quote_argument;
@@ -820,6 +848,132 @@ mod tests {
             terminal_dimensions(layout),
             PtyDimensions { rows: 40, cols: 86 }
         );
+    }
+
+    // ---- A finished program takes its pane with it ------------------------
+
+    /// Adds two terminals so the workspace outlives the one being closed, and
+    /// returns the workspace with the terminal to exit.
+    fn workspace_with_two_terminals(app: &mut App) -> (model::WorkspaceId, TerminalId) {
+        let workspace = app
+            .selected_workspace_id()
+            .expect("a workspace is selected");
+        app.add_terminal_to_selected_workspace();
+        app.add_terminal_to_selected_workspace();
+        let terminal = app
+            .project
+            .workspace(workspace)
+            .unwrap()
+            .terminals
+            .last()
+            .unwrap()
+            .id;
+        (workspace, terminal)
+    }
+
+    fn terminal_ids(app: &App, workspace: model::WorkspaceId) -> Vec<TerminalId> {
+        app.project
+            .workspace(workspace)
+            .map(|workspace| workspace.terminals.iter().map(|item| item.id).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_program_that_finished_closes_its_own_pane() {
+        // Quitting yazi, or `:q` in an editor, used to leave a row whose only
+        // content was the line saying it had exited.
+        let mut app = App::default();
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let (workspace, terminal) = workspace_with_two_terminals(&mut app);
+        let before = terminal_ids(&app, workspace).len();
+
+        apply_pty_event(
+            &mut app,
+            &mut pty_runtime,
+            PtyEvent::Exited {
+                terminal: PtyKey::Terminal(terminal),
+                status: PtyExit {
+                    code: 0,
+                    signal: None,
+                },
+            },
+        );
+
+        let remaining = terminal_ids(&app, workspace);
+        assert_eq!(remaining.len(), before - 1);
+        assert!(!remaining.contains(&terminal));
+    }
+
+    #[test]
+    fn a_failed_program_keeps_its_pane_so_the_screen_can_be_read() {
+        let mut app = App::default();
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let (workspace, terminal) = workspace_with_two_terminals(&mut app);
+        let before = terminal_ids(&app, workspace).len();
+
+        apply_pty_event(
+            &mut app,
+            &mut pty_runtime,
+            PtyEvent::Exited {
+                terminal: PtyKey::Terminal(terminal),
+                status: PtyExit {
+                    code: 127,
+                    signal: None,
+                },
+            },
+        );
+
+        let remaining = terminal_ids(&app, workspace);
+        assert_eq!(remaining.len(), before);
+        assert!(remaining.contains(&terminal));
+    }
+
+    #[test]
+    fn a_lost_daemon_session_never_closes_a_pane() {
+        // The "session unavailable" exit is synthesized by the client, not
+        // reported by a program: a daemon that lost its sessions must not
+        // delete the user's panes on the way back up.
+        let mut app = App::default();
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let (workspace, terminal) = workspace_with_two_terminals(&mut app);
+        let before = terminal_ids(&app, workspace).len();
+
+        apply_pty_event(
+            &mut app,
+            &mut pty_runtime,
+            PtyEvent::Exited {
+                terminal: PtyKey::Terminal(terminal),
+                status: PtyExit {
+                    code: 1,
+                    signal: Some("server session unavailable".to_string()),
+                },
+            },
+        );
+
+        let remaining = terminal_ids(&app, workspace);
+        assert_eq!(remaining.len(), before);
+        assert!(remaining.contains(&terminal));
+    }
+
+    #[test]
+    fn a_pane_killed_by_a_signal_keeps_its_row_even_at_code_zero() {
+        let mut app = App::default();
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let (workspace, terminal) = workspace_with_two_terminals(&mut app);
+
+        apply_pty_event(
+            &mut app,
+            &mut pty_runtime,
+            PtyEvent::Exited {
+                terminal: PtyKey::Terminal(terminal),
+                status: PtyExit {
+                    code: 0,
+                    signal: Some("SIGTERM".to_string()),
+                },
+            },
+        );
+
+        assert!(terminal_ids(&app, workspace).contains(&terminal));
     }
 
     // ---- E2 / B8: connection failures reach the user ----------------------

@@ -105,6 +105,33 @@ impl App {
             .map(|workspace| workspace.id)
     }
 
+    /// Removes a terminal whose program finished on its own, reporting the
+    /// PTYs whose durable state went with it the way [`App::delete_target`]
+    /// does.
+    ///
+    /// Unlike a deletion there is no stop to order this against: the child is
+    /// already gone and the daemon dropped its session when it reaped it, so
+    /// the only thing left is the row standing for it. Emptying the workspace
+    /// this way retires it, exactly as deleting the last pane by hand does.
+    pub fn remove_finished_terminal(&mut self, terminal: TerminalId) -> Vec<PtyKey> {
+        let Some(workspace) = self.workspace_of_terminal(terminal) else {
+            return Vec::new();
+        };
+
+        self.delete_target(DeleteTarget::Terminal {
+            workspace,
+            terminal,
+        })
+    }
+
+    fn workspace_of_terminal(&self, terminal: TerminalId) -> Option<WorkspaceId> {
+        self.project
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.terminals.iter().any(|item| item.id == terminal))
+            .map(|workspace| workspace.id)
+    }
+
     fn remove_workspace_if_empty(&mut self, workspace_id: WorkspaceId) {
         let is_empty = self
             .project

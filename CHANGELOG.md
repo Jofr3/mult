@@ -8,6 +8,21 @@ and the project aims to adhere to
 
 ## [Unreleased]
 
+### A pane whose program finished closes itself
+
+`q` in `yazi`, `:q` in an editor, `exit` in a shell: the program ended and the
+row stayed, holding nothing but the line saying it had exited. Panes now retire
+with the programs they were opened for, and a workspace emptied that way retires
+too — what deleting its last pane by hand has always done.
+
+Only a *clean* exit closes a pane. A non-zero status or a signal keeps the row
+and its final screen, because there that screen is the whole explanation: an
+`editor_command` naming a binary that does not exist prints the shell's `command
+not found`, exits 127, and must stay long enough to be read, or `Ctrl+e` looks
+like a key that does nothing. The exits `mult` synthesizes for itself carry a
+signal for this reason, so a daemon that has lost its sessions still reports
+`terminated by server session unavailable` into a pane that is still there.
+
 ### `Ctrl+e` opens your editor on the workspace root
 
 The companion to `Ctrl+n`: `Ctrl+e` — and the palette's "Open editor" — runs

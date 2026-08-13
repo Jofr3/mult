@@ -202,6 +202,21 @@ Sidebar labels:
 - A title is program-supplied, so control characters are stripped from it and
   its length is capped before it is drawn.
 
+Pane lifecycle:
+
+- A pane whose program **finished** closes itself. Quitting `yazi` with `q`,
+  `:q` in an editor, or `exit` in a shell removes the row rather than leaving a
+  dead pane behind, and a workspace emptied that way retires with it — the same
+  thing that happens when you delete its last pane with `Ctrl+q`.
+- A pane whose program **failed** stays. A non-zero exit or a signal keeps the
+  row and its last screen, because that screen is the only explanation you get:
+  an editor command that does not exist would otherwise vanish instantly and
+  read as the key having done nothing. The pane reports `PTY exited: exit 127`
+  and waits for you.
+- "Failed" includes the exits `mult` synthesizes itself, so a daemon that loses
+  its sessions never deletes your panes — see
+  [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#a-pane-says-the-session-is-unavailable-after-restarting-the-daemon).
+
 Terminal emulation notes:
 
 - Cursor-key mode (DECCKM) and keypad mode (DECKPAM) are honoured, so arrows
