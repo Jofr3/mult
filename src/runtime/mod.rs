@@ -24,7 +24,7 @@ mod test_support;
 use std::{
     io::{self},
     os::fd::RawFd,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
@@ -63,13 +63,15 @@ const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Run the client event loop.
 ///
-/// `store` is the process-lifetime state lock `main` acquired: it is the single
-/// save path, so no code here re-resolves the state path from the environment
-/// (B16).
+/// `config_override` is the original `--config` value, if any, so an in-place
+/// reload observes the same path precedence as startup. `store` is the
+/// process-lifetime state lock `main` acquired: it is the single save path, so
+/// no code here re-resolves the state path from the environment (B16).
 pub fn run(
     terminal: &mut DefaultTerminal,
     mut app: App,
     mut config: Config,
+    config_override: Option<&Path>,
     shutdown: &AtomicBool,
     store: &storage::StateStore,
 ) -> io::Result<()> {
@@ -142,7 +144,7 @@ pub fn run(
         // A transient notice that has run out of time is a reason to redraw and
         // nothing else; a quiet session never gets here with anything pending.
         needs_redraw |= app.expire_notices(now);
-        needs_redraw |= reload_config_if_requested(&mut app, &mut config);
+        needs_redraw |= reload_config_if_requested(&mut app, &mut config, config_override);
         needs_redraw |= drain_pty_events(&mut app, &mut pty_runtime);
         needs_redraw |= drain_agent_events(&mut app, &mut agent_backend);
         needs_redraw |= drain_mult_agent_status_events(
@@ -227,16 +229,19 @@ pub fn run(
 /// A failure is reported through the status surface and the old config is kept:
 /// a typo in a colorscheme must not end a session that is holding live PTYs.
 /// Returns whether the frame needs rebuilding.
-fn reload_config_if_requested(app: &mut App, config: &mut Config) -> bool {
+fn reload_config_if_requested(
+    app: &mut App,
+    config: &mut Config,
+    config_override: Option<&Path>,
+) -> bool {
     if !app.take_config_reload_request() {
         return false;
     }
 
-    // No `--config` here on purpose: the flag is `main`'s, and re-resolving it
-    // would need it threaded through the whole event loop. `$MULT_CONFIG_PATH`
-    // and the default path still apply, which is where a reloadable config
-    // realistically lives.
-    match config::load_or_default(None) {
+    // Keep the same precedence startup used. In particular, a session started
+    // with `--config` must reload that file rather than silently switching to
+    // `$MULT_CONFIG_PATH` or the default just as a project SFTP target changes.
+    match config::load_or_default(config_override) {
         Ok(reloaded) => {
             report_config_warnings(app, &reloaded);
             if reloaded == *config {
@@ -269,10 +274,7 @@ fn reload_config_if_requested(app: &mut App, config: &mut Config) -> bool {
             app.push_notice(
                 NoticeLevel::Error,
                 NoticeSource::Report,
-                format!(
-                    "Config reload failed; keeping the previous config: {error} ({})",
-                    config::config_path().display()
-                ),
+                format!("Config reload failed; keeping the previous config: {error}"),
             );
         }
     }
@@ -467,11 +469,33 @@ pub(super) fn mult_runtime_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::{cell::Cell, os::unix::fs::PermissionsExt};
 
     use super::*;
     use crate::runtime::test_support::*;
     use std::fs;
+
+    #[test]
+    fn config_reload_keeps_using_the_startup_flag_path() {
+        let root = unique_status_path("config-reload").with_extension("dir");
+        fs::create_dir_all(&root).expect("create private config directory");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("restrict config directory");
+        let path = root.join("config.json");
+        fs::write(&path, r#"{"pi_agent_command":"from-flag"}"#).expect("write flagged config");
+
+        let mut app = App::default();
+        let mut config = Config::default();
+        app.request_config_reload();
+
+        assert!(reload_config_if_requested(
+            &mut app,
+            &mut config,
+            Some(&path)
+        ));
+        assert_eq!(config.pi_agent_command, "from-flag");
+        let _ = fs::remove_dir_all(root);
+    }
 
     /// The one thing the event loop cannot detect for itself: `event::poll`
     /// never returns from a hung-up terminal, so the hangup has to be seen

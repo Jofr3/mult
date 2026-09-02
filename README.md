@@ -146,10 +146,10 @@ Global controls when no prompt is open:
 | `Ctrl+x` | Add a new Claude Code agent chat to the selected workspace |
 | `Ctrl+t` | Add a new shell terminal to the selected workspace |
 | `Ctrl+n` | Open the file manager (`yazi` by default) in the selected workspace's root directory |
+| `Ctrl+s` | Open Yazi at the selected project's configured SFTP target; reuse its existing SFTP tab |
 | `Ctrl+e` | Open your editor (`$VISUAL`, `$EDITOR`, or `editor_command`) in the selected workspace's root directory |
 | `Ctrl+f` | Open/import a workspace |
 | `Ctrl+p` | Open the command palette |
-| `Ctrl+s` | Search the selected terminal pane (see the note below for chats) |
 | `Ctrl+q` | Delete the selected chat/terminal, or an empty workspace — immediately, with no confirmation |
 | `?` or `F1` | Show every key and command in an overlay |
 | `Ctrl+Esc` | Quit |
@@ -240,11 +240,11 @@ Terminal emulation notes:
   notification, a cursor-position report — do not count as typing: they do not
   end a scrollback view the way a keystroke does.
 
-The command palette includes discoverable actions for focus changes, starting input, adding/deleting sessions, opening workspaces, search, clearing search, showing the keybinding overlay, dismissing notices, reloading the config, and quitting. The palette and the overlay are generated from one binding table, so neither can drift from the other.
+The command palette includes discoverable actions for focus changes, starting input, adding/deleting sessions, opening workspaces, opening project SFTP, search, clearing search, showing the keybinding overlay, dismissing notices, reloading the config, and quitting. The palette and the overlay are generated from one binding table, so neither can drift from the other.
 
 "Reload config" re-reads `config.json` in place. The colorscheme, `projects`, agent commands and auto-start settings apply to the next frame; `mouse_capture` is a terminal mode set once for the session and needs a restart, and an already-running PTY keeps the command it was started with. A config that fails to load leaves the running one in place and reports the error.
 
-**Chat search is not wired up.** `Ctrl+s` on a chat searches the *structured* transcript, which only the experimental process-agent backend writes and which nothing calls today, so it is empty for every chat you can create — the pane says so instead of reporting "no matches". Terminal search works normally. See [docs/ROADMAP.md](docs/ROADMAP.md#open-decisions-carried-over).
+**Chat search is not wired up.** The palette's **Search selected pane** action searches a chat's *structured* transcript, which only the experimental process-agent backend writes and which nothing calls today, so it is empty for every chat you can create — the pane says so instead of reporting "no matches". Terminal search works normally. See [docs/ROADMAP.md](docs/ROADMAP.md#open-decisions-carried-over).
 
 `NO_COLOR` (set to any non-empty value) drops every colour: `mult` then emits nothing but the terminal's own foreground and background, and uses bold/reverse video and per-state glyphs so status is still readable.
 
@@ -273,7 +273,7 @@ Example:
   "mouse_capture": true,
   "clipboard_osc52": true,
   "projects": [
-    { "name": "mult", "path": "~/projects/mult" },
+    { "name": "mult", "path": "~/projects/mult", "sftp": "my-server" },
     { "name": "api", "path": "~/srv/api", "remote": "user@hostname" },
     ["scratch", "/tmp/scratch"]
   ],
@@ -285,12 +285,17 @@ Example:
 }
 ```
 
-`pi_agent_command` and `claude_code_command` select the binary for each agent backend (`Ctrl+a` starts a `pi` chat, `Ctrl+x` a Claude Code chat); `auto_start_*` toggle whether the selected chat of that kind starts on focus. Both commands are launched through your login shell (`$SHELL -lc …`), so shell features — pipelines, `$VAR` expansion, globbing — work inside them. This is intentionally different from `MULT_AGENT_CMD` (below), which `mult` splits into arguments itself with no shell involved. `file_manager_command` and `editor_command` are the third and fourth of these: `Ctrl+n` and `Ctrl+e` run them through the same login shell, in the selected workspace's root directory. `editor_command` is empty by default, which means `mult` asks the environment instead — `$VISUAL`, then `$EDITOR`, then `vi` — so `Ctrl+e` opens whatever you already told your system your editor is. Set the key to pin one editor for `mult` regardless.
+`pi_agent_command` and `claude_code_command` select the binary for each agent backend (`Ctrl+a` starts a `pi` chat, `Ctrl+x` a Claude Code chat); `auto_start_*` toggle whether the selected chat of that kind starts on focus. Both commands are launched through your login shell (`$SHELL -lc …`), so shell features — pipelines, `$VAR` expansion, globbing — work inside them. This is intentionally different from `MULT_AGENT_CMD` (below), which `mult` splits into arguments itself with no shell involved. `file_manager_command` and `editor_command` are the third and fourth of these: `Ctrl+n` and `Ctrl+e` run them through the same login shell, in the selected workspace's root directory. `editor_command` is empty by default, which means `mult` asks the environment instead — `$VISUAL`, then `$EDITOR`, then `vi` — so `Ctrl+e` opens whatever you already told your system your editor is. Set the key to pin one editor for `mult` regardless. A project's optional
+`sftp` is a Yazi VFS name such as `my-server`, or a complete `sftp://` URL;
+`Ctrl+s` opens `yazi sftp://my-server`. Each workspace keeps at most one of
+these SFTP panes, and another press focuses it instead of creating a duplicate.
+See [docs/CONFIG.md](docs/CONFIG.md#sftp--open-the-project-in-yazi) for setup and
+remote-workspace behavior.
 
 A `projects` entry with a `remote` is opened on that machine instead of this
 one, and `path` is read on the far side (a leading `~` is the *remote* user's
-home). Terminals — the workspace's own shell, `Ctrl+t`, `Ctrl+n`, `Ctrl+e` and
-command terminals — are plain `ssh -t <remote> 'cd <path> && …'`, so they end
+home). Terminals — the workspace's own shell, `Ctrl+t`, `Ctrl+n`, `Ctrl+s`,
+`Ctrl+e` and command terminals — are plain `ssh -t <remote> 'cd <path> && …'`, so they end
 with their pane like any terminal. The agent chat is not: `Ctrl+a`/`Ctrl+x` run it inside a `tmux` session named
 after the project, created on first use and attached to afterwards, so closing
 `mult` detaches the agent rather than killing it. One session means one chat —

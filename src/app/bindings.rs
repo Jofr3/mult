@@ -15,6 +15,7 @@ pub enum CommandAction {
     AddShellTerminal,
     AddCommandTerminal,
     OpenFileManager,
+    OpenSftp,
     OpenEditor,
     OpenWorkspace,
     DeleteSelected,
@@ -150,7 +151,7 @@ pub const BINDINGS: &[BindingEntry] = &[
         BindingAvailability::SelectedPane,
     ),
     BindingEntry::global(
-        Some("Ctrl+s"),
+        None,
         "Search selected pane",
         "filter terminal output or chat transcript lines",
         Some(CommandAction::SearchSelectedPane),
@@ -189,6 +190,13 @@ pub const BINDINGS: &[BindingEntry] = &[
         "Open file manager",
         "open the configured file manager in the selected workspace's root directory",
         Some(CommandAction::OpenFileManager),
+        BindingAvailability::SelectedWorkspace,
+    ),
+    BindingEntry::global(
+        Some("Ctrl+s"),
+        "Open SFTP",
+        "open Yazi at the selected project's configured SFTP target",
+        Some(CommandAction::OpenSftp),
         BindingAvailability::SelectedWorkspace,
     ),
     BindingEntry::global(

@@ -31,7 +31,7 @@ use super::prompt::{
     handle_terminal_command_key,
 };
 use super::session::{
-    open_editor, open_file_manager, start_or_focus_selected_terminal, start_terminal,
+    open_editor, open_file_manager, open_sftp, start_or_focus_selected_terminal, start_terminal,
 };
 
 pub(super) fn handle_event(
@@ -204,7 +204,8 @@ fn handle_control_key(
         app.begin_command_palette();
         return true;
     }
-    if is_unshifted_control_char(key, 's') && app.begin_search() {
+    if is_unshifted_control_char(key, 's') {
+        open_sftp(app, pty_runtime, config, layout);
         return true;
     }
     if is_unshifted_control_char(key, 'a') {
@@ -385,8 +386,8 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_p_opens_palette_and_ctrl_s_opens_search_for_selected_pane() {
-        let store = test_state_store("ctrl-p-opens-palette-and-ctrl-s-opens-se");
+    fn ctrl_p_opens_the_command_palette() {
+        let store = test_state_store("ctrl-p-opens-palette");
         let mut app = App::default();
         let mut pty_runtime = PtyRuntime::new_offline();
         let config = Config::default();
@@ -401,24 +402,6 @@ mod tests {
             layout,
         );
         assert!(matches!(app.prompt(), Some(Prompt::CommandPalette(_))));
-        app.cancel_prompt();
-
-        let workspace = app.project.workspaces[0].id;
-        let terminal = app.project.workspaces[0].terminals[0].id;
-        let target = NavItem::Terminal {
-            workspace,
-            terminal,
-        };
-        app.select_item(target);
-        handle_unprompted_key(
-            &mut app,
-            &mut pty_runtime,
-            &config,
-            &store,
-            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
-            layout,
-        );
-        assert!(matches!(app.prompt(), Some(Prompt::Search(_))));
     }
 
     #[test]
@@ -680,6 +663,143 @@ mod tests {
             layout,
         );
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_s_opens_one_yazi_sftp_terminal_and_reuses_it() {
+        let store = test_state_store("sftp");
+        let mut app = App::default();
+        let workspace = app
+            .selected_workspace_id()
+            .expect("a workspace is selected");
+        let path = app
+            .project
+            .workspace(workspace)
+            .and_then(|workspace| workspace.cwd.clone())
+            .expect("the first-run workspace has a local path");
+        let config = Config {
+            projects: vec![crate::config::ConfiguredProject {
+                name: "mult".to_string(),
+                path,
+                remote: None,
+                sftp: Some("my-server".to_string()),
+            }],
+            ..Config::default()
+        };
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let before = app.project.workspace(workspace).unwrap().terminals.len();
+
+        assert!(handle_control_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &store,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            layout,
+        ));
+        let terminals = &app.project.workspace(workspace).unwrap().terminals;
+        assert_eq!(terminals.len(), before + 1);
+        let opened = terminals.last().unwrap();
+        assert_eq!(opened.name, "sftp");
+        assert_eq!(
+            opened.launch,
+            crate::model::TerminalLaunch::Command("yazi sftp://my-server".to_string())
+        );
+        let opened_id = opened.id;
+
+        // A later config value does not create a second SFTP pane while the
+        // existing one is still part of this workspace.
+        let changed = Config {
+            projects: vec![crate::config::ConfiguredProject {
+                name: "mult".to_string(),
+                path: config.projects[0].path.clone(),
+                remote: None,
+                sftp: Some("replacement".to_string()),
+            }],
+            ..Config::default()
+        };
+        app.select_previous();
+        assert!(handle_control_key(
+            &mut app,
+            &mut pty_runtime,
+            &changed,
+            &store,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            layout,
+        ));
+        assert_eq!(
+            app.project.workspace(workspace).unwrap().terminals.len(),
+            before + 1
+        );
+        assert_eq!(
+            app.selected_item(),
+            Some(NavItem::Terminal {
+                workspace,
+                terminal: opened_id,
+            })
+        );
+
+        // The existing tab remains reachable even if a reload removed the
+        // config value; it is still this workspace's one SFTP tab.
+        app.select_previous();
+        assert!(handle_control_key(
+            &mut app,
+            &mut pty_runtime,
+            &Config::default(),
+            &store,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            layout,
+        ));
+        assert_eq!(
+            app.selected_item(),
+            Some(NavItem::Terminal {
+                workspace,
+                terminal: opened_id,
+            })
+        );
+
+        // Already selected is an idempotent focus request.
+        assert!(handle_control_key(
+            &mut app,
+            &mut pty_runtime,
+            &Config::default(),
+            &store,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            layout,
+        ));
+        assert_eq!(
+            app.project.workspace(workspace).unwrap().terminals.len(),
+            before + 1
+        );
+    }
+
+    #[test]
+    fn ctrl_s_without_a_project_sftp_reports_the_missing_config() {
+        let store = test_state_store("sftp-missing");
+        let config = Config::default();
+        let mut app = App::default();
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let workspace = app.selected_workspace_id().unwrap();
+        let before = app.project.workspace(workspace).unwrap().terminals.len();
+
+        assert!(handle_control_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &store,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            layout,
+        ));
+
+        assert_eq!(
+            app.project.workspace(workspace).unwrap().terminals.len(),
+            before
+        );
+        assert!(app.notices().iter().any(|notice| notice
+            .text()
+            .contains("no SFTP target is configured for this workspace")));
     }
 
     #[test]

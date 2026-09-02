@@ -435,11 +435,13 @@ mod tests {
                 name: "frontend".to_string(),
                 path: other_path,
                 remote: None,
+                sftp: None,
             },
             ConfiguredProject {
                 name: "mult".to_string(),
                 path: selected_path.clone(),
                 remote: None,
+                sftp: None,
             },
         ];
         let mut app = App::default();
@@ -478,11 +480,13 @@ mod tests {
                 name: "first".to_string(),
                 path: first_path,
                 remote: None,
+                sftp: None,
             },
             ConfiguredProject {
                 name: "second".to_string(),
                 path: second_path.clone(),
                 remote: None,
+                sftp: None,
             },
         ];
         let mut app = App::default();
@@ -504,6 +508,7 @@ mod tests {
             name: "mult".to_string(),
             path: PathBuf::from("~/projects/mult"),
             remote: Some("user@hostname".to_string()),
+            sftp: None,
         }];
         let mut app = App::default();
 
@@ -540,6 +545,7 @@ mod tests {
             name: "mult".to_string(),
             path: PathBuf::from("~/projects/mult"),
             remote: Some("user@hostname".to_string()),
+            sftp: None,
         }];
         let mut app = App::default();
         app.begin_open_workspace(&projects);
@@ -563,16 +569,19 @@ mod tests {
                 name: "mult".to_string(),
                 path: PathBuf::from("~/projects/mult"),
                 remote: Some("user@one".to_string()),
+                sftp: None,
             },
             ConfiguredProject {
                 name: "mult-two".to_string(),
                 path: PathBuf::from("~/projects/mult"),
                 remote: Some("user@two".to_string()),
+                sftp: None,
             },
             ConfiguredProject {
                 name: "docs".to_string(),
                 path: PathBuf::from("~/projects/docs"),
                 remote: Some("user@one".to_string()),
+                sftp: None,
             },
         ];
         let mut app = App::default();
@@ -595,6 +604,7 @@ mod tests {
             name: "mult".to_string(),
             path: PathBuf::from("~/projects/mult"),
             remote: Some("-oProxyCommand=id".to_string()),
+            sftp: None,
         }];
         let mut app = App::default();
 
@@ -623,6 +633,7 @@ mod tests {
             name: "docs.site".to_string(),
             path: PathBuf::from("/srv/docs"),
             remote: Some("host".to_string()),
+            sftp: None,
         }];
         let mut app = App::default();
 

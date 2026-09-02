@@ -108,6 +108,7 @@ fn run(options: Options) -> io::Result<()> {
             terminal.terminal_mut(),
             app,
             config,
+            options.config.as_deref(),
             shutdown.as_ref(),
             &state_store,
         )

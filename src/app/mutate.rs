@@ -1,12 +1,16 @@
 //! Structural changes to the project: adding and deleting workspaces, chats and
 //! terminals, and the per-item runtime state those changes have to keep honest.
 
+use mult_protocol::shell::quote_argument;
+
 use crate::model::{
-    AgentGeneration, AgentKind, ChatId, ChatStatus, PtyKey, TerminalId, WorkspaceId,
-    DEFAULT_AGENT_CHAT_TITLE,
+    AgentGeneration, AgentKind, ChatId, ChatStatus, PtyKey, TerminalId, TerminalLaunch,
+    WorkspaceId, DEFAULT_AGENT_CHAT_TITLE,
 };
 
 use super::*;
+
+const SFTP_TERMINAL_NAME: &str = "sftp";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteTarget {
     Workspace(WorkspaceId),
@@ -319,6 +323,72 @@ impl App {
         self.open_tool_in_selected_workspace(command, "no editor command is configured")
     }
 
+    /// Selects this workspace's Yazi SFTP terminal, adding it when needed.
+    ///
+    /// SFTP is identified by the reserved terminal name rather than by the
+    /// generated command. A config reload may change the target, but an open
+    /// workspace must still never acquire a second SFTP pane alongside the
+    /// first one. Once that pane exits cleanly normal terminal lifecycle removes
+    /// it, and the next press opens the newly configured target.
+    pub fn open_sftp_in_selected_workspace(&mut self, target: Option<&str>) -> Option<TerminalId> {
+        let workspace = self.selected_workspace_id()?;
+
+        if let Some(terminal) = self
+            .project
+            .workspace(workspace)?
+            .terminals
+            .iter()
+            .find(|terminal| {
+                terminal.name == SFTP_TERMINAL_NAME
+                    && matches!(
+                        &terminal.launch,
+                        TerminalLaunch::Command(command) if is_yazi_sftp_command(command)
+                    )
+            })
+            .map(|terminal| terminal.id)
+        {
+            self.select_item(NavItem::Terminal {
+                workspace,
+                terminal,
+            });
+            self.clear_operation_error();
+            return Some(terminal);
+        }
+
+        let Some(target) = target.map(str::trim).filter(|target| !target.is_empty()) else {
+            self.record_operation_failure("no SFTP target is configured for this workspace");
+            return None;
+        };
+        let url = if target.starts_with("sftp://") {
+            target.to_string()
+        } else {
+            format!("sftp://{target}")
+        };
+        let command = format!("yazi {}", quote_argument(&url));
+        match self
+            .project
+            .add_command_terminal(workspace, SFTP_TERMINAL_NAME.to_string(), command)
+        {
+            Ok(Some(terminal)) => {
+                self.select_item(NavItem::Terminal {
+                    workspace,
+                    terminal,
+                });
+                self.clear_operation_error();
+                self.mark_structural_change();
+                Some(terminal)
+            }
+            Ok(None) => {
+                self.record_operation_failure("selected workspace no longer exists");
+                None
+            }
+            Err(error) => {
+                self.record_operation_failure(error.to_string());
+                None
+            }
+        }
+    }
+
     /// Selects the terminal of the selected workspace running `command`, adding
     /// one in the workspace root if there is none yet.
     ///
@@ -396,6 +466,12 @@ impl App {
     }
 }
 
+fn is_yazi_sftp_command(command: &str) -> bool {
+    command
+        .strip_prefix("yazi ")
+        .is_some_and(|target| target.starts_with("sftp://") || target.starts_with("'sftp://"))
+}
+
 pub(super) fn clean_git_branch_name(branch: String) -> Option<String> {
     let branch = branch.trim();
     (!branch.is_empty()).then(|| branch.to_string())
@@ -404,6 +480,63 @@ pub(super) fn clean_git_branch_name(branch: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sftp_command_preserves_a_full_url_as_one_shell_argument() {
+        let mut app = App::default();
+        let workspace = app.selected_workspace_id().unwrap();
+
+        let terminal = app
+            .open_sftp_in_selected_workspace(Some(
+                "sftp://my-server//work space;$HOME`not-a-command`",
+            ))
+            .expect("an SFTP terminal is added");
+
+        assert_eq!(
+            app.project.terminal(workspace, terminal).unwrap().launch,
+            TerminalLaunch::Command(
+                "yazi 'sftp://my-server//work space;$HOME`not-a-command`'".to_string()
+            )
+        );
+        assert!(!is_yazi_sftp_command("sftp"));
+    }
+
+    #[test]
+    fn each_workspace_keeps_its_own_sftp_terminal() {
+        let mut app = App::default();
+        let first_workspace = app.project.workspaces[0].id;
+        let first = app
+            .open_sftp_in_selected_workspace(Some("first"))
+            .expect("the first workspace gets an SFTP terminal");
+        let second_workspace = app.project.workspaces[1].id;
+        let second_shell = app.project.workspaces[1].terminals[0].id;
+        app.select_item(NavItem::Terminal {
+            workspace: second_workspace,
+            terminal: second_shell,
+        });
+
+        let second = app
+            .open_sftp_in_selected_workspace(Some("second"))
+            .expect("the second workspace gets its own SFTP terminal");
+
+        assert_ne!(first, second);
+        assert_eq!(
+            app.project
+                .workspace(first_workspace)
+                .unwrap()
+                .terminals
+                .len(),
+            2
+        );
+        assert_eq!(
+            app.project
+                .workspace(second_workspace)
+                .unwrap()
+                .terminals
+                .len(),
+            2
+        );
+    }
 
     #[test]
     fn new_chats_use_agent_title() {

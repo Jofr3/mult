@@ -12,11 +12,11 @@ symbols:
 |   $ t│                                                                                      │      |
 |      │Global                                                                                │      |
 |      │? or F1                    Show keybindings                                           │      |
-|      │Ctrl+s                     Search selected pane                                       │      |
 |      │Ctrl+a                     New pi agent chat                                          │      |
 |      │Ctrl+x                     New Claude Code chat                                       │      |
 |      │Ctrl+t                     New shell terminal                                         │      |
 |      │Ctrl+n                     Open file manager                                          │      |
+|      │Ctrl+s                     Open SFTP                                                  │      |
 |      │Ctrl+e                     Open editor                                                │      |
 |      │Ctrl+f                     Open workspace                                             │      |
 |      │Ctrl+q                     Delete selected item                                       │      |

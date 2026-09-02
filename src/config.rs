@@ -12,6 +12,7 @@ use serde::{
 };
 
 use crate::{
+    model::Workspace,
     paths,
     storage::{read_private_file, SecureDirectory, CONFIG_DIRECTORY},
     ui::Palette,
@@ -205,6 +206,14 @@ pub struct ConfiguredProject {
     /// reading the field, and the distinction stays in one place.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
+    /// A Yazi SFTP VFS name (for example `my-server`) or full `sftp://` URL.
+    ///
+    /// Like `remote`, an absent or blank value means the project has no SFTP
+    /// shortcut. The project-to-target association remains config-owned rather
+    /// than becoming a `Workspace` field, so adding or changing it takes effect
+    /// after a config reload even for a workspace that is already open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sftp: Option<String>,
 }
 
 impl ConfiguredProject {
@@ -215,6 +224,37 @@ impl ConfiguredProject {
             .as_deref()
             .map(str::trim)
             .filter(|remote| !remote.is_empty())
+    }
+
+    /// The Yazi SFTP target for this project, with surrounding whitespace
+    /// removed, or `None` when no target is configured.
+    pub fn sftp_destination(&self) -> Option<&str> {
+        self.sftp
+            .as_deref()
+            .map(str::trim)
+            .filter(|sftp| !sftp.is_empty())
+    }
+
+    /// Whether this configured project is the source of `workspace`.
+    ///
+    /// Config entries are shortcuts rather than durable IDs, so SFTP lookup
+    /// uses the same identities workspace import uses: canonical local path,
+    /// or the exact remote host-and-path pair. This also makes a newly added
+    /// `sftp` key work for workspaces created before that key existed.
+    pub fn matches_workspace(&self, workspace: &Workspace) -> bool {
+        match (self.remote_destination(), workspace.remote.as_ref()) {
+            (Some(host), Some(remote)) => {
+                host == remote.host && self.path.to_string_lossy().trim() == remote.path
+            }
+            (None, None) => {
+                let Some(cwd) = workspace.cwd.as_deref() else {
+                    return false;
+                };
+                let path = self.expanded_path();
+                path == cwd || fs::canonicalize(path).is_ok_and(|path| path == cwd)
+            }
+            _ => false,
+        }
     }
 
     /// `path` with a leading `~` expanded from `$HOME`, as the open-workspace
@@ -391,8 +431,9 @@ impl Default for Config {
 }
 
 /// A project is written either as `{"name": …, "path": …}` — optionally with
-/// `"remote"` — or as the pair `["name", "path"]`, which is always local: a
-/// two-element shorthand has nowhere to say which machine it means.
+/// `"remote"` and `"sftp"` — or as the pair `["name", "path"]`, which is
+/// always local and has no SFTP shortcut: a two-element shorthand has nowhere
+/// to carry either optional value.
 ///
 /// Hand-written rather than an `#[serde(untagged)]` enum: untagged buffers the
 /// value and reports every failure as "data did not match any variant", losing
@@ -431,6 +472,7 @@ impl<'de> Deserialize<'de> for ConfiguredProject {
                     name,
                     path,
                     remote: None,
+                    sftp: None,
                 })
             }
 
@@ -438,10 +480,11 @@ impl<'de> Deserialize<'de> for ConfiguredProject {
             where
                 A: MapAccess<'de>,
             {
-                const FIELDS: &[&str] = &["name", "path", "remote"];
+                const FIELDS: &[&str] = &["name", "path", "remote", "sftp"];
                 let mut name: Option<String> = None;
                 let mut path: Option<PathBuf> = None;
                 let mut remote: Option<String> = None;
+                let mut sftp: Option<String> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -463,6 +506,12 @@ impl<'de> Deserialize<'de> for ConfiguredProject {
                             }
                             remote = Some(map.next_value()?);
                         }
+                        "sftp" => {
+                            if sftp.is_some() {
+                                return Err(de::Error::duplicate_field("sftp"));
+                            }
+                            sftp = Some(map.next_value()?);
+                        }
                         unknown => return Err(de::Error::unknown_field(unknown, FIELDS)),
                     }
                 }
@@ -471,6 +520,7 @@ impl<'de> Deserialize<'de> for ConfiguredProject {
                     name: name.ok_or_else(|| de::Error::missing_field("name"))?,
                     path: path.ok_or_else(|| de::Error::missing_field("path"))?,
                     remote,
+                    sftp,
                 })
             }
         }
@@ -885,7 +935,7 @@ mod tests {
         let path = unique_temp_file();
         fs::write(
             &path,
-            r#"{"projects":[{"name":"mult","path":"~/projects/mult"},["docs","/tmp/docs"]]}"#,
+            r#"{"projects":[{"name":"mult","path":"~/projects/mult","sftp":"my-server"},["docs","/tmp/docs"]]}"#,
         )
         .expect("write config");
 
@@ -898,11 +948,13 @@ mod tests {
                     name: "mult".to_string(),
                     path: PathBuf::from("~/projects/mult"),
                     remote: None,
+                    sftp: Some("my-server".to_string()),
                 },
                 ConfiguredProject {
                     name: "docs".to_string(),
                     path: PathBuf::from("/tmp/docs"),
                     remote: None,
+                    sftp: None,
                 },
             ]
         );
@@ -1222,6 +1274,52 @@ mod tests {
         assert_eq!(config.projects[1].remote_destination(), None);
     }
 
+    #[test]
+    fn a_project_can_name_its_yazi_sftp_target() {
+        let path = unique_temp_file();
+        fs::write(
+            &path,
+            r#"{"projects":[{"name":"mult","path":"/tmp","sftp":" sftp://my-server "},{"name":"docs","path":"/tmp","sftp":""}]}"#,
+        )
+        .expect("write config");
+
+        let config = load_from_path(&path).expect("load config");
+
+        assert_eq!(
+            config.projects[0].sftp.as_deref(),
+            Some(" sftp://my-server ")
+        );
+        assert_eq!(
+            config.projects[0].sftp_destination(),
+            Some("sftp://my-server")
+        );
+        assert_eq!(config.projects[1].sftp_destination(), None);
+    }
+
+    #[test]
+    fn sftp_lookup_matches_a_remote_workspace_by_host_and_path() {
+        let project = ConfiguredProject {
+            name: "mult".to_string(),
+            path: PathBuf::from("~/projects/mult"),
+            remote: Some(" user@hostname ".to_string()),
+            sftp: Some("my-server".to_string()),
+        };
+        let mut state = crate::model::ProjectState::try_default().unwrap();
+        let workspace = state
+            .add_remote_workspace(
+                "renamed".to_string(),
+                crate::model::RemoteTarget {
+                    host: "user@hostname".to_string(),
+                    path: "~/projects/mult".to_string(),
+                    session: "different-name".to_string(),
+                },
+            )
+            .unwrap();
+
+        assert!(project.matches_workspace(state.workspace(workspace).unwrap()));
+        assert_eq!(project.sftp_destination(), Some("my-server"));
+    }
+
     /// The remote path names a directory on the *other* machine, so the
     /// is-it-a-directory check that a local shortcut gets would warn about
     /// every remote project that does not happen to shadow a local path.
@@ -1264,11 +1362,12 @@ mod tests {
     }
 
     #[test]
-    fn the_pair_spelling_has_no_remote_and_an_unknown_project_key_still_fails() {
+    fn the_pair_spelling_has_no_optional_targets_and_an_unknown_project_key_still_fails() {
         let path = unique_temp_file();
         fs::write(&path, r#"{"projects":[["docs","/tmp/docs"]]}"#).expect("write config");
         let config = load_from_path(&path).expect("load config");
         assert_eq!(config.projects[0].remote, None);
+        assert_eq!(config.projects[0].sftp, None);
 
         let path = unique_temp_file();
         fs::write(

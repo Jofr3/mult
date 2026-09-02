@@ -8,6 +8,22 @@ and the project aims to adhere to
 
 ## [Unreleased]
 
+### Project SFTP in Yazi
+
+A project object may now set `"sftp"` to a Yazi VFS name or complete
+`sftp://` URL. `Ctrl+s` opens that target in Yazi as a command-terminal tab.
+Each workspace keeps one SFTP tab: pressing the key again focuses the existing
+one, and pressing it while that tab is already selected is idempotent. Search
+remains available through the command palette.
+
+The project-to-SFTP association remains live configuration rather than a
+workspace-state field. Reloading config therefore makes a newly added target
+available to an already-open workspace with the same canonical local path or
+remote host-and-path identity. The SFTP tab itself is an ordinary persisted
+command terminal while it exists; it wins until it exits, preserving the
+one-tab invariant. Reloading also now keeps using the path supplied by
+`--config`, rather than falling back to the default config file.
+
 ### A project can live on another machine
 
 A `projects` entry may now say where the project *is*:
@@ -18,9 +34,9 @@ A `projects` entry may now say where the project *is*:
 
 Opening it with `Ctrl+f` no longer looks for `~/projects/mult` on this machine.
 The workspace opens on the other one, and everything in it runs there: the shell
-it opens on and every `Ctrl+t` after it, `Ctrl+n`, `Ctrl+e`, command terminals,
-and agent chats. `path` is read on the far side, so a leading `~` is the *remote*
-user's home, and nothing is canonicalized or checked here.
+it opens on and every `Ctrl+t` after it, `Ctrl+n`, `Ctrl+s`, `Ctrl+e`, command
+terminals, and agent chats. `path` is read on the far side, so a leading `~` is
+the *remote* user's home, and nothing is canonicalized or checked here.
 
 Terminals are plain `ssh` — `cd <path> && exec "$SHELL" -l`, or `cd <path> &&
 <your command>`, evaluated by the remote login shell so `$VAR`, pipelines and

@@ -66,8 +66,8 @@ nothing:
 - a value has the wrong type (`"mouse_capture": "yes"`);
 - a key is not one `mult` knows. `deny_unknown_fields` is on for the top-level
   object, for `colorscheme`, and for a `projects` entry, so a typo like
-  `auto_start_terminal` (no `s`) or `colorscheme.foreground` fails instead of
-  being accepted and doing nothing;
+  `auto_start_terminal` (no `s`), `projects[].sftpp`, or
+  `colorscheme.foreground` fails instead of being accepted and doing nothing;
 - the file, or the directory holding it, fails one of the ownership checks above.
 
 Parse errors name the file and the position, and the accepted keys are listed:
@@ -119,26 +119,66 @@ default below.
 ### `projects`
 
 Each entry may be written either as an object or as a two-element array; both
-produce the same `{name, path}` pair, and the object form may add `remote`:
+produce the same `{name, path}` pair, and the object form may add `remote` and
+`sftp`:
 
 ```json
 "projects": [
-  { "name": "mult", "path": "~/projects/mult" },
-  { "name": "api", "path": "~/srv/api", "remote": "user@hostname" },
+  { "name": "mult", "path": "~/projects/mult", "sftp": "my-server" },
+  { "name": "api", "path": "~/srv/api", "remote": "user@hostname", "sftp": "api-files" },
   ["scratch", "/tmp/scratch"]
 ]
 ```
 
 Both spellings reject unknown keys, so `{"name": "mult", "pathh": "…"}` is a
 startup error rather than a shortcut that silently has no path. The array
-shorthand is always local: two elements have nowhere to say which machine they
-mean.
+shorthand is always local and has no SFTP shortcut: two elements have nowhere
+to carry either optional value.
 
 A leading `~` or `~/` in `path` is expanded from `$HOME`. If `$HOME` is unset the
 path is used literally. The expanded path is checked once, at load: a shortcut
 pointing at something that is not a directory is reported as a warning and kept,
 and it fails if you open it. The check is a snapshot — a directory that appears
 (or disappears) later is not re-checked until the next start or config reload.
+
+#### `sftp` — open the project in Yazi
+
+`sftp` names a virtual SFTP filesystem configured in Yazi's `vfs.toml`. It may
+be the VFS name by itself or a complete Yazi URL; these are equivalent:
+
+```json
+{ "name": "api", "path": "~/src/api", "sftp": "api-files" }
+{ "name": "api", "path": "~/src/api", "sftp": "sftp://api-files" }
+```
+
+Pressing `Ctrl+s` runs `yazi sftp://api-files` in a new command-terminal tab.
+The target is passed as one shell-quoted argument, not evaluated as part of the
+command. See [Yazi's VFS documentation](https://yazi-rs.github.io/docs/configuration/vfs/)
+for the corresponding `vfs.toml` entry and its SSH authentication options.
+
+A workspace has at most one SFTP tab. If one exists, `Ctrl+s` selects and
+focuses it; if it is already selected, the press is idempotent. Quitting Yazi
+removes the cleanly finished tab as usual, so the next press creates a fresh
+one. An absent, empty or whitespace-only `sftp` value means no new SFTP tab can
+be opened; when no earlier tab exists, pressing `Ctrl+s` reports that in the
+notice area.
+
+The project-to-target association stays in `config.json`, rather than becoming
+a field on the durable workspace. `mult` resolves it by canonical local path,
+or by the remote host-and-path pair. Adding or changing `sftp`, then running
+**Reload config**, therefore also enables it for a matching workspace that was
+already open. The SFTP tab itself is an ordinary command terminal, so its
+launch command is persisted while the tab exists. If a tab is currently open
+when the value changes or is removed, it remains the workspace's one SFTP tab
+until it exits; another press focuses it rather than opening a replacement
+alongside it.
+
+In a local workspace Yazi runs locally. In a workspace configured with
+`remote`, it follows the rule for every terminal in that workspace: Yazi runs
+on the project machine through `ssh`, so the `vfs.toml` entry and credentials
+must be available there. An autospawned `mult-server` deliberately does not
+inherit `SSH_AUTH_SOCK`; use a Yazi `key_file`/password setup or start the daemon
+manually with the agent socket in its environment when Yazi needs it.
 
 #### `remote` — a project on another machine
 
@@ -158,11 +198,12 @@ on that machine, in `path`. What it does *not* do is look for `path` here.
 ssh -t <remote> 'cd <path> && exec "$SHELL" -l'
 ```
 
-`Ctrl+n`, `Ctrl+e` and a command terminal run `file_manager_command`,
-`editor_command` and your own command the same way — `cd` into the project
+`Ctrl+n`, `Ctrl+s`, `Ctrl+e` and a command terminal run the file manager,
+Yazi SFTP, the editor and your own command the same way — `cd` into the project
 directory, then the command, evaluated by the *remote* login shell, so `$VAR`,
-pipelines and globs mean what they mean on that machine. Those binaries have to
-exist there. No `tmux`: a terminal is its connection, and it ends when you close
+pipelines and globs mean what they mean on that machine. Those binaries and,
+for `Ctrl+s`, the named Yazi VFS configuration have to exist there. No `tmux`:
+a terminal is its connection, and it ends when you close
 the pane, exactly like a local one.
 
 **The agent chat runs inside `tmux`.** An agent is not a terminal — it is a long

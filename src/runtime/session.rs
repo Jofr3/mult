@@ -18,7 +18,7 @@ pub(super) fn sync_pane_focus(app: &App, pty_runtime: &mut PtyRuntime) {
     pty_runtime.set_focused_pane(app.focused_pty());
 }
 use crate::{
-    app::{App, NoticeLevel, NoticeSource},
+    app::{App, FocusMode, NoticeLevel, NoticeSource},
     config::Config,
     model::{self, ChatStatus, PtyKey, TerminalId, TerminalLaunch},
     pty::{AttachExistingResult, PtyDimensions, PtyEvent, PtyRuntime, PtySpawn},
@@ -346,6 +346,45 @@ pub(super) fn open_file_manager(
         .open_file_manager_in_selected_workspace(&config.file_manager_command)
         .is_none()
     {
+        return;
+    }
+
+    start_or_focus_selected_terminal(app, pty_runtime, config, layout);
+}
+
+/// Open Yazi at the selected workspace's configured SFTP target.
+///
+/// The project-to-target association stays in `config.json` rather than in the
+/// workspace model. It is looked up by the same local-path or remote-host/path
+/// identity used when the workspace was imported, so a config reload applies
+/// to an already-open workspace. `App` owns the one-pane rule; this layer
+/// deliberately starts a stopped pane because pressing `Ctrl+s` is explicit
+/// authorization.
+pub(super) fn open_sftp(
+    app: &mut App,
+    pty_runtime: &mut PtyRuntime,
+    config: &Config,
+    layout: AppLayout,
+) {
+    let focused_before = if app.focus() == Some(FocusMode::Terminal) {
+        app.selected_terminal_id().map(|(_, terminal)| terminal)
+    } else {
+        None
+    };
+    let target = app
+        .selected_workspace_id()
+        .and_then(|workspace| app.project.workspace(workspace))
+        .and_then(|workspace| {
+            config
+                .projects
+                .iter()
+                .filter(|project| project.matches_workspace(workspace))
+                .find_map(|project| project.sftp_destination())
+        });
+    let Some(terminal) = app.open_sftp_in_selected_workspace(target) else {
+        return;
+    };
+    if focused_before == Some(terminal) {
         return;
     }
 
