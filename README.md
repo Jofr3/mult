@@ -25,6 +25,13 @@ The current implementation is a Ratatui/Crossterm client plus a small `mult-serv
 - Terminal scrollback, paste handling, mouse text selection, and OSC52 clipboard copy (opt-out via `clipboard_osc52`).
 - Full xterm mouse reporting to programs that ask for it (press/release/drag/motion, every protocol mode and encoding, modifier bits), with `Shift` reserved for `mult`'s own selection; cursor-key, keypad, bracketed-paste and focus-reporting modes honoured.
 - Configurable project shortcuts and colorscheme.
+- A project shortcut may name a machine: `"remote": "user@hostname"` opens the
+  workspace over `ssh`, with every pane — shells, the file manager, the editor,
+  command terminals and agent chats — running on that machine in the project
+  directory. Terminals are plain `ssh`; an **agent chat** runs inside a `tmux`
+  session on the remote side, so closing `mult` detaches it and the next start
+  finds the same conversation still going. The workspace's git branch is read
+  from that machine too, in the background.
 
 ## Quick start
 
@@ -267,6 +274,7 @@ Example:
   "clipboard_osc52": true,
   "projects": [
     { "name": "mult", "path": "~/projects/mult" },
+    { "name": "api", "path": "~/srv/api", "remote": "user@hostname" },
     ["scratch", "/tmp/scratch"]
   ],
   "colorscheme": {
@@ -278,6 +286,20 @@ Example:
 ```
 
 `pi_agent_command` and `claude_code_command` select the binary for each agent backend (`Ctrl+a` starts a `pi` chat, `Ctrl+x` a Claude Code chat); `auto_start_*` toggle whether the selected chat of that kind starts on focus. Both commands are launched through your login shell (`$SHELL -lc …`), so shell features — pipelines, `$VAR` expansion, globbing — work inside them. This is intentionally different from `MULT_AGENT_CMD` (below), which `mult` splits into arguments itself with no shell involved. `file_manager_command` and `editor_command` are the third and fourth of these: `Ctrl+n` and `Ctrl+e` run them through the same login shell, in the selected workspace's root directory. `editor_command` is empty by default, which means `mult` asks the environment instead — `$VISUAL`, then `$EDITOR`, then `vi` — so `Ctrl+e` opens whatever you already told your system your editor is. Set the key to pin one editor for `mult` regardless.
+
+A `projects` entry with a `remote` is opened on that machine instead of this
+one, and `path` is read on the far side (a leading `~` is the *remote* user's
+home). Terminals — the workspace's own shell, `Ctrl+t`, `Ctrl+n`, `Ctrl+e` and
+command terminals — are plain `ssh -t <remote> 'cd <path> && …'`, so they end
+with their pane like any terminal. The agent chat is not: `Ctrl+a`/`Ctrl+x` run it inside a `tmux` session named
+after the project, created on first use and attached to afterwards, so closing
+`mult` detaches the agent rather than killing it. One session means one chat —
+pressing either key again navigates to the chat already there. The row still
+follows the agent's own title (`mult` turns `set-titles` on for that session),
+but the status dot does not move: the hooks that move it write into `mult`'s
+private runtime directory on this machine, so a remote chat runs without them.
+See
+[docs/CONFIG.md](docs/CONFIG.md#remote--a-project-on-another-machine).
 
 The example above sets 3 of the 12 colorscheme keys. **[docs/CONFIG.md](docs/CONFIG.md) is the complete reference** — every top-level and colorscheme key with its type, default and effect, including `_nc` (the unfocused-pane background, written with a leading underscore).
 
@@ -334,7 +356,7 @@ State path:
 - otherwise `$XDG_DATA_HOME/mult/state.json`
 - otherwise the effective user's passwd home at `~/.local/share/mult/state.json`; startup fails clearly if no durable home can be resolved
 
-The state file is owned by one TUI at a time through a nonblocking process-lifetime lock acquired before loading. A second TUI using the same state path fails clearly instead of overwriting a stale snapshot. Writes are atomic through an owner-only temporary file; state and lock files are `0600`, and newly-created state directories are `0700`. A file that lost part of itself — a renamed or `null` field, missing ID hints, an identity table that no longer matches — is decoded for what it still holds and repaired in place rather than discarded; only a file the decoder can make nothing of is moved aside with a `.corrupt-*` suffix before resetting to defaults, and that reset is reported on stderr and in the app, naming the backup. State files with a newer schema version are rejected without rewriting them. Older state is explicitly migrated one version at a time (1 -> 2 -> 3) and saved before any daemon restoration or command launch. Version 3 persists a terminal's *intent* (`restore_on_launch`) rather than its liveness; whether a pane is actually live is the daemon's answer and is never read from disk.
+The state file is owned by one TUI at a time through a nonblocking process-lifetime lock acquired before loading. A second TUI using the same state path fails clearly instead of overwriting a stale snapshot. Writes are atomic through an owner-only temporary file; state and lock files are `0600`, and newly-created state directories are `0700`. A file that lost part of itself — a renamed or `null` field, missing ID hints, an identity table that no longer matches — is decoded for what it still holds and repaired in place rather than discarded; only a file the decoder can make nothing of is moved aside with a `.corrupt-*` suffix before resetting to defaults, and that reset is reported on stderr and in the app, naming the backup. State files with a newer schema version are rejected without rewriting them. Older state is explicitly migrated one version at a time (1 -> 2 -> 3 -> 4) and saved before any daemon restoration or command launch. Version 3 persists a terminal's *intent* (`restore_on_launch`) rather than its liveness; whether a pane is actually live is the daemon's answer and is never read from disk. Version 4 adds remote workspaces — the machine and directory a workspace is opened on. The field defaults, so the bump is about meaning rather than decoding: an older client would ignore it and start the workspace's panes on the wrong machine, and refusing the file is the only way to prevent that.
 
 Durable state contains the workspace tree, terminal metadata and launch commands, immutable session identities, statuses, and messages received through the structured experimental process-agent API. Normal Pi and Claude Code chats run in PTYs: their raw terminal output can survive a TUI reconnect while the same daemon session lives, but it is not treated as an authoritative structured transcript and does not survive daemon loss. Raw terminal buffers and scrollback are not stored in the JSON state file. The separate bounded transcript-journal codec is reserved for backends that provide real role/message boundaries; `mult` never invents those boundaries by scraping PTY bytes.
 
@@ -358,6 +380,7 @@ src/runtime/                (lib) the TUI event loop and its wiring
   mouse.rs                          mouse hit-testing, xterm mouse forwarding, text selection, scrollback
   clipboard.rs                      OSC 52 clipboard writes, base64, tmux passthrough
   session.rs                        PTY restore/start/resize, pane focus reports, drained PTY events
+  remote_branch.rs                  the background ssh probe that reads a remote workspace's branch
   agent_launch.rs                   starting and focusing chat agents; the process-agent backend
   agent_command.rs                  agent command lines and the generated extension/hook files
   agent_status.rs                   the per-chat agent status journals and the daemon reconciliation
@@ -387,6 +410,7 @@ src/ui/                     (lib) Ratatui rendering
 src/layout.rs               (lib) `AppLayout`: the frame divided, resolved once per loop iteration
 src/model.rs                (lib) durable project model, IDs, session identity, state schema
 src/pty.rs                  (lib) client-side PTY runtime and server protocol adapter
+src/remote.rs               (lib) the ssh command lines a remote workspace's panes run, and the tmux session an agent chat lives in
 src/cli.rs                  (lib) argument parsing for both binaries
 src/config.rs               (lib) config loading, validation, defaults, and DEFAULT_COLOR_SCHEME
 src/storage.rs              (lib) state load/save, ownership lock, migrations, corrupt-state backups

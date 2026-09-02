@@ -326,10 +326,12 @@ mod tests {
                 crate::config::ConfiguredProject {
                     name: "first".to_string(),
                     path: "/tmp/first".into(),
+                    remote: None,
                 },
                 crate::config::ConfiguredProject {
                     name: "second".to_string(),
                     path: "/tmp/second".into(),
+                    remote: None,
                 },
             ];
         });

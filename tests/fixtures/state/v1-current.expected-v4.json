@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "namespace": "000102030405060708090a0b0c0d0e0f",
   "session_identities": {
     "chats": {
@@ -19,6 +19,7 @@
       "id": 1,
       "name": "complete",
       "cwd": "/work/project",
+      "remote": null,
       "environment": {
         "RUST_LOG": "debug"
       },

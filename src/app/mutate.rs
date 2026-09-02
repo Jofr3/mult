@@ -245,6 +245,20 @@ impl App {
         agent: AgentKind,
     ) -> Option<(WorkspaceId, ChatId)> {
         let workspace = self.selected_workspace_id()?;
+        // A remote workspace holds one agent, because it has one `tmux` session
+        // — named after the project — and a second chat on that name would be
+        // the first agent mirrored into another pane rather than a new one. So
+        // the key that would add a chat selects the chat already there; the
+        // caller then starts or focuses it, which for an agent already running
+        // over there is a re-attach.
+        if let Some(existing) = self.only_remote_chat(workspace) {
+            self.select_item(NavItem::Chat {
+                workspace,
+                chat: existing,
+            });
+            self.clear_operation_error();
+            return Some((workspace, existing));
+        }
         let name = DEFAULT_AGENT_CHAT_TITLE.to_string();
         let chat = match self
             .project
@@ -358,6 +372,13 @@ impl App {
         }
     }
 
+    /// The chat a remote workspace already has, if it is remote and it has one.
+    fn only_remote_chat(&self, workspace: WorkspaceId) -> Option<ChatId> {
+        let workspace = self.project.workspace(workspace)?;
+        workspace.remote.as_ref()?;
+        workspace.chats.first().map(|chat| chat.id)
+    }
+
     fn command_terminal_running(
         &self,
         workspace: WorkspaceId,
@@ -395,6 +416,86 @@ mod tests {
         assert_eq!(
             app.project.chat(workspace, chat).unwrap().name,
             DEFAULT_AGENT_CHAT_TITLE
+        );
+    }
+
+    /// A remote workspace has one `tmux` session, named for the project, so it
+    /// has one chat: pressing the key again lands on the chat already there
+    /// rather than adding a second pane onto the same agent.
+    #[test]
+    fn a_remote_workspace_keeps_one_agent_chat_and_returns_to_it() {
+        let mut app = App::default();
+        let workspace = app.selected_workspace_id().unwrap();
+        app.project.workspace_mut(workspace).unwrap().chats.clear();
+        app.project.workspace_mut(workspace).unwrap().remote = Some(crate::model::RemoteTarget {
+            host: "user@hostname".to_string(),
+            path: "~/projects/mult".to_string(),
+            session: "mult".to_string(),
+        });
+        let terminal = app.project.workspace(workspace).unwrap().terminals[0].id;
+
+        let (_, first) = app
+            .add_chat_to_selected_workspace_and_return(AgentKind::ClaudeCode)
+            .expect("the first chat is created");
+        // Somewhere else in the same workspace, so the second press has to
+        // navigate rather than already being there.
+        app.select_item(NavItem::Terminal {
+            workspace,
+            terminal,
+        });
+
+        let (_, again) = app
+            .add_chat_to_selected_workspace_and_return(AgentKind::Pi)
+            .expect("the key returns the chat already there");
+
+        assert_eq!(again, first, "the same chat, whichever agent key was used");
+        assert_eq!(
+            app.project.workspace(workspace).unwrap().chats.len(),
+            1,
+            "and no second one beside it"
+        );
+        assert_eq!(
+            app.selected_item(),
+            Some(NavItem::Chat {
+                workspace,
+                chat: first
+            }),
+            "pressing it again navigates to the open chat"
+        );
+    }
+
+    /// A local workspace is unchanged: every press is another chat.
+    #[test]
+    fn a_local_workspace_still_adds_a_chat_each_time() {
+        let mut app = App::default();
+        let workspace = app.selected_workspace_id().unwrap();
+        let chats = app.project.workspace(workspace).unwrap().chats.len();
+
+        app.add_chat_to_selected_workspace_and_return(AgentKind::Pi);
+        app.add_chat_to_selected_workspace_and_return(AgentKind::ClaudeCode);
+
+        assert_eq!(
+            app.project.workspace(workspace).unwrap().chats.len(),
+            chats + 2
+        );
+    }
+
+    #[test]
+    fn a_remote_workspace_still_adds_terminals() {
+        let mut app = App::default();
+        let workspace = app.selected_workspace_id().unwrap();
+        app.project.workspace_mut(workspace).unwrap().remote = Some(crate::model::RemoteTarget {
+            host: "user@hostname".to_string(),
+            path: "~/projects/mult".to_string(),
+            session: "mult".to_string(),
+        });
+        let terminals = app.project.workspace(workspace).unwrap().terminals.len();
+
+        app.add_terminal_to_selected_workspace();
+
+        assert_eq!(
+            app.project.workspace(workspace).unwrap().terminals.len(),
+            terminals + 1
         );
     }
 

@@ -305,6 +305,96 @@ used to say "Pi agent" and name pi's keys for every chat; that was `F18`.
 
 ---
 
+## A remote workspace pane exits immediately
+
+**Symptom.** A pane in a workspace opened from a `projects` entry with a
+`remote` prints one line from `ssh` and exits — or, on a clean exit, closes
+itself and takes the row with it:
+
+```
+ssh: Could not resolve hostname hostnam: Name or service not known
+```
+
+```
+Host key verification failed.
+```
+
+```
+user@hostname: Permission denied (publickey).
+```
+
+> **[pane]** `bash: line 1: tmux: command not found`
+
+**Cause.** `mult` runs `ssh -t <remote> '<command>'` through your login shell and
+adds no options of its own: authentication, host keys and known-hosts are
+`ssh`'s. `tmux` has to exist on the *remote* machine, but only for **agent
+chats** — terminals are plain `ssh`. Nothing here is checked before the pane
+starts, so what you see is what `ssh` or the remote shell said.
+
+**Fix.** Make the connection work outside `mult` first — `ssh user@hostname` in
+an ordinary terminal is the same connection this uses, including anything you
+have put in `~/.ssh/config` for that host. Then:
+
+- a passphrase or password prompt appears *inside* the pane and can be typed
+  into; a pane that seems to hang is often waiting on one, so select it and
+  look. `ssh-add` before starting `mult` avoids it per pane;
+- for a host key you have not accepted yet, accept it once outside `mult`. The
+  prompt works in the pane too, but a first connection is easier to read in a
+  plain terminal;
+- put the port, identity file or jump host in `~/.ssh/config` under a `Host`
+  alias and use the alias as `remote`. `mult` passes the destination to `ssh`
+  verbatim and cannot carry extra flags — a `remote` starting with `-` is
+  rejected at load with a warning, because `ssh` would read it as an option;
+- install `tmux` on the remote machine if you want agent chats there. Terminals
+  do not use it: a shell, the file manager, the editor and command terminals all
+  work on a machine with no `tmux` at all.
+
+**Not a fault:** detaching a chat's session from inside it (`Ctrl+b d` by
+default) ends `ssh` cleanly, and a pane whose program finished cleanly closes.
+Nothing is lost — the `tmux` session keeps running on the remote machine with
+the agent in it, and starting the chat again re-attaches, which is what
+`new-session -A` is for.
+
+One more message comes from `mult` itself rather than `ssh`:
+
+> **[pane]** `failed to start terminal `shell`: the remote destination "…" starts with `-`, which ssh would read as an option`
+
+— the same problem the startup warning names, reported where you tried to use
+it. The agent form reads `failed to start Claude Code agent for `agent`: …`.
+
+**A remote workspace with no branch** in the sidebar is usually the same
+problem seen from another angle. The branch probe runs `ssh` with
+`BatchMode=yes` — it has no pane to ask for a passphrase in, so it fails rather
+than hang — and it reads exactly one file, `<path>/.git/HEAD`. So no branch
+means the connection needs input (`ssh-add` first), the path is not a repository
+*root* (a subdirectory or a linked worktree is not followed across the
+connection), or `HEAD` is detached.
+
+---
+
+## A remote agent chat never shows a status dot
+
+**Symptom.** An agent chat in a remote workspace works — you can talk to it, it
+answers — but the dot in the sidebar stays the idle gray one, whatever the agent
+is doing.
+
+**Cause.** Expected, and not fixable from this side. Both backends report status
+by writing into files `mult` prepares in its private runtime directory: pi
+through the extension it is given with `-e`, Claude Code through the hooks in
+the file it is given with `--settings`. Those files exist on the machine `mult`
+runs on, and an agent on another machine can neither read nor write them. A
+remote chat is therefore started with the plain `pi_agent_command` /
+`claude_code_command` — passing paths that do not exist over there would stop
+the agent starting, which is worse than a still dot.
+
+**What still works.** Everything in the pane: the agent's own output, its
+prompts, its progress. And the session outlives the connection — that is the
+point of running it inside `tmux` — so a dropped link, a closed laptop or a
+`mult` restart leaves the conversation where it was, and starting the chat again
+attaches to it.
+
+---
+
 ## "Input rejected for pane N", or "too many pending requests"
 
 > **[pane]** `Input rejected for pane {n}: NotOwner`

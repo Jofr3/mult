@@ -174,7 +174,12 @@ fn open_workspace_match_line(
     } else {
         Style::default().fg(palette.text)
     };
-    let path = entry.path.display().to_string();
+    // `user@host:~/projects/mult` — the `scp` spelling, because it is the one
+    // a user already reads as "this is somewhere else".
+    let path = match &entry.remote {
+        Some(host) => format!("{host}:{}", entry.path.display()),
+        None => entry.path.display().to_string(),
+    };
 
     Line::from(vec![
         Span::styled(marker, style),

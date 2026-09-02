@@ -34,6 +34,24 @@ pub(super) fn agent_command(config: &Config, agent: AgentKind) -> String {
     }
 }
 
+/// The command a chat in a **remote** workspace runs, which is the configured
+/// agent command and nothing else.
+///
+/// Neither backend's status plumbing can cross the connection: pi's `-e`
+/// extension and Claude Code's `--settings` hooks are files written into
+/// `mult`'s private runtime directory *here*, and the hooks report by writing
+/// into a journal *here* too. Passing those paths to an agent over there would
+/// at best do nothing and at worst stop the agent starting, because the file it
+/// was told to load does not exist on that machine. So the agent runs plain,
+/// and the chat's status dot stays idle — the pane still shows everything the
+/// agent prints, which is what a remote chat is for.
+pub(super) fn remote_agent_command(config: &Config, agent: AgentKind) -> String {
+    match agent {
+        AgentKind::Pi => pi_command(config),
+        AgentKind::ClaudeCode => claude_code_command(config),
+    }
+}
+
 fn pi_command(config: &Config) -> String {
     let command = config.pi_agent_command.trim();
     if command.is_empty() {
@@ -374,6 +392,25 @@ mod tests {
         assert!(cc.starts_with("claude --here"));
         assert!(cc.contains(" --settings "));
         assert!(!cc.contains(" -e "));
+    }
+
+    /// The status artifacts are local files, so a remote agent is launched
+    /// without them instead of being handed paths that do not exist on the
+    /// machine it runs on.
+    #[test]
+    fn a_remote_agent_command_carries_no_local_status_artifacts() {
+        let config = config_with(|config| {
+            config.pi_agent_command = "pi --model test".to_string();
+            config.claude_code_command = "claude --resume".to_string();
+        });
+
+        let pi = remote_agent_command(&config, AgentKind::Pi);
+        assert_eq!(pi, "pi --model test");
+        assert!(!pi.contains(" -e "));
+
+        let claude = remote_agent_command(&config, AgentKind::ClaudeCode);
+        assert_eq!(claude, "claude --resume");
+        assert!(!claude.contains(" --settings "));
     }
 
     #[test]

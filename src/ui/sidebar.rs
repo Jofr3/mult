@@ -28,6 +28,12 @@ const WORKSPACE_ICON: &str = "▣ ";
 
 const GIT_BRANCH_ICON: &str = "";
 
+/// Stands in for [`WORKSPACE_ICON`] on a workspace that is not on this
+/// machine. Which machine that is stays out of the row: one glyph is enough
+/// to say "not here", and the pane placeholder spells out the destination
+/// where it is actually needed.
+const REMOTE_WORKSPACE_ICON: &str = " ";
+
 pub(super) fn draw_sidebar(
     frame: &mut Frame,
     app: &App,
@@ -153,14 +159,27 @@ fn sidebar_item_width(area: Rect) -> usize {
     )
 }
 
+/// Which glyph a workspace row opens with. The only thing the row says about a
+/// remote workspace: not which machine, just that it is not this one — the name
+/// is what the row is for, and the destination is spelled out in the pane
+/// placeholder where it is actually needed.
+fn workspace_icon(workspace: &Workspace) -> &'static str {
+    if workspace.remote.is_some() {
+        REMOTE_WORKSPACE_ICON
+    } else {
+        WORKSPACE_ICON
+    }
+}
+
 fn workspace_sidebar_line(
     workspace: &Workspace,
     branch: Option<&str>,
     palette: Palette,
     item_width: usize,
 ) -> Line<'static> {
+    let icon = workspace_icon(workspace);
     if let Some(branch) = branch.filter(|branch| !branch.trim().is_empty()) {
-        let workspace_icon_width = text_width(WORKSPACE_ICON);
+        let workspace_icon_width = text_width(icon);
         let branch_icon_width = text_width(GIT_BRANCH_ICON) + 1;
         let branch_trailing_space_width = 1;
         let minimum_name_width = 1;
@@ -191,7 +210,7 @@ fn workspace_sidebar_line(
                 .saturating_sub(workspace_icon_width + text_width(&workspace_name) + branch_width);
 
             return Line::from(vec![
-                Span::styled(WORKSPACE_ICON, Style::default().fg(palette.foam)),
+                Span::styled(icon, Style::default().fg(palette.foam)),
                 Span::styled(
                     workspace_name,
                     Style::default()
@@ -207,13 +226,13 @@ fn workspace_sidebar_line(
         }
     }
 
-    let workspace_icon_width = text_width(WORKSPACE_ICON);
+    let workspace_icon_width = text_width(icon);
     let workspace_name = truncate_text(
         &workspace.name,
         item_width.saturating_sub(workspace_icon_width),
     );
     Line::from(vec![
-        Span::styled(WORKSPACE_ICON, Style::default().fg(palette.foam)),
+        Span::styled(icon, Style::default().fg(palette.foam)),
         Span::styled(
             workspace_name,
             Style::default()
@@ -231,9 +250,8 @@ fn workspace_sidebar_line(
 /// Claude Code chats in a workspace would otherwise be three identical rows.
 /// What the agent says it is working on is what tells them apart.
 fn chat_sidebar_label(chat: &ChatSession, pty_runtime: &PtyRuntime, max_width: usize) -> String {
-    let name = pty_runtime
-        .terminal_title(PtyKey::ChatAgent(chat.id))
-        .unwrap_or_else(|| chat.name.clone());
+    let name =
+        window_title(PtyKey::ChatAgent(chat.id), pty_runtime).unwrap_or_else(|| chat.name.clone());
     truncate_text(&name, max_width)
 }
 
@@ -277,7 +295,7 @@ fn terminal_command_label(terminal: &TerminalSession, pty_runtime: &PtyRuntime) 
         TerminalLaunch::Shell => running_command_label(key, pty_runtime)
             .or_else(|| program_title(key, pty_runtime))
             .or_else(|| last_command_label(key, pty_runtime))
-            .or_else(|| pty_runtime.terminal_title(key))
+            .or_else(|| window_title(key, pty_runtime))
             .unwrap_or_else(|| "terminal".to_string()),
     }
 }
@@ -307,9 +325,38 @@ fn last_command_label(key: PtyKey, pty_runtime: &PtyRuntime) -> Option<String> {
 /// The pane's window title, but only when it is a program saying what it is
 /// doing rather than a shell repeating where it stands.
 fn program_title(key: PtyKey, pty_runtime: &PtyRuntime) -> Option<String> {
-    pty_runtime
-        .terminal_title(key)
-        .filter(|title| !title_is_directory(title))
+    window_title(key, pty_runtime).filter(|title| !title_is_directory(title))
+}
+
+/// The pane's window title as a row should show it: without the `[host]` a
+/// prompt puts in front of it.
+///
+/// A shell on another machine is where this shows up — a prompt that writes
+/// `[jofre-serv] ~/.dotfiles` is answering "which machine am I on", which the
+/// row already says with the workspace's own icon. What is left is the part
+/// that varies between panes, and it is also what the rest of this file already
+/// knows how to rank: `~/.dotfiles` is recognisably a `cwd` title, where
+/// `[jofre-serv] ~/.dotfiles` was not, so stripping the label also puts the
+/// title back below the command the pane is running.
+fn window_title(key: PtyKey, pty_runtime: &PtyRuntime) -> Option<String> {
+    pty_runtime.terminal_title(key).map(|title| {
+        strip_bracketed_label(&title)
+            .map(ToOwned::to_owned)
+            .unwrap_or(title)
+    })
+}
+
+/// `[label] rest` -> `rest`, and `None` for anything that is not that shape or
+/// is nothing but the label.
+fn strip_bracketed_label(title: &str) -> Option<&str> {
+    let rest = title.strip_prefix('[')?;
+    let (label, rest) = rest.split_once(']')?;
+    // A `]` that closes something opened later is not this shape.
+    if label.contains('[') {
+        return None;
+    }
+    let rest = rest.trim_start();
+    (!rest.is_empty()).then_some(rest)
 }
 
 /// Whether a window title says nothing but which directory the pane is in.
@@ -675,6 +722,35 @@ mod tests {
             terminal_display_label(&shell_terminal, &pty_runtime, 80),
             "src/pty.rs - NVIM"
         );
+    }
+
+    /// A remote shell's prompt usually announces the machine, and the row
+    /// already says that with its icon. What is left is the part that differs
+    /// between panes — and, being a bare path again, it also stops outranking
+    /// the command the pane is running.
+    #[test]
+    fn a_bracketed_host_label_is_dropped_from_a_window_title() {
+        assert_eq!(
+            strip_bracketed_label("[jofre-serv] ~/.dotfiles"),
+            Some("~/.dotfiles")
+        );
+        assert_eq!(
+            strip_bracketed_label("[jofre-serv]~/.dotfiles"),
+            Some("~/.dotfiles")
+        );
+        // Nothing but the label is not a better row than the label itself.
+        assert_eq!(strip_bracketed_label("[jofre-serv]"), None);
+        assert_eq!(strip_bracketed_label("[jofre-serv]   "), None);
+        // Not this shape: left alone.
+        assert_eq!(strip_bracketed_label("nvim [+]"), None);
+        assert_eq!(strip_bracketed_label("[unclosed ~/src"), None);
+        assert_eq!(strip_bracketed_label("[[nested]] x"), None);
+        assert_eq!(strip_bracketed_label("~/.dotfiles"), None);
+
+        // And once stripped, `~/.dotfiles` is a directory title like any other.
+        assert!(title_is_directory(
+            strip_bracketed_label("[jofre-serv] ~/.dotfiles").unwrap()
+        ));
     }
 
     #[test]
@@ -1057,5 +1133,45 @@ mod tests {
         let sidebar_row = buffer_text(terminal.backend(), 0, 0, 34);
         assert!(sidebar_row.contains("▣ mult"));
         assert!(sidebar_row.ends_with(" main "));
+    }
+    /// The row says "not this machine" with its icon and nothing else: no
+    /// host, and no branch to show either, since there is no local checkout.
+    #[test]
+    fn a_remote_workspace_row_is_marked_by_its_icon_alone() {
+        let mut app = App::default();
+        app.project.workspaces.truncate(1);
+        app.project.workspaces[0].name = "mult".to_string();
+        app.project.workspaces[0].chats.clear();
+        app.project.workspaces[0].terminals.clear();
+        app.project.workspaces[0].cwd = None;
+        app.project.workspaces[0].remote = Some(crate::model::RemoteTarget {
+            host: "user@hostname".to_string(),
+            path: "~/projects/mult".to_string(),
+            session: "mult".to_string(),
+        });
+
+        let backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        terminal
+            .draw(|frame| {
+                draw_app(
+                    frame,
+                    &app,
+                    &PtyRuntime::new_offline(),
+                    &config::Config::default(),
+                )
+            })
+            .expect("draw app");
+
+        let sidebar_row = buffer_text(terminal.backend(), 0, 0, 34);
+        assert!(sidebar_row.contains("\u{f233} mult"), "{sidebar_row:?}");
+        assert!(
+            !sidebar_row.contains("hostname"),
+            "the machine belongs in the pane, not the row: {sidebar_row:?}"
+        );
+        assert!(
+            !sidebar_row.contains("\u{25a3}"),
+            "a remote workspace does not keep the local icon: {sidebar_row:?}"
+        );
     }
 }

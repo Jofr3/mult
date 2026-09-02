@@ -12,7 +12,15 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 /// daemon actually owns) with `restore_on_launch` (intent, which only the state
 /// file can hold) and folded the "user has seen this Done" bit into
 /// [`ChatStatus`] itself (F16). See `storage::migrate_v2_to_v3`.
-pub const STATE_VERSION: u32 = 3;
+///
+/// Version 4 added remote workspaces: [`Workspace::remote`]. The field itself
+/// defaults, so the bump is not about decoding — it is about *meaning*. A
+/// version-3 client reading a version-4 file would ignore the field and see an
+/// ordinary workspace with no `cwd`, and would then run its panes on this
+/// machine, in whatever directory it happened to start in, rather than on the
+/// machine the user chose. Under version 4 it declines to load the file at all
+/// and leaves the bytes untouched. See `storage::migrate_v3_to_v4`.
+pub const STATE_VERSION: u32 = 4;
 pub const DEFAULT_AGENT_CHAT_TITLE: &str = "agent";
 /// Upper bound on the text of a single persisted [`ChatMessage`].
 ///
@@ -212,6 +220,13 @@ pub struct Workspace {
     pub name: String,
     #[serde(default, deserialize_with = "null_or_default")]
     pub cwd: Option<PathBuf>,
+    /// Set when this workspace lives on another machine, in which case `cwd` is
+    /// `None`: the directory it names is not on this filesystem, and treating a
+    /// remote path as a local one is how a pane ends up silently started in the
+    /// wrong place. Everything the workspace runs goes through `ssh` instead —
+    /// see [`crate::remote`].
+    #[serde(default, deserialize_with = "null_or_default")]
+    pub remote: Option<RemoteTarget>,
     #[serde(default, deserialize_with = "null_or_default")]
     pub environment: BTreeMap<String, String>,
     /// A workspace that loses its chats keeps its terminals, and vice versa:
@@ -220,6 +235,29 @@ pub struct Workspace {
     pub chats: Vec<ChatSession>,
     #[serde(default, deserialize_with = "null_or_default")]
     pub terminals: Vec<TerminalSession>,
+}
+
+/// Where a remote workspace is and what to attach to when it is opened.
+///
+/// The three fields are settled once, when the workspace is imported from a
+/// configured project, and then persisted: a `mult` restarted tomorrow has to
+/// build the same `ssh` line as today or it attaches to nothing. In particular
+/// [`Self::session`] is stored rather than derived from the workspace name,
+/// because renaming a workspace must not orphan the `tmux` session its panes
+/// are already inside.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteTarget {
+    /// The `ssh` destination as the user wrote it: `user@host`, `host`, or a
+    /// `Host` alias from their `ssh_config`.
+    pub host: String,
+    /// The project directory **on the remote machine**. A `String` and not a
+    /// `PathBuf` on purpose: it is a token for the remote shell, never a path
+    /// this process opens, and a leading `~` belongs to the remote user's home.
+    pub path: String,
+    /// The base `tmux` session name for this project, already reduced to what
+    /// `tmux` accepts by [`crate::remote::session_name`]. Each agent chat gets
+    /// its own session derived from it; terminals use no `tmux` at all.
+    pub session: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -809,11 +847,31 @@ impl ProjectState {
         name: String,
         cwd: Option<PathBuf>,
     ) -> Result<WorkspaceId, IdAllocationError> {
+        self.push_workspace(name, cwd, None)
+    }
+
+    /// A workspace on another machine. It has no `cwd`, because the directory
+    /// it works in is not on this filesystem.
+    pub fn add_remote_workspace(
+        &mut self,
+        name: String,
+        remote: RemoteTarget,
+    ) -> Result<WorkspaceId, IdAllocationError> {
+        self.push_workspace(name, None, Some(remote))
+    }
+
+    fn push_workspace(
+        &mut self,
+        name: String,
+        cwd: Option<PathBuf>,
+        remote: Option<RemoteTarget>,
+    ) -> Result<WorkspaceId, IdAllocationError> {
         let id = self.allocate_workspace_id()?;
         self.workspaces.push(Workspace {
             id,
             name,
             cwd,
+            remote,
             environment: BTreeMap::new(),
             chats: Vec::new(),
             terminals: Vec::new(),
@@ -1953,6 +2011,7 @@ mod tests {
             id,
             name: name.to_string(),
             cwd: None,
+            remote: None,
             environment: BTreeMap::new(),
             chats: Vec::new(),
             terminals: Vec::new(),

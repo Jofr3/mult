@@ -87,7 +87,12 @@ warning is printed to stderr at startup and shown in the app's notice area:
   that key; the rest of the scheme is unaffected;
 - a `projects` entry whose `path` is not a directory right now, or whose `name`
   is empty. The shortcut is still offered — the directory may simply not be
-  mounted yet — and fails if you open it.
+  mounted yet — and fails if you open it. A **remote** entry is not checked
+  against this filesystem at all: its path is a directory on the other machine;
+- a `projects` entry whose `remote` is not something `ssh` could use as a
+  destination (empty after trimming, starting with `-`, or containing
+  whitespace or a control character). The shortcut is still offered and reports
+  the same problem in the prompt if you open it.
 
 Nothing is ignored silently. If you set something and nothing happens, `mult`
 either refused to start or said so.
@@ -108,29 +113,134 @@ default below.
 | `auto_start_terminals` | bool | `true` | Whether selecting a terminal starts it. This governs *shell* terminals; a persisted **command** terminal is never relaunched during restoration regardless of this setting — see [Command terminals are not auto-relaunched](TROUBLESHOOTING.md#a-pane-says-the-session-is-unavailable-after-restarting-the-daemon). |
 | `mouse_capture` | bool | `true` | Whether `mult` puts the terminal into mouse-reporting mode at startup. `false` gives your emulator's native selection and scrollback back, at the cost of wheel scrolling, drag-selection and OSC 52 copy inside `mult`. |
 | `clipboard_osc52` | bool | `true` | Whether a copied selection is written to the host terminal as an OSC 52 "set clipboard" escape. `false` stops `mult` from ever emitting one: drag-selection still highlights and `Ctrl+Shift+C` is still consumed, but nothing leaves for the clipboard. The escape carries the selected text to whatever is on the far end of the terminal — an SSH client, a multiplexer, an emulator that logs sequences — which is not always where pane contents should go. |
-| `projects` | array | `[]` | Shortcuts offered by the **Open workspace** prompt (`Ctrl+f`). See below. |
+| `projects` | array | `[]` | Shortcuts offered by the **Open workspace** prompt (`Ctrl+f`), each optionally naming a machine to open it on. See below. |
 | `colorscheme` | object | Rosé Pine Moon | Twelve colours. See below. |
 
 ### `projects`
 
 Each entry may be written either as an object or as a two-element array; both
-produce the same `{name, path}` pair:
+produce the same `{name, path}` pair, and the object form may add `remote`:
 
 ```json
 "projects": [
   { "name": "mult", "path": "~/projects/mult" },
+  { "name": "api", "path": "~/srv/api", "remote": "user@hostname" },
   ["scratch", "/tmp/scratch"]
 ]
 ```
 
 Both spellings reject unknown keys, so `{"name": "mult", "pathh": "…"}` is a
-startup error rather than a shortcut that silently has no path.
+startup error rather than a shortcut that silently has no path. The array
+shorthand is always local: two elements have nowhere to say which machine they
+mean.
 
 A leading `~` or `~/` in `path` is expanded from `$HOME`. If `$HOME` is unset the
 path is used literally. The expanded path is checked once, at load: a shortcut
 pointing at something that is not a directory is reported as a warning and kept,
 and it fails if you open it. The check is a snapshot — a directory that appears
 (or disappears) later is not re-checked until the next start or config reload.
+
+#### `remote` — a project on another machine
+
+`remote` is an `ssh` destination: `user@hostname`, `hostname`, or a `Host` alias
+from your `~/.ssh/config`, which is the place to put a port, an identity file or
+a jump host — `mult` passes the destination to `ssh` and adds no options of its
+own. An absent `remote`, and a `remote` that is empty or only whitespace, both
+mean an ordinary local project.
+
+Opening a remote shortcut with `Ctrl+f` creates a workspace whose panes all run
+on that machine, in `path`. What it does *not* do is look for `path` here.
+
+**Terminals are plain `ssh`.** The shell the workspace opens on, and every
+`Ctrl+t` after it, is
+
+```sh
+ssh -t <remote> 'cd <path> && exec "$SHELL" -l'
+```
+
+`Ctrl+n`, `Ctrl+e` and a command terminal run `file_manager_command`,
+`editor_command` and your own command the same way — `cd` into the project
+directory, then the command, evaluated by the *remote* login shell, so `$VAR`,
+pipelines and globs mean what they mean on that machine. Those binaries have to
+exist there. No `tmux`: a terminal is its connection, and it ends when you close
+the pane, exactly like a local one.
+
+**The agent chat runs inside `tmux`.** An agent is not a terminal — it is a long
+conversation that should still be there after a dropped link, a closed laptop or
+a `mult` restart. So `Ctrl+a` / `Ctrl+x` in a remote workspace start
+
+```sh
+ssh -t <remote> 'tmux new-session -A -d -s <project> -c <path> <agent command> \
+  ; set-option -t <project> set-titles on \
+  ; set-option -t <project> set-titles-string <format> \
+  ; attach-session -t <project>'
+```
+
+`new-session -A -d` creates the session the first time and finds it already
+running every time after; `attach-session` puts it on screen. Closing `mult` is
+therefore a *detach*: the agent keeps working on the remote machine, and the next
+start finds the same conversation where you left it.
+
+The two `set-option`s are what let the row label follow the agent. `tmux` does
+not pass an inner program's window title outward unless it is told to, so
+without them the sidebar could only ever say `agent`; with them, what the agent
+says it is working on reaches the row exactly as it does locally. Both are set
+with `-t` on the session, so the remote machine's own `tmux` configuration is
+left alone, and the format asks for the pane's title *unless* it is still
+`tmux`'s default — which is the remote hostname, and would be a row saying
+nothing.
+
+**One session, so one chat.** The session is named after the project — reduced
+to what `tmux` accepts, since `.` and `:` are its own separators, so `docs.site`
+opens `docs-site` — and a remote workspace holds exactly one agent chat on it. A
+second chat would attach to the same session, which means the same agent shown
+twice with its own command silently dropped. So `Ctrl+a` and `Ctrl+x` in a
+remote workspace that already has a chat **navigate to it** rather than adding
+another; whichever of the two you press, you land on the chat that is there.
+(The name is settled when the workspace is created and stored with it, so
+renaming the project later does not orphan the session.)
+
+Two consequences worth knowing:
+
+- **The status dot does not move for a remote chat**, though the row label
+  does. Both backends report
+  status through files `mult` writes into its private runtime directory *here* —
+  pi's `-e` extension, Claude Code's `--settings` hooks — and an agent on
+  another machine cannot read or write them. A remote chat therefore runs the
+  plain `pi_agent_command` / `claude_code_command`, with no `-e` and no
+  `--settings`, and stays showing idle however busy it is. The pane shows
+  everything the agent prints, which is what the chat is for.
+- **A second `mult` attaching to the same session** sees the same agent — that
+  is `tmux`, and it is usually what you want. It also means the same chat opened
+  on two machines shares one conversation.
+
+Everything else that follows from a workspace being remote:
+
+- **`path` is a directory over there.** It is never looked for on this machine,
+  and a leading `~` is expanded by the remote shell, so it is the *remote*
+  user's home. Nothing is canonicalized: a symlinked project path stays as
+  written.
+- **The sidebar marks the workspace with a different icon** (`` rather than
+  `▣`) and nothing else. The machine's name is not repeated on every row; the
+  pane placeholder names it where it matters.
+- **The git branch is shown**, read from the other machine. It is fetched in the
+  background — `cat <path>/.git/HEAD` over `ssh`, never `git`, for the reason
+  the local probe does not run `git` either — at most once every 30 seconds per
+  workspace, and the sidebar shows the last answer until the next one arrives.
+  The probe runs with `BatchMode=yes`, so it fails silently rather than waiting
+  for a passphrase it has no pane to ask in: a host you can only reach by typing
+  a passphrase shows no branch, and `ssh-add` before starting `mult` fixes it.
+  A workspace whose path is a *subdirectory* of the repository, or a linked
+  worktree, shows no branch — the probe reads exactly one file and does not walk
+  ancestors or follow a `gitdir:` pointer across the connection.
+- **A `[host]` prefix is stripped from pane titles.** A remote prompt that sets
+  its window title to `[jofre-serv] ~/.dotfiles` is answering a question the row
+  already answers with its icon, so the row shows `~/.dotfiles` — which then
+  ranks below whatever command the pane is running, like any other `cwd` title.
+- **`ssh` and `tmux` are not `mult`'s to install.** A missing `tmux` on the
+  remote, a host key you have not accepted, or an agent with no key loaded all
+  surface as what the pane prints — see
+  [TROUBLESHOOTING.md](TROUBLESHOOTING.md#a-remote-workspace-pane-exits-immediately).
 
 ### `colorscheme`
 

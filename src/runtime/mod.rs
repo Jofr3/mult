@@ -15,6 +15,7 @@ mod input;
 mod keymap;
 mod mouse;
 mod prompt;
+mod remote_branch;
 mod save;
 mod session;
 #[cfg(test)]
@@ -46,6 +47,7 @@ use self::agent_launch::{auto_start_selected_chat_agent, drain_agent_events, Run
 use self::agent_status::{drain_mult_agent_status_events, AgentStatusBridge, JournalStatusSource};
 use self::clipboard::flush_host_terminal_writes;
 use self::input::handle_event;
+use self::remote_branch::RemoteBranchProbe;
 use self::save::{save_content_if_due, save_if_dirty_with, SaveSchedule};
 use self::session::{
     auto_start_selected_terminal, drain_pty_events, register_project_session_identities,
@@ -87,8 +89,10 @@ pub fn run(
     register_project_session_identities(&app, &mut pty_runtime);
     let mut layout = AppLayout::compute(&app, frame_area);
     restore_persisted_sessions(&mut app, &mut pty_runtime, &config, layout);
-    refresh_workspace_git_branches(&mut app);
-    let mut last_git_branch_refresh = Instant::now();
+    let mut remote_branches = RemoteBranchProbe::default();
+    let started_at = Instant::now();
+    refresh_workspace_git_branches(&mut app, &mut remote_branches, started_at);
+    let mut last_git_branch_refresh = started_at;
 
     // The screen is static unless something changes, so only rebuild a frame
     // when needed instead of every ~16ms tick. The tick still runs so PTY/agent
@@ -132,7 +136,7 @@ pub fn run(
         }
         if now.saturating_duration_since(last_git_branch_refresh) >= GIT_BRANCH_REFRESH_INTERVAL {
             // Only an actual branch change is a reason to rebuild the frame.
-            needs_redraw |= refresh_workspace_git_branches(&mut app);
+            needs_redraw |= refresh_workspace_git_branches(&mut app, &mut remote_branches, now);
             last_git_branch_refresh = now;
         }
         // A transient notice that has run out of time is a reason to redraw and
@@ -412,16 +416,39 @@ pub(super) fn finish_after_host_terminal_error_with(
 /// Re-read every workspace's checked-out branch. Returns whether any of them
 /// changed — a branch is only visible in the sidebar, so an unchanged probe must
 /// not force a redraw the loop otherwise skips (S4).
-fn refresh_workspace_git_branches(app: &mut App) -> bool {
+///
+/// A local workspace is read here and now: it is one small file. A remote one
+/// cannot be — an `ssh` on the render thread would stall the whole UI for as
+/// long as the network felt like — so it is read on a background thread and
+/// whatever the last probe returned is used until the next answer arrives.
+fn refresh_workspace_git_branches(
+    app: &mut App,
+    remote_branches: &mut RemoteBranchProbe,
+    now: Instant,
+) -> bool {
+    remote_branches.collect_answers();
     let branches = app
         .project
         .workspaces
         .iter()
         .map(|workspace| {
-            let branch = workspace.cwd.as_deref().and_then(git::current_branch);
+            let branch = match workspace.remote.as_ref() {
+                Some(target) => {
+                    remote_branches.refresh(workspace.id, target, now);
+                    remote_branches.branch(workspace.id)
+                }
+                None => workspace.cwd.as_deref().and_then(git::current_branch),
+            };
             (workspace.id, branch)
         })
         .collect::<Vec<_>>();
+    remote_branches.retain(
+        &app.project
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id)
+            .collect(),
+    );
     app.replace_workspace_git_branches(branches)
 }
 
@@ -500,9 +527,11 @@ mod tests {
 
         let mut app = App::default();
         app.project.workspaces[0].cwd = Some(root.clone());
+        let mut remote_branches = RemoteBranchProbe::default();
+        let now = Instant::now();
 
         assert!(
-            refresh_workspace_git_branches(&mut app),
+            refresh_workspace_git_branches(&mut app, &mut remote_branches, now),
             "the first probe learns the branch"
         );
         assert_eq!(
@@ -510,13 +539,17 @@ mod tests {
             Some("main")
         );
         assert!(
-            !refresh_workspace_git_branches(&mut app),
+            !refresh_workspace_git_branches(&mut app, &mut remote_branches, now),
             "an unchanged branch reports no change"
         );
 
         fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/side\n")
             .expect("switch fixture branch");
-        assert!(refresh_workspace_git_branches(&mut app));
+        assert!(refresh_workspace_git_branches(
+            &mut app,
+            &mut remote_branches,
+            now
+        ));
         assert_eq!(
             app.workspace_git_branch(app.project.workspaces[0].id),
             Some("side")

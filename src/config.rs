@@ -137,6 +137,20 @@ impl Config {
                 warnings.push(format!("{file}: projects[{index}] has an empty path"));
                 continue;
             }
+            // A remote project's path is a directory on the other machine, so
+            // there is nothing here to check it against — asking this
+            // filesystem about it would warn about every remote project that
+            // does not happen to shadow a local directory. What *can* be
+            // checked without a network round trip is the destination itself.
+            if let Some(remote) = project.remote_destination() {
+                if let Err(error) = crate::remote::check_destination(remote) {
+                    warnings.push(format!(
+                        "{file}: project {:?} is not openable because {error}; the shortcut is still offered",
+                        project.name
+                    ));
+                }
+                continue;
+            }
             // Checked, not enforced: a project directory may legitimately be on
             // a filesystem that is not mounted yet, and refusing to start over a
             // shortcut nobody pressed would be absurd. The shortcut stays in the
@@ -181,11 +195,35 @@ impl Eq for Config {}
 pub struct ConfiguredProject {
     pub name: String,
     pub path: PathBuf,
+    /// An `ssh` destination — `user@host`, `host`, or a `Host` alias — when the
+    /// project lives on another machine, in which case `path` is a directory
+    /// *there* and nothing local is ever looked for at it.
+    ///
+    /// Absent and present-but-blank mean the same thing, so a `"remote": ""`
+    /// left behind by editing the key out is an ordinary local project rather
+    /// than an `ssh` into nowhere. Ask [`Self::remote_destination`] rather than
+    /// reading the field, and the distinction stays in one place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
 }
 
 impl ConfiguredProject {
+    /// The `ssh` destination this project is opened through, or `None` for an
+    /// ordinary local project.
+    pub fn remote_destination(&self) -> Option<&str> {
+        self.remote
+            .as_deref()
+            .map(str::trim)
+            .filter(|remote| !remote.is_empty())
+    }
+
     /// `path` with a leading `~` expanded from `$HOME`, as the open-workspace
     /// prompt expands it before importing the workspace.
+    ///
+    /// Only meaningful for a local project: a remote project's `~` is the
+    /// remote user's home, which this process cannot resolve and must not
+    /// guess at — see [`crate::remote`], which leaves the expansion to the
+    /// shell on the other side.
     ///
     /// `app::expand_path` is the twin of this and should collapse onto it when
     /// F20 folds the duplicated helpers together; it is duplicated rather than
@@ -352,8 +390,9 @@ impl Default for Config {
     }
 }
 
-/// A project is written either as `{"name": …, "path": …}` or as the pair
-/// `["name", "path"]`.
+/// A project is written either as `{"name": …, "path": …}` — optionally with
+/// `"remote"` — or as the pair `["name", "path"]`, which is always local: a
+/// two-element shorthand has nowhere to say which machine it means.
 ///
 /// Hand-written rather than an `#[serde(untagged)]` enum: untagged buffers the
 /// value and reports every failure as "data did not match any variant", losing
@@ -388,16 +427,21 @@ impl<'de> Deserialize<'de> for ConfiguredProject {
                 if sequence.next_element::<de::IgnoredAny>()?.is_some() {
                     return Err(de::Error::invalid_length(3, &self));
                 }
-                Ok(ConfiguredProject { name, path })
+                Ok(ConfiguredProject {
+                    name,
+                    path,
+                    remote: None,
+                })
             }
 
             fn visit_map<A>(self, mut map: A) -> Result<ConfiguredProject, A::Error>
             where
                 A: MapAccess<'de>,
             {
-                const FIELDS: &[&str] = &["name", "path"];
+                const FIELDS: &[&str] = &["name", "path", "remote"];
                 let mut name: Option<String> = None;
                 let mut path: Option<PathBuf> = None;
+                let mut remote: Option<String> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -413,6 +457,12 @@ impl<'de> Deserialize<'de> for ConfiguredProject {
                             }
                             path = Some(map.next_value()?);
                         }
+                        "remote" => {
+                            if remote.is_some() {
+                                return Err(de::Error::duplicate_field("remote"));
+                            }
+                            remote = Some(map.next_value()?);
+                        }
                         unknown => return Err(de::Error::unknown_field(unknown, FIELDS)),
                     }
                 }
@@ -420,6 +470,7 @@ impl<'de> Deserialize<'de> for ConfiguredProject {
                 Ok(ConfiguredProject {
                     name: name.ok_or_else(|| de::Error::missing_field("name"))?,
                     path: path.ok_or_else(|| de::Error::missing_field("path"))?,
+                    remote,
                 })
             }
         }
@@ -846,10 +897,12 @@ mod tests {
                 ConfiguredProject {
                     name: "mult".to_string(),
                     path: PathBuf::from("~/projects/mult"),
+                    remote: None,
                 },
                 ConfiguredProject {
                     name: "docs".to_string(),
                     path: PathBuf::from("/tmp/docs"),
+                    remote: None,
                 },
             ]
         );
@@ -1142,6 +1195,93 @@ mod tests {
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("project \"gone\""), "{warnings:?}");
         assert!(warnings[0].contains("is not a directory"), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_project_can_name_the_machine_it_is_on() {
+        let path = unique_temp_file();
+        fs::write(
+            &path,
+            r#"{"projects":[{"name":"mult","path":"~/projects/mult","remote":"user@hostname"},{"name":"here","path":"/tmp","remote":""}]}"#,
+        )
+        .expect("write config");
+
+        let config = load_from_path(&path).expect("load config");
+
+        assert_eq!(
+            config.projects[0].remote.as_deref(),
+            Some("user@hostname"),
+            "the key round trips verbatim"
+        );
+        assert_eq!(
+            config.projects[0].remote_destination(),
+            Some("user@hostname")
+        );
+        // "If not empty": a key edited down to nothing is a local project, not
+        // an ssh into nowhere.
+        assert_eq!(config.projects[1].remote_destination(), None);
+    }
+
+    /// The remote path names a directory on the *other* machine, so the
+    /// is-it-a-directory check that a local shortcut gets would warn about
+    /// every remote project that does not happen to shadow a local path.
+    #[test]
+    fn a_remote_project_is_not_checked_against_this_filesystem() {
+        let directory = unique_temp_dir();
+        let path = directory.join(CONFIG_FILE_NAME);
+        fs::write(
+            &path,
+            r#"{"projects":[{"name":"mult","path":"/nowhere/on/this/machine","remote":"user@hostname"}]}"#,
+        )
+        .expect("write config");
+
+        let config = load_from_path(&path).expect("load config");
+
+        assert!(config.warnings().is_empty(), "{:?}", config.warnings());
+    }
+
+    /// What *can* be checked without a network round trip is the destination.
+    #[test]
+    fn a_malformed_remote_destination_is_a_warning_and_keeps_the_shortcut() {
+        let directory = unique_temp_dir();
+        let path = directory.join(CONFIG_FILE_NAME);
+        fs::write(
+            &path,
+            r#"{"projects":[{"name":"mult","path":"~/projects/mult","remote":"-oProxyCommand=id"}]}"#,
+        )
+        .expect("write config");
+
+        let config = load_from_path(&path).expect("a malformed destination is not fatal");
+
+        assert_eq!(config.projects.len(), 1, "the shortcut is still offered");
+        let warnings = config.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("project \"mult\""), "{warnings:?}");
+        assert!(
+            warnings[0].contains("ssh would read as an option"),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn the_pair_spelling_has_no_remote_and_an_unknown_project_key_still_fails() {
+        let path = unique_temp_file();
+        fs::write(&path, r#"{"projects":[["docs","/tmp/docs"]]}"#).expect("write config");
+        let config = load_from_path(&path).expect("load config");
+        assert_eq!(config.projects[0].remote, None);
+
+        let path = unique_temp_file();
+        fs::write(
+            &path,
+            r#"{"projects":[{"name":"a","path":"/tmp","remotee":"user@host"}]}"#,
+        )
+        .expect("write config");
+
+        let error = load_from_path(&path).expect_err("a mistyped key is a startup error");
+
+        let message = error.to_string();
+        assert!(message.contains("remotee"), "{message}");
+        assert!(message.contains("`remote`"), "{message}");
     }
 
     /// C14: a symlinked `config.json` is the layout every dotfile manager

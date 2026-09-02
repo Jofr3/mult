@@ -8,6 +8,91 @@ and the project aims to adhere to
 
 ## [Unreleased]
 
+### A project can live on another machine
+
+A `projects` entry may now say where the project *is*:
+
+```json
+{ "name": "mult", "path": "~/projects/mult", "remote": "user@hostname" }
+```
+
+Opening it with `Ctrl+f` no longer looks for `~/projects/mult` on this machine.
+The workspace opens on the other one, and everything in it runs there: the shell
+it opens on and every `Ctrl+t` after it, `Ctrl+n`, `Ctrl+e`, command terminals,
+and agent chats. `path` is read on the far side, so a leading `~` is the *remote*
+user's home, and nothing is canonicalized or checked here.
+
+Terminals are plain `ssh` — `cd <path> && exec "$SHELL" -l`, or `cd <path> &&
+<your command>`, evaluated by the remote login shell so `$VAR`, pipelines and
+globs mean what they mean over there. A terminal is its connection: close the
+pane and it is over, exactly like a local one.
+
+An **agent chat** is not a terminal, and does not behave like one. An agent is a
+long conversation that is usually mid-task when the laptop closes, so it runs
+inside `tmux` on the remote machine: `new-session -A -d` ensures the session
+exists with the agent in it, and `attach-session` puts it on screen. Closing
+`mult`, losing the link or sleeping the laptop is a *detach* — the agent keeps
+working, and the next start finds the same conversation where it was left.
+
+The session is named for the project, reduced to what `tmux` accepts since `.`
+and `:` are its own separators, so `docs.site` opens `docs-site`. There is one
+session, and therefore **one chat**: a second would attach to the same session,
+which is one agent shown in two panes with the second one's command silently
+dropped. In a remote workspace `Ctrl+a` and `Ctrl+x` navigate to the chat that
+is already there instead of adding another — whichever of the two you press.
+
+The row label follows the agent, the way it does locally. That has to be asked
+for: `tmux` keeps an inner program's window title to itself unless `set-titles`
+is on. So `mult` turns it on — on that session only, with `-t`, because a remote
+machine's `tmux` configuration belongs to whoever set it up — and asks for the
+pane's title *unless* it is still `tmux`'s default, which is the remote
+hostname and would be a row that says nothing.
+
+One thing is lost across the connection, and it is worth stating plainly: **the
+status dot does not move for a remote chat.** Both backends report status
+through files `mult` writes into its private runtime directory on *this*
+machine — pi's `-e` extension, Claude Code's `--settings` hooks — which an agent
+over there can neither read nor write. A remote chat therefore runs the plain
+configured command, without those flags (pointing an agent at a file that does
+not exist on its machine is worse than not pointing it anywhere), and reads idle
+however busy it is. The pane still shows everything the agent prints.
+
+In the sidebar a remote workspace is marked by its icon — `` rather than `▣` —
+and nothing else. The machine's name is not repeated on every row; the pane's
+own placeholder names it where that actually helps.
+
+The branch **is** shown, read from the other machine. Not on the render thread,
+which an `ssh` round trip would stall for as long as the network felt like: a
+background probe fetches it at most once every 30 seconds per workspace and the
+row shows the last answer until the next arrives. What crosses the connection is
+`cat <path>/.git/HEAD`, never `git` — the same refusal the local probe has always
+made, and more pointed over `ssh`, since `include.path` and `core.hooksPath`
+would be code execution on the machine your work lives on. The probe runs in
+`BatchMode`, so a host that would ask for a passphrase fails instead of waiting
+for an answer it has no pane to collect; that host simply shows no branch.
+
+One smaller thing on those rows: a `[host]` prefix is dropped from a pane's
+window title. A remote prompt that writes `[jofre-serv] ~/.dotfiles` is
+answering "which machine", which the row's icon already says — so the row reads
+`~/.dotfiles`, and being a plain path again it also goes back to ranking below
+whatever command the pane is actually running.
+
+`remote` is an `ssh` destination and nothing more: `user@host`, `host`, or a
+`Host` alias from your `~/.ssh/config`, which is where a port, an identity file
+or a jump host belongs. `mult` adds no `ssh` options of its own, and a
+destination `ssh` would misread — one starting with `-`, or with whitespace in
+it — is reported as a config warning at startup and refused in the prompt, with
+the shortcut still offered either way. An absent `remote` and an empty one both
+mean an ordinary local project.
+
+The state file therefore knows about machines, which makes it **version 4**.
+Version 3 files migrate on load, gaining nothing but "this workspace is local",
+which is what every workspace they can describe already was. The bump is not
+about decoding — the new field defaults — but about meaning: a version-3 client
+would ignore it, see a workspace with no directory, and start its panes here
+rather than on the machine you chose. Refusing the file is the only way to stop
+that, and refusing it leaves the bytes untouched.
+
 ### A pane whose program finished closes itself
 
 `q` in `yazi`, `:q` in an editor, `exit` in a shell: the program ended and the

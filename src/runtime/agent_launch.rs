@@ -17,10 +17,10 @@ use crate::{
     config::Config,
     model::{self, AgentKind, ChatStatus, PtyKey},
     pty::{AttachExistingResult, PtyRuntime, PtySpawn},
-    storage,
+    remote, storage,
 };
 
-use super::agent_command::agent_command;
+use super::agent_command::{agent_command, remote_agent_command};
 use super::agent_status::{
     agent_session_metadata, agent_status_kind, mult_agent_status_path,
     prepare_mult_agent_status_file, reconcile_agent_status, MULT_AGENT_CHAT_ID_ENV,
@@ -31,6 +31,23 @@ use super::save::save_if_dirty_with;
 use super::session::chat_agent_dimensions;
 
 const AGENT_CMD_ENV: &str = "MULT_AGENT_CMD";
+
+/// The line an agent chat in a **remote** workspace runs: `ssh` in, and
+/// create-or-attach the project's `tmux` session with the agent inside it.
+///
+/// `tmux` is here and not on the terminals for one reason. A terminal is its
+/// connection — close the pane and it is over, which is what a terminal is. An
+/// agent is a conversation: it is mid-task when the laptop sleeps, and it must
+/// still be mid-task when the link comes back. Wrapping it in a session that
+/// lives on the remote machine is what makes closing `mult` a detach instead of
+/// a kill, and the next start an attach instead of a fresh agent.
+fn remote_agent_launch(
+    config: &Config,
+    agent: AgentKind,
+    target: &model::RemoteTarget,
+) -> Result<String, remote::RemoteError> {
+    remote::tmux_agent_command(target, &remote_agent_command(config, agent))
+}
 
 pub(super) enum RuntimeAgentBackend {
     Noop(NoopAgentBackend),
@@ -236,6 +253,7 @@ pub(super) fn start_or_focus_chat_agent(
     let Some(workspace) = app.project.workspace(workspace_id) else {
         return;
     };
+    let remote_target = workspace.remote.clone();
     let (chat_name, agent, cwd, workspace_environment) = workspace
         .chats
         .iter()
@@ -343,7 +361,25 @@ pub(super) fn start_or_focus_chat_agent(
         return;
     }
 
-    let command = agent_command(config, agent);
+    let (command, cwd) = match remote_target.as_ref() {
+        // A remote agent has no local directory to start in: where it runs is
+        // the `-c` inside the `tmux` line, on the other machine.
+        Some(target) => match remote_agent_launch(config, agent, target) {
+            Ok(command) => (command, None),
+            Err(error) => {
+                app.mark_chat_status_by_id(chat_id, ChatStatus::Failed);
+                pty_runtime.append_terminal_system_line(
+                    terminal_id,
+                    format!(
+                        "failed to start {} agent for `{chat_name}`: {error}",
+                        agent.display_name()
+                    ),
+                );
+                return;
+            }
+        },
+        None => (agent_command(config, agent), cwd),
+    };
     let status_path = mult_agent_status_path(identity, generation);
     if let Err(error) = prepare_mult_agent_status_file(&status_path) {
         app.mark_chat_status_by_id(chat_id, ChatStatus::Failed);
@@ -477,6 +513,38 @@ pub(super) fn drain_agent_events(app: &mut App, backend: &mut impl AgentBackend)
 mod tests {
 
     use super::*;
+
+    /// The agent, not the shell, is what `tmux` is for: closing `mult` detaches
+    /// the session and the next start attaches to the same conversation, still
+    /// where it was left.
+    #[test]
+    fn a_remote_agent_runs_inside_its_own_tmux_session() {
+        let config = crate::runtime::test_support::config_with(|config: &mut Config| {
+            config.claude_code_command = "claude --resume".to_string();
+        });
+        let target = model::RemoteTarget {
+            host: "user@hostname".to_string(),
+            path: "~/projects/mult".to_string(),
+            session: "mult".to_string(),
+        };
+
+        let command = remote_agent_launch(&config, AgentKind::ClaudeCode, &target).unwrap();
+
+        // The exact quoting is `remote`'s to pin; what belongs here is that the
+        // chat is launched into the project's session with the configured
+        // command.
+        assert!(command.starts_with("ssh -t 'user@hostname' "), "{command}");
+        assert!(command.contains("new-session -A -d -s "), "{command}");
+        assert!(command.contains("claude --resume"), "{command}");
+        // The local status plumbing cannot cross the connection, so a remote
+        // agent is launched without it rather than pointed at files that only
+        // exist on this machine.
+        assert!(!command.contains("--settings"));
+
+        // The session is the project's, and there is one of it: a remote
+        // workspace holds one chat, so nothing else can be attached to it.
+        assert!(command.contains("attach-session -t "), "{command}");
+    }
 
     #[test]
     fn process_agent_command_parses_from_env_style_string() {

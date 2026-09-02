@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "namespace": "000102030405060708090a0b0c0d0e0f",
   "session_identities": {
     "chats": {
@@ -17,6 +17,7 @@
       "id": 1,
       "name": "historical",
       "cwd": null,
+      "remote": null,
       "environment": {},
       "chats": [
         {

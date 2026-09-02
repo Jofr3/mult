@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 5,
   "namespace": "future-namespace-format",
   "session_identities": {
     "chats": {},
@@ -9,7 +9,11 @@
   "next_chat_id": 2,
   "next_terminal_id": 2,
   "future_top_level": {
-    "preserve": [1, 2, 3]
+    "preserve": [
+      1,
+      2,
+      3
+    ]
   },
   "workspaces": [
     {
@@ -26,7 +30,16 @@
           "messages": []
         }
       ],
-      "terminals": []
+      "terminals": [
+        {
+          "id": 1,
+          "name": "future",
+          "restore_on_launch": false,
+          "launch": {
+            "kind": "future_launch"
+          }
+        }
+      ]
     }
   ]
 }

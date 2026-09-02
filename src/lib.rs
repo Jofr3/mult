@@ -7,6 +7,7 @@ pub mod layout;
 pub mod model;
 pub mod paths;
 pub mod pty;
+pub mod remote;
 pub mod runtime;
 pub mod storage;
 pub mod transcript;

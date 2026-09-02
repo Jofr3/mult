@@ -22,6 +22,7 @@ use crate::{
     config::Config,
     model::{self, ChatStatus, PtyKey, TerminalId, TerminalLaunch},
     pty::{AttachExistingResult, PtyDimensions, PtyEvent, PtyRuntime, PtySpawn},
+    remote::{self, RemoteError},
 };
 
 use super::agent_status::{
@@ -160,6 +161,51 @@ pub(super) fn restore_persisted_sessions(
     }
 }
 
+/// What a terminal actually runs, which is a question about its *workspace*
+/// as much as about its own launch.
+///
+/// A remote workspace has no local directory, so neither of its terminals can
+/// be a local process in one: the shell and the user's command both become an
+/// `ssh` line built from the workspace's target, and `cwd` stays `None` because
+/// the directory that matters is on the other side. The command a command
+/// terminal persists is untouched by this — it is wrapped, not rewritten — so
+/// what the sidebar names and what `Ctrl+e`/`Ctrl+n` match on stay the same on
+/// both kinds of workspace.
+///
+/// No `tmux` anywhere here. A terminal *is* its connection: when the pane goes,
+/// so does it. The thing that has to outlive a dropped link is the agent, and
+/// that is `agent_launch`'s business.
+fn terminal_spawn(
+    key: PtyKey,
+    workspace: &model::Workspace,
+    launch: &TerminalLaunch,
+) -> Result<PtySpawn, RemoteError> {
+    let Some(target) = workspace.remote.as_ref() else {
+        return Ok(match launch {
+            TerminalLaunch::Shell => {
+                PtySpawn::shell(key, workspace.cwd.clone(), workspace.environment.clone())
+            }
+            TerminalLaunch::Command(command) => PtySpawn::command_line(
+                key,
+                command.clone(),
+                workspace.cwd.clone(),
+                workspace.environment.clone(),
+            ),
+        });
+    };
+
+    let command = match launch {
+        TerminalLaunch::Shell => remote::login_shell_command(target)?,
+        TerminalLaunch::Command(command) => remote::wrapped_command(target, command)?,
+    };
+    Ok(PtySpawn::command_line(
+        key,
+        command,
+        None,
+        workspace.environment.clone(),
+    ))
+}
+
 fn start_selected_terminal(
     app: &mut App,
     pty_runtime: &mut PtyRuntime,
@@ -210,16 +256,16 @@ pub(super) fn start_terminal(
         );
         return false;
     }
-    let mut spawn = match &terminal.launch {
-        TerminalLaunch::Shell => {
-            PtySpawn::shell(key, workspace.cwd.clone(), workspace.environment.clone())
+    let mut spawn = match terminal_spawn(key, workspace, &terminal.launch) {
+        Ok(spawn) => spawn,
+        Err(error) => {
+            pty_runtime.append_terminal_system_line(
+                key,
+                format!("failed to start terminal `{terminal_name}`: {error}"),
+            );
+            app.record_terminal_stopped(terminal_id);
+            return false;
         }
-        TerminalLaunch::Command(command) => PtySpawn::command_line(
-            key,
-            command.clone(),
-            workspace.cwd.clone(),
-            workspace.environment.clone(),
-        ),
     };
     spawn.size = terminal_dimensions(layout);
 
@@ -523,7 +569,76 @@ mod tests {
     use crate::runtime::test_support::*;
     use crate::storage;
     use mult_protocol::shell::quote_argument;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    /// A remote workspace has no local pane: what each launch means is an
+    /// `ssh` line, and the pane's `cwd` is nothing, because the directory the
+    /// work happens in is on the other machine.
+    #[test]
+    fn every_pane_of_a_remote_workspace_runs_through_ssh() {
+        let workspace = remote_workspace();
+        let key = PtyKey::Terminal(TerminalId(1));
+
+        let shell = terminal_spawn(key, &workspace, &TerminalLaunch::Shell).unwrap();
+        assert_eq!(shell.cwd, None, "a remote pane has no local directory");
+        assert_eq!(
+            shell.args.last().unwrap(),
+            r#"ssh -t 'user@host' 'cd "$HOME/projects/mult" && exec "$SHELL" -l'"#,
+            "a terminal is a plain connection: no tmux, and it ends when the pane does"
+        );
+
+        let command = terminal_spawn(
+            key,
+            &workspace,
+            &TerminalLaunch::Command("cargo test".to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            command.args.last().unwrap(),
+            r#"ssh -t 'user@host' 'cd "$HOME/projects/mult" && cargo test'"#
+        );
+    }
+
+    /// The local paths are untouched by any of it.
+    #[test]
+    fn a_local_workspace_still_runs_its_panes_here() {
+        let mut workspace = remote_workspace();
+        workspace.remote = None;
+        workspace.cwd = Some(PathBuf::from("/work/project"));
+        let key = PtyKey::Terminal(TerminalId(1));
+
+        let shell = terminal_spawn(key, &workspace, &TerminalLaunch::Shell).unwrap();
+        assert_eq!(shell.cwd.as_deref(), Some(Path::new("/work/project")));
+        assert!(
+            shell.args.is_empty(),
+            "a local shell is the login shell itself"
+        );
+
+        let command = terminal_spawn(
+            key,
+            &workspace,
+            &TerminalLaunch::Command("cargo test".to_string()),
+        )
+        .unwrap();
+        assert_eq!(command.args.last().unwrap(), "cargo test");
+    }
+
+    fn remote_workspace() -> model::Workspace {
+        model::Workspace {
+            id: model::WorkspaceId(1),
+            name: "mult".to_string(),
+            cwd: None,
+            remote: Some(model::RemoteTarget {
+                host: "user@host".to_string(),
+                path: "~/projects/mult".to_string(),
+                session: "mult".to_string(),
+            }),
+            environment: std::collections::BTreeMap::new(),
+            chats: Vec::new(),
+            terminals: Vec::new(),
+        }
+    }
 
     /// D1: both resize sites ran on every ~16 ms tick and called `resize`
     /// unconditionally, so an idle session wrote a `Resize` to the socket ~125

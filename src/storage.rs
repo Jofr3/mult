@@ -295,11 +295,16 @@ impl StateStore {
                 notice: None,
             }),
             Ok(DecodedState::V2(old)) => Ok(LoadedState {
-                state: migrate_v2_to_v3(old, source)?,
+                state: migrate_v2_to_current(old, source)?,
                 needs_save: true,
                 notice: None,
             }),
-            Ok(DecodedState::V3(mut state)) => {
+            Ok(DecodedState::V3(old)) => Ok(LoadedState {
+                state: migrate_v3_to_v4(old, source)?,
+                needs_save: true,
+                notice: None,
+            }),
+            Ok(DecodedState::V4(mut state)) => {
                 // Repair before validating, not after: a lenient decode can
                 // leave the ID allocators and the identity table describing a
                 // slightly different set of sessions than actually decoded, and
@@ -466,8 +471,11 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, StateDecodeError> {
         2 => serde_json::from_slice(bytes)
             .map(DecodedState::V2)
             .map_err(StateDecodeError::InvalidJson),
-        STATE_VERSION => serde_json::from_slice(bytes)
+        3 => serde_json::from_slice(bytes)
             .map(DecodedState::V3)
+            .map_err(StateDecodeError::InvalidJson),
+        STATE_VERSION => serde_json::from_slice(bytes)
+            .map(DecodedState::V4)
             .map_err(StateDecodeError::InvalidJson),
         version => Err(StateDecodeError::UnsupportedVersion(version)),
     }
@@ -517,11 +525,11 @@ fn migrate_v1_to_current(
     let next_workspace_id = old.next_workspace_id;
     let next_chat_id = old.next_chat_id;
     let next_terminal_id = old.next_terminal_id;
-    migrate_v2_to_v3(
+    migrate_v2_to_current(
         StateV2 {
             version: 2,
-            // Version 1 has no namespace, so one is minted here. `migrate_v2_to_v3`
-            // then assigns the per-session tokens against it.
+            // Version 1 has no namespace, so one is minted here.
+            // `migrate_v3_to_v4` then assigns the per-session tokens against it.
             namespace: next_namespace(source)?,
             session_identities: SessionIdentities::default(),
             agent_generations: BTreeMap::new(),
@@ -547,9 +555,9 @@ fn migrate_v1_to_current(
 /// displayed after a restart, since that side table always started empty. The
 /// unowned `Thinking`/`Waiting` reset that `normalize_unowned_agent_statuses`
 /// performs on load applies afterwards, unchanged.
-fn migrate_v2_to_v3(old: StateV2, source: &mut impl IdentitySource) -> io::Result<ProjectState> {
-    let mut state = ProjectState {
-        version: STATE_VERSION,
+fn migrate_v2_to_v3(old: StateV2) -> StateV3 {
+    StateV3 {
+        version: 3,
         namespace: old.namespace,
         session_identities: old.session_identities,
         agent_generations: old.agent_generations,
@@ -559,7 +567,7 @@ fn migrate_v2_to_v3(old: StateV2, source: &mut impl IdentitySource) -> io::Resul
         workspaces: old
             .workspaces
             .into_iter()
-            .map(|workspace| Workspace {
+            .map(|workspace| WorkspaceV3 {
                 id: workspace.id,
                 name: workspace.name,
                 cwd: workspace.cwd,
@@ -577,20 +585,65 @@ fn migrate_v2_to_v3(old: StateV2, source: &mut impl IdentitySource) -> io::Resul
                     .collect(),
             })
             .collect(),
+    }
+}
+
+fn migrate_v2_to_current(
+    old: StateV2,
+    source: &mut impl IdentitySource,
+) -> io::Result<ProjectState> {
+    migrate_v3_to_v4(migrate_v2_to_v3(old), source)
+}
+
+/// Version 3 -> 4: every workspace version 3 could describe is a local one.
+///
+/// The hop is therefore `remote: None` and nothing else — a machine is not
+/// something a migration can invent, and a workspace that was working in a
+/// local directory yesterday is still working in it today. What the new version
+/// buys is the *refusal* in the other direction: a version-3 client would parse
+/// a remote workspace perfectly well and then act on it wrongly, starting its
+/// panes here instead of over there, because a field it does not know is a
+/// field it ignores. The version number is what turns that into "this file is
+/// newer than I am".
+///
+/// This is also where the repairs every migrated file needs happen, because it
+/// is the last hop in the chain whatever version the file came in at.
+fn migrate_v3_to_v4(old: StateV3, source: &mut impl IdentitySource) -> io::Result<ProjectState> {
+    let mut state = ProjectState {
+        version: STATE_VERSION,
+        namespace: old.namespace,
+        session_identities: old.session_identities,
+        agent_generations: old.agent_generations,
+        next_workspace_id: old.next_workspace_id,
+        next_chat_id: old.next_chat_id,
+        next_terminal_id: old.next_terminal_id,
+        workspaces: old
+            .workspaces
+            .into_iter()
+            .map(|workspace| Workspace {
+                id: workspace.id,
+                name: workspace.name,
+                cwd: workspace.cwd,
+                remote: None,
+                environment: workspace.environment,
+                chats: workspace.chats,
+                terminals: workspace.terminals,
+            })
+            .collect(),
     };
 
     state
         .normalize_next_ids()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    // Normalize rather than assign: a version-2 file already carries an
+    // Normalize rather than assign: a version-2 or -3 file already carries an
     // identity table and its tokens must survive verbatim, or the daemon
     // sessions it owns become unaddressable. Version 1 arrives with an empty
     // table, so the same call mints every token instead.
     state.normalize_session_identities(source)?;
-    // Same rule the version-3 load path applies: a `Thinking`/`Waiting` chat
-    // that no live generation owns is not thinking, it is idle. Version 1 has
-    // no generations at all, so every such chat resets — which is exactly what
-    // the old `migrate_v1_to_v2` did inline.
+    // Same rule the current-version load path applies: a `Thinking`/`Waiting`
+    // chat that no live generation owns is not thinking, it is idle. Version 1
+    // has no generations at all, so every such chat resets — which is exactly
+    // what the old `migrate_v1_to_v2` did inline.
     normalize_unowned_agent_statuses(&mut state);
     validate_current_state(&state)?;
     Ok(state)
@@ -688,7 +741,8 @@ struct StateVersionEnvelope {
 enum DecodedState {
     V1(StateV1),
     V2(StateV2),
-    V3(ProjectState),
+    V3(StateV3),
+    V4(ProjectState),
 }
 
 #[derive(Debug)]
@@ -786,6 +840,43 @@ struct TerminalV2 {
     status: TerminalStatusV2,
     #[serde(default, deserialize_with = "null_or_default")]
     launch: TerminalLaunch,
+}
+
+/// The version-3 on-disk shape: the current one, minus the remote workspaces
+/// version 4 added.
+///
+/// Mirrored here rather than reused, for the reason [`StateV2`] is: the live
+/// model must never carry a field — or lack one — only a migration cares about.
+#[derive(Debug, Deserialize)]
+struct StateV3 {
+    #[allow(dead_code)]
+    version: u32,
+    namespace: StateNamespace,
+    #[serde(default, deserialize_with = "null_or_default")]
+    session_identities: SessionIdentities,
+    #[serde(default, deserialize_with = "null_or_default")]
+    agent_generations: BTreeMap<ChatId, AgentGeneration>,
+    #[serde(default, deserialize_with = "null_or_default")]
+    next_workspace_id: u64,
+    #[serde(default, deserialize_with = "null_or_default")]
+    next_chat_id: u64,
+    #[serde(default, deserialize_with = "null_or_default")]
+    next_terminal_id: u64,
+    workspaces: Vec<WorkspaceV3>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceV3 {
+    id: WorkspaceId,
+    name: String,
+    #[serde(default, deserialize_with = "null_or_default")]
+    cwd: Option<PathBuf>,
+    #[serde(default, deserialize_with = "null_or_default")]
+    environment: BTreeMap<String, String>,
+    #[serde(default, deserialize_with = "null_or_default")]
+    chats: Vec<ChatSession>,
+    #[serde(default, deserialize_with = "null_or_default")]
+    terminals: Vec<TerminalSession>,
 }
 
 /// Liveness as versions 1 and 2 persisted it. Retained only so their terminals
@@ -1175,6 +1266,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::model::RemoteTarget;
 
     static NEXT_TEST_PATH: AtomicU64 = AtomicU64::new(1);
 
@@ -1340,27 +1432,102 @@ mod tests {
     }
 
     #[test]
-    fn v1_original_shape_migrates_to_exact_golden_v3() {
+    fn v1_original_shape_migrates_to_exact_golden_v4() {
         assert_golden_migration(
             include_bytes!("../tests/fixtures/state/v1-original.json"),
-            include_bytes!("../tests/fixtures/state/v1-original.expected-v3.json"),
+            include_bytes!("../tests/fixtures/state/v1-original.expected-v4.json"),
         );
     }
 
     #[test]
-    fn v1_current_shape_migrates_to_exact_golden_v3() {
+    fn v1_current_shape_migrates_to_exact_golden_v4() {
         assert_golden_migration(
             include_bytes!("../tests/fixtures/state/v1-current.json"),
-            include_bytes!("../tests/fixtures/state/v1-current.expected-v3.json"),
+            include_bytes!("../tests/fixtures/state/v1-current.expected-v4.json"),
         );
     }
 
     #[test]
-    fn v2_shape_migrates_to_exact_golden_v3() {
+    fn v2_shape_migrates_to_exact_golden_v4() {
         assert_golden_migration(
             include_bytes!("../tests/fixtures/state/v2-current.json"),
-            include_bytes!("../tests/fixtures/state/v2-current.expected-v3.json"),
+            include_bytes!("../tests/fixtures/state/v2-current.expected-v4.json"),
         );
+    }
+
+    #[test]
+    fn v3_shape_migrates_to_exact_golden_v4() {
+        assert_golden_migration(
+            include_bytes!("../tests/fixtures/state/v3-current.json"),
+            include_bytes!("../tests/fixtures/state/v3-current.expected-v4.json"),
+        );
+    }
+
+    /// The version-3 -> 4 hop adds a field and must not touch anything else:
+    /// every workspace a version-3 file describes is a local one, and stays a
+    /// local one.
+    #[test]
+    fn a_v3_file_loads_with_every_workspace_still_local() {
+        let path = unique_test_dir().join("state.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = include_bytes!("../tests/fixtures/state/v3-current.json");
+        fs::write(&path, original).unwrap();
+        let store =
+            StateStore::acquire(StatePaths::from_explicit_path(path.clone()).unwrap()).unwrap();
+
+        let loaded = store.load_or_default().unwrap();
+
+        assert!(loaded.notice.is_none(), "a migration is not a recovery");
+        assert!(
+            loaded.needs_save,
+            "the file is rewritten at the new version"
+        );
+        assert_eq!(loaded.state.version, STATE_VERSION);
+        let workspace = &loaded.state.workspaces[0];
+        assert_eq!(workspace.cwd.as_deref(), Some(Path::new("/work/project")));
+        assert_eq!(workspace.remote, None);
+        assert_eq!(workspace.terminals.len(), 2);
+        assert!(workspace.terminals[1].restore_on_launch);
+
+        let reserialized: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&loaded.state).unwrap()).unwrap();
+        let source: serde_json::Value = serde_json::from_slice(original).unwrap();
+        assert_eq!(reserialized["namespace"], source["namespace"]);
+        assert_eq!(
+            reserialized["session_identities"],
+            source["session_identities"]
+        );
+    }
+
+    /// A remote workspace survives the round trip its whole point depends on:
+    /// reopening `mult` tomorrow has to rebuild the same `ssh` line, or it
+    /// attaches to nothing.
+    #[test]
+    fn a_remote_workspace_round_trips_through_the_state_file() {
+        let path = unique_test_dir().join("state.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let store =
+            StateStore::acquire(StatePaths::from_explicit_path(path.clone()).unwrap()).unwrap();
+        let mut state = ProjectState::try_default().unwrap();
+        state.workspaces.clear();
+        let target = RemoteTarget {
+            host: "user@hostname".to_string(),
+            path: "~/projects/mult".to_string(),
+            session: "mult".to_string(),
+        };
+        let workspace = state
+            .add_remote_workspace("mult".to_string(), target.clone())
+            .unwrap();
+        state.add_terminal(workspace, "shell".to_string()).unwrap();
+
+        store.save(&state).unwrap();
+        let loaded = store.load_or_default().unwrap();
+
+        assert!(!loaded.needs_save, "a file this version wrote is current");
+        let restored = &loaded.state.workspaces[0];
+        assert_eq!(restored.remote, Some(target));
+        assert_eq!(restored.cwd, None, "a remote workspace has no local root");
+        assert_eq!(restored.terminals[0].launch, TerminalLaunch::Shell);
     }
 
     /// F16 round trip: a version-2 file on disk still loads, keeps every field
@@ -1431,12 +1598,12 @@ mod tests {
     }
 
     #[test]
-    fn canonical_v3_fixture_does_not_need_save() {
+    fn canonical_v4_fixture_does_not_need_save() {
         let path = unique_test_dir().join("state.json");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
-            include_bytes!("../tests/fixtures/state/v2-current.expected-v3.json"),
+            include_bytes!("../tests/fixtures/state/v3-current.expected-v4.json"),
         )
         .unwrap();
         let store = StateStore::acquire(StatePaths::from_explicit_path(path).unwrap()).unwrap();
@@ -1468,7 +1635,7 @@ mod tests {
     fn future_state_is_rejected_and_preserved_byte_for_byte() {
         let path = unique_test_dir().join("state.json");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let original = include_bytes!("../tests/fixtures/state/future-v4-unknown.json");
+        let original = include_bytes!("../tests/fixtures/state/future-v5-unknown.json");
         fs::write(&path, original).unwrap();
         let store =
             StateStore::acquire(StatePaths::from_explicit_path(path.clone()).unwrap()).unwrap();
@@ -1477,7 +1644,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            StateError::UnsupportedVersion { version: 4, .. }
+            StateError::UnsupportedVersion { version: 5, .. }
         ));
         assert_eq!(fs::read(path).unwrap(), original);
     }
@@ -1617,7 +1784,7 @@ mod tests {
         // Same missing fields as the test above, but a version this build does
         // not know.
         let future =
-            br#"{"version":4,"namespace":"11111111111111111111111111111111","workspaces":[]}"#;
+            br#"{"version":5,"namespace":"11111111111111111111111111111111","workspaces":[]}"#;
         fs::write(&path, future).unwrap();
         let store =
             StateStore::acquire(StatePaths::from_explicit_path(path.clone()).unwrap()).unwrap();
@@ -1626,7 +1793,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            StateError::UnsupportedVersion { version: 4, .. }
+            StateError::UnsupportedVersion { version: 5, .. }
         ));
         assert!(error.to_string().contains("is unsupported"));
         assert_eq!(fs::read(&path).unwrap(), future);
@@ -1882,8 +2049,11 @@ mod tests {
         let mut source = FixedIdentitySource::sequential(256);
         let migrated = match decode_state(input).unwrap() {
             DecodedState::V1(state) => migrate_v1_to_current(state, &mut source).unwrap(),
-            DecodedState::V2(state) => migrate_v2_to_v3(state, &mut source).unwrap(),
-            DecodedState::V3(_) => panic!("a golden migration fixture must predate v3"),
+            DecodedState::V2(state) => migrate_v2_to_current(state, &mut source).unwrap(),
+            DecodedState::V3(state) => migrate_v3_to_v4(state, &mut source).unwrap(),
+            DecodedState::V4(_) => {
+                panic!("a golden migration fixture must predate the current version")
+            }
         };
         let actual = format!("{}\n", serde_json::to_string_pretty(&migrated).unwrap());
 

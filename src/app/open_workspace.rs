@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::ConfiguredProject;
+use crate::{config::ConfiguredProject, model::RemoteTarget};
 
 use super::*;
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +24,11 @@ pub enum OpenWorkspaceMode {
 pub struct OpenWorkspaceMatch {
     pub name: String,
     pub path: PathBuf,
+    /// The `ssh` destination the project is opened through, when it is not on
+    /// this machine. The prompt renders it in front of the path, which is the
+    /// only place a user can tell the two kinds of shortcut apart before
+    /// pressing enter.
+    pub remote: Option<String>,
 }
 
 impl App {
@@ -95,7 +100,20 @@ impl App {
         if mode == OpenWorkspaceMode::ConfiguredProjects {
             let matches = open_workspace_matches_for(&raw_input, projects);
             if let Some(project) = matches.get(selected.min(matches.len().saturating_sub(1))) {
-                self.import_workspace_path(expand_path(&project.path), Some(project.name.clone()));
+                match project.remote.clone() {
+                    // A remote path is not expanded and not canonicalized: it
+                    // names a directory on the other machine, and the only
+                    // process that can resolve it is the shell over there.
+                    Some(host) => self.import_remote_workspace(
+                        &project.name,
+                        &host,
+                        &project.path.to_string_lossy(),
+                    ),
+                    None => self.import_workspace_path(
+                        expand_path(&project.path),
+                        Some(project.name.clone()),
+                    ),
+                }
                 return;
             }
 
@@ -144,16 +162,88 @@ impl App {
             .filter(|name| !name.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| workspace_name(&cwd));
+        self.insert_workspace(name, Some(cwd), None);
+    }
+
+    /// Imports a project that lives on another machine.
+    ///
+    /// None of what [`Self::import_workspace_path`] does to a local path is
+    /// right here: there is nothing on this filesystem to canonicalize, to
+    /// check for existence, or to expand a `~` against, and doing any of it
+    /// would either fail on a perfectly good project or silently open a local
+    /// directory that happens to share the name. What can be checked without a
+    /// network round trip is the destination, and that is checked now rather
+    /// than at the first blank pane.
+    fn import_remote_workspace(&mut self, name: &str, host: &str, path: &str) {
+        let host = match crate::remote::check_destination(host) {
+            Ok(host) => host.to_string(),
+            Err(error) => {
+                self.set_open_workspace_error(error.to_string());
+                return;
+            }
+        };
+        let path = path.trim();
+        if path.is_empty() {
+            self.set_open_workspace_error(crate::remote::RemoteError::EmptyPath.to_string());
+            return;
+        }
+
+        // Identity is the machine plus the directory, the remote counterpart of
+        // the canonical `cwd` a local import dedupes on: opening the same
+        // shortcut twice must land on the workspace already attached to that
+        // tmux session rather than start a second one beside it.
+        if let Some(existing) = self.project.workspaces.iter().find(|workspace| {
+            workspace
+                .remote
+                .as_ref()
+                .is_some_and(|target| target.host == host && target.path == path)
+        }) {
+            let workspace = existing.id;
+            self.clear_prompt();
+            self.select_first_item_in_workspace(workspace);
+            return;
+        }
+
+        let name = match name.trim() {
+            "" => path
+                .rsplit('/')
+                .find(|part| !part.is_empty())
+                .unwrap_or(path),
+            name => name,
+        };
+        let target = RemoteTarget {
+            host,
+            path: path.to_string(),
+            session: crate::remote::session_name(name),
+        };
+        self.insert_workspace(name.to_string(), None, Some(target));
+    }
+
+    /// The half of an import that both kinds share: allocate, add the pane the
+    /// workspace opens on, and select it.
+    fn insert_workspace(
+        &mut self,
+        name: String,
+        cwd: Option<PathBuf>,
+        remote: Option<RemoteTarget>,
+    ) {
         // Stage both allocations so terminal-ID exhaustion cannot leave a
         // half-imported workspace in memory.
         let mut project = self.project.clone();
-        let workspace = match project.add_workspace(name, Some(cwd)) {
+        let workspace = match remote {
+            Some(target) => project.add_remote_workspace(name, target),
+            None => project.add_workspace(name, cwd),
+        };
+        let workspace = match workspace {
             Ok(workspace) => workspace,
             Err(error) => {
                 self.set_open_workspace_error(error.to_string());
                 return;
             }
         };
+        // A shell either way. On a remote workspace it is a shell over there,
+        // which `runtime::session` arranges when the pane starts; the workspace
+        // opens on the same thing whichever machine it is on.
         match project.add_terminal(workspace, "shell".to_string()) {
             Ok(Some(_)) => {}
             Ok(None) => {
@@ -196,6 +286,7 @@ fn open_workspace_matches_for(
                     OpenWorkspaceMatch {
                         name: project.name.clone(),
                         path: project.path.clone(),
+                        remote: project.remote_destination().map(ToOwned::to_owned),
                     },
                 )
             })
@@ -307,6 +398,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::model::TerminalLaunch;
 
     #[test]
     fn importing_workspace_adds_terminal_without_agent_chat() {
@@ -342,10 +434,12 @@ mod tests {
             ConfiguredProject {
                 name: "frontend".to_string(),
                 path: other_path,
+                remote: None,
             },
             ConfiguredProject {
                 name: "mult".to_string(),
                 path: selected_path.clone(),
+                remote: None,
             },
         ];
         let mut app = App::default();
@@ -383,10 +477,12 @@ mod tests {
             ConfiguredProject {
                 name: "first".to_string(),
                 path: first_path,
+                remote: None,
             },
             ConfiguredProject {
                 name: "second".to_string(),
                 path: second_path.clone(),
+                remote: None,
             },
         ];
         let mut app = App::default();
@@ -398,6 +494,144 @@ mod tests {
         let imported = app.project.workspaces.last().unwrap();
         assert_eq!(imported.name, "second");
         assert_eq!(imported.cwd.as_deref(), Some(second_path.as_path()));
+    }
+
+    /// Opening a remote project must not look at this filesystem at all: the
+    /// path below exists on no machine here, and the import still succeeds.
+    #[test]
+    fn a_remote_project_imports_without_touching_the_local_filesystem() {
+        let projects = vec![ConfiguredProject {
+            name: "mult".to_string(),
+            path: PathBuf::from("~/projects/mult"),
+            remote: Some("user@hostname".to_string()),
+        }];
+        let mut app = App::default();
+
+        app.begin_open_workspace(&projects);
+        app.submit_open_workspace(&projects);
+
+        let imported = app.project.workspaces.last().unwrap();
+        assert_eq!(imported.name, "mult");
+        assert_eq!(imported.cwd, None, "a remote workspace has no local root");
+        assert_eq!(
+            imported.remote,
+            Some(RemoteTarget {
+                host: "user@hostname".to_string(),
+                path: "~/projects/mult".to_string(),
+                session: "mult".to_string(),
+            })
+        );
+        assert_eq!(imported.chats.len(), 0);
+        assert_eq!(imported.terminals.len(), 1);
+        assert_eq!(
+            imported.terminals[0].launch,
+            TerminalLaunch::Shell,
+            "a terminal is a terminal; what makes it remote is where it starts"
+        );
+        assert_eq!(app.prompt(), None);
+        assert!(app.is_dirty());
+    }
+
+    /// The remote counterpart of the local import's canonical-`cwd` check: the
+    /// second open lands on the workspace already attached to that session.
+    #[test]
+    fn opening_the_same_remote_project_twice_selects_the_first_workspace() {
+        let projects = vec![ConfiguredProject {
+            name: "mult".to_string(),
+            path: PathBuf::from("~/projects/mult"),
+            remote: Some("user@hostname".to_string()),
+        }];
+        let mut app = App::default();
+        app.begin_open_workspace(&projects);
+        app.submit_open_workspace(&projects);
+        let first = app.project.workspaces.last().unwrap().id;
+        let count = app.project.workspaces.len();
+
+        app.begin_open_workspace(&projects);
+        app.submit_open_workspace(&projects);
+
+        assert_eq!(app.project.workspaces.len(), count);
+        assert_eq!(app.selected_workspace_id(), Some(first));
+    }
+
+    /// The same project name on two machines is two projects, and the same
+    /// machine twice at different paths is two workspaces.
+    #[test]
+    fn a_remote_workspace_is_identified_by_machine_and_directory() {
+        let projects = vec![
+            ConfiguredProject {
+                name: "mult".to_string(),
+                path: PathBuf::from("~/projects/mult"),
+                remote: Some("user@one".to_string()),
+            },
+            ConfiguredProject {
+                name: "mult-two".to_string(),
+                path: PathBuf::from("~/projects/mult"),
+                remote: Some("user@two".to_string()),
+            },
+            ConfiguredProject {
+                name: "docs".to_string(),
+                path: PathBuf::from("~/projects/docs"),
+                remote: Some("user@one".to_string()),
+            },
+        ];
+        let mut app = App::default();
+        let before = app.project.workspaces.len();
+
+        for index in 0..projects.len() {
+            app.begin_open_workspace(&projects);
+            for _ in 0..index {
+                app.select_next_open_workspace_match(&projects);
+            }
+            app.submit_open_workspace(&projects);
+        }
+
+        assert_eq!(app.project.workspaces.len(), before + 3);
+    }
+
+    #[test]
+    fn a_remote_project_ssh_could_not_use_stays_in_the_prompt() {
+        let projects = vec![ConfiguredProject {
+            name: "mult".to_string(),
+            path: PathBuf::from("~/projects/mult"),
+            remote: Some("-oProxyCommand=id".to_string()),
+        }];
+        let mut app = App::default();
+
+        app.begin_open_workspace(&projects);
+        app.submit_open_workspace(&projects);
+
+        let Some(Prompt::OpenWorkspace(prompt)) = app.prompt() else {
+            panic!("expected prompt to remain open");
+        };
+        assert!(
+            prompt
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("ssh would read as an option")),
+            "{:?}",
+            prompt.error
+        );
+        assert!(!app.is_dirty());
+    }
+
+    /// A `tmux` session name is not a free-form string, so the workspace name
+    /// and the session it opens are allowed to differ.
+    #[test]
+    fn a_project_name_tmux_would_refuse_still_opens() {
+        let projects = vec![ConfiguredProject {
+            name: "docs.site".to_string(),
+            path: PathBuf::from("/srv/docs"),
+            remote: Some("host".to_string()),
+        }];
+        let mut app = App::default();
+
+        app.begin_open_workspace(&projects);
+        app.submit_open_workspace(&projects);
+
+        let imported = app.project.workspaces.last().unwrap();
+        assert_eq!(imported.name, "docs.site", "the row keeps the user's name");
+        assert_eq!(imported.remote.as_ref().unwrap().session, "docs-site");
     }
 
     #[test]

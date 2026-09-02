@@ -311,6 +311,21 @@ fn draw_terminal_details(
                 Span::raw(command.clone()),
             ]));
         }
+        // Where a pane runs is not obvious from a blank screen, and for a
+        // remote workspace it is the first thing to check when nothing appears
+        // — a connection that is still asking for a passphrase looks exactly
+        // like one that is not happening.
+        if let Some(target) = app
+            .project
+            .workspace(workspace_id)
+            .and_then(|workspace| workspace.remote.as_ref())
+        {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("Remote: ", Style::default().fg(palette.muted)),
+                Span::raw(format!("{}:{}", target.host, target.path)),
+            ]));
+        }
         render_lines_pane(frame, area, lines, focused, palette, false);
         return;
     }

@@ -125,7 +125,11 @@ fn read_bounded_regular_file(path: &Path) -> Option<Vec<u8>> {
 /// ID (detached), which is what `git symbolic-ref --quiet --short HEAD`
 /// distinguished. Only `refs/heads/` is accepted: that is what checking out a
 /// branch writes, and anything else is not a branch to display.
-fn branch_from_head(head: &[u8]) -> Option<String> {
+///
+/// Public because the remote-branch probe reads a `HEAD` this process cannot
+/// open — it arrives over a pipe from another machine — and must validate it by
+/// exactly the same rules, including the control-character check below.
+pub fn branch_from_head(head: &[u8]) -> Option<String> {
     let branch = first_nonempty_line(head)?
         .strip_prefix("ref:")?
         .trim()
