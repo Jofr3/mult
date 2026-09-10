@@ -8,6 +8,28 @@ and the project aims to adhere to
 
 ## [Unreleased]
 
+### Reattaching to a busy agent no longer times out (B24)
+
+Reopening `mult` after closing its terminal window could leave an agent chat
+marked failed — `failed to restore agent without relaunching it: timed out` —
+even though the agent was still alive in the daemon and its work untouched. It
+took about two seconds to fail, and it hit exactly the chats that had been open
+long enough to produce a lot of output.
+
+Two things combined. Retained scrollback is stored as one chunk per PTY read,
+and a program that prints a line at a time is handed a tiny read per line, so a
+busy agent accumulated *thousands* of ~80-byte chunks. Replay sends one wire
+message per chunk, and the client's delivery queue is bounded: the queue
+overflowed mid-replay, the daemon abandoned the transaction, and the client —
+with no `ReplayEnd` ever arriving — sat until its attach deadline elapsed and
+then reported the live session as failed.
+
+The daemon now coalesces adjacent retained chunks into frame-sized replay
+messages, so the message count is bounded by the retained size (~40 messages for
+a full history) rather than by how the bytes were written. Independently, an
+attach's timeout now bounds *silence* between messages rather than the whole
+transaction, so a large replay that keeps arriving is never cut off partway.
+
 ### Project SFTP in Yazi
 
 A project object may now set `"sftp"` to a Yazi VFS name or complete

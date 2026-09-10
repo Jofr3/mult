@@ -441,6 +441,11 @@ struct PendingStop {
 }
 
 const SERVER_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a correlated request may wait for the *next* message from the
+/// daemon. It is a silence budget, not a whole-transaction one: an attach
+/// resets it on every message it receives (see [`PtyRuntime::perform_attach`]),
+/// so a large scrollback replay that keeps arriving is never cut off, while a
+/// daemon that goes quiet for this long still ends the wait.
 const ATTACH_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Slots in the reader thread's queue. Each slot can hold an 8 KiB PTY chunk,
@@ -1951,7 +1956,16 @@ impl PtyRuntime {
         self.pending_reattach.retain(|queued| *queued != terminal);
         self.write_idempotent_request(&request)?;
         let pane_id = pane_for_key(terminal);
-        let deadline = Instant::now() + ATTACH_ACK_TIMEOUT;
+        // Bounds *silence*, not the whole transaction. An attach is an ack
+        // followed by a replay of the pane's retained scrollback, which is
+        // bounded by size (up to ~2.4 MiB per pane), not by time; a single
+        // fixed deadline for the lot timed out re-attaching to a busy agent
+        // and left restoration marking a perfectly live session `Failed`
+        // (B24). Each message received below is progress, so the deadline is
+        // reset on every one: a steadily arriving replay of any size finishes,
+        // while a daemon that actually goes quiet for `ATTACH_ACK_TIMEOUT`
+        // still ends the wait.
+        let mut deadline = Instant::now() + ATTACH_ACK_TIMEOUT;
         let mut accepted_lease = None;
         let mut replay_next = None;
         let mut replay_watermark = None;
@@ -1959,7 +1973,10 @@ impl PtyRuntime {
         let mut replay_omitted = 0;
         loop {
             let message = match self.receive_for_request(request_id, deadline) {
-                Ok(message) => message,
+                Ok(message) => {
+                    deadline = Instant::now() + ATTACH_ACK_TIMEOUT;
+                    message
+                }
                 Err(error) if error.is_disconnected() => {
                     self.resume_and_resend(&request)?;
                     self.reset_parser(terminal, size);
@@ -4605,6 +4622,95 @@ mod tests {
             runtime.pane_entry(terminal).expected_output,
             Some(OutputSequence::new(12))
         );
+    }
+
+    /// B24: an attach's deadline bounds silence between messages, not the whole
+    /// transaction. A replay that keeps arriving must complete even when its
+    /// total duration exceeds `ATTACH_ACK_TIMEOUT` — otherwise re-attaching to a
+    /// busy agent on restore times out and its live session is wrongly reported
+    /// `Failed`. The chunks here are paced so the run lasts longer than one
+    /// `ATTACH_ACK_TIMEOUT` while no single gap reaches it; the pre-fix code,
+    /// with a fixed start-of-transaction deadline, timed this out.
+    #[test]
+    fn a_steady_replay_longer_than_the_ack_timeout_still_completes() {
+        assert!(
+            ATTACH_ACK_TIMEOUT >= Duration::from_secs(2),
+            "the pacing below assumes a multi-second ack timeout"
+        );
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let terminal = PtyKey::Terminal(TerminalId(24));
+        let mut runtime = unattached_test_runtime(client_stream, receiver);
+        // Each gap is comfortably under the timeout; three of them sum past it.
+        let gap = ATTACH_ACK_TIMEOUT.mul_f32(0.6);
+        let server = thread::spawn(move || {
+            let ClientMessage::Attach { request_id, .. } =
+                read_client_message(&mut server_stream, "reading paced Attach")
+            else {
+                panic!("expected Attach");
+            };
+            let pane = PaneId(24);
+            let lease = test_lease();
+            let chunks: [&[u8]; 3] = [b"first-", b"second-", b"third"];
+            let total: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+            let watermark = OutputSequence::new(total as u64);
+            sender
+                .send(ServerMessage::AttachResult {
+                    request_id,
+                    outcome: AttachOutcome::Attached {
+                        session: SessionId(24),
+                        pane: mult_protocol::PaneInfo {
+                            id: pane,
+                            title: "agent".to_string(),
+                            rows: 6,
+                            cols: 20,
+                        },
+                        lease,
+                    },
+                })
+                .expect("send attach acceptance");
+            sender
+                .send(ServerMessage::ReplayBegin {
+                    request_id,
+                    pane,
+                    lease,
+                    first_sequence: OutputSequence::ZERO,
+                    watermark,
+                    omitted_prefix_bytes: 0,
+                })
+                .expect("send replay begin");
+            let mut offset = 0u64;
+            for chunk in chunks {
+                thread::sleep(gap);
+                sender
+                    .send(ServerMessage::ReplayChunk {
+                        request_id,
+                        pane,
+                        lease,
+                        sequence: OutputSequence::new(offset),
+                        bytes: Arc::<[u8]>::from(chunk),
+                    })
+                    .expect("send replay chunk");
+                offset += chunk.len() as u64;
+            }
+            sender
+                .send(ServerMessage::ReplayEnd {
+                    request_id,
+                    pane,
+                    lease,
+                    watermark,
+                })
+                .expect("send replay end");
+        });
+
+        let result = runtime
+            .attach_existing(terminal, PtyDimensions { rows: 6, cols: 20 })
+            .expect("a steady replay must attach rather than time out");
+
+        assert_eq!(result, AttachExistingResult::Attached);
+        assert!(runtime.is_running(terminal));
+        assert!(runtime.terminal_lines(terminal)[0].contains("first-second-third"));
+        server.join().expect("server thread should finish");
     }
 
     #[test]

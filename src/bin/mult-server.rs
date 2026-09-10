@@ -483,17 +483,57 @@ impl RawHistory {
 
     /// The retained history as replay-sized chunks, oldest first.
     ///
-    /// Every chunk but the oldest is shared with the pane at zero cost. Only
-    /// the oldest needs a copy, and only when a trim landed inside it.
+    /// One wire message is sent per chunk, and the client's delivery queue is
+    /// bounded (`CLIENT_QUEUE_CAPACITY`): if the queue overflows mid-transaction
+    /// the daemon abandons the whole replay, and the client — with no `ReplayEnd`
+    /// coming — times out attaching to a perfectly live pane and marks it failed
+    /// (B24). Live output arrives as ~8 KiB reads, but a program that prints a
+    /// line at a time is delivered a tiny read per line, so a busy agent retains
+    /// *thousands* of ~80-byte chunks and blows past the queue on attach.
+    ///
+    /// So adjacent retained chunks are coalesced up to `RAW_HISTORY_CHUNK_BYTES`
+    /// here: the message count becomes `ceil(retained / RAW_HISTORY_CHUNK_BYTES)`
+    /// — ~40 for a full history — regardless of how the bytes were written. A
+    /// chunk already at the frame size is still shared with the pane at zero
+    /// cost; only runs of small chunks are copied, and only on attach, which
+    /// already feeds every retained byte into the client's parser.
     fn replay_chunks(&self) -> Vec<Arc<[u8]>> {
-        let mut chunks = Vec::with_capacity(self.chunks.len());
+        let mut chunks: Vec<Arc<[u8]>> = Vec::new();
+        let mut pending: Vec<u8> = Vec::new();
+        let flush = |pending: &mut Vec<u8>, chunks: &mut Vec<Arc<[u8]>>| {
+            if !pending.is_empty() {
+                chunks.push(Arc::from(std::mem::take(pending).into_boxed_slice()));
+            }
+        };
         for (index, chunk) in self.chunks.iter().enumerate() {
-            if index == 0 && self.front_offset > 0 {
-                chunks.push(Arc::from(&chunk[self.front_offset..]));
+            let slice = if index == 0 && self.front_offset > 0 {
+                &chunk[self.front_offset..]
             } else {
-                chunks.push(Arc::clone(chunk));
+                &chunk[..]
+            };
+            // A full-sized chunk with nothing buffered before it is already a
+            // frame; share it rather than copy it.
+            if pending.is_empty() && slice.len() == RAW_HISTORY_CHUNK_BYTES {
+                let share = if index == 0 && self.front_offset > 0 {
+                    Arc::from(slice)
+                } else {
+                    Arc::clone(chunk)
+                };
+                chunks.push(share);
+                continue;
+            }
+            let mut rest = slice;
+            while !rest.is_empty() {
+                let space = RAW_HISTORY_CHUNK_BYTES - pending.len();
+                let take = space.min(rest.len());
+                pending.extend_from_slice(&rest[..take]);
+                rest = &rest[take..];
+                if pending.len() == RAW_HISTORY_CHUNK_BYTES {
+                    flush(&mut pending, &mut chunks);
+                }
             }
         }
+        flush(&mut pending, &mut chunks);
         chunks
     }
 
@@ -5207,56 +5247,63 @@ mod tests {
         );
     }
 
-    /// N3: a queued replay must not make the pane's history resident twice.
+    /// N3: a queued replay must not make the pane's history resident twice —
+    /// a retained chunk that is already frame-sized is shared with the pane,
+    /// not copied, when it stands on a frame boundary.
     #[test]
-    fn queued_replay_chunks_share_the_pane_history_instead_of_copying_it() {
-        let server = Arc::new(Mutex::new(ServerState::default()));
-        let scope = server.lock().unwrap().allocate_scope().unwrap();
-        let pane = Arc::new(Mutex::new(test_pane_state(None)));
-        for value in 0..3_u8 {
-            pane.lock()
-                .unwrap()
-                .append_raw_history(&shared(&[value; 16]))
-                .unwrap();
-        }
-        let history = pane
-            .lock()
-            .unwrap()
-            .raw_history
-            .replay_chunks()
-            .iter()
-            .map(|chunk| chunk.as_ptr() as usize)
-            .collect::<Vec<_>>();
-        assert_eq!(history.len(), 3);
-        server
-            .lock()
-            .unwrap()
-            .sessions
-            .insert(SessionId(1), Arc::clone(&pane));
-        let request_id = request_id(1);
-        let (client, receiver) = test_client_with_capacity(1, 16);
+    fn a_frame_sized_replay_chunk_is_shared_with_the_pane() {
+        let mut history = RawHistory::default();
+        let frame = shared(&vec![7u8; RAW_HISTORY_CHUNK_BYTES]);
+        history.append(&frame, RAW_HISTORY_MAX_BYTES);
 
-        handle_attach_request(
-            &server,
-            scope,
-            false,
-            &client,
-            attach_request(request_id, 1, 1),
-        )
-        .unwrap();
-
-        let mut queued = Vec::new();
-        for _ in 0..7 {
-            if let ClientDelivery::Replay { bytes, .. } = receiver
-                .recv_delivery_timeout(TEST_IO_TIMEOUT)
-                .expect("attach transaction delivery")
-            {
-                queued.push(bytes.as_ptr() as usize);
-            }
-        }
+        let chunks = history.replay_chunks();
+        assert_eq!(chunks.len(), 1);
         assert_eq!(
-            queued, history,
-            "queued replay chunks must reference the pane's own retained chunks"
+            chunks[0].as_ptr(),
+            frame.as_ptr(),
+            "a full-frame retained chunk is shared, not copied"
+        );
+    }
+
+    /// B24: a program that prints a line at a time is delivered a tiny PTY read
+    /// per line, so a busy pane retains thousands of ~80-byte chunks. Replay
+    /// sends one wire message per chunk, and the client's delivery queue is
+    /// bounded — without coalescing the queue overflowed, the daemon abandoned
+    /// the transaction, and the client timed out attaching to a live pane and
+    /// marked it failed. Replay must coalesce adjacent small chunks so the
+    /// message count is bounded by the retained size, not the write pattern.
+    #[test]
+    fn many_tiny_retained_chunks_coalesce_into_few_replay_messages() {
+        let mut history = RawHistory::default();
+        let line = shared(b"a line of agent output\n");
+        let count = 5_000;
+        for _ in 0..count {
+            history.append(&line, RAW_HISTORY_MAX_BYTES);
+        }
+
+        let chunks = history.replay_chunks();
+        let expected: Vec<u8> = line
+            .iter()
+            .copied()
+            .cycle()
+            .take(count * line.len())
+            .collect();
+        assert_eq!(
+            chunks.concat(),
+            expected,
+            "coalescing must preserve every retained byte in order"
+        );
+        let ceiling = history.len().div_ceil(RAW_HISTORY_CHUNK_BYTES);
+        assert!(
+            chunks.len() <= ceiling,
+            "replay sends at most ceil(retained / frame) messages, got {} for {} bytes",
+            chunks.len(),
+            history.len()
+        );
+        assert!(
+            chunks.len() < CLIENT_QUEUE_CAPACITY,
+            "the whole replay must fit the client's delivery queue, got {} messages",
+            chunks.len()
         );
     }
 

@@ -268,6 +268,21 @@ You may also see the exit reported as:
 which is how the client reports panes it can no longer reach when the daemon
 goes away underneath it.
 
+A restoration message that ends in **`: timed out …`** is different, and was a
+bug (B24), fixed:
+
+> **[pane]** `failed to restore agent without relaunching it: timed out waiting for correlated mult-server response`
+
+The daemon session was alive and the agent's work untouched; the client simply
+could not finish reattaching. Retained scrollback is replayed one wire message
+per stored chunk, and a busy agent that printed a line at a time accumulated
+thousands of tiny chunks — enough to overflow the client's bounded delivery
+queue, at which point the daemon abandoned the replay and the client waited out
+its attach timeout (~2 s) and marked the chat failed. Replay now coalesces those
+chunks into frame-sized messages, so a reopened `mult` reattaches to a busy
+agent the same as to a quiet one. If you are on a build from before the fix,
+reopening `mult` again generally succeeds once the pane is idle.
+
 ---
 
 ## An agent chat starts and immediately dies (`pi` / `claude` not installed)
