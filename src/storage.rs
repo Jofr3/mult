@@ -300,11 +300,15 @@ impl StateStore {
                 notice: None,
             }),
             Ok(DecodedState::V3(old)) => Ok(LoadedState {
-                state: migrate_v3_to_v4(old, source)?,
+                state: migrate_v3_to_current(old, source)?,
                 needs_save: true,
                 notice: None,
             }),
-            Ok(DecodedState::V4(mut state)) => {
+            Ok(DecodedState::V4(mut state) | DecodedState::V5(mut state)) => {
+                let migrated = state.version == 4;
+                if migrated {
+                    state = migrate_v4_to_v5(state);
+                }
                 // Repair before validating, not after: a lenient decode can
                 // leave the ID allocators and the identity table describing a
                 // slightly different set of sessions than actually decoded, and
@@ -318,7 +322,10 @@ impl StateStore {
                 validate_current_state(&state)?;
                 Ok(LoadedState {
                     state,
-                    needs_save: ids_normalized || identities_normalized || statuses_normalized,
+                    needs_save: migrated
+                        || ids_normalized
+                        || identities_normalized
+                        || statuses_normalized,
                     notice: None,
                 })
             }
@@ -474,8 +481,11 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, StateDecodeError> {
         3 => serde_json::from_slice(bytes)
             .map(DecodedState::V3)
             .map_err(StateDecodeError::InvalidJson),
-        STATE_VERSION => serde_json::from_slice(bytes)
+        4 => serde_json::from_slice(bytes)
             .map(DecodedState::V4)
+            .map_err(StateDecodeError::InvalidJson),
+        STATE_VERSION => serde_json::from_slice(bytes)
+            .map(DecodedState::V5)
             .map_err(StateDecodeError::InvalidJson),
         version => Err(StateDecodeError::UnsupportedVersion(version)),
     }
@@ -592,7 +602,24 @@ fn migrate_v2_to_current(
     old: StateV2,
     source: &mut impl IdentitySource,
 ) -> io::Result<ProjectState> {
-    migrate_v3_to_v4(migrate_v2_to_v3(old), source)
+    migrate_v3_to_current(migrate_v2_to_v3(old), source)
+}
+
+/// Version 4 -> 5 changes only the envelope: existing chats retain their agent,
+/// identity and generation. The new version protects Codex chats from older
+/// clients, which cannot decode that variant.
+fn migrate_v4_to_v5(mut state: ProjectState) -> ProjectState {
+    state.version = STATE_VERSION;
+    state
+}
+
+fn migrate_v3_to_current(
+    old: StateV3,
+    source: &mut impl IdentitySource,
+) -> io::Result<ProjectState> {
+    let state = migrate_v4_to_v5(migrate_v3_to_v4(old, source)?);
+    validate_current_state(&state)?;
+    Ok(state)
 }
 
 /// Version 3 -> 4: every workspace version 3 could describe is a local one.
@@ -606,11 +633,10 @@ fn migrate_v2_to_current(
 /// field it ignores. The version number is what turns that into "this file is
 /// newer than I am".
 ///
-/// This is also where the repairs every migrated file needs happen, because it
-/// is the last hop in the chain whatever version the file came in at.
+/// This is also where identity/status repairs for versions 1–3 happen.
 fn migrate_v3_to_v4(old: StateV3, source: &mut impl IdentitySource) -> io::Result<ProjectState> {
     let mut state = ProjectState {
-        version: STATE_VERSION,
+        version: 4,
         namespace: old.namespace,
         session_identities: old.session_identities,
         agent_generations: old.agent_generations,
@@ -645,7 +671,6 @@ fn migrate_v3_to_v4(old: StateV3, source: &mut impl IdentitySource) -> io::Resul
     // has no generations at all, so every such chat resets — which is exactly
     // what the old `migrate_v1_to_v2` did inline.
     normalize_unowned_agent_statuses(&mut state);
-    validate_current_state(&state)?;
     Ok(state)
 }
 
@@ -743,6 +768,7 @@ enum DecodedState {
     V2(StateV2),
     V3(StateV3),
     V4(ProjectState),
+    V5(ProjectState),
 }
 
 #[derive(Debug)]
@@ -1432,35 +1458,79 @@ mod tests {
     }
 
     #[test]
-    fn v1_original_shape_migrates_to_exact_golden_v4() {
+    fn v1_original_shape_migrates_to_exact_golden_v5() {
         assert_golden_migration(
             include_bytes!("../tests/fixtures/state/v1-original.json"),
-            include_bytes!("../tests/fixtures/state/v1-original.expected-v4.json"),
+            include_bytes!("../tests/fixtures/state/v1-original.expected-v5.json"),
         );
     }
 
     #[test]
-    fn v1_current_shape_migrates_to_exact_golden_v4() {
+    fn v1_current_shape_migrates_to_exact_golden_v5() {
         assert_golden_migration(
             include_bytes!("../tests/fixtures/state/v1-current.json"),
-            include_bytes!("../tests/fixtures/state/v1-current.expected-v4.json"),
+            include_bytes!("../tests/fixtures/state/v1-current.expected-v5.json"),
         );
     }
 
     #[test]
-    fn v2_shape_migrates_to_exact_golden_v4() {
+    fn v2_shape_migrates_to_exact_golden_v5() {
         assert_golden_migration(
             include_bytes!("../tests/fixtures/state/v2-current.json"),
-            include_bytes!("../tests/fixtures/state/v2-current.expected-v4.json"),
+            include_bytes!("../tests/fixtures/state/v2-current.expected-v5.json"),
         );
     }
 
     #[test]
-    fn v3_shape_migrates_to_exact_golden_v4() {
+    fn v3_shape_migrates_to_exact_golden_v5() {
         assert_golden_migration(
             include_bytes!("../tests/fixtures/state/v3-current.json"),
-            include_bytes!("../tests/fixtures/state/v3-current.expected-v4.json"),
+            include_bytes!("../tests/fixtures/state/v3-current.expected-v5.json"),
         );
+    }
+
+    #[test]
+    fn v4_shape_migrates_to_exact_golden_v5() {
+        assert_golden_migration(
+            include_bytes!("../tests/fixtures/state/v4-current.json"),
+            include_bytes!("../tests/fixtures/state/v4-current.expected-v5.json"),
+        );
+    }
+
+    #[test]
+    fn codex_chats_and_session_identities_survive_storage() {
+        let path = unique_test_dir().join("state.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            include_bytes!("../tests/fixtures/state/v4-current.json"),
+        )
+        .unwrap();
+        let store =
+            StateStore::acquire(StatePaths::from_explicit_path(path.clone()).unwrap()).unwrap();
+        let loaded = store.load_or_default().unwrap();
+        assert!(loaded.needs_save);
+        assert!(loaded.notice.is_none());
+        let mut state = loaded.state;
+        let workspace = state.workspaces[0].id;
+        let chat = state
+            .add_chat(
+                workspace,
+                "Codex".into(),
+                ChatStatus::Idle,
+                AgentKind::Codex,
+            )
+            .unwrap()
+            .unwrap();
+        store.save(&state).unwrap();
+        let loaded = store.load_or_default().unwrap();
+        assert!(!loaded.needs_save);
+        assert_eq!(loaded.state, state);
+        assert_eq!(
+            loaded.state.chat(workspace, chat).unwrap().agent,
+            AgentKind::Codex
+        );
+        assert_eq!(loaded.state.version, 5);
     }
 
     /// The version-3 -> 4 hop adds a field and must not touch anything else:
@@ -1603,7 +1673,7 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
-            include_bytes!("../tests/fixtures/state/v3-current.expected-v4.json"),
+            include_bytes!("../tests/fixtures/state/v3-current.expected-v5.json"),
         )
         .unwrap();
         let store = StateStore::acquire(StatePaths::from_explicit_path(path).unwrap()).unwrap();
@@ -1635,7 +1705,7 @@ mod tests {
     fn future_state_is_rejected_and_preserved_byte_for_byte() {
         let path = unique_test_dir().join("state.json");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let original = include_bytes!("../tests/fixtures/state/future-v5-unknown.json");
+        let original = include_bytes!("../tests/fixtures/state/future-v6-unknown.json");
         fs::write(&path, original).unwrap();
         let store =
             StateStore::acquire(StatePaths::from_explicit_path(path.clone()).unwrap()).unwrap();
@@ -1644,7 +1714,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            StateError::UnsupportedVersion { version: 5, .. }
+            StateError::UnsupportedVersion { version: 6, .. }
         ));
         assert_eq!(fs::read(path).unwrap(), original);
     }
@@ -1784,7 +1854,7 @@ mod tests {
         // Same missing fields as the test above, but a version this build does
         // not know.
         let future =
-            br#"{"version":5,"namespace":"11111111111111111111111111111111","workspaces":[]}"#;
+            br#"{"version":6,"namespace":"11111111111111111111111111111111","workspaces":[]}"#;
         fs::write(&path, future).unwrap();
         let store =
             StateStore::acquire(StatePaths::from_explicit_path(path.clone()).unwrap()).unwrap();
@@ -1793,7 +1863,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            StateError::UnsupportedVersion { version: 5, .. }
+            StateError::UnsupportedVersion { version: 6, .. }
         ));
         assert!(error.to_string().contains("is unsupported"));
         assert_eq!(fs::read(&path).unwrap(), future);
@@ -2050,8 +2120,9 @@ mod tests {
         let migrated = match decode_state(input).unwrap() {
             DecodedState::V1(state) => migrate_v1_to_current(state, &mut source).unwrap(),
             DecodedState::V2(state) => migrate_v2_to_current(state, &mut source).unwrap(),
-            DecodedState::V3(state) => migrate_v3_to_v4(state, &mut source).unwrap(),
-            DecodedState::V4(_) => {
+            DecodedState::V3(state) => migrate_v3_to_current(state, &mut source).unwrap(),
+            DecodedState::V4(state) => migrate_v4_to_v5(state),
+            DecodedState::V5(_) => {
                 panic!("a golden migration fixture must predate the current version")
             }
         };

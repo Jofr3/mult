@@ -497,6 +497,7 @@ fn auto_start_enabled(config: &Config, agent: AgentKind) -> bool {
     match agent {
         AgentKind::Pi => config.auto_start_pi_agent,
         AgentKind::ClaudeCode => config.auto_start_claude_code_agent,
+        AgentKind::Codex => config.auto_start_codex_agent,
     }
 }
 
@@ -513,6 +514,27 @@ pub(super) fn drain_agent_events(app: &mut App, backend: &mut impl AgentBackend)
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn codex_remote_launch_has_titles_without_local_hooks() {
+        let target = model::RemoteTarget {
+            host: "user@hostname".into(),
+            path: "~/projects/mult".into(),
+            session: "mult".into(),
+        };
+        let command = remote_agent_launch(&Config::default(), AgentKind::Codex, &target).unwrap();
+        assert!(command.contains("codex"));
+        assert!(command.contains("tui.terminal_title="));
+        assert!(command.contains("set-titles-string"));
+        assert!(command.contains("attach-session"));
+        assert!(!command.contains("hooks."));
+        assert!(!command.contains("mult-codex-status"));
+        let mut config = Config::default();
+        assert!(auto_start_enabled(&config, AgentKind::Codex));
+        config.auto_start_codex_agent = false;
+        assert!(!auto_start_enabled(&config, AgentKind::Codex));
+        assert!(auto_start_enabled(&config, AgentKind::Pi));
+    }
 
     /// The agent, not the shell, is what `tmux` is for: closing `mult` detaches
     /// the session and the next start attaches to the same conversation, still

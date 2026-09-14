@@ -12,8 +12,8 @@ use ratatui::{
 use crate::{
     app::{App, FocusMode, NavItem, SidebarRow},
     model::{
-        ChatSession, ChatStatus, PtyKey, TerminalId, TerminalLaunch, TerminalSession, Workspace,
-        WorkspaceId,
+        AgentKind, ChatSession, ChatStatus, PtyKey, TerminalId, TerminalLaunch, TerminalSession,
+        Workspace, WorkspaceId,
     },
     pty::PtyRuntime,
 };
@@ -250,9 +250,29 @@ fn workspace_sidebar_line(
 /// Claude Code chats in a workspace would otherwise be three identical rows.
 /// What the agent says it is working on is what tells them apart.
 fn chat_sidebar_label(chat: &ChatSession, pty_runtime: &PtyRuntime, max_width: usize) -> String {
-    let name =
-        window_title(PtyKey::ChatAgent(chat.id), pty_runtime).unwrap_or_else(|| chat.name.clone());
+    let name = window_title(PtyKey::ChatAgent(chat.id), pty_runtime)
+        .map(|title| match chat.agent {
+            AgentKind::Codex => codex_sidebar_title(title),
+            _ => title,
+        })
+        .unwrap_or_else(|| chat.name.clone());
     truncate_text(&name, max_width)
+}
+
+/// Codex's `thread` title item falls back to the session UUID before it has
+/// a name. Replace that whole item, keeping the ` | <status>` suffix and named
+/// titles intact. This runs before width truncation and never changes PTY state.
+fn codex_sidebar_title(mut title: String) -> String {
+    let thread = title.split(" | ").next().unwrap_or_default();
+    if thread.len() == 36
+        && thread.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+    {
+        title.replace_range(..thread.len(), "codex");
+    }
+    title
 }
 
 fn terminal_display_label(
@@ -549,6 +569,80 @@ mod tests {
         // A title the program blanks out returns the row to the chat's name.
         pty_runtime.process_terminal_output(key, b"\x1b]0;\x07");
         assert_eq!(chat_sidebar_label(&chat, &pty_runtime, 40), "agent");
+    }
+
+    #[test]
+    fn unnamed_codex_titles_show_the_agent_and_keep_activity() {
+        let chat = test_chat(AgentKind::Codex);
+        let key = PtyKey::ChatAgent(chat.id);
+        let mut runtime = PtyRuntime::new_offline();
+        runtime.ensure_parser(key, crate::pty::PtyDimensions { rows: 24, cols: 80 });
+        // Actual Codex 0.154.0 startup titles, before a thread is named.
+        let thread = "01a09faa-8e9e-7131-af88-3e6aa385636d";
+        for suffix in ["", " | Ready", " | Starting", " | Working"] {
+            runtime.process_terminal_output(key, format!("\x1b]0;{thread}{suffix}\x07").as_bytes());
+            assert_eq!(
+                chat_sidebar_label(&chat, &runtime, 60),
+                format!("codex{suffix}")
+            );
+        }
+        assert_eq!(chat_sidebar_label(&chat, &runtime, 10), "codex | W…");
+        // The substitution is presentation only, and specific to Codex.
+        assert_eq!(
+            runtime.terminal_title(key).unwrap(),
+            format!("{thread} | Working")
+        );
+        for agent in [AgentKind::Pi, AgentKind::ClaudeCode] {
+            let other = ChatSession {
+                agent,
+                ..chat.clone()
+            };
+            assert_eq!(
+                chat_sidebar_label(&other, &runtime, 60),
+                format!("{thread} | Working")
+            );
+        }
+        // /rename, Unicode, UUIDs mentioned in names, and near-matches stay intact.
+        for title in [
+            "Fix sidebar | Ready".to_string(),
+            "修复侧栏 | Working".to_string(),
+            format!("Investigate {thread} | Ready"),
+            format!("{thread} crash | Ready"),
+            format!("{thread}0 | Ready"),
+            "01a09faa-8e9e-7131-af88-3e6aa385636z | Ready".to_string(),
+        ] {
+            runtime.process_terminal_output(key, format!("\x1b]2;{title}\x1b\\").as_bytes());
+            assert_eq!(chat_sidebar_label(&chat, &runtime, 100), title);
+        }
+        runtime.process_terminal_output(key, b"\x1b]0;\x07");
+        assert_eq!(chat_sidebar_label(&chat, &runtime, 40), "agent");
+    }
+
+    #[test]
+    fn codex_title_updates_follow_the_right_chat() {
+        let chat = test_chat(AgentKind::Codex);
+        let other = ChatSession {
+            id: ChatId(2),
+            ..chat.clone()
+        };
+        let key = PtyKey::ChatAgent(chat.id);
+        let mut runtime = PtyRuntime::new_offline();
+        runtime.ensure_parser(key, crate::pty::PtyDimensions { rows: 24, cols: 80 });
+        // OSC can straddle PTY reads. Renaming or changing activity updates
+        // this row without changing another chat or its durable identity.
+        runtime.process_terminal_output(key, b"\x1b]2;Fix sidebar");
+        runtime.process_terminal_output(key, b" | Working\x07");
+        assert_eq!(
+            chat_sidebar_label(&chat, &runtime, 60),
+            "Fix sidebar | Working"
+        );
+        assert_eq!(chat_sidebar_label(&other, &runtime, 60), "agent");
+        runtime.process_terminal_output(key, b"\x1b]2;Review parser | Ready\x1b\\");
+        assert_eq!(
+            chat_sidebar_label(&chat, &runtime, 60),
+            "Review parser | Ready"
+        );
+        assert_eq!(chat.agent.label(), "codex");
     }
 
     #[test]

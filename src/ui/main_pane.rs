@@ -421,6 +421,13 @@ mod tests {
             "{claude}"
         );
         assert!(!claude.contains("pi_agent_command"), "{claude}");
+
+        let codex = hint_for(AgentKind::Codex);
+        assert!(codex.contains("Codex agent not started"), "{codex}");
+        assert!(
+            codex.contains("`codex_command`/`auto_start_codex_agent`"),
+            "{codex}"
+        );
     }
 
     #[test]

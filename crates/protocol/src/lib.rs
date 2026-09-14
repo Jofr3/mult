@@ -15,7 +15,7 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 pub mod peer;
 pub mod shell;
 
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 pub const AGENT_STATUS_SCHEMA_VERSION: u16 = 1;
 pub const DEFAULT_SOCKET_NAME: &str = "mult.sock";
 pub const SOCKET_PATH_ENV: &str = "MULT_SOCKET_PATH";
@@ -505,6 +505,7 @@ pub enum LaunchSpec {
 pub enum AgentKind {
     Pi,
     ClaudeCode,
+    Codex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

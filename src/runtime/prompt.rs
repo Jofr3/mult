@@ -226,6 +226,16 @@ fn execute_command_action(
                 AgentKind::ClaudeCode,
             );
         }
+        CommandAction::AddCodexChat => {
+            add_agent_to_selected_workspace(
+                app,
+                pty_runtime,
+                config,
+                store,
+                layout,
+                AgentKind::Codex,
+            );
+        }
         CommandAction::AddShellTerminal => app.add_terminal_to_selected_workspace(),
         CommandAction::AddCommandTerminal => {
             app.begin_new_terminal_command();

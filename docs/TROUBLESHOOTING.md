@@ -285,7 +285,7 @@ reopening `mult` again generally succeeds once the pane is idle.
 
 ---
 
-## An agent chat starts and immediately dies (`pi` / `claude` not installed)
+## An agent chat starts and immediately dies (`pi` / `claude` / `codex` not installed)
 
 **Symptom.** The pane shows the shell's own error and an exit line:
 
@@ -297,7 +297,7 @@ reopening `mult` again generally succeeds once the pane is idle.
 
 or, for an agent chat, `pi agent exited: exit 127` / `Claude Code agent exited: exit 127`.
 
-**Cause.** `pi_agent_command` and `claude_code_command` are run through your
+**Cause.** `pi_agent_command`, `claude_code_command` and `codex_command` are run through your
 login shell (`$SHELL -lc "<command>"`). `mult` does not check that the binary
 exists first — the shell does, and reports it in the pane. Exit 127 is the
 shell's conventional "command not found".
@@ -315,7 +315,8 @@ exists on the `PATH` set in `~/.bashrc` will not be found. See
 
 The idle placeholder in an *empty* chat pane names the chat's own agent and its
 own two config keys — `pi_agent_command`/`auto_start_pi_agent` for a pi chat,
-`claude_code_command`/`auto_start_claude_code_agent` for a Claude Code one. It
+`claude_code_command`/`auto_start_claude_code_agent` for Claude Code, and
+`codex_command`/`auto_start_codex_agent` for Codex. It
 used to say "Pi agent" and name pi's keys for every chat; that was `F18`.
 
 ---
@@ -387,19 +388,45 @@ connection), or `HEAD` is detached.
 
 ---
 
+## A Codex chat has the wrong title or an idle status dot
+
+Keep `{mult_codex_args}` in `codex_command`, for example
+`"codex {mult_codex_args}"`. `mult` warns when a custom command omits it.
+The placeholder enables the conversation name and activity in Codex’s terminal
+title. Use `/rename Fix parser` inside Codex to update the sidebar name.
+An unnamed chat displays `codex` with its activity; if the row instead shows a
+UUID, rebuild/restart the `mult` client to pick up the title fallback.
+An existing running chat keeps its original launch settings; config changes
+apply to newly started chats.
+
+For the lifecycle dot, open Codex’s `/hooks` browser and review/trust the
+session hooks pointing at `mult-codex-status-v2.sh`. Codex skips untrusted,
+changed, or disabled hooks. Title updates do not depend on those hooks.
+Title settings and hook flags were verified with Codex 0.154.0; update older
+versions if they do not support them.
+
+If startup reports `clamping Interrupt hook timeout to 3s` from
+`/<session-flags>/config.toml`, an older `mult` launch requested five seconds
+for that hook. `mult` now requests three seconds, Codex's maximum for
+`Interrupt`. Rebuild/restart `mult` and start a new Codex chat to receive the
+corrected hook settings; reconnecting to an existing chat keeps its old flags.
+
+---
+
 ## A remote agent chat never shows a status dot
 
 **Symptom.** An agent chat in a remote workspace works — you can talk to it, it
 answers — but the dot in the sidebar stays the idle gray one, whatever the agent
 is doing.
 
-**Cause.** Expected, and not fixable from this side. Both backends report status
+**Cause.** Expected, and not fixable from this side. All backends report status
 by writing into files `mult` prepares in its private runtime directory: pi
 through the extension it is given with `-e`, Claude Code through the hooks in
-the file it is given with `--settings`. Those files exist on the machine `mult`
+the file it is given with `--settings`, and Codex through session hooks. Those files exist on the machine `mult`
 runs on, and an agent on another machine can neither read nor write them. A
 remote chat is therefore started with the plain `pi_agent_command` /
-`claude_code_command` — passing paths that do not exist over there would stop
+`claude_code_command`; Codex keeps title options but omits local hooks.
+Passing paths that do not exist over there would stop
 the agent starting, which is worse than a still dot.
 
 **What still works.** Everything in the pane: the agent's own output, its
@@ -527,7 +554,7 @@ dotfiles. The layout every dotfile manager produces now loads —
 `home-manager`'s `xdg.configFile`, which has no non-symlink mode at all, along
 with GNU stow and chezmoi.
 
-**What is still checked.** `pi_agent_command` and `claude_code_command` are
+**What is still checked.** `pi_agent_command`, `claude_code_command` and `codex_command` are
 handed to `$SHELL -lc` and auto-started by default, so whoever controls those
 bytes runs code as you with no keystroke. `mult` resolves the path through
 symlinks and then applies every check to the file it resolved *to*: it must be

@@ -1,6 +1,6 @@
 # mult
 
-`mult` is a terminal UI for multiplexing project workspaces, `pi` agent chats, and per-workspace PTY terminals.
+`mult` is a terminal UI for multiplexing project workspaces, Pi, Claude Code and Codex agent chats, and per-workspace PTY terminals.
 
 The current implementation is a Ratatui/Crossterm client plus a small `mult-server` process that owns long-lived PTYs. The client renders workspaces, chats, terminals, prompt overlays, status indicators, git branches, and terminal output while the server keeps terminal sessions alive across client reconnects.
 
@@ -11,9 +11,10 @@ The current implementation is a Ratatui/Crossterm client plus a small `mult-serv
 - Runtime PTY sessions managed by `mult-server` over a Unix socket.
 - Shell terminals and command terminals.
 - Auto-start for the selected terminal or selected agent chat.
-- Two agent backends per chat — `pi` (via a bundled status extension) and
-  Claude Code (via generated lifecycle hooks) — chosen when the chat is created,
-  and both reporting live status into the sidebar dot.
+- Three agent backends per chat — Pi, Claude Code and Codex — chosen when
+  the chat is created, with lifecycle status in the sidebar. Codex uses its
+  native terminal title for the conversation name and activity; its status
+  hooks require a one-time review in Codex’s `/hooks` browser.
 - Sidebar rows follow the pane's own window title (OSC 0/2) where the label
   would otherwise be a guess: what an agent says it is working on, and a
   shell's `cwd` or the file an editor is on.
@@ -144,6 +145,7 @@ Global controls when no prompt is open:
 | `Ctrl+k` | Select previous sidebar item |
 | `Ctrl+a` | Add a new `pi` agent chat to the selected workspace |
 | `Ctrl+x` | Add a new Claude Code agent chat to the selected workspace |
+| `Ctrl+o` | Add a new Codex agent chat to the selected workspace |
 | `Ctrl+t` | Add a new shell terminal to the selected workspace |
 | `Ctrl+n` | Open the file manager (`yazi` by default) in the selected workspace's root directory |
 | `Ctrl+s` | Open Yazi at the selected project's configured SFTP target; reuse its existing SFTP tab |
@@ -286,10 +288,12 @@ Example:
 {
   "pi_agent_command": "pi",
   "claude_code_command": "claude",
+  "codex_command": "codex {mult_codex_args}",
   "file_manager_command": "yazi",
   "editor_command": "",
   "auto_start_pi_agent": true,
   "auto_start_claude_code_agent": true,
+  "auto_start_codex_agent": true,
   "auto_start_terminals": true,
   "mouse_capture": true,
   "clipboard_osc52": true,
@@ -306,7 +310,7 @@ Example:
 }
 ```
 
-`pi_agent_command` and `claude_code_command` select the binary for each agent backend (`Ctrl+a` starts a `pi` chat, `Ctrl+x` a Claude Code chat); `auto_start_*` toggle whether the selected chat of that kind starts on focus. Both commands are launched through your login shell (`$SHELL -lc …`), so shell features — pipelines, `$VAR` expansion, globbing — work inside them. This is intentionally different from `MULT_AGENT_CMD` (below), which `mult` splits into arguments itself with no shell involved. `file_manager_command` and `editor_command` are the third and fourth of these: `Ctrl+n` and `Ctrl+e` run them through the same login shell, in the selected workspace's root directory. `editor_command` is empty by default, which means `mult` asks the environment instead — `$VISUAL`, then `$EDITOR`, then `vi` — so `Ctrl+e` opens whatever you already told your system your editor is. Set the key to pin one editor for `mult` regardless. A project's optional
+`pi_agent_command`, `claude_code_command` and `codex_command` select each agent backend (`Ctrl+a` starts a Pi chat, `Ctrl+x` a Claude Code chat, and `Ctrl+o` a Codex chat); `auto_start_*` toggle whether the selected chat of that kind starts on focus. All three commands are launched through your login shell (`$SHELL -lc …`), so shell features — pipelines, `$VAR` expansion, globbing — work inside them. This is intentionally different from `MULT_AGENT_CMD` (below), which `mult` splits into arguments itself with no shell involved. `file_manager_command` and `editor_command` also use this path: `Ctrl+n` and `Ctrl+e` run them through the same login shell, in the selected workspace's root directory. `editor_command` is empty by default, which means `mult` asks the environment instead — `$VISUAL`, then `$EDITOR`, then `vi` — so `Ctrl+e` opens whatever you already told your system your editor is. Set the key to pin one editor for `mult` regardless. A project's optional
 `sftp` is a Yazi VFS name such as `my-server`, or a complete `sftp://` URL;
 `Ctrl+s` opens `yazi sftp://my-server`. Each workspace keeps at most one of
 these SFTP panes, and another press focuses it instead of creating a duplicate.
@@ -317,10 +321,10 @@ A `projects` entry with a `remote` is opened on that machine instead of this
 one, and `path` is read on the far side (a leading `~` is the *remote* user's
 home). Terminals — the workspace's own shell, `Ctrl+t`, `Ctrl+n`, `Ctrl+s`,
 `Ctrl+e` and command terminals — are plain `ssh -t <remote> 'cd <path> && …'`, so they end
-with their pane like any terminal. The agent chat is not: `Ctrl+a`/`Ctrl+x` run it inside a `tmux` session named
+with their pane like any terminal. The agent chat is not: `Ctrl+a`/`Ctrl+x`/`Ctrl+o` run it inside a `tmux` session named
 after the project, created on first use and attached to afterwards, so closing
 `mult` detaches the agent rather than killing it. One session means one chat —
-pressing either key again navigates to the chat already there. The row still
+pressing any of these keys again navigates to the chat already there. The row still
 follows the agent's own title (`mult` turns `set-titles` on for that session),
 but the status dot does not move: the hooks that move it write into `mult`'s
 private runtime directory on this machine, so a remote chat runs without them.
@@ -328,6 +332,27 @@ See
 [docs/CONFIG.md](docs/CONFIG.md#remote--a-project-on-another-machine).
 
 The example above sets 3 of the 12 colorscheme keys. **[docs/CONFIG.md](docs/CONFIG.md) is the complete reference** — every top-level and colorscheme key with its type, default and effect, including `_nc` (the unfocused-pane background, written with a leading underscore).
+
+### Codex sidebar titles
+
+Press `Ctrl+o`, or choose **New Codex chat** from `Ctrl+p`. Codex runs its
+interactive CLI in the same persistent PTY as the other agents. The default
+command includes `{mult_codex_args}`, which `mult` replaces with Codex’s
+terminal-title settings and local status hooks. Use `/rename Fix parser` inside
+Codex to change the conversation name shown in the sidebar; its activity status
+updates alongside the name. Unnamed conversations show `codex` in place of
+their UUID. No RPC client or transcript scraping is needed.
+
+For a custom command, keep the placeholder where Codex should receive options:
+
+```json
+{ "codex_command": "codex {mult_codex_args} --model your-model" }
+```
+
+Codex’s `/hooks` browser lets you review and trust the generated status hooks.
+Until trusted, the sidebar title still updates, but the lifecycle dot stays
+idle. Remote chats get title settings without local status hooks. See
+[Codex configuration](docs/CONFIG.md#codex) for customization and requirements.
 
 ### Environment variables
 

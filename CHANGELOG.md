@@ -8,6 +8,26 @@ and the project aims to adhere to
 
 ## [Unreleased]
 
+### Codex agent chats and sidebar titles (E13)
+
+`Ctrl+o` and **New Codex chat** add a Codex chat, configured by `codex_command`
+and `auto_start_codex_agent`. The default command shows Codex’s conversation
+name and activity in the sidebar; `/rename` updates the name. Local lifecycle
+hooks update the status dot after review in Codex’s `/hooks` browser. Remote
+chats keep title updates and the existing tmux reconnect behavior.
+
+Unnamed Codex chats show `codex` instead of a session UUID, retaining their
+activity suffix until a name is set. The generated `Interrupt` hook requests
+Codex's supported three-second timeout, removing the startup clamping warning.
+
+The default command is `codex {mult_codex_args}`. Keep the placeholder when
+customizing it to receive title settings and local status hooks. Commands without
+it run unchanged with a configuration warning.
+
+State version 5 preserves existing chats and prevents older clients from
+misreading Codex chats. Protocol version 12 requires upgrading both binaries
+and restarting the daemon when existing sessions can be closed.
+
 ### Ordinary wheel scrolling in Codex's main view (B26)
 
 Codex reserves rows for its prompt and scrolls output in the region above it.

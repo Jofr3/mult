@@ -44,6 +44,8 @@ pub struct Config {
     pub pi_agent_command: String,
     #[serde(default = "default_claude_code_command")]
     pub claude_code_command: String,
+    #[serde(default = "default_codex_command")]
+    pub codex_command: String,
     /// The file manager `Ctrl+n` opens in the selected workspace's root
     /// directory. Run through the login shell, like the agent commands.
     #[serde(default = "default_file_manager_command")]
@@ -60,6 +62,8 @@ pub struct Config {
     pub auto_start_pi_agent: bool,
     #[serde(default = "default_auto_start_claude_code_agent")]
     pub auto_start_claude_code_agent: bool,
+    #[serde(default = "default_auto_start_codex_agent")]
+    pub auto_start_codex_agent: bool,
     #[serde(default = "default_auto_start_terminals")]
     pub auto_start_terminals: bool,
     #[serde(default = "default_mouse_capture")]
@@ -120,6 +124,9 @@ impl Config {
 
     /// Collects the value-level warnings for a config just read from `path`.
     fn collect_warnings(&mut self, path: &Path) {
+        let codex = self.codex_command.trim();
+        let codex_without_integration =
+            !codex.is_empty() && !codex.contains(CODEX_ARGS_PLACEHOLDER);
         let file = path.display();
         let mut warnings = Vec::new();
 
@@ -166,6 +173,11 @@ impl Config {
             }
         }
 
+        if codex_without_integration {
+            warnings.push(format!(
+                "{file}: codex_command has no {CODEX_ARGS_PLACEHOLDER} placeholder; running it unchanged without mult's Codex title settings or status hooks"
+            ));
+        }
         self.warnings = warnings;
     }
 }
@@ -178,10 +190,12 @@ impl PartialEq for Config {
     fn eq(&self, other: &Self) -> bool {
         self.pi_agent_command == other.pi_agent_command
             && self.claude_code_command == other.claude_code_command
+            && self.codex_command == other.codex_command
             && self.file_manager_command == other.file_manager_command
             && self.editor_command == other.editor_command
             && self.auto_start_pi_agent == other.auto_start_pi_agent
             && self.auto_start_claude_code_agent == other.auto_start_claude_code_agent
+            && self.auto_start_codex_agent == other.auto_start_codex_agent
             && self.auto_start_terminals == other.auto_start_terminals
             && self.mouse_capture == other.mouse_capture
             && self.clipboard_osc52 == other.clipboard_osc52
@@ -416,10 +430,12 @@ impl Default for Config {
         Self {
             pi_agent_command: default_pi_agent_command(),
             claude_code_command: default_claude_code_command(),
+            codex_command: default_codex_command(),
             file_manager_command: default_file_manager_command(),
             editor_command: default_editor_command(),
             auto_start_pi_agent: default_auto_start_pi_agent(),
             auto_start_claude_code_agent: default_auto_start_claude_code_agent(),
+            auto_start_codex_agent: default_auto_start_codex_agent(),
             auto_start_terminals: default_auto_start_terminals(),
             mouse_capture: default_mouse_capture(),
             clipboard_osc52: default_clipboard_osc52(),
@@ -744,6 +760,12 @@ fn default_claude_code_command() -> String {
     "claude".to_string()
 }
 
+pub(crate) const CODEX_ARGS_PLACEHOLDER: &str = "{mult_codex_args}";
+
+pub(crate) fn default_codex_command() -> String {
+    format!("codex {CODEX_ARGS_PLACEHOLDER}")
+}
+
 fn default_file_manager_command() -> String {
     "yazi".to_string()
 }
@@ -777,6 +799,10 @@ fn default_auto_start_pi_agent() -> bool {
 }
 
 fn default_auto_start_claude_code_agent() -> bool {
+    true
+}
+
+fn default_auto_start_codex_agent() -> bool {
     true
 }
 
@@ -988,6 +1014,36 @@ mod tests {
         assert_eq!(config.pi_agent_command, "pi");
         assert_eq!(config.claude_code_command, "claude --resume");
         assert!(config.auto_start_claude_code_agent);
+    }
+
+    #[test]
+    fn codex_config_loads_and_warns_when_integration_is_omitted() {
+        let path = unique_temp_file();
+        fs::write(
+            &path,
+            r#"{"codex_command":"codex --resume","auto_start_codex_agent":false}"#,
+        )
+        .unwrap();
+        let config = load_from_path(&path).unwrap();
+        assert_eq!(config.codex_command, "codex --resume");
+        assert!(!config.auto_start_codex_agent);
+        assert_eq!(config.warnings().len(), 1);
+        assert!(config.warnings()[0].contains("{mult_codex_args}"));
+        assert_ne!(config, Config::default());
+
+        fs::write(
+            &path,
+            r#"{"codex_command":"codex {mult_codex_args} --model test"}"#,
+        )
+        .unwrap();
+        let config = load_from_path(&path).unwrap();
+        assert!(config.auto_start_codex_agent);
+        assert!(config.warnings().is_empty());
+        assert_eq!(config.pi_agent_command, "pi");
+        assert_eq!(config.claude_code_command, "claude");
+        assert!(Config::default()
+            .codex_command
+            .contains(CODEX_ARGS_PLACEHOLDER));
     }
 
     #[test]

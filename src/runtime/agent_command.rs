@@ -1,7 +1,7 @@
 //! Building the shell command line that backs a chat, and generating the
 //! private runtime artifacts it points at.
 //!
-//! Both agent backends report status into the same per-chat journal `mult`
+//! All agent backends report status into the same per-chat journal `mult`
 //! polls, but through different mechanisms: pi loads a bundled extension
 //! (`-e`), Claude Code gets a generated hooks settings file (`--settings`).
 
@@ -14,7 +14,10 @@ use std::{
 
 use mult_protocol::{peer::effective_uid, shell::quote_argument};
 
-use crate::{config::Config, model::AgentKind};
+use crate::{
+    config::{default_codex_command, Config, CODEX_ARGS_PLACEHOLDER},
+    model::AgentKind,
+};
 
 use super::ensure_mult_runtime_dir;
 
@@ -24,20 +27,21 @@ pub(super) const MULT_CLAUDE_STATUS_SCRIPT_SOURCE: &str =
     include_str!("../../extensions/mult-claude-status.sh");
 
 /// Build the shell command line that backs a chat, chosen by its agent kind.
-/// Both backends report status into the same per-chat file that `mult` polls,
-/// but through different mechanisms: pi loads a bundled extension (`-e`), while
-/// Claude Code gets a generated hooks settings file (`--settings`).
+/// Pi loads a bundled extension (`-e`); Claude Code uses a generated hooks
+/// settings file (`--settings`); Codex receives session hook config overrides.
 pub(super) fn agent_command(config: &Config, agent: AgentKind) -> String {
     match agent {
         AgentKind::Pi => pi_command_with_mult_status_extension(config),
         AgentKind::ClaudeCode => claude_code_command_with_mult_status_hooks(config),
+        AgentKind::Codex => codex_command(config, true),
     }
 }
 
 /// The command a chat in a **remote** workspace runs, which is the configured
-/// agent command and nothing else.
+/// agent command without local status artifacts. Codex also receives title
+/// options at its explicit placeholder, since those refer to no local paths.
 ///
-/// Neither backend's status plumbing can cross the connection: pi's `-e`
+/// None of the backends' status plumbing can cross the connection: pi's `-e`
 /// extension and Claude Code's `--settings` hooks are files written into
 /// `mult`'s private runtime directory *here*, and the hooks report by writing
 /// into a journal *here* too. Passing those paths to an agent over there would
@@ -49,7 +53,78 @@ pub(super) fn remote_agent_command(config: &Config, agent: AgentKind) -> String 
     match agent {
         AgentKind::Pi => pi_command(config),
         AgentKind::ClaudeCode => claude_code_command(config),
+        AgentKind::Codex => codex_command(config, false),
     }
+}
+
+/// Codex emits OSC titles itself. Include its thread name (updated by /rename)
+/// and activity status instead of the default, which only names the project.
+/// Remote chats get this option too: it references no local files.
+const CODEX_TITLE_CONFIG: &str = r#"tui.terminal_title=["thread","status"]"#;
+
+fn codex_command(config: &Config, local: bool) -> String {
+    let configured = config.codex_command.trim();
+    let command = if configured.is_empty() {
+        default_codex_command()
+    } else {
+        configured.to_string()
+    };
+    if !command.contains(CODEX_ARGS_PLACEHOLDER) {
+        // A configured command is an arbitrary shell expression. Only put
+        // options where its author explicitly reserved a place for them.
+        return command;
+    }
+
+    let mut args = vec!["-c".to_string(), CODEX_TITLE_CONFIG.to_string()];
+    if local {
+        if let Some(script) = ensure_mult_runtime_dir().ok().and_then(|dir| {
+            write_private_runtime_file(
+                &dir,
+                "mult-codex-status",
+                "sh",
+                MULT_CLAUDE_STATUS_SCRIPT_SOURCE.as_bytes(),
+            )
+        }) {
+            args.extend(codex_status_args(&script));
+        }
+    }
+    let args = args
+        .iter()
+        .map(|arg| quote_argument(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    command.replace(CODEX_ARGS_PLACEHOLDER, &args)
+}
+
+/// Session flags add hooks without editing the user's Codex configuration.
+/// Codex still requires its normal /hooks trust review. Never bypass it.
+fn codex_status_args(script: &Path) -> Vec<String> {
+    let script = quote_argument(&script.display().to_string());
+    let mut args = Vec::new();
+    for (event, status) in [
+        ("SessionStart", "idle"),
+        ("UserPromptSubmit", "running"),
+        ("PreToolUse", "running"),
+        ("PermissionRequest", "waiting"),
+        ("PostToolUse", "running"),
+        ("Stop", "finished"),
+        ("Interrupt", "idle"),
+    ] {
+        // The shared writer emits nothing. Codex's Stop hook accepts JSON;
+        // an empty object is also a no-op for all the other lifecycle hooks.
+        let command = format!("sh {script} {status}; printf '{{}}\\n'");
+        // JSON string escaping is compatible with TOML basic strings for
+        // this command. Quote the entire override for the login shell later.
+        let command = serde_json::to_string(&command).expect("serialize hook command");
+        // Codex clamps Interrupt to at most three seconds and warns at startup
+        // if we request more. Other events retain the five-second budget.
+        let timeout = if event == "Interrupt" { 3 } else { 5 };
+        args.push("-c".to_string());
+        args.push(format!(
+            "hooks.{event}=[{{hooks=[{{type=\"command\",command={command},timeout={timeout}}}]}}]"
+        ));
+    }
+    args
 }
 
 fn pi_command(config: &Config) -> String {
@@ -284,6 +359,115 @@ mod tests {
 
     use super::*;
     use crate::runtime::test_support::*;
+
+    #[test]
+    fn codex_options_are_inserted_at_the_placeholder_and_shell_quoted() {
+        let config = config_with(|config| {
+            config.codex_command = "printf '%s\\0' {mult_codex_args}; printf tail".into();
+        });
+        let output = std::process::Command::new("sh")
+            .args(["-c", &agent_command(&config, AgentKind::Codex)])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let args = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .map(|arg| std::str::from_utf8(arg).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(&args[..2], &["-c", CODEX_TITLE_CONFIG]);
+        assert!(args
+            .iter()
+            .any(|arg| arg.starts_with("hooks.UserPromptSubmit=")));
+        assert_eq!(args.last(), Some(&"tail"));
+        assert!(!args.iter().any(|arg| arg.contains("bypass")));
+
+        let plain = config_with(|config| config.codex_command = "codex | cat".into());
+        assert_eq!(agent_command(&plain, AgentKind::Codex), "codex | cat");
+        assert_eq!(
+            remote_agent_command(&plain, AgentKind::Codex),
+            "codex | cat"
+        );
+        let blank = config_with(|config| config.codex_command = "  ".into());
+        assert_eq!(
+            agent_command(&blank, AgentKind::Codex),
+            agent_command(&Config::default(), AgentKind::Codex)
+        );
+    }
+
+    #[test]
+    fn codex_hooks_append_lifecycle_records_and_return_empty_json() {
+        use std::{
+            os::unix::fs::PermissionsExt,
+            process::{Command, Stdio},
+        };
+        let dir = unique_status_path("codex-hooks").with_extension("dir");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        // Exercise both TOML-string and shell quoting of a real hook path.
+        let script = dir.join("status ' $literal \\\".sh");
+        fs::write(&script, MULT_CLAUDE_STATUS_SCRIPT_SOURCE).unwrap();
+        let journal = dir.join("status.jsonl");
+        fs::write(&journal, "").unwrap();
+        let args = codex_status_args(&script);
+        for pair in args.chunks_exact(2) {
+            let (encoded, timeout) = pair[1]
+                .split_once("command=")
+                .unwrap()
+                .1
+                .rsplit_once(",timeout=")
+                .unwrap();
+            let timeout: u64 = timeout.strip_suffix("}]}]").unwrap().parse().unwrap();
+            let limit = if pair[1].starts_with("hooks.Interrupt=") {
+                3
+            } else {
+                5
+            };
+            assert!(
+                (1..=limit).contains(&timeout),
+                "hook timeout exceeds Codex's limit: {}",
+                pair[1]
+            );
+            let command: String = serde_json::from_str(encoded).unwrap();
+            let output = Command::new("sh")
+                .args(["-c", &command])
+                .env("MULT_AGENT_STATUS_PATH", &journal)
+                .env("MULT_AGENT_STATUS_VERSION", "1")
+                .env("MULT_AGENT_NAMESPACE", "11111111111111111111111111111111")
+                .env(
+                    "MULT_AGENT_SESSION_TOKEN",
+                    "22222222222222222222222222222222",
+                )
+                .env("MULT_AGENT_CHAT_ID", "7")
+                .env("MULT_AGENT_KIND", "codex")
+                .env("MULT_AGENT_GENERATION", "33333333333333333333333333333333")
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"{}\n");
+            assert!(output.stderr.is_empty());
+        }
+        let records = fs::read_to_string(&journal)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let statuses = records
+            .iter()
+            .map(|record| record["status"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            ["idle", "running", "running", "waiting", "running", "finished", "idle"]
+        );
+        for record in records {
+            assert_eq!(record["agentKind"], "codex");
+            assert_eq!(record["chatId"], "7");
+            assert_eq!(record["generation"], "33333333333333333333333333333333");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     /// S5: a second `mult` writing the same runtime artifact must not stall
     /// this one's render loop. The lock is taken non-blocking with a bounded

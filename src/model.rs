@@ -20,7 +20,9 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 /// machine, in whatever directory it happened to start in, rather than on the
 /// machine the user chose. Under version 4 it declines to load the file at all
 /// and leaves the bytes untouched. See `storage::migrate_v3_to_v4`.
-pub const STATE_VERSION: u32 = 4;
+/// Version 5 adds Codex chats. Older clients must refuse the file before
+/// decoding the new agent variant as corrupt and resetting the project.
+pub const STATE_VERSION: u32 = 5;
 pub const DEFAULT_AGENT_CHAT_TITLE: &str = "agent";
 /// Upper bound on the text of a single persisted [`ChatMessage`].
 ///
@@ -282,6 +284,7 @@ pub enum AgentKind {
     #[default]
     Pi,
     ClaudeCode,
+    Codex,
 }
 
 impl AgentKind {
@@ -291,6 +294,7 @@ impl AgentKind {
         match self {
             Self::Pi => "pi",
             Self::ClaudeCode => "cc",
+            Self::Codex => "codex",
         }
     }
 
@@ -299,6 +303,7 @@ impl AgentKind {
         match self {
             Self::Pi => "pi",
             Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
         }
     }
 
@@ -310,6 +315,7 @@ impl AgentKind {
         match self {
             Self::Pi => ("pi_agent_command", "auto_start_pi_agent"),
             Self::ClaudeCode => ("claude_code_command", "auto_start_claude_code_agent"),
+            Self::Codex => ("codex_command", "auto_start_codex_agent"),
         }
     }
 }

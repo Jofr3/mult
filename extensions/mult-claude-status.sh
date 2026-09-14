@@ -1,12 +1,12 @@
 #!/bin/sh
-# mult <-> Claude Code generation-scoped status bridge.
+# mult <-> Claude Code / Codex generation-scoped status bridge.
 #
 # mult creates an owner-private append-only journal and exports the complete
 # durable session identity. This hook appends one bounded lifecycle transition;
 # the TUI validates every field and the daemon remains authoritative.
 set -u
 
-# Claude Code delivers hook JSON on stdin. Status boundaries come from the
+# Both agents deliver hook JSON on stdin. Status boundaries come from the
 # configured hook event, not from arbitrary PTY bytes, so the body is drained
 # and deliberately ignored.
 cat >/dev/null 2>&1 || true

@@ -29,7 +29,7 @@ contributor-facing version is in [../AGENTS.md](../AGENTS.md) and
 [../CONTRIBUTING.md](../CONTRIBUTING.md).
 
 1. **Command execution semantics are deliberate and differ per path.**
-   `pi_agent_command`, `claude_code_command` and `TerminalLaunch::Command` are
+   `pi_agent_command`, `claude_code_command`, `codex_command` and `TerminalLaunch::Command` are
    run through the login shell (`$SHELL -lc`) and are shell-evaluated on
    purpose. `MULT_AGENT_CMD` is split into argv with no shell. Do not unify
    them.

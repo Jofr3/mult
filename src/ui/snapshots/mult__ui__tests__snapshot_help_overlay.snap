@@ -6,14 +6,14 @@ size: 100x40
 
 symbols:
 | ▣ mult                           Terminal is stopped. Type to start it and send input.             |
-|   $ terminal                                                                                       |
-|      ┌──────────────────────────────────────────────────────────────────────────────────────┐      |
-| ▣ web│Keybindings                                                                           │      |
-|   $ t│                                                                                      │      |
-|      │Global                                                                                │      |
+|   $ t┌──────────────────────────────────────────────────────────────────────────────────────┐      |
+|      │Keybindings                                                                           │      |
+| ▣ web│                                                                                      │      |
+|   $ t│Global                                                                                │      |
 |      │? or F1                    Show keybindings                                           │      |
 |      │Ctrl+a                     New pi agent chat                                          │      |
 |      │Ctrl+x                     New Claude Code chat                                       │      |
+|      │Ctrl+o                     New Codex chat                                             │      |
 |      │Ctrl+t                     New shell terminal                                         │      |
 |      │Ctrl+n                     Open file manager                                          │      |
 |      │Ctrl+s                     Open SFTP                                                  │      |
@@ -48,11 +48,11 @@ symbols:
 
 styles:
 |abbccccaaaaaaaaaaaaaaaaaaaaaaaaaaadddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
-|eeeffeeeeeeeeeeeeeeeeeeeeeeeeeeeeedddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd|
-|aaaaaaggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggdddddd|
-|abbcccghhhhhhhhhhhdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddgdddddd|
-|aaaiiagddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddgdddddd|
-|aaaaaagjjjjjjddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddgdddddd|
+|eeeffeggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggdddddd|
+|aaaaaaghhhhhhhhhhhdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddgdddddd|
+|abbcccgddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddgdddddd|
+|aaaiiagjjjjjjddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddgdddddd|
+|aaaaaagkkkkkkkkkkkkkkkkkkkkkkkkkdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddgdddddd|
 |aaaaaagkkkkkkkkkkkkkkkkkkkkkkkkkdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddgdddddd|
 |aaaaaagkkkkkkkkkkkkkkkkkkkkkkkkkdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddgdddddd|
 |aaaaaagkkkkkkkkkkkkkkkkkkkkkkkkkdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddgdddddd|

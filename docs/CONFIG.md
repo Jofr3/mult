@@ -26,7 +26,7 @@ directory. A **missing** file is not an error — `mult` starts on the built-in
 defaults, so the whole file is optional.
 
 The file also has to pass an ownership check before a byte of it is read, for a
-sharper reason than state has: `pi_agent_command` and `claude_code_command` are
+sharper reason than state has: `pi_agent_command`, `claude_code_command` and `codex_command` are
 handed to `$SHELL -lc` and auto-started by default, so whoever controls those
 bytes runs code as you without a keystroke — and both environment variables
 above steer the path there. A config is read only when:
@@ -74,9 +74,9 @@ Parse errors name the file and the position, and the accepted keys are listed:
 
 ```
 mult: config error at /home/you/.config/mult/config.json:2:23: unknown field
-`auto_start_terminal`, expected one of `pi_agent_command`, `claude_code_command`,
+`auto_start_terminal`, expected one of `pi_agent_command`, `claude_code_command`, `codex_command`,
 `file_manager_command`, `editor_command`, `auto_start_pi_agent`,
-`auto_start_claude_code_agent`, `auto_start_terminals`, `mouse_capture`,
+`auto_start_claude_code_agent`, `auto_start_codex_agent`, `auto_start_terminals`, `mouse_capture`,
 `clipboard_osc52`, `projects`, `colorscheme`
 ```
 
@@ -106,15 +106,53 @@ default below.
 | --- | --- | --- | --- |
 | `pi_agent_command` | string | `"pi"` | The command run for a `pi` agent chat (`Ctrl+a`). Executed as `$SHELL -lc "<command>"`, so pipelines, `$VAR` expansion, globbing and aliases from your login shell all apply. |
 | `claude_code_command` | string | `"claude"` | The command run for a Claude Code agent chat (`Ctrl+x`). Also executed through `$SHELL -lc`. |
+| `codex_command` | string | `"codex {mult_codex_args}"` | The Codex chat command (`Ctrl+o`), run through the login shell. The placeholder inserts title settings and local status hooks; see below. |
 | `file_manager_command` | string | `"yazi"` | The command run by **Open file manager** (`Ctrl+n`), in the selected workspace's root directory. Also executed through `$SHELL -lc`. The workspace keeps one file manager pane: `Ctrl+n` reuses the terminal whose command matches this key before adding another. |
 | `editor_command` | string | `""` | The command run by **Open editor** (`Ctrl+e`), in the selected workspace's root directory. Also executed through `$SHELL -lc`. Empty means "this user's editor": `$VISUAL`, then `$EDITOR`, then `vi` — a variable that is set but blank counts as unset. Like the file manager, the workspace keeps one editor pane: `Ctrl+e` reuses the terminal whose command matches the resolved editor before adding another. |
 | `auto_start_pi_agent` | bool | `true` | Whether selecting a `pi` chat starts its PTY immediately. With `false` the chat stays idle until you type into it or run **Start selected PTY**. |
 | `auto_start_claude_code_agent` | bool | `true` | The same, for Claude Code chats. |
+| `auto_start_codex_agent` | bool | `true` | Whether selecting a Codex chat starts its PTY. |
 | `auto_start_terminals` | bool | `true` | Whether selecting a terminal starts it. This governs *shell* terminals; a persisted **command** terminal is never relaunched during restoration regardless of this setting — see [Command terminals are not auto-relaunched](TROUBLESHOOTING.md#a-pane-says-the-session-is-unavailable-after-restarting-the-daemon). |
 | `mouse_capture` | bool | `true` | Whether `mult` puts the terminal into mouse-reporting mode at startup. `false` gives your emulator's native selection and scrollback back, at the cost of wheel scrolling, drag-selection and OSC 52 copy inside `mult`. |
 | `clipboard_osc52` | bool | `true` | Whether a copied selection is written to the host terminal as an OSC 52 "set clipboard" escape. `false` stops `mult` from ever emitting one: drag-selection still highlights and `Ctrl+Shift+C` is still consumed, but nothing leaves for the clipboard. The escape carries the selected text to whatever is on the far end of the terminal — an SSH client, a multiplexer, an emulator that logs sequences — which is not always where pane contents should go. |
 | `projects` | array | `[]` | Shortcuts offered by the **Open workspace** prompt (`Ctrl+f`), each optionally naming a machine to open it on. See below. |
 | `colorscheme` | object | Rosé Pine Moon | Twelve colours. See below. |
+
+### Codex
+
+Codex chats require the `codex` CLI on the machine where the chat runs. Title
+settings and session hook flags were verified with Codex 0.154.0. The default
+`codex {mult_codex_args}` expands to title options and, locally, lifecycle hooks.
+No Codex config file is edited, and existing user/project hooks remain loaded.
+Review and trust the generated hooks in Codex’s `/hooks` browser; new or changed
+hooks remain disabled until trusted. If Codex hooks are disabled by configuration,
+its lifecycle dot remains idle. The title works independently of hook trust.
+
+The title uses `tui.terminal_title=["thread","status"]`: the conversation name
+and current activity. Before a conversation has a name, `mult` displays `codex`
+in place of Codex's UUID, keeping the activity suffix. `/rename Fix parser`
+changes the name. To choose another title format, put a later Codex override
+after the placeholder:
+
+```json
+{
+  "codex_command": "codex {mult_codex_args} -c 'tui.terminal_title=[\"thread\"]'",
+  "auto_start_codex_agent": true
+}
+```
+
+Keep `{mult_codex_args}` unquoted at the argument position in custom shell
+commands. Without it, the command runs unchanged and `mult` warns that its title
+settings and hooks were omitted. An empty command uses the built-in default.
+Remote chats replace the placeholder with only the title options, since the
+status script and journal live on the local machine.
+
+The hooks report idle at session start/interruption, running on prompt submission
+and tool use, waiting for permission, and finished at the end of a turn. This is
+lifecycle status, not a stored chat transcript.
+
+References: [Codex title settings](https://learn.chatgpt.com/docs/config-file/config-sample)
+and [Codex lifecycle hooks](https://learn.chatgpt.com/docs/hooks).
 
 ### `projects`
 
@@ -235,22 +273,23 @@ nothing.
 to what `tmux` accepts, since `.` and `:` are its own separators, so `docs.site`
 opens `docs-site` — and a remote workspace holds exactly one agent chat on it. A
 second chat would attach to the same session, which means the same agent shown
-twice with its own command silently dropped. So `Ctrl+a` and `Ctrl+x` in a
+twice with its own command silently dropped. So `Ctrl+a`, `Ctrl+x` and `Ctrl+o` in a
 remote workspace that already has a chat **navigate to it** rather than adding
-another; whichever of the two you press, you land on the chat that is there.
+another; whichever you press, you land on the chat that is there.
 (The name is settled when the workspace is created and stored with it, so
 renaming the project later does not orphan the session.)
 
 Two consequences worth knowing:
 
 - **The status dot does not move for a remote chat**, though the row label
-  does. Both backends report
+  does. All backends report
   status through files `mult` writes into its private runtime directory *here* —
-  pi's `-e` extension, Claude Code's `--settings` hooks — and an agent on
+  pi's `-e` extension, Claude Code's `--settings` hooks and Codex's session hooks — and an agent on
   another machine cannot read or write them. A remote chat therefore runs the
   plain `pi_agent_command` / `claude_code_command`, with no `-e` and no
   `--settings`, and stays showing idle however busy it is. The pane shows
-  everything the agent prints, which is what the chat is for.
+  everything the agent prints, which is what the chat is for. Codex keeps
+  its title options, but omits the local hook options.
 - **A second `mult` attaching to the same session** sees the same agent — that
   is `tmux`, and it is usually what you want. It also means the same chat opened
   on two machines shares one conversation.

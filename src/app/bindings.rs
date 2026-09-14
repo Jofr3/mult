@@ -12,6 +12,7 @@ pub enum CommandAction {
     StartInput,
     AddAgentChat,
     AddClaudeCodeChat,
+    AddCodexChat,
     AddShellTerminal,
     AddCommandTerminal,
     OpenFileManager,
@@ -169,6 +170,13 @@ pub const BINDINGS: &[BindingEntry] = &[
         "New Claude Code chat",
         "add a Claude Code agent chat to the selected workspace",
         Some(CommandAction::AddClaudeCodeChat),
+        BindingAvailability::SelectedWorkspace,
+    ),
+    BindingEntry::global(
+        Some("Ctrl+o"),
+        "New Codex chat",
+        "add a Codex agent chat to the selected workspace",
+        Some(CommandAction::AddCodexChat),
         BindingAvailability::SelectedWorkspace,
     ),
     BindingEntry::global(

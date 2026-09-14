@@ -172,6 +172,23 @@ before durable state is mutated, and a refused stop leaves the item in place wit
 why. Do not re-add the prompt without asking; if the concern resurfaces, an undo buffer (E3's other
 option) is the open avenue.
 
+### E13 — Codex agent chats and sidebar titles
+
+**Status: done.** Add Codex alongside Pi and Claude Code (`Ctrl+o` and the
+command palette), with its own command/auto-start config. Codex’s terminal title
+shows thread name and activity, following `/rename` through the existing OSC
+sidebar path. Session hooks report lifecycle status after Codex’s normal trust
+review; remote launches carry title options only. Explicit command placeholders
+preserve arbitrary shell expressions. State v5 migrates v1–v4; protocol v12 adds
+the agent kind. Regression coverage includes titles, hook execution/quoting,
+configuration, remote launch, chat creation and persistence.
+
+**Startup follow-up:** unnamed Codex threads emitted a UUID that filled the
+sidebar, and the generated five-second `Interrupt` timeout produced a clamping
+warning. The sidebar substitutes `codex` for the UUID while preserving activity
+and named titles; `Interrupt` now requests three seconds. Regressions cover the
+observed Codex 0.154.0 title format and the event-specific timeout limit.
+
 ## F. Architecture
 
 | ID | Sev | Where | Item | Status |

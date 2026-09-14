@@ -210,6 +210,7 @@ fn wire_agent_kind(agent: AgentKind) -> WireAgentKind {
     match agent {
         AgentKind::Pi => WireAgentKind::Pi,
         AgentKind::ClaudeCode => WireAgentKind::ClaudeCode,
+        AgentKind::Codex => WireAgentKind::Codex,
     }
 }
 
@@ -426,6 +427,7 @@ pub(super) fn agent_status_kind(agent: AgentKind) -> &'static str {
     match agent {
         AgentKind::Pi => "pi",
         AgentKind::ClaudeCode => "claude_code",
+        AgentKind::Codex => "codex",
     }
 }
 

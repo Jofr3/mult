@@ -227,6 +227,10 @@ fn handle_control_key(
         app.add_terminal_to_selected_workspace();
         return true;
     }
+    if is_unshifted_control_char(key, 'o') {
+        add_agent_to_selected_workspace(app, pty_runtime, config, store, layout, AgentKind::Codex);
+        return true;
+    }
     if is_unshifted_control_char(key, 'f') {
         app.begin_open_workspace(&config.projects);
         return true;
@@ -525,6 +529,33 @@ mod tests {
             app.project.workspaces[0].chats[0].agent,
             AgentKind::ClaudeCode
         );
+        let chat = app.project.workspaces[0].chats[0].id;
+        assert_eq!(app.selected_item(), Some(NavItem::Chat { workspace, chat }));
+    }
+
+    #[test]
+    fn ctrl_o_adds_a_codex_agent_chat() {
+        let store = test_state_store("ctrl-o-adds-a-codex-agent-chat");
+        let mut app = App::default();
+        let mut pty_runtime = PtyRuntime::new_offline();
+        let config = Config::default();
+        let layout = AppLayout::compute(&app, Rect::new(0, 0, 120, 40));
+        let workspace = app.project.workspaces[0].id;
+        assert!(app.project.workspaces[0].chats.is_empty());
+
+        handle_unprompted_key(
+            &mut app,
+            &mut pty_runtime,
+            &config,
+            &store,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            layout,
+        );
+
+        // Ctrl+o adds and selects a chat backed by Codex, distinct from
+        // the pi chat that Ctrl+a creates.
+        assert_eq!(app.project.workspaces[0].chats.len(), 1);
+        assert_eq!(app.project.workspaces[0].chats[0].agent, AgentKind::Codex);
         let chat = app.project.workspaces[0].chats[0].id;
         assert_eq!(app.selected_item(), Some(NavItem::Chat { workspace, chat }));
     }
