@@ -8,6 +8,25 @@ and the project aims to adhere to
 
 ## [Unreleased]
 
+### Ordinary wheel scrolling in Codex's main view (B26)
+
+Codex reserves rows for its prompt and scrolls output in the region above it.
+The terminal emulator discarded lines from that region because it only saved
+history when the scrolling region occupied the entire screen. This left no
+history for `mult`'s wheel handler, even with alternate-screen mode disabled.
+The bundled emulator patch now retains lines scrolled off the top of the main
+screen while preserving the fixed prompt. Scrolling regions below the top and
+the alternate screen still produce no terminal history.
+
+### Wheel scrolling in Codex's transcript viewer (B25)
+
+Codex's transcript viewer requests xterm alternate scroll (DECSET 1007), which
+turns wheel notches into cursor keys without enabling mouse reporting. `mult`
+ignored that request and tried to scroll the alternate screen's empty
+scrollback buffer. It now sends Up/Down keys while that mode and the alternate
+screen are active, honours application cursor-key mode, and gives explicit
+mouse reporting precedence. Shift still bypasses application scrolling.
+
 ### Reattaching to a busy agent no longer times out (B24)
 
 Reopening `mult` after closing its terminal window could leave an agent chat

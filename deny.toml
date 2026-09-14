@@ -30,6 +30,6 @@ multiple-versions = "warn"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# The default crates.io registry. fnug-vt100 is a published crates.io crate, so
-# no extra source allowance is needed for the vt100 fork.
+# The default crates.io registry. The patched fnug-vt100 copy is a local path
+# dependency with its original MIT license in vendor/fnug-vt100.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

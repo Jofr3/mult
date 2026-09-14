@@ -12,6 +12,7 @@ repository.workspace = true
 [workspace]
 members = ["crates/protocol"]
 default-members = [".", "crates/protocol"]
+exclude = ["vendor/fnug-vt100"]
 
 # The single source of the release version. `crates/protocol` inherits it, so a
 # release touches one literal here plus `flake.nix` and
@@ -50,7 +51,8 @@ signal-hook = "0.3"
 tui-term = { version = "0.3.4", default-features = false }
 # Fork of vt100 0.15 with deep visible scrollback support; keep tui-term's
 # vt100 feature disabled and render through the local adapter in src/ui.rs.
-vt100 = { package = "fnug-vt100", version = "0.15.2" }
+# Local B26 fix retains top-anchored scroll regions used by Codex's prompt.
+vt100 = { package = "fnug-vt100", version = "0.15.2", path = "vendor/fnug-vt100" }
 
 [dev-dependencies]
 # Full-buffer render snapshots for the TUI (see `src/ui.rs` tests).

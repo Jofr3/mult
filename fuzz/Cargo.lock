@@ -430,8 +430,6 @@ checksum = "0ce7134b9999ecaf8bcd65542e436736ef32ddca1b3e06094cb6ec5755203b80"
 [[package]]
 name = "fnug-vt100"
 version = "0.15.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d8e1ff93e609cab5bc741da6d70204fd612b72c53dd829e4fe88e8d628aebd3"
 dependencies = [
  "itoa",
  "log",

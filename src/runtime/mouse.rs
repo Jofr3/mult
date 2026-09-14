@@ -368,6 +368,17 @@ fn scroll_output_at_mouse(
         return false;
     };
 
+    if !mouse.modifiers.contains(KeyModifiers::SHIFT)
+        && pty_runtime.forward_alternate_scroll(
+            terminal,
+            matches!(direction, ScrollDirection::Up),
+            MOUSE_SCROLL_ROWS,
+        )
+    {
+        app.clear_text_selection();
+        return true;
+    }
+
     match direction {
         ScrollDirection::Up => {
             scroll_terminal_output_up(app, pty_runtime, terminal, MOUSE_SCROLL_ROWS)
@@ -577,8 +588,9 @@ mod tests {
                 .resize(terminal, screen)
                 .expect("size the pane's screen");
             pty_runtime.process_terminal_output(terminal, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
-            // The program turns on SGR mouse reporting: from here the pointer is
-            // its input, as far as the mode it asked for reaches.
+            // Feed modes through the replay path as well: reopening the client
+            // must restore the program's input modes without answering old
+            // terminal queries.
             pty_runtime.process_terminal_output(terminal, modes);
 
             let (_, output_area) = layout
@@ -636,6 +648,141 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    #[test]
+    fn wheel_scrolls_inline_history_above_a_fixed_prompt_without_a_shortcut() {
+        let mut session = GrabbedMouseSession::with_mouse_modes(
+            "wheel-scrolls-inline-history",
+            PtyDimensions { rows: 6, cols: 12 },
+            b"\x1b[2J\x1b[5;1HPROMPT\x1b[6;1HSTATUS\x1b[1;4r\x1b[Hone\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven",
+        );
+        let area = session.output_area;
+        assert_eq!(
+            session.pty_runtime.terminal_lines(session.terminal),
+            ["four", "five", "six", "seven", "PROMPT", "STATUS"],
+        );
+        session.mouse(MouseEventKind::ScrollUp, area.x, area.y, KeyModifiers::NONE);
+        assert_eq!(session.scrollback(), 3);
+        assert_eq!(
+            session.pty_runtime.terminal_lines(session.terminal),
+            ["one", "two", "three", "four", "five", "six"],
+        );
+        session.mouse(
+            MouseEventKind::ScrollDown,
+            area.x,
+            area.y,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(session.scrollback(), 0);
+        assert_eq!(
+            session.pty_runtime.terminal_lines(session.terminal),
+            ["four", "five", "six", "seven", "PROMPT", "STATUS"],
+        );
+        assert!(
+            session.recorded_input().is_empty(),
+            "ordinary scrolling sends no keys"
+        );
+    }
+
+    #[test]
+    fn alternate_scroll_delivers_cursor_keys_in_both_directions() {
+        for (label, modes, up, down) in [
+            (
+                "alternate-scroll-csi",
+                &b"\x1b[?1049h\x1b[?1007h\x1b[6n"[..],
+                &b"\x1b[A"[..],
+                &b"\x1b[B"[..],
+            ),
+            (
+                "alternate-scroll-ss3",
+                &b"\x1b[?1049h\x1b[?1007;1h"[..],
+                &b"\x1bOA"[..],
+                &b"\x1bOB"[..],
+            ),
+        ] {
+            let mut session = GrabbedMouseSession::with_mouse_modes(
+                label,
+                PtyDimensions { rows: 2, cols: 8 },
+                modes,
+            );
+            let area = session.output_area;
+            assert!(!session.pty_runtime.terminal_reports_mouse(session.terminal));
+            for kind in [MouseEventKind::ScrollUp, MouseEventKind::ScrollDown] {
+                session.mouse(kind, area.x, area.y, KeyModifiers::NONE);
+            }
+            assert_eq!(session.scrollback(), 0);
+            assert_eq!(session.recorded_input(), vec![up.repeat(3), down.repeat(3)]);
+        }
+    }
+
+    #[test]
+    fn alternate_scroll_requires_the_mode_and_alternate_screen() {
+        for (label, modes, expected_scrollback) in [
+            ("alternate-scroll-default", &b""[..], 3),
+            ("alternate-scroll-normal-screen", &b"\x1b[?1007h"[..], 3),
+            ("alternate-scroll-no-mode", &b"\x1b[?1049h"[..], 0),
+            (
+                "alternate-scroll-reset",
+                &b"\x1b[?1049h\x1b[?1007h\x1b[?1007l"[..],
+                0,
+            ),
+            (
+                "alternate-scroll-exit-screen",
+                &b"\x1b[?1049h\x1b[?1007h\x1b[?1049l"[..],
+                3,
+            ),
+            (
+                "alternate-scroll-terminal-reset",
+                &b"\x1b[?1007h\x1bc\x1b[?1049h"[..],
+                0,
+            ),
+        ] {
+            let mut session = GrabbedMouseSession::with_mouse_modes(
+                label,
+                PtyDimensions { rows: 2, cols: 8 },
+                modes,
+            );
+            let area = session.output_area;
+            session.mouse(MouseEventKind::ScrollUp, area.x, area.y, KeyModifiers::NONE);
+            assert_eq!(session.scrollback(), expected_scrollback, "{label}");
+            assert!(session.recorded_input().is_empty(), "{label}");
+        }
+    }
+
+    #[test]
+    fn alternate_scroll_respects_shift_and_pointer_location() {
+        let mut session = GrabbedMouseSession::with_mouse_modes(
+            "alternate-scroll-pointer-override",
+            PtyDimensions { rows: 2, cols: 8 },
+            b"\x1b[?1049h\x1b[?1007h",
+        );
+        let area = session.output_area;
+        session.mouse(
+            MouseEventKind::ScrollUp,
+            area.x,
+            area.y,
+            KeyModifiers::SHIFT,
+        );
+        session.mouse(MouseEventKind::ScrollUp, 0, 0, KeyModifiers::NONE);
+        assert!(session.recorded_input().is_empty());
+    }
+
+    #[test]
+    fn mouse_reporting_takes_precedence_over_alternate_scroll() {
+        let mut session = GrabbedMouseSession::with_mouse_modes(
+            "alternate-scroll-mouse-reporting",
+            PtyDimensions { rows: 24, cols: 80 },
+            b"\x1b[?1049h\x1b[?1007;1000;1006h",
+        );
+        let area = session.output_area;
+        for kind in [MouseEventKind::ScrollUp, MouseEventKind::ScrollDown] {
+            session.mouse(kind, area.x, area.y, KeyModifiers::NONE);
+        }
+        assert_eq!(
+            session.recorded_input(),
+            vec![b"\x1b[<64;1;1M".to_vec(), b"\x1b[<65;1;1M".to_vec()],
+        );
     }
 
     #[test]

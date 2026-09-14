@@ -501,6 +501,8 @@ const TERMINAL_MAX_TRACKED_COMMAND_BYTES: usize = 512;
 /// DECSET parameter for focus reporting: the program asks to be told when the
 /// terminal window gains (`CSI I`) or loses (`CSI O`) focus.
 const FOCUS_REPORTING_MODE: usize = 1004;
+/// Convert wheel notches to cursor keys while using the alternate screen.
+const ALTERNATE_SCROLL_MODE: usize = 1007;
 const FOCUS_IN_REPORT: &[u8] = b"\x1b[I";
 const FOCUS_OUT_REPORT: &[u8] = b"\x1b[O";
 /// xterm mouse button bits. The low two bits number the button, bit 5 marks a
@@ -607,6 +609,8 @@ struct TerminalResponseDetector {
     /// here because `vt100` does not model the mode, and this detector is
     /// already scanning every escape sequence the program emits.
     focus_reporting: bool,
+    /// xterm alternate scroll (DECSET 1007), also absent from `vt100`.
+    alternate_scroll: bool,
     /// Parameter and intermediate bytes of the CSI sequence being scanned.
     ///
     /// Held here rather than inside [`TerminalResponseState::Csi`] so entering
@@ -623,6 +627,7 @@ impl Default for TerminalResponseDetector {
         Self {
             state: TerminalResponseState::default(),
             focus_reporting: false,
+            alternate_scroll: false,
             csi: [0; TERMINAL_MAX_CSI_SEQUENCE_BYTES],
             csi_len: 0,
         }
@@ -1018,23 +1023,16 @@ impl PtyRuntime {
             let parser = entry
                 .parser
                 .get_or_insert_with(|| Parser::new(24, 80, TERMINAL_SCROLLBACK_LINES));
-            let response = if respond {
-                let responder = entry.responder.get_or_insert_with(Default::default);
-                feed_parser_with_responder(parser, responder, bytes)
-            } else {
-                // No terminal queries to answer on this path (scrollback replay,
-                // local echo, system lines), so feed the whole slice in one call
-                // rather than one parser dispatch per byte — a replay can be
-                // megabytes.
-                parser.process(bytes);
-                Vec::new()
-            };
+            // Replay must restore modes such as alternate scroll too, but
+            // must not send replies to terminal queries from the old output.
+            let responder = entry.responder.get_or_insert_with(Default::default);
+            let response = feed_parser_with_responder(parser, responder, bytes);
             clamp_parser_scrollback(parser);
             response
         };
 
         self.pane_entry(terminal).saw_output = true;
-        if response.is_empty() {
+        if !respond || response.is_empty() {
             return;
         }
         // One write per output chunk, never one per query: this runs on the
@@ -1513,6 +1511,50 @@ impl PtyRuntime {
     pub fn terminal_reports_mouse(&self, terminal: PtyKey) -> bool {
         self.parser(terminal)
             .is_some_and(|parser| parser.screen().mouse_protocol_mode() != MouseProtocolMode::None)
+    }
+
+    /// Deliver wheel scrolling as cursor keys for an alternate-screen program
+    /// that requested DECSET 1007 (for example Codex's transcript viewer).
+    /// Mouse reporting takes precedence; the normal screen still uses local
+    /// scrollback. Generated keys are synthetic input, like mouse reports.
+    pub fn forward_alternate_scroll(&mut self, terminal: PtyKey, up: bool, rows: usize) -> bool {
+        if rows == 0
+            || !self.is_running(terminal)
+            || !self
+                .pane(terminal)
+                .and_then(|pane| pane.responder.as_ref())
+                .is_some_and(|responder| responder.alternate_scroll)
+        {
+            return false;
+        }
+        let Some(parser) = self.parser(terminal) else {
+            return false;
+        };
+        let screen = parser.screen();
+        if !screen.alternate_screen() || screen.mouse_protocol_mode() != MouseProtocolMode::None {
+            return false;
+        }
+        let key = [
+            0x1b,
+            if screen.application_cursor() {
+                b'O'
+            } else {
+                b'['
+            },
+            if up { b'A' } else { b'B' },
+        ];
+        let Some(pane) = self.attached_pane(terminal) else {
+            return false;
+        };
+        let bytes = key.repeat(rows.min(TERMINAL_SCROLLBACK_LINES));
+        if let Err(error) = self.send_input_inner(terminal, pane, &bytes, InputOrigin::Synthetic) {
+            self.pending_events.push(PtyEvent::Error {
+                terminal,
+                message: error.to_string(),
+            });
+        }
+        // This notch belongs to the program even when delivery fails.
+        true
     }
 
     /// Whether the program in `terminal` asked to hear about this *kind* of
@@ -3417,8 +3459,8 @@ impl TerminalResponseDetector {
     /// Record the private modes this client implements itself, on the way past.
     ///
     /// Only DECSET/DECRST (`CSI ? … h` / `CSI ? … l`) is inspected, and only
-    /// for [`FOCUS_REPORTING_MODE`] — every other mode is `vt100`'s business
-    /// and is left to it. The sequence is still handed to the parser
+    /// for focus reporting and alternate scroll — every other mode is
+    /// `vt100`'s business. The sequence is still handed to the parser
     /// unchanged; this is an observation, not an interception.
     ///
     /// Called with the sequence's final byte while the parameters are still in
@@ -3435,8 +3477,12 @@ impl TerminalResponseDetector {
             return;
         }
         // `CSI ? 1004 ; 1006 h` sets both, so every parameter is checked.
-        if parse_csi_params(sequence).contains(&FOCUS_REPORTING_MODE) {
-            self.focus_reporting = set;
+        for mode in parse_csi_params(sequence) {
+            match mode {
+                FOCUS_REPORTING_MODE => self.focus_reporting = set,
+                ALTERNATE_SCROLL_MODE => self.alternate_scroll = set,
+                _ => {}
+            }
         }
     }
 
@@ -3453,6 +3499,11 @@ impl TerminalResponseDetector {
                 _ => (TerminalResponseState::Ground, None),
             },
             TerminalResponseState::Escape => match byte {
+                b'c' => {
+                    self.focus_reporting = false;
+                    self.alternate_scroll = false;
+                    (TerminalResponseState::Ground, None)
+                }
                 b'[' => {
                     self.csi_len = 0;
                     (TerminalResponseState::Csi, None)
@@ -5291,8 +5342,7 @@ mod tests {
         assert!(!runtime.terminal_reports_focus(terminal));
         assert!(!runtime.send_focus(terminal, true));
 
-        // `process_terminal_output` does not run the responder; only real
-        // daemon output does, which is what `feed_terminal_output` models.
+        // Live daemon output both observes modes and answers terminal queries.
         runtime.feed_terminal_output(terminal, b"\x1b[?1004h", true);
         assert!(runtime.terminal_reports_focus(terminal));
 
@@ -5426,6 +5476,104 @@ mod tests {
         // And the matching reset clears it, whichever position it is in.
         feed(&mut detector, b"\x1b[?1006;1004l");
         assert!(!detector.focus_reporting);
+    }
+
+    #[test]
+    fn alternate_scroll_tracks_private_modes_and_terminal_reset() {
+        let mut detector = TerminalResponseDetector::default();
+        for (bytes, expected) in [
+            (&b"\x1b[1007h\x1b[?10070h"[..], false),
+            (&b"\x1b]0;\x1b[?1007h\x07"[..], false),
+            (&b"\x1b[?1004;1007h"[..], true),
+            (&b"\x1b[?1007;1004l"[..], false),
+            (&b"\x1b[?1007h"[..], true),
+            (&b"\x1bc"[..], false),
+        ] {
+            for byte in bytes {
+                detector.advance(*byte);
+            }
+            assert_eq!(detector.alternate_scroll, expected, "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn alternate_scroll_does_not_send_keys_to_a_stopped_pane() {
+        let mut runtime = PtyRuntime::new_offline();
+        let terminal = PtyKey::Terminal(TerminalId(7));
+        runtime.ensure_parser(terminal, PtyDimensions { rows: 24, cols: 80 });
+        runtime.process_terminal_output(terminal, b"\x1b[?1049h\x1b[?1007h");
+        assert!(!runtime.forward_alternate_scroll(terminal, true, 3));
+    }
+
+    #[test]
+    fn top_anchored_scroll_regions_keep_history_and_the_fixed_prompt() {
+        for scroll in [&b"\r\n"[..], &b"\x1b[S"[..]] {
+            let mut runtime = PtyRuntime::new_offline();
+            let terminal = PtyKey::Terminal(TerminalId(7));
+            runtime.ensure_parser(terminal, PtyDimensions { rows: 4, cols: 12 });
+            runtime.process_terminal_output(
+                terminal,
+                b"one\r\ntwo\r\nPROMPT\r\nSTATUS\x1b[1;2r\x1b[2;1H",
+            );
+            runtime.process_terminal_output(terminal, scroll);
+            runtime.process_terminal_output(terminal, b"three");
+            assert_eq!(
+                runtime.terminal_lines(terminal),
+                ["two", "three", "PROMPT", "STATUS"]
+            );
+            assert!(runtime.scroll_up(terminal, 1).unwrap());
+            assert_eq!(
+                runtime.terminal_lines(terminal),
+                ["one", "two", "three", "PROMPT"]
+            );
+            assert!(runtime.scroll_down(terminal, 1).unwrap());
+            assert_eq!(
+                runtime.terminal_lines(terminal),
+                ["two", "three", "PROMPT", "STATUS"]
+            );
+        }
+    }
+
+    #[test]
+    fn scrolling_below_the_top_or_in_the_alternate_screen_does_not_create_history() {
+        for (prefix, region) in [
+            (&b""[..], &b"\x1b[2;3r"[..]),
+            (&b"\x1b[?1049h"[..], &b"\x1b[1;3r"[..]),
+        ] {
+            let mut runtime = PtyRuntime::new_offline();
+            let terminal = PtyKey::Terminal(TerminalId(7));
+            runtime.ensure_parser(terminal, PtyDimensions { rows: 4, cols: 12 });
+            runtime.process_terminal_output(terminal, prefix);
+            runtime.process_terminal_output(terminal, b"HEADER\r\none\r\ntwo\r\nFOOTER");
+            runtime.process_terminal_output(terminal, region);
+            runtime.process_terminal_output(terminal, b"\x1b[3;1H\r\nthree");
+            assert!(!runtime.scroll_up(terminal, 1).unwrap());
+            assert_eq!(
+                runtime.parser(terminal).unwrap().screen().scrollback_len(),
+                0
+            );
+            assert_eq!(runtime.terminal_lines(terminal).last().unwrap(), "FOOTER");
+        }
+    }
+
+    #[test]
+    fn top_anchored_history_is_bounded_and_keeps_the_reader_position() {
+        let mut parser = Parser::new(4, 12, 3);
+        parser.process(b"one\r\ntwo\r\nPROMPT\r\nSTATUS\x1b[1;2r\x1b[2;1H\r\nthree");
+        parser.set_scrollback(1);
+        parser.process(b"\r\nfour");
+        assert_eq!(parser.screen().scrollback(), 2);
+        assert!(parser
+            .screen()
+            .contents()
+            .starts_with("one\ntwo\nthree\nfour"));
+        parser.process(b"\r\nfive\r\nsix\r\nseven");
+        assert_eq!(parser.screen().scrollback_len(), 3);
+        assert_eq!(parser.screen().scrollback(), 3);
+        assert!(parser
+            .screen()
+            .contents()
+            .starts_with("three\nfour\nfive\nsix"));
     }
 
     #[test]

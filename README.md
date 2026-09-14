@@ -179,6 +179,9 @@ Prompt controls:
 Mouse support:
 
 - Scroll wheel scrolls the selected output pane.
+- Inline applications such as Codex retain scrollback when they reserve the
+  bottom rows for a prompt. Wheel scrolling over the main output pane works
+  directly, without opening a transcript viewer or pressing a shortcut.
 - Drag over terminal/chat-agent output to select visible text and copy it through OSC52.
 - `Ctrl+Shift+C` copies the active `mult` text selection when the terminal forwards that key to `mult`.
 - Both copy paths are gated by `clipboard_osc52` (default `true`). Set it to `false` and `mult` never writes an OSC 52 escape: selection still highlights and `Ctrl+Shift+C` is still consumed, but nothing reaches the clipboard.
@@ -195,6 +198,24 @@ Mouse support:
   and `Shift`+wheel scrolls `mult`'s own scrollback even inside a full-screen
   program. A pane whose program has exited needs no `Shift`: the pointer
   returns to `mult` on its own.
+- **Alternate-screen viewers can request wheel-to-arrow scrolling.** Programs
+  such as Codex's transcript viewer enable xterm alternate scroll (DECSET
+  1007). With that mode enabled, wheel up/down sends three Up/Down keys per
+  notch while the alternate screen is active. Application cursor-key mode is
+  honoured; mouse reporting takes precedence, and `Shift` still requests local
+  scrollback. This does not add a scrollback buffer to the alternate screen.
+
+To use Codex's separate transcript viewer, its default `Ctrl+t` shortcut is
+also `mult`'s new-terminal shortcut. An optional alternative in Codex's
+`config.toml` (restart Codex after adding it) is:
+
+```toml
+[tui.keymap.global]
+open_transcript = ["ctrl-t", "alt-t"]
+```
+
+`Alt+t` opens the transcript; use the wheel, arrows, or Page Up/Down to scroll
+and `q` to close it.
 
 Sidebar labels:
 
